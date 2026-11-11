@@ -1,0 +1,10 @@
+{
+  "name": "spec-kit",
+  "upstream_url": "https://github.com/github/spec-kit",
+  "commit_sha": "40dd00f39763ccf653ccb18deb684d006f522176",
+  "license": "MIT",
+  "vendored_at": "2026-11-11",
+  "vendored_paths": ["skills/", "templates/", "scripts/"],
+  "skill_count": 9,
+  "notes": "Generated format, not a raw subtree copy: `specify init --integration claude` (specify-cli 1.4.0, speckit_version 1.4.0) was run against a scratch dir and the generated .claude/skills/speckit-*/ dirs were copied to skills/. The .specify/templates/ doc templates went to templates/ and .specify/scripts/bash/ helper scripts went to scripts/ because the SKILL.md files invoke them (paths are written relative to a project .specify/ dir — the agent should copy scripts/+templates/ into the workspace as .specify/ when following a speckit-* skill). Per-project state (.specify/memory, feature.json, integrations) was not vendored. Upstream reference clone kept at commit_sha for provenance; generated assets come from the specify-cli 1.4.0 bundle which corresponds to spec-kit 1.4.0."
+}

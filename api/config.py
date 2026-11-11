@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     # taken by another local project.
     GATEWAY_URL: str = "http://localhost:8081"
 
+    # Shared secret for POST /api/events/ingest (X-Ingest-Token header).
+    # The gateway and sandbox-facing /internal/* endpoints use this to push
+    # events into the store. Dev default — override in real deployments.
+    INGEST_TOKEN: str = "dev-ingest-token"
+
     # Root of the local artifact store: ./data/artifacts/<run_id>/<sandbox_id>/
     ARTIFACT_ROOT: Path = Path("./data/artifacts")
 

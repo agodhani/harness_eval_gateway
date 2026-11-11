@@ -1,0 +1,10 @@
+{
+  "name": "superpowers",
+  "upstream_url": "https://github.com/obra/superpowers",
+  "commit_sha": "22f0b463e7a5e579904dd6211a520321035526f7",
+  "license": "MIT",
+  "vendored_at": "2026-11-11",
+  "vendored_paths": ["skills/"],
+  "skill_count": 14,
+  "notes": "Only the skills/ subtree was vendored (SKILL.md files plus their references/scripts/assets). hooks/, plugin manifests, index.js, docs/, tests/ and other repo tooling were intentionally skipped. Skills are upstream content; see upstream LICENSE."
+}

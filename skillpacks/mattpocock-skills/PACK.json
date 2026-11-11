@@ -1,0 +1,10 @@
+{
+  "name": "mattpocock-skills",
+  "upstream_url": "https://github.com/mattpocock/skills",
+  "commit_sha": "4ae2317ddb22b046e26455e4f9c9b3aaaf62212d",
+  "license": "MIT",
+  "vendored_at": "2026-11-11",
+  "vendored_paths": ["skills/engineering/", "skills/productivity/"],
+  "skill_count": 28,
+  "notes": "Only the promoted buckets were vendored: skills/engineering/ (21 skills) and skills/productivity/ (7 skills). misc/, in-progress/, deprecated/ and docs/ were intentionally skipped per upstream's own promotion policy. Skills are upstream content; see upstream LICENSE."
+}

@@ -38,9 +38,13 @@ services:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/harness_eval
       # Host Ollama from inside the container (host install, port 11434).
       OLLAMA_BASE_URL: http://host.docker.internal:11434
-      GATEWAY_URL: http://localhost:8080
+      # Control-plane -> gateway over compose DNS on `internal` (container
+      # port 8080; host-side default stays http://localhost:8081).
+      GATEWAY_URL: http://gateway:8080
       ARTIFACT_ROOT: /data/artifacts
       LOG_LEVEL: INFO
+      # Shared secret for /api/events/ingest — must match the gateway's.
+      INGEST_TOKEN: dev-ingest-token
     ports:
       - "8001:8000"
     volumes:
@@ -49,8 +53,46 @@ services:
     extra_hosts:
       # Docker Desktop / Linux bridge -> host gateway (needed for Ollama).
       - "host.docker.internal:host-gateway"
+    healthcheck:
+      # No curl in python:slim — probe /health with urllib instead.
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status == 200 else 1)\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
     depends_on:
       postgres:
+        condition: service_healthy
+    networks:
+      - internal
+
+  # F3 — AI gateway: OpenAI-compatible proxy -> host Ollama, with per-run
+  # creds, metering events -> api ingest, and token budgets. Sandboxes reach
+  # it (and ONLY it) on the internal network; host port 8081 avoids the
+  # locally-occupied 8080.
+  gateway:
+    build: .
+    command: uvicorn gateway.main:app --host 0.0.0.0 --port 8080
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/harness_eval
+      # Host Ollama from inside the container.
+      OLLAMA_UPSTREAM_URL: http://host.docker.internal:11434
+      # Control-plane ingest for metering events.
+      API_INGEST_URL: http://api:8000
+      INGEST_TOKEN: dev-ingest-token
+      GATEWAY_CRED_SECRET: dev-secret-change-me
+      DEFAULT_RUN_TOKEN_BUDGET: "200000"
+      LOG_LEVEL: INFO
+    ports:
+      - "8081:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      api:
         condition: service_healthy
     networks:
       - internal

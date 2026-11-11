@@ -15,10 +15,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F0 | Dev environment & scaffold | ✅ | `docker-compose.yml`, `db/`, `.github/workflows/ci.yml`, `web/e2e/` | `tests/test_smoke.py` |
 | F1 | Submission form → run spec | 🔲 | `web/app/submit/`, `api/routers/runs.py` | `tests/unit/api/test_runs.py` |
 | F2 | Orchestrator (matrix, rubric, lifecycle) | 🔲 | `orchestrator/` | `tests/unit/orchestrator/` |
-| F3 | AI gateway (proxy, metering, budgets) | 🔲 | `gateway/` | `tests/unit/gateway/` |
-| F4 | Sandbox runtime (spawn, egress, snapshot, done) | 🔲 | `sandbox/`, `data/artifacts/` | `tests/integration/test_sandbox.py` |
-| F5 | Miniloop harness + adapter + skill packs | 🔲 | `adapters/miniloop/`, `skillpacks/` | `tests/unit/adapters/miniloop/` |
-| F6 | Event store + live timeline | 🔲 | `api/routers/events.py`, `web/app/runs/[id]/timeline/` | `tests/unit/api/test_events.py` |
+| F3 | AI gateway (proxy, metering, budgets) | ✅ | `gateway/` | `tests/unit/gateway/` |
+| F4 | Sandbox runtime (spawn, egress, snapshot, done) | ✅ | `sandbox/`, `data/artifacts/` | `tests/integration/test_sandbox.py` |
+| F5 | Miniloop harness + adapter + skill packs | ✅ | `adapters/miniloop/`, `skillpacks/` | `tests/unit/adapters/miniloop/` |
+| F6 | Event store + live timeline | 🚧 API done; UI pending | `api/routers/events.py`, `web/app/runs/[id]/timeline/` | `tests/unit/api/test_events.py` |
 | F7 | Evaluator sandbox (rubric scoring) | 🔲 | `evaluator/` | `tests/integration/test_evaluator.py` |
 | F8 | Results UI (matrix, scores, artifacts) | 🔲 | `web/app/runs/`, `api/routers/results.py` | `tests/e2e/` (later) |
 
@@ -72,62 +72,69 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     recorded correctly
 - **Depends on:** F3, F4, F5
 
-### F3 — AI gateway
+### F3 — AI gateway ✅
 
 - **What:** OpenAI-compatible `/v1/chat/completions` endpoint → Ollama
-  upstream; per-run/sandbox credentials map traffic to a run; records tokens
-  in/out, latency, failures (cost ≈ 0 local, still recorded); budget caps;
-  emits `llm_request`/`llm_response`/`error` events. Anthropic-compatible
-  endpoint added later if a CLI adapter requires it.
-- **Where:** `gateway/` (`app.py`, `providers/ollama.py`, `metering.py`,
-  `auth.py`), event emission → F6 ingestion
+  upstream; per-run/sandbox HMAC credentials (`heg.<b64>.<sig>`); records
+  tokens in/out, latency, failures; token budgets (429 + `error` event);
+  emits `llm_request`/`llm_response`/`error` events. `/internal/events`
+  (harness-event proxy, cred or ingest-token auth) + `/internal/done`
+  (done_signal) for sandbox egress. Anthropic-compatible endpoint post-MVP.
+- **Where:** `gateway/` (`main.py`, `creds.py`, `metering.py`, `deps.py`,
+  `config.py`, `mint_cred.py` CLI), compose service `gateway` (:8081→8080)
 - **Verify:**
-  - Unit: `tests/unit/gateway/test_proxy.py`, `test_metering.py`,
-    `test_budgets.py`
-  - Manual: `curl` chat completion with run creds → response streams back +
-    event rows in Postgres
-  - Budget: exceed cap → 429 + `budget_exceeded` event
-- **Depends on:** F0 + F6 ingestion endpoint (build that slice first)
+  - Unit: `tests/unit/gateway/` (creds, metering, proxy — hermetic)
+  - Manual: mint cred (`uv run python -m gateway.mint_cred`) →
+    `curl localhost:8081/v1/chat/completions` → completion + event rows
+  - M2 e2e proven: sandbox→gateway→Ollama→events (see run
+    `a58dd3de-1b71-4c4e-9a06-ad5d2ce5210e` in dev DB)
+- **Depends on:** F0 + F6 ingestion endpoint
 
-### F4 — Sandbox runtime
+### F4 — Sandbox runtime ✅
 
-- **What:** spawn one Docker container per sandbox on an internal network
-  (egress only to gateway); identical initial workspace; injected `done`
-  command on PATH; env wiring (gateway URL, run creds, task prompt); workspace
-  snapshot → `data/artifacts/` on exit.
-- **Where:** `sandbox/` (`runtime.py`, `images/`, `done` script),
-  `data/artifacts/`
+- **What:** spawn one Docker container per sandbox on internal network
+  `heg-sandbox` (`--internal`, egress locked — proven: external DNS fails);
+  gateway attached with alias `gateway` → `http://gateway:8080` is the only
+  egress; `./skillpacks` bind-mounted ro at `/opt/skillpacks`; `done` CLI on
+  PATH → `POST /internal/done`; workspace bind-mount; snapshot →
+  `data/artifacts/<run>/<sandbox>/{workspace/,transcript.log,meta.json}`.
+- **Where:** `sandbox/` (`runtime.py`, `spec.py`, `images/miniloop.Dockerfile`,
+  `images/done`, `images/testapp/`), `data/artifacts/`, `data/sandboxes/`
 - **Verify:**
-  - Integration: `tests/integration/test_sandbox.py`
-    (`@pytest.mark.docker`): spawn → exec → snapshot exists
-  - Manual: `curl` to external host fails inside sandbox; gateway reachable
+  - Integration: `tests/integration/test_sandbox.py` (`@pytest.mark.docker`,
+    6 pass 1 skip) — incl. egress-lockdown proof
+  - M2 e2e proven: real miniloop sandbox completed task + artifact
 - **Depends on:** F0; integrates with F3, F5
 
-### F5 — Miniloop harness + adapter + skill packs
+### F5 — Miniloop harness + adapter + skill packs ✅
 
-- **What:** our custom minimal coding agent — tool-call loop over the gateway
-  (tools: shell exec, file read/write, `done`); skill packs vendored under
-  `skillpacks/` (`superpowers`, `mattpocock-skills`, `spec-kit`), catalog
-  injected into the system prompt; adapter implements the harness contract
-  (`image_spec`, `env`, `launch`, `translate_events`, `completion_signal`).
-- **Where:** `adapters/miniloop/` (agent program + adapter), `skillpacks/`
+- **What:** custom minimal coding agent — tool-call loop over the gateway
+  (tools: `shell`, `read_file`, `write_file`, `use_skill`, `done`); default
+  model `qwen3:8b` via Ollama; JSONL harness events on stdout + HTTP ingest;
+  `MINILOOP_RESULT` terminator line; skill packs vendored under `skillpacks/`
+  (51 SKILL.md: superpowers 14, mattpocock-skills 28, spec-kit 9 generated);
+  progressive-disclosure catalog in system prompt.
+- **Where:** `adapters/miniloop/` (`agent.py`, `tools.py`, `events.py`,
+  `skills.py`, `prompts.py`, `adapter.py`, `__main__.py`), `skillpacks/`
 - **Verify:**
-  - Unit: `tests/unit/adapters/miniloop/test_loop.py`, `test_tools.py`,
-    `test_events.py`
-  - Integration: sandbox run of "create hello.txt containing X" →
-    `agent_done`, file present in artifact, harness events emitted
+  - Unit: `tests/unit/adapters/miniloop/` (64 tests — loop, tools, events,
+    skills, adapter)
+  - Live: `python -m adapters.miniloop` vs host Ollama → agent_done ✓
+  - M2 e2e proven: in-sandbox run, 51 skills discovered, done_signal emitted
 - **Depends on:** F3, F4
 
-### F6 — Event store + live timeline
+### F6 — Event store + live timeline 🚧 (API ✅ / UI pending)
 
 - **What:** append-only `events` table + ingestion API + query API + SSE
   stream; UI timeline page — live during run, replayable after with
-  timestamps.
-- **Where:** `api/routers/events.py` (ingest, query, SSE), db `events`,
-  `web/app/runs/[id]/timeline/`
+  timestamps. **API side done** (`api/routers/events.py`: ingest batch/single,
+  query w/ filters+pagination, SSE tail); UI timeline is Phase 2.
+- **Where:** `api/routers/events.py`, `api/schemas.py` (EventSource/EventType
+  enums), db `events`, `web/app/runs/[id]/timeline/` (pending)
 - **Verify:**
-  - Unit: `tests/unit/api/test_events.py` (ingest ordering, filters)
-  - UI: timeline updates live without refresh; reload preserves order
+  - Unit: `tests/unit/api/test_events.py` + `test_event_types.py` (13+ tests)
+  - Live: SSE verified via curl; M2 events persisted
+  - UI: pending Phase 2
 - **Depends on:** F0 (ingestion slice unblocks F3)
 
 ### F7 — Evaluator sandbox

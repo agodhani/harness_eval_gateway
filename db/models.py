@@ -93,7 +93,14 @@ class Event(Base):
     __tablename__ = "events"
     __table_args__ = (Index("ix_events_run_sandbox_ts", "run_id", "sandbox_id", "ts"),)
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # BIGINT on Postgres; INTEGER on sqlite so it becomes an INTEGER PRIMARY
+    # KEY (rowid alias) and autoincrement actually works in tests — sqlite
+    # does not auto-assign BIGINT PKs.
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
     run_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("runs.id"), index=True)
     # Nullable: run-level events (rubric gen, orchestration) have no sandbox.
     sandbox_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -105,7 +112,9 @@ class Event(Base):
     # gateway | harness | sandbox | evaluator | orchestrator
     source: Mapped[str] = mapped_column(String(32))
     # llm_request | llm_response | tool_call | shell_command | file_op |
-    # test_execution | checkpoint | skill_invocation | done_signal | error
+    # test_execution | checkpoint | skill_invocation | done_signal | error |
+    # run_started | terminal_state | context_compacted | miniloop_result
+    # (authoritative list: api/schemas.py EventType — keep in sync)
     type: Mapped[str] = mapped_column(String(64))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
 

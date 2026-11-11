@@ -137,7 +137,9 @@ done skill pack) that signals the orchestrator — `agent_done` is distinct from
 - **sources**: `gateway`, `harness`, `sandbox`, `evaluator`, `orchestrator`
 - **types**: `llm_request`, `llm_response` (tokens in/out, cache r/w, latency,
   cost, model), `tool_call`, `shell_command`, `file_op`, `test_execution`,
-  `checkpoint`, `skill_invocation`, `done_signal`, `error`
+  `checkpoint`, `skill_invocation`, `done_signal`, `error`, `run_started`,
+  `terminal_state`, `context_compacted`, `miniloop_result` (authoritative
+  list: `api/schemas.py::EventType` — a contract test AST-scans emitters)
 
 Gateway events are captured passively from the request/response stream.
 Agent-level events (tool calls, shell, file ops) are produced by the harness
@@ -265,4 +267,10 @@ or tests change.
   land.
 - **Update `FEATURE_MAP.md`** whenever a feature's code paths, UI surface, or
   tests change — it's part of the definition of done.
-- Dev environment commands: TBD — fill in once scaffolded.
+- Dev environment: `docker compose up -d` (api :8001, postgres :5433,
+  gateway :8081); `uv run pytest`; `uv run ruff check .`; web dev
+  `cd web && npm run dev` (use `-p 3002` if :3000 is taken);
+  e2e `cd web && E2E_PORT=3100 npm run test:e2e`.
+- **Known issues (Phase 3 candidates):** event ingest has no retry/buffering —
+  a sandbox emitting during an api restart loses early events; gateway emits
+  best-effort. `heg-dev` static cred exists for dev only.

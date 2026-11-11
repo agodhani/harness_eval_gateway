@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""`done` CLI baked into every sandbox image (F4).
+
+Signals task completion to the orchestrator THROUGH THE AI GATEWAY — the
+sandbox's only egress route:
+
+    POST $GATEWAY_BASE_URL/internal/done
+    Authorization: Bearer $GATEWAY_CRED
+    Content-Type: application/json
+    {"summary": "...", "status": "..."}
+
+Usage: ``done [--status STATUS] [summary words ...]``
+Defaults: status="done", summary="" (override --status e.g. "failed").
+
+Exit codes: 0 on HTTP 2xx, 1 on HTTP/transport error, 2 on missing env/usage.
+
+NOTE: `done` is a bash reserved word — invoke it as ``command done ...``,
+``/usr/local/bin/done ...``, or via direct exec (not ``bash -c "done ..."``).
+"""
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    status = "done"
+    if "--status" in args:
+        idx = args.index("--status")
+        if idx + 1 >= len(args):
+            print("done: --status requires a value", file=sys.stderr)
+            return 2
+        status = args[idx + 1]
+        del args[idx : idx + 2]
+    summary = " ".join(args)
+
+    base = os.environ.get("GATEWAY_BASE_URL", "").rstrip("/")
+    cred = os.environ.get("GATEWAY_CRED", "")
+    if not base or not cred:
+        print(
+            "done: GATEWAY_BASE_URL and GATEWAY_CRED must be set",
+            file=sys.stderr,
+        )
+        return 2
+
+    body = json.dumps({"summary": summary, "status": status}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base}/internal/done",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cred}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            print(f"done: HTTP {resp.status} {text}")
+            return 0 if 200 <= resp.status < 300 else 1
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        print(f"done: HTTP {exc.code} {detail}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"done: request failed: {exc.reason}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
