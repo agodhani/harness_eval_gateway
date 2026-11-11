@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend — ruff + pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: harness_eval
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d harness_eval"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    env:
+      # tests/conftest.py only sets a sqlite fallback via setdefault(), so this
+      # env var wins and DB-backed tests run against the service container.
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/harness_eval
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv + Python 3.12
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --locked
+
+      - name: Apply database migrations
+        run: uv run alembic upgrade head
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Test
+        # `-m "not docker"` skips tests marked @pytest.mark.docker (they need a
+        # live Docker daemon). `integration`-marked tests run here — the
+        # Postgres service satisfies them.
+        run: uv run pytest -m "not docker"
+
+  web:
+    name: Web — lint + build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+
+      # Node 22 LTS for CI stability (local dev currently uses Node 25).
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+  e2e:
+    name: E2E — Playwright
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      # playwright.config.ts webServer runs `npm run build && npm run start`
+      # (next start on :3000), waits for it, runs the suite, then stops it.
+      - name: Run e2e tests
+        run: npm run test:e2e

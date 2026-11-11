@@ -1,0 +1,63 @@
+# harness_eval_gateway — local dev topology.
+#
+# `internal` carries only control-plane traffic (api <-> postgres).
+# Ollama runs on the HOST (not containerized for MVP); the api reaches it via
+# host.docker.internal (see extra_hosts below + OLLAMA_BASE_URL env).
+# Agent sandboxes (F4) will get their OWN internal network later — only the
+# AI gateway will be reachable from them (egress lockdown).
+#
+#   docker compose up -d        # postgres + api
+#   docker compose down -v      # stop + wipe pgdata
+#
+# Published host ports are offset to avoid conflicts with other local
+# projects' containers (postgres 5433->5432, api 8001->8000; gateway default 8081).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: harness_eval
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d harness_eval"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  api:
+    build: .
+    environment:
+      # `postgres` resolves on the `internal` network.
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/harness_eval
+      # Host Ollama from inside the container (host install, port 11434).
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      GATEWAY_URL: http://localhost:8080
+      ARTIFACT_ROOT: /data/artifacts
+      LOG_LEVEL: INFO
+    ports:
+      - "8001:8000"
+    volumes:
+      # Persist artifacts on the host under ./data/artifacts/<run>/<sandbox>/
+      - ./data/artifacts:/data/artifacts
+    extra_hosts:
+      # Docker Desktop / Linux bridge -> host gateway (needed for Ollama).
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  pgdata:

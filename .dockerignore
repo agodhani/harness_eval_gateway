@@ -1,0 +1,19 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+
+# Local data / artifacts
+data/artifacts/*
+!data/artifacts/.gitkeep
+
+# Node / Next.js
+node_modules
+web/node_modules
+web/.next
+web/out
+
+# Env / local config
+.env

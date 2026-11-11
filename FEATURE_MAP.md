@@ -12,7 +12,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 | ID | Feature | Status | Primary code | Primary tests |
 |----|---------|--------|--------------|---------------|
-| F0 | Dev environment & scaffold | 🔲 | `docker-compose.yml`, `db/`, repo root | `tests/test_smoke.py` |
+| F0 | Dev environment & scaffold | ✅ | `docker-compose.yml`, `db/`, `.github/workflows/ci.yml`, `web/e2e/` | `tests/test_smoke.py` |
 | F1 | Submission form → run spec | 🔲 | `web/app/submit/`, `api/routers/runs.py` | `tests/unit/api/test_runs.py` |
 | F2 | Orchestrator (matrix, rubric, lifecycle) | 🔲 | `orchestrator/` | `tests/unit/orchestrator/` |
 | F3 | AI gateway (proxy, metering, budgets) | 🔲 | `gateway/` | `tests/unit/gateway/` |
@@ -24,19 +24,24 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 ## Feature details
 
-### F0 — Dev environment & scaffold
+### F0 — Dev environment & scaffold ✅
 
-- **What:** repo layout, docker-compose (Postgres 16, Ollama), Alembic base
-  schema (`runs`, `sandboxes`, `events`, `rubrics`, `scores`, `artifacts`),
-  pytest + lint scaffold.
-- **Where:** `docker-compose.yml`, `db/migrations/`, `pyproject.toml`,
-  `tests/`
+- **What:** repo layout, docker-compose (Postgres 16 on host port **5433**,
+  api on **8001** — offset to avoid conflicts with other local projects),
+  Alembic base schema (`runs`, `sandboxes`, `events`, `rubrics`, `scores`,
+  `artifacts`), pytest + ruff scaffold, Next.js 16 app, GitHub Actions CI
+  (backend lint+pytest w/ Postgres service, web lint+build, Playwright e2e).
+- **Where:** `docker-compose.yml`, `Dockerfile`, `db/migrations/`,
+  `pyproject.toml`, `.github/workflows/ci.yml`, `web/playwright.config.ts`,
+  `web/e2e/smoke.spec.ts`, `tests/`
 - **Verify:**
-  - `docker compose up -d` → Postgres healthy, `curl localhost:11434/api/tags`
-    responds (Ollama)
-  - `ollama pull qwen2.5-coder:3b` succeeds (default small model)
-  - `alembic upgrade head` → all tables present
-  - `pytest tests/test_smoke.py` green
+  - `docker compose up -d` → `curl localhost:8001/health` + `/health/db` ok
+  - `DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5433/harness_eval alembic upgrade head` → all tables present
+  - `uv run pytest` + `uv run ruff check .` green
+  - `cd web && npm run lint && npm run build` green
+  - `cd web && E2E_PORT=3100 npm run test:e2e` → smoke passes (3100 avoids
+    local port-3000 conflict; CI uses 3000)
+  - CI: push triggers `.github/workflows/ci.yml` — 3 jobs must go green
 - **Depends on:** —
 
 ### F1 — Submission form → run spec
