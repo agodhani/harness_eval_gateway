@@ -18,8 +18,12 @@ produced artifact against a human-approved rubric. All model traffic and agent
 activity are captured as structured events powering a live + persisted
 execution timeline.
 
-**MVP shape:** 1 model × 2 harnesses → 2 concurrent sandboxes. Evaluator runs
-afterwards in its own sandbox.
+**MVP shape:** 1 model (Ollama, small local model) × 2 harness configs → 2
+concurrent sandboxes. Evaluator runs afterwards in its own sandbox. Since
+**miniloop** (our custom harness) is the first adapter, the MVP comparison
+axis is harness *configuration* — e.g. different skill pack sets or system
+prompts across the two sandboxes. Multi-harness comparisons land as CLI
+adapters are added.
 
 ## Core concepts
 
@@ -75,12 +79,13 @@ afterwards in its own sandbox.
    expands run matrix, generates rubric via gateway, drives run state machine
    (`submitted → rubric_review → provisioning → running → evaluating →
    done | failed`), manages sandbox lifecycle, enforces termination policy.
-3. **AI gateway (Python, custom)** — exposes both OpenAI-compatible
-   (`/v1/chat/completions`) and Anthropic-compatible (`/v1/messages`)
-   endpoints, translates to upstream providers (OpenRouter primary; Ollama /
-   direct as configured). Per-run credentials map traffic to run+sandbox.
-   Records: model, tokens in/out, cache read/write, latency, cost, failures.
-   Emits events to Postgres. Enforces token/cost budgets.
+3. **AI gateway (Python, custom)** — exposes an OpenAI-compatible
+   (`/v1/chat/completions`) endpoint, translates to upstream providers
+   (**Ollama is the default upstream for MVP** — small local models, e.g.
+   `qwen2.5-coder:3b`). Anthropic-compatible (`/v1/messages`) endpoint added
+   when a CLI adapter requires it. Per-run credentials map traffic to
+   run+sandbox. Records: model, tokens in/out, cache read/write, latency,
+   cost, failures. Emits events to Postgres. Enforces token/cost budgets.
 4. **Sandboxes (Docker)** — per-harness image + installed skill packs + clean
    workspace + injected `done` mechanism. Env points harness at gateway with
    run-scoped creds. Egress locked to gateway — no telemetry holes.
@@ -150,10 +155,15 @@ Each adapter provides:
 - `translate_events(stream)` → normalized `Event[]`
 - `completion_signal()` — how `done` / loop-completion is detected
 
-**MVP adapter candidates** (free/open access): Claude Code CLI, Codex CLI,
-Aider (scripted minimal loop), plus a custom minimal loop harness. Providers:
-OpenRouter primary; Ollama for local models; direct Anthropic/OpenAI if keys
-exist.
+**MVP adapter:** `miniloop` — our custom minimal coding agent (tool-call
+loop: shell exec, file read/write, `done`). Post-MVP adapters: Claude Code
+CLI, Codex CLI, Aider (note: these need paid accounts/API keys — not free).
+
+**Default skill packs** (named presets, vendored under `skillpacks/`):
+`superpowers`, `mattpocock-skills`, `spec-kit`.
+
+**Providers:** Ollama default (local, free); OpenRouter / direct
+Anthropic/OpenAI post-MVP.
 
 ## Rubric
 
@@ -169,21 +179,25 @@ applied identically to all sandboxes.
 - **Backend**: Python 3.12, FastAPI, asyncio; SQLAlchemy + Alembic
 - **Frontend**: Next.js (TypeScript), SSE for live timeline
 - **DB**: Postgres 16 (docker-compose)
+- **Inference**: Ollama (docker-compose or host), small models for testing
 - **Sandboxes**: Docker, per-harness image, host docker socket for spawning
 - **Evaluator**: sandboxed agent (same infra)
 - **Artifacts**: local disk `./data/artifacts/`
+- **Auth**: none — local single-user tool for MVP
 
 ## Repo layout (proposed)
 
 ```
-gateway/       # LLM proxy: adapters, metering, budgets, event emission
+gateway/       # LLM proxy: providers, metering, budgets, event emission
 orchestrator/  # run state machine, matrix expansion, rubric gen, lifecycle
 api/           # control-plane HTTP API (FastAPI app)
-adapters/      # harness adapters (claude_code, codex, aider, miniloop, ...)
+adapters/      # harness adapters (miniloop first; cli adapters post-MVP)
 sandbox/       # image defs, workspace prep, done mechanism, event collector
 evaluator/     # rubric scoring agent
+skillpacks/    # vendored default packs: superpowers, mattpocock-skills, spec-kit
 web/           # Next.js app
 db/            # schema + Alembic migrations
+tests/         # unit / integration / e2e
 data/          # artifacts (gitignored)
 docs/
 docker-compose.yml
@@ -191,18 +205,27 @@ docker-compose.yml
 
 ## MVP feature map
 
-| # | Feature | Status |
-|---|---------|--------|
-| F1 | Submission form → run spec | not started |
-| F2 | Orchestrator: matrix, rubric gen, lifecycle | not started |
-| F3 | Gateway: OpenAI+Anthropic endpoints, telemetry, budgets | not started |
-| F4 | Sandbox runtime: images, skill packs, egress lockdown | not started |
-| F5 | Event store + live timeline (SSE) + replay | not started |
-| F6 | Evaluator sandbox: rubric scoring + rationale | not started |
-| F7 | Results UI: matrix, scores, timeline, artifacts | not started |
+Feature IDs, code locations, and verification steps are maintained in
+**[FEATURE_MAP.md](./FEATURE_MAP.md)** — update it whenever a feature's paths
+or tests change.
+
+| # | Feature |
+|---|---------|
+| F0 | Dev environment & scaffold |
+| F1 | Submission form → run spec |
+| F2 | Orchestrator: matrix, rubric gen, lifecycle |
+| F3 | AI gateway: OpenAI-compatible proxy → Ollama, telemetry, budgets |
+| F4 | Sandbox runtime: spawn, egress lockdown, snapshots, done mechanism |
+| F5 | Miniloop harness + adapter + default skill packs |
+| F6 | Event store + live timeline (SSE) + replay |
+| F7 | Evaluator sandbox: rubric scoring + rationale |
+| F8 | Results UI: matrix, scores, timeline, artifacts |
 
 ## Post-MVP roadmap
 
+- Additional harness adapters: Claude Code CLI, Codex CLI, Aider
+- Additional providers: OpenRouter, direct Anthropic/OpenAI
+- Anthropic-compatible gateway endpoint (`/v1/messages`)
 - Model-vs-model comparisons (multi-model matrices)
 - Objective scoring: build/test execution, coverage, static analysis
 - Automated test-suite generation as eval target
@@ -223,6 +246,16 @@ docker-compose.yml
 - LLM-judge scoring only for MVP; objective checks post-MVP.
 - Artifacts local; metadata in Postgres.
 - Evaluator model is user-selected at submission (independence is opt-in).
+- **Ollama is the default inference** for MVP — small local models; cost ≈ 0
+  but still metered uniformly.
+- **Miniloop-first**: our custom harness is the initial adapter; MVP
+  comparisons vary harness config (skill packs, prompts), not CLIs.
+- Default skill packs shipped as named presets: superpowers,
+  mattpocock-skills, spec-kit.
+- Termination caps confirmed: 60 min wall clock, $2 spend cap, stuck-loop =
+  3 consecutive identical tool calls.
+- No auth — local single-user tool; docker-compose topology; sandboxes
+  spawned via host Docker socket.
 
 ## Working conventions
 
@@ -230,4 +263,6 @@ docker-compose.yml
 - Events are append-only — never update/delete; corrections are new events.
 - Keep changes small and verifiable; note new commands/config here as they
   land.
+- **Update `FEATURE_MAP.md`** whenever a feature's code paths, UI surface, or
+  tests change — it's part of the definition of done.
 - Dev environment commands: TBD — fill in once scaffolded.
