@@ -1,20 +1,34 @@
 """FastAPI control-plane app factory.
 
-F0 exposes only health endpoints. Feature routers (runs, events, results, ...)
-are added per FEATURE_MAP.md; the web UI calls them under `/api/*` (Next.js
-rewrites or a router prefix — decided in F1).
+Feature routers (runs, events, results, ...) are added per FEATURE_MAP.md;
+the web UI calls them under `/api/*` (Next.js rewrites or a router prefix —
+decided in F1).
+
+Lifespan runs ``orchestrator.runner.startup_sweep`` on boot (reconcile DB
+state after an api restart — in-process tasks die with the process) and
+``runner.shutdown`` on exit (cancel in-flight orchestration tasks).
 """
+
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.config import get_settings
-from api.routers import events, health
+from api.routers import events, health, results, runs
+from orchestrator import runner
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await runner.startup_sweep()
+    yield
+    await runner.shutdown()
 
 
 def create_app() -> FastAPI:
     get_settings()  # fail fast on bad env config
-    app = FastAPI(title="harness_eval_gateway", version="0.1.0")
+    app = FastAPI(title="harness_eval_gateway", version="0.1.0", lifespan=lifespan)
 
     # Local dev: allow the Next.js dev server on any localhost port.
     app.add_middleware(
@@ -27,6 +41,8 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(events.router)
+    app.include_router(runs.router)
+    app.include_router(results.router)
     return app
 
 

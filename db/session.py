@@ -12,13 +12,27 @@ from sqlalchemy.pool import StaticPool
 def make_engine(database_url: str, **kwargs) -> Engine:
     """Create a SQLAlchemy engine for `database_url`.
 
-    SQLite gets a single shared in-process connection (StaticPool +
-    check_same_thread=False) so `:memory:` databases and threaded test
-    clients see the same data.
+    SQLite ``:memory:`` databases get a single shared in-process connection
+    (``StaticPool``) — a pooled second connection would see an empty DB.
+    Because that is ONE sqlite3 connection, access must be serialized:
+    all orchestrator DB work runs on the event-loop thread and API
+    handlers use per-request sessions; do NOT wrap DB calls in
+    ``asyncio.to_thread`` against a ``:memory:`` engine.
+
+    File-backed sqlite uses the default pool so each session checks out
+    its OWN connection — concurrent callers (FastAPI threadpool endpoints,
+    ``asyncio.to_thread`` workers) can never share one sqlite3 connection,
+    which is what segfaulted under ``StaticPool``. ``check_same_thread``
+    stays off because pooled connections migrate between threads, and a
+    busy ``timeout`` keeps concurrent writers from failing on SQLITE_BUSY.
     """
     if database_url.startswith("sqlite"):
-        kwargs.setdefault("connect_args", {})["check_same_thread"] = False
-        kwargs.setdefault("poolclass", StaticPool)
+        connect_args = kwargs.setdefault("connect_args", {})
+        connect_args["check_same_thread"] = False
+        if ":memory:" in database_url:
+            kwargs.setdefault("poolclass", StaticPool)
+        else:
+            connect_args.setdefault("timeout", 30)
     return create_engine(database_url, pool_pre_ping=True, **kwargs)
 
 

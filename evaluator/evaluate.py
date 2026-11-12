@@ -1,0 +1,467 @@
+"""F7 — evaluate one sandbox artifact with a sandboxed LLM judge.
+
+Contract (docs/orchestrator-plan.md §5 — the orchestrator calls this and
+nothing else)::
+
+    scores = await evaluate_sandbox(
+        run_id=..., sandbox_id=..., rubric_id=..., rubric={...},
+        artifact_dir=..., workspace_dir=..., transcript_path=...,
+        terminal_reason=..., model=..., gateway_base_url=...,
+        gateway_cred=..., session_factory=..., timeout_seconds=1800.0,
+    )
+
+What it does:
+
+1. Stages a throwaway eval workspace at ``<eval_root>/<run>/<sandbox>/
+   eval_workspace/`` — default ``eval_root`` is ``<artifact_root>/../eval``
+   (i.e. ``data/eval``), a sibling of the artifact store so it lives on the
+   same host-visible mount. Contents: a copy of the artifact ``workspace/``
+   (the candidate repo) plus ``rubric.json`` (frozen rubric),
+   ``EVAL_PROMPT.md`` (judge brief), and ``EVAL_TRANSCRIPT.log`` when a
+   transcript exists.
+2. Spawns a miniloop sandbox (``heg-sandbox:latest`` on the egress-locked
+   ``heg-sandbox`` network) with the run-scoped gateway cred, the evaluator
+   model, and a judge TASK_PROMPT. The agent reads the rubric + files and
+   writes ``scores.json`` to the workspace root (= the staged dir on host).
+3. Waits for container exit (or ``timeout_seconds`` → docker stop), removes
+   the container, parses ``scores.json``, validates it, and inserts
+   ``Score`` rows (one per rubric dimension + an ``overall`` pseudo-row when
+   present) plus ``source="evaluator"`` events — all in one transaction.
+
+Return / failure semantics (plan §6): returns the ``Score`` rows it
+managed to persist. A missing/invalid ``scores.json`` yields an ``error``
+event + ``[]`` — the orchestrator decides run-level failure by counting
+rows. Infrastructure failures (bad params, missing workspace, spawn errors)
+raise. The eval sandbox is always removed; the staged dir is kept for
+debugging.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import shutil
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
+
+from db.models import Event, Rubric, Score
+from evaluator.prompts import build_eval_prompt
+from evaluator.sandbox_spec import (
+    DEFAULT_EVAL_MAX_ITERS,
+    SANDBOX_GATEWAY_URL,
+    build_eval_env,
+    build_eval_spec,
+    eval_sandbox_id,
+)
+from evaluator.scores import (
+    OVERALL_DIMENSION,
+    SCORES_FILENAME,
+    ScoresFileError,
+    load_scores_file,
+)
+from sandbox.runtime import DEFAULT_IMAGE, SandboxRuntime
+
+logger = logging.getLogger(__name__)
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_EVAL_ROOT = _REPO_ROOT / "data" / "eval"
+
+#: Container states worth continuing to poll for (docker .State.Status).
+_ACTIVE_STATES = {"created", "running", "restarting", "paused"}
+
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+
+
+def _as_uuid(value: Any, field: str) -> uuid.UUID:
+    if isinstance(value, uuid.UUID):
+        return value
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError(f"evaluate_sandbox: {field} is not a UUID: {value!r}") from exc
+
+
+def _lookup_rubric_id(
+    session_factory: sessionmaker[Session], run_uuid: uuid.UUID
+) -> uuid.UUID | None:
+    """Latest rubric for the run — approved preferred, then highest version."""
+    try:
+        with session_factory() as s:
+            rows = s.execute(
+                select(Rubric.id, Rubric.status, Rubric.version).where(
+                    Rubric.run_id == run_uuid
+                )
+            ).all()
+    except Exception:
+        logger.warning("evaluator: rubric lookup failed for run %s", run_uuid, exc_info=True)
+        return None
+    if not rows:
+        return None
+    approved = [r for r in rows if r.status == "approved"]
+    pool = approved or list(rows)
+    return max(pool, key=lambda r: r.version).id
+
+
+def _emit_event(
+    session_factory: sessionmaker[Session],
+    *,
+    run_id: uuid.UUID,
+    sandbox_id: uuid.UUID,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    """Insert one ``source="evaluator"`` event. NEVER raises — telemetry must
+    not break evaluation."""
+    try:
+        with session_factory() as s:
+            s.add(
+                Event(
+                    run_id=run_id,
+                    sandbox_id=sandbox_id,
+                    source="evaluator",
+                    type=event_type,
+                    payload=payload,
+                )
+            )
+            s.commit()
+    except Exception:
+        logger.warning(
+            "evaluator: failed to emit %s event", event_type, exc_info=True
+        )
+
+
+def _stage_eval_workspace(
+    *,
+    eval_root: Path,
+    run_uuid: uuid.UUID,
+    sandbox_uuid: uuid.UUID,
+    workspace_dir: Path,
+    transcript_path: Path | None,
+    rubric: dict[str, Any],
+    terminal_reason: str | None,
+) -> Path:
+    """Build ``<eval_root>/<run>/<sandbox>/eval_workspace/`` and return it.
+
+    Layout::
+
+        eval_workspace/           # = /workspace in the eval container
+          <candidate repo files>  # copied from artifact workspace/
+          rubric.json             # frozen rubric (overwrites any candidate file)
+          EVAL_PROMPT.md          # judge brief
+          EVAL_TRANSCRIPT.log     # candidate transcript, when available
+          scores.json             # <- written later by the judge agent
+    """
+    stage_dir = eval_root / str(run_uuid) / str(sandbox_uuid)
+    eval_ws = stage_dir / "eval_workspace"
+    if eval_ws.exists():
+        shutil.rmtree(eval_ws)
+    eval_ws.mkdir(parents=True)
+
+    # Copy the candidate workspace CONTENTS (dirs_exist_ok into fresh dir).
+    shutil.copytree(workspace_dir, eval_ws, dirs_exist_ok=True, symlinks=True)
+
+    (eval_ws / "rubric.json").write_text(
+        json.dumps(rubric, indent=2, ensure_ascii=False, default=str) + "\n",
+        encoding="utf-8",
+    )
+    (eval_ws / "EVAL_PROMPT.md").write_text(
+        build_eval_prompt(rubric, terminal_reason=terminal_reason),
+        encoding="utf-8",
+    )
+    if transcript_path is not None and Path(transcript_path).is_file():
+        shutil.copy2(transcript_path, eval_ws / "EVAL_TRANSCRIPT.log")
+    return eval_ws
+
+
+async def _wait_for_exit(
+    rt: SandboxRuntime,
+    eval_sid: str,
+    *,
+    deadline: float,
+    poll_interval: float,
+) -> tuple[dict[str, Any], bool]:
+    """Poll ``rt.status`` until the container leaves an active state.
+
+    Returns ``(last_status_dict, timed_out)``. On deadline, issues
+    ``rt.stop(remove=False)`` so a stuck judge can't leak a container; the
+    caller removes it and still tries to read scores.json (partial output
+    beats nothing).
+    """
+    last: dict[str, Any] = {"status": "unknown"}
+    while True:
+        last = await asyncio.to_thread(rt.status, eval_sid)
+        state = str(last.get("status") or "unknown")
+        if state not in _ACTIVE_STATES:
+            return last, False
+        if time.monotonic() >= deadline:
+            await asyncio.to_thread(rt.stop, eval_sid, remove=False)
+            # One final status read for the event payload.
+            try:
+                last = await asyncio.to_thread(rt.status, eval_sid)
+            except Exception:
+                logger.debug("evaluator: post-stop status read failed", exc_info=True)
+            return last, True
+        await asyncio.sleep(poll_interval)
+
+
+# ---------------------------------------------------------------------------
+# contract
+# ---------------------------------------------------------------------------
+
+
+async def evaluate_sandbox(
+    *,
+    run_id: uuid.UUID | str,
+    sandbox_id: uuid.UUID | str,
+    rubric_id: uuid.UUID | str | None = None,
+    rubric: dict[str, Any] | None = None,
+    artifact_dir: Path | str | None = None,
+    workspace_dir: Path | str | None = None,
+    transcript_path: Path | str | None = None,
+    terminal_reason: str | None = None,
+    model: str | None = None,
+    gateway_base_url: str = SANDBOX_GATEWAY_URL,
+    gateway_cred: str | None = None,
+    session_factory: sessionmaker[Session] | None = None,
+    timeout_seconds: float = 1800.0,
+    runtime: SandboxRuntime | None = None,
+    max_iters: int = DEFAULT_EVAL_MAX_ITERS,
+    eval_root: Path | str | None = None,
+    poll_interval_seconds: float = 2.0,
+    image: str = DEFAULT_IMAGE,
+    # -- compatibility aliases (alternative spellings seen in design notes) --
+    evaluator_model: str | None = None,
+    cred: str | None = None,
+    artifact_workspace_path: Path | str | None = None,
+) -> list[Score]:
+    """Score one sandbox's artifact with a sandboxed judge agent.
+
+    Plan §5 params are keyword-only and match the orchestrator contract;
+    ``runtime``/``max_iters``/``eval_root``/``poll_interval_seconds``/
+    ``image`` are DI/test knobs, and ``evaluator_model``/``cred``/
+    ``artifact_workspace_path`` are accepted aliases for
+    ``model``/``gateway_cred``/``workspace_dir``.
+
+    Returns the persisted ``Score`` ORM rows (detached). Raises ``ValueError``
+    on missing required inputs, ``FileNotFoundError`` when the artifact
+    workspace is absent, and propagates sandbox spawn/runtime errors.
+    """
+    # ---- resolve + validate ------------------------------------------------
+    run_uuid = _as_uuid(run_id, "run_id")
+    sandbox_uuid = _as_uuid(sandbox_id, "sandbox_id")
+
+    model_name = (model or evaluator_model or "").strip()
+    cred_token = gateway_cred or cred
+    if not model_name:
+        raise ValueError("evaluate_sandbox: 'model' (evaluator_model) is required")
+    if not cred_token:
+        raise ValueError("evaluate_sandbox: 'gateway_cred' (cred) is required")
+    if session_factory is None:
+        raise ValueError("evaluate_sandbox: 'session_factory' is required")
+    if not isinstance(rubric, dict) or not rubric:
+        raise ValueError("evaluate_sandbox: 'rubric' must be a non-empty dict")
+
+    ws_dir = workspace_dir if workspace_dir is not None else artifact_workspace_path
+    art_dir = Path(artifact_dir) if artifact_dir is not None else None
+    if ws_dir is None and art_dir is not None:
+        ws_dir = art_dir / "workspace"
+    if ws_dir is None:
+        raise ValueError(
+            "evaluate_sandbox: 'workspace_dir' (or 'artifact_dir') is required"
+        )
+    ws_path = Path(ws_dir)
+    art_path = art_dir if art_dir is not None else ws_path.parent
+    if not ws_path.is_dir():
+        raise FileNotFoundError(
+            f"evaluate_sandbox: artifact workspace not found: {ws_path}"
+        )
+    transcript = (
+        Path(transcript_path)
+        if transcript_path is not None
+        else (art_path / "transcript.log" if art_path else None)
+    )
+
+    rid_uuid = (
+        _as_uuid(rubric_id, "rubric_id")
+        if rubric_id is not None
+        else _lookup_rubric_id(session_factory, run_uuid)
+    )
+    rt = runtime if runtime is not None else SandboxRuntime()
+    if eval_root is not None:
+        eval_root_path = Path(eval_root)
+    else:
+        # Default: sibling of the artifact root — <data>/eval. Deriving it
+        # from the runtime's artifact_root keeps the staged workspace on the
+        # same host-visible mount as artifacts/sandbox state (compose mounts
+        # ./data -> /data; the eval workspace is bind-mounted into the eval
+        # container, so it MUST live under a host path).
+        art_root = getattr(rt, "artifact_root", None)
+        eval_root_path = (
+            Path(art_root).parent / "eval" if art_root else DEFAULT_EVAL_ROOT
+        )
+    eval_sid = eval_sandbox_id(sandbox_uuid)
+    deadline = time.monotonic() + float(timeout_seconds)
+
+    # ---- stage + spawn ------------------------------------------------------
+    eval_ws = await asyncio.to_thread(
+        _stage_eval_workspace,
+        eval_root=eval_root_path,
+        run_uuid=run_uuid,
+        sandbox_uuid=sandbox_uuid,
+        workspace_dir=ws_path,
+        transcript_path=transcript,
+        rubric=rubric,
+        terminal_reason=terminal_reason,
+    )
+
+    _emit_event(
+        session_factory,
+        run_id=run_uuid,
+        sandbox_id=sandbox_uuid,
+        event_type="checkpoint",
+        payload={
+            "phase": "eval_started",
+            "eval_sandbox_id": eval_sid,
+            "model": model_name,
+            "eval_workspace": str(eval_ws),
+            "terminal_reason": terminal_reason,
+            "max_iters": max_iters,
+        },
+    )
+
+    env = build_eval_env(
+        gateway_base_url=gateway_base_url,
+        cred=cred_token,
+        model=model_name,
+        max_iters=max_iters,
+    )
+    spec = build_eval_spec(
+        sandbox_id=eval_sid,
+        run_id=str(run_uuid),
+        eval_workspace=eval_ws,
+        env=env,
+        image=image,
+    )
+    try:
+        await asyncio.to_thread(rt.spawn, spec)
+    except Exception as exc:
+        _emit_event(
+            session_factory,
+            run_id=run_uuid,
+            sandbox_id=sandbox_uuid,
+            event_type="error",
+            payload={
+                "phase": "eval_spawn_failed",
+                "eval_sandbox_id": eval_sid,
+                "message": f"{type(exc).__name__}: {exc}",
+            },
+        )
+        raise
+
+    last_status: dict[str, Any] = {"status": "unknown"}
+    timed_out = False
+    try:
+        last_status, timed_out = await _wait_for_exit(
+            rt,
+            eval_sid,
+            deadline=deadline,
+            poll_interval=poll_interval_seconds,
+        )
+    finally:
+        try:
+            await asyncio.to_thread(rt.remove, eval_sid)
+        except Exception:
+            logger.warning("evaluator: failed to remove %s", eval_sid, exc_info=True)
+
+    exit_code = last_status.get("exit_code")
+    container_state = str(last_status.get("status") or "unknown")
+
+    # ---- collect scores -----------------------------------------------------
+    scores_path = eval_ws / SCORES_FILENAME
+    try:
+        parsed = load_scores_file(scores_path)
+    except ScoresFileError as exc:
+        reason = "scores_missing" if not scores_path.exists() else "scores_invalid"
+        _emit_event(
+            session_factory,
+            run_id=run_uuid,
+            sandbox_id=sandbox_uuid,
+            event_type="error",
+            payload={
+                "phase": "eval_scores_failed",
+                "reason": reason,
+                "detail": str(exc),
+                "eval_sandbox_id": eval_sid,
+                "container_status": container_state,
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+            },
+        )
+        return []
+
+    rows = [
+        Score(
+            sandbox_id=sandbox_uuid,
+            rubric_id=rid_uuid,
+            dimension=entry.dimension,
+            score=entry.score,
+            rationale=entry.rationale,
+        )
+        for entry in parsed.entries
+    ]
+    if parsed.overall is not None:
+        rows.append(
+            Score(
+                sandbox_id=sandbox_uuid,
+                rubric_id=rid_uuid,
+                dimension=OVERALL_DIMENSION,
+                score=parsed.overall,
+                rationale=parsed.summary,
+            )
+        )
+
+    with session_factory() as s:
+        s.add_all(rows)
+        s.add(
+            Event(
+                run_id=run_uuid,
+                sandbox_id=sandbox_uuid,
+                source="evaluator",
+                type="checkpoint",
+                payload={
+                    "phase": "eval_scored",
+                    "eval_sandbox_id": eval_sid,
+                    "container_status": container_state,
+                    "exit_code": exit_code,
+                    "timed_out": timed_out,
+                    "dimensions": [e.dimension for e in parsed.entries],
+                    "overall": parsed.overall,
+                    "summary": parsed.summary[:500],
+                    "warnings": parsed.warnings,
+                    "scores_path": str(scores_path),
+                },
+            )
+        )
+        s.commit()
+        # Force-load attrs before detaching so callers can read them even
+        # with expire_on_commit=True session factories.
+        for row in rows:
+            _ = (row.id, row.sandbox_id, row.rubric_id, row.dimension, row.score, row.rationale)
+        s.expunge_all()
+
+    logger.info(
+        "evaluator: sandbox %s scored %d dimensions (overall=%s)",
+        sandbox_uuid,
+        len(parsed.entries),
+        parsed.overall,
+    )
+    return rows

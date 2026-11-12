@@ -5,6 +5,10 @@ FROM python:3.12-slim
 # uv for fast, lockfile-reproducible installs
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
+# docker CLI — the orchestrator (F2) drives SandboxRuntime, which shells out
+# to `docker` against the mounted /var/run/docker.sock (compose).
+COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
+
 WORKDIR /app
 
 # Install deps first for layer caching (dev deps excluded).

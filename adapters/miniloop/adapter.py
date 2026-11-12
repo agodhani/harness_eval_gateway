@@ -69,6 +69,7 @@ def env(
     ingest_token: str | None = None,
     max_iters: int | None = None,
     skillpacks_root: str = "/opt/skillpacks",
+    system_prompt_extra: str | None = None,
 ) -> dict[str, str]:
     """Environment variables the miniloop agent reads (see agent.AgentConfig)."""
     out = {
@@ -90,6 +91,8 @@ def env(
         out["INGEST_TOKEN"] = ingest_token
     if max_iters is not None:
         out["MAX_ITERS"] = str(max_iters)
+    if system_prompt_extra:
+        out["SYSTEM_PROMPT_EXTRA"] = system_prompt_extra
     return out
 
 
@@ -102,6 +105,7 @@ def launch(task: dict[str, Any]) -> dict[str, Any]:
       - ``workspace``: container working dir (default ``/workspace``)
       - ``gateway_url``, ``cred``: default to env GATEWAY_BASE_URL/GATEWAY_CRED
       - ``events_ingest_url``, ``ingest_token``, ``max_iters``, ``skillpacks_root``
+      - ``system_prompt_extra``: appended to the agent's system prompt
 
     Returns::
 
@@ -127,6 +131,7 @@ def launch(task: dict[str, Any]) -> dict[str, Any]:
         ingest_token=task.get("ingest_token"),
         max_iters=task.get("max_iters"),
         skillpacks_root=task.get("skillpacks_root", "/opt/skillpacks"),
+        system_prompt_extra=task.get("system_prompt_extra"),
     )
     return {
         "cmd": ["python", "-m", "miniloop"],
@@ -174,6 +179,27 @@ def translate_events(stdout_lines: Iterable[str]) -> list[dict[str, Any]]:
             }
         )
     return events
+
+
+def parse_terminal_state(logs: str) -> str | None:
+    """Extract the agent's terminal state from captured container logs.
+
+    Scans for ``MINILOOP_RESULT {json}`` marker lines (reusing
+    :func:`translate_events`) and returns the ``terminal_state`` of the LAST
+    one found — ``agent_done`` | ``harness_complete`` | ``stuck_loop`` |
+    ``error`` — or ``None`` when no well-formed result line exists (crash
+    before the agent could report, truncated logs, non-miniloop image).
+    """
+    terminal_state: str | None = None
+    for event in translate_events(logs.splitlines()):
+        if event.get("type") != "miniloop_result":
+            continue
+        payload = event.get("payload")
+        if isinstance(payload, dict):
+            state = payload.get("terminal_state")
+            if isinstance(state, str) and state:
+                terminal_state = state
+    return terminal_state
 
 
 def completion_signal() -> dict[str, Any]:

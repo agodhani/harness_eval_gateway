@@ -36,17 +36,14 @@ from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request, s
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
 
 from api.schemas import EventSource, EventType
 from gateway import metering
 from gateway.config import get_settings
 from gateway.creds import CredClaims, CredError, verify_cred
-from gateway.deps import get_db, get_upstream_client
+from gateway.deps import get_session_factory, get_upstream_client
 
 router = APIRouter()
-
-DbSession = Annotated[Session, Depends(get_db)]
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +141,20 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _tokens_used(run_uuid: uuid.UUID) -> int:
+    """Run token total for the budget gate on a FRESH session.
+
+    Called via ``asyncio.to_thread`` — it must not reuse a request-scoped
+    session, which would share one DBAPI connection across threads.
+    """
+    with get_session_factory()() as session:
+        return metering.tokens_used(session, run_uuid)
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(
     body: Annotated[dict[str, Any], Body()],
     claims: Annotated[CredClaims, Depends(get_cred)],
-    session: DbSession,
     upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
 ) -> Response:
     settings = get_settings()
@@ -156,7 +162,7 @@ async def chat_completions(
     # --- budget gate (before any upstream traffic) ---
     run_uuid = metering.uuid_or_none(claims.run_id)
     if run_uuid is not None:
-        used = await asyncio.to_thread(metering.tokens_used, session, run_uuid)
+        used = await asyncio.to_thread(_tokens_used, run_uuid)
         estimate = metering.max_tokens_estimate(body)
         limit = metering.token_budget(claims, settings)
         if used + estimate > limit:
