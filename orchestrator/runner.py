@@ -35,8 +35,10 @@ from .events import emit
 
 log = logging.getLogger(__name__)
 
-#: run_id -> in-flight orchestration task (rubric draft or lifecycle).
-_TASKS: dict[uuid.UUID, asyncio.Task[None]] = {}
+#: (run_id, task kind) -> in-flight orchestration task. Keyed by kind so an
+#: approve landing while the rubric task is finishing doesn't swallow the
+#: lifecycle task.
+_TASKS: dict[tuple[uuid.UUID, str], asyncio.Task[None]] = {}
 
 _runtime: SandboxRuntime | None = None
 
@@ -81,16 +83,17 @@ def reset_runtime() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _track(run_id: uuid.UUID, coro: Any) -> asyncio.Task[None]:
-    existing = _TASKS.get(run_id)
+def _track(kind: str, run_id: uuid.UUID, coro: Any) -> asyncio.Task[None]:
+    key = (run_id, kind)
+    existing = _TASKS.get(key)
     if existing is not None and not existing.done():
         return existing
     task = asyncio.create_task(coro)
-    _TASKS[run_id] = task
+    _TASKS[key] = task
 
     def _discard(t: asyncio.Task[None]) -> None:
-        if _TASKS.get(run_id) is t:
-            _TASKS.pop(run_id, None)
+        if _TASKS.get(key) is t:
+            _TASKS.pop(key, None)
 
     task.add_done_callback(_discard)
     return task
@@ -104,6 +107,7 @@ def start_rubric_task(
 ) -> asyncio.Task[None]:
     """Register the rubric-draft background task for a submitted run."""
     return _track(
+        "rubric",
         run_id,
         rubric_mod.draft_rubric(
             run_id,
@@ -123,6 +127,7 @@ def start_lifecycle_task(
 ) -> asyncio.Task[None]:
     """Register the post-approval lifecycle task for a run."""
     return _track(
+        "lifecycle",
         run_id,
         lifecycle.run_lifecycle(
             run_id,

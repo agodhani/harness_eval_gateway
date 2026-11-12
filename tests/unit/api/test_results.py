@@ -125,6 +125,36 @@ def test_run_results_shape(client: TestClient, scored_run) -> None:
     assert sb2["terminal_reason"] == "timeout"
 
 
+def test_run_results_includes_artifacts(
+    client: TestClient, scored_run, session_factory
+) -> None:
+    """Artifact rows surface as {id, kind, path} so the UI can build
+    /api/artifacts/{id}/download links."""
+    s = session_factory()
+    try:
+        art = Artifact(
+            sandbox_id=scored_run["sb1"],
+            kind="workspace",
+            path="/data/artifacts/x/y/workspace",
+            size_bytes=123,
+        )
+        s.add(art)
+        s.commit()
+        art_id = art.id
+    finally:
+        s.close()
+
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    body = resp.json()
+    sb1 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"]))
+    assert sb1["artifacts"] == [
+        {"id": str(art_id), "kind": "workspace", "path": "/data/artifacts/x/y/workspace"}
+    ]
+    sb2 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"]))
+    assert sb2["artifacts"] == []
+
+
 def test_run_results_404(client: TestClient) -> None:
     resp = client.get(f"/api/runs/{uuid.uuid4()}/results")
     assert resp.status_code == 404

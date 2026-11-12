@@ -176,12 +176,26 @@ def _dir_size(path: Path) -> int:
     return total
 
 
+def _snapshot_sizes(snapshot: Any) -> dict[str, int]:
+    """kind -> size for each artifact candidate. Runs on a worker thread —
+    rglob'ing a large workspace must not block the event loop."""
+    return {
+        kind: _dir_size(Path(path))
+        for kind, path in (
+            ("workspace", snapshot.workspace_dir),
+            ("transcript", snapshot.transcript_path),
+            ("meta", snapshot.meta_path),
+        )
+    }
+
+
 def _finalize_db(
     session_factory: sessionmaker[Session],
     *,
     run_id: uuid.UUID,
     sandbox_id: uuid.UUID,
     snapshot: Any,
+    sizes: dict[str, int],
     reason: str,
 ) -> None:
     """DB half of finalize: artifact rows + sandbox terminal fields + event."""
@@ -205,10 +219,14 @@ def _finalize_db(
                         sandbox_id=sandbox_id,
                         kind=kind,
                         path=str(p),
-                        size_bytes=_dir_size(p),
+                        size_bytes=sizes.get(kind, 0),
                     )
                 )
-        sb.status = "done" if reason in state_machine.DONE_REASONS else "failed"
+        to_status = "done" if reason in state_machine.DONE_REASONS else "failed"
+        try:
+            state_machine.transition(session, sb, to_status)
+        except state_machine.InvalidTransition:
+            sb.status = to_status
         sb.terminal_reason = reason
         sb.finished_at = _now()
         emit(
@@ -244,6 +262,13 @@ async def finalize_sandbox(
     except Exception as exc:  # noqa: BLE001 — e.g. container already gone
         log.warning("finalize: snapshot failed for %s: %s", sid, exc)
 
+    sizes: dict[str, int] = {}
+    if snapshot is not None:
+        try:
+            sizes = await asyncio.to_thread(_snapshot_sizes, snapshot)
+        except Exception:
+            log.warning("finalize: artifact sizing failed for %s", sid, exc_info=True)
+
     # 2) DB rows (artifacts + terminal fields + checkpoint event).
     try:
         _finalize_db(
@@ -251,6 +276,7 @@ async def finalize_sandbox(
             run_id=run_id,
             sandbox_id=sandbox_id,
             snapshot=snapshot,
+            sizes=sizes,
             reason=reason,
         )
     except Exception:

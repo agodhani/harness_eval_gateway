@@ -5,9 +5,11 @@ __pycache__
 .pytest_cache
 .ruff_cache
 
-# Local data / artifacts
+# Local data / artifacts / sandbox + eval state
 data/artifacts/*
 !data/artifacts/.gitkeep
+data/sandboxes/
+data/eval/
 
 # Node / Next.js
 node_modules

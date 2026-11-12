@@ -26,6 +26,7 @@ SETTINGS = SimpleNamespace(
     GATEWAY_URL="http://gateway.test:8080",
     GATEWAY_CRED_SECRET="unit-test-secret",
     RUBRIC_MODEL="",
+    EVAL_TOKEN_BUDGET=200_000,
 )
 
 
@@ -156,12 +157,12 @@ async def test_draft_rubric_success(session_factory) -> None:
 
     assert seen["url"] == "http://gateway.test:8080/v1/chat/completions"
     assert seen["auth"].startswith("Bearer heg.")
-    # run-level cred: no sandbox_id, no max_tokens claim
+    # run-level cred: no sandbox_id; max_tokens = spent (0) + EVAL_TOKEN_BUDGET
     cred = seen["auth"].removeprefix("Bearer ")
     claims = verify_cred(cred, secret="unit-test-secret")
     assert claims.run_id == str(run.id)
     assert claims.sandbox_id is None
-    assert claims.max_tokens is None
+    assert claims.max_tokens == SETTINGS.EVAL_TOKEN_BUDGET
     assert seen["body"]["model"] == "test-model"  # RUBRIC_MODEL unset -> run model
     assert seen["body"]["stream"] is False
 

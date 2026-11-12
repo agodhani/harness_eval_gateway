@@ -48,6 +48,14 @@ class DimensionScore(BaseModel):
     rationale: str = ""
 
 
+class ArtifactRef(BaseModel):
+    """Artifact row exposed for the download endpoint."""
+
+    id: UUID
+    kind: str
+    path: str
+
+
 class SandboxResult(BaseModel):
     """One sandbox's evaluation outcome inside the run matrix."""
 
@@ -59,6 +67,7 @@ class SandboxResult(BaseModel):
     rubric_id: UUID | None = None
     dimensions: dict[str, DimensionScore] = Field(default_factory=dict)
     overall: DimensionScore | None = None
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
 
 
 class RunResults(BaseModel):
@@ -119,6 +128,23 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
     for sc in scores:
         by_sandbox.setdefault(sc.sandbox_id, []).append(sc)
 
+    artifacts = (
+        session.execute(
+            select(Artifact)
+            .where(Artifact.sandbox_id.in_(sandbox_ids))
+            .order_by(Artifact.created_at.asc(), Artifact.id)
+        )
+        .scalars()
+        .all()
+        if sandbox_ids
+        else []
+    )
+    artifacts_by_sandbox: dict[UUID, list[Artifact]] = {
+        sid: [] for sid in sandbox_ids
+    }
+    for art in artifacts:
+        artifacts_by_sandbox.setdefault(art.sandbox_id, []).append(art)
+
     results: list[SandboxResult] = []
     for sb in sandboxes:
         dimensions: dict[str, DimensionScore] = {}
@@ -142,6 +168,10 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
                 rubric_id=rubric_id,
                 dimensions=dimensions,
                 overall=overall,
+                artifacts=[
+                    ArtifactRef(id=a.id, kind=a.kind, path=a.path)
+                    for a in artifacts_by_sandbox.get(sb.id, [])
+                ],
             )
         )
 

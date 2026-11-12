@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from db.models import Rubric, Run, Sandbox, Score
 from gateway.creds import mint_cred
+from gateway.metering import tokens_used
 from sandbox.runtime import SandboxRuntime
 
 from . import monitor, provision, state_machine
@@ -96,6 +97,13 @@ def _latest_approved_rubric(
             .order_by(Rubric.version.desc())
             .limit(1)
         ).scalar_one_or_none()
+
+
+def _run_tokens_used(
+    session_factory: sessionmaker[Session], run_id: uuid.UUID
+) -> int:
+    with session_factory() as session:
+        return tokens_used(session, run_id)
 
 
 def _score_count(session_factory: sessionmaker[Session], run_id: uuid.UUID) -> int:
@@ -204,14 +212,6 @@ async def _evaluate_all(
             )
             return
 
-    # One run-level evaluator cred for the whole pass: fresh TTL, no
-    # max_tokens (must not 429 against the shared run budget).
-    eval_cred = mint_cred(
-        run_id=run.id,
-        sandbox_id=None,
-        secret=settings.GATEWAY_CRED_SECRET,
-        ttl_seconds=int(settings.EVAL_TIMEOUT_SECONDS) + 600,
-    )
     evaluator_model = (run.config or {}).get("evaluator_model") or run.model_name
     timeout = float(settings.EVAL_TIMEOUT_SECONDS)
 
@@ -222,6 +222,17 @@ async def _evaluate_all(
     # inside the api container is /app (not daemon-visible).
     eval_root = Path(runtime.artifact_root).parent / "eval"
     for sb in sandboxes:
+        # Fresh cred per eval: a single cred's TTL can't span N sequential
+        # evals. max_tokens = tokens already spent + EVAL_TOKEN_BUDGET so the
+        # judge keeps its own allowance instead of 429ing on participant spend.
+        eval_cred = mint_cred(
+            run_id=run.id,
+            sandbox_id=sb.id,
+            secret=settings.GATEWAY_CRED_SECRET,
+            ttl_seconds=int(settings.EVAL_TIMEOUT_SECONDS) + 600,
+            max_tokens=_run_tokens_used(session_factory, run.id)
+            + int(settings.EVAL_TOKEN_BUDGET),
+        )
         artifact_dir = Path(sb.artifact_path)  # type: ignore[arg-type]
         kwargs = {
             "run_id": run.id,

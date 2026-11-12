@@ -3,8 +3,8 @@
 Hermetic: file-backed sqlite (tmp_path) + FakeRuntime — NO real docker, NO
 real gateway. ``settings`` is a SimpleNamespace carrying every attribute the
 orchestrator modules read (GATEWAY_URL, GATEWAY_CRED_SECRET, RUBRIC_MODEL,
-SANDBOX_IMAGE, MONITOR_POLL_SECONDS, EVAL_TIMEOUT_SECONDS, HOST_DATA_ROOT,
-SKILLPACKS_DIR, ARTIFACT_ROOT).
+SANDBOX_IMAGE, MONITOR_POLL_SECONDS, EVAL_TIMEOUT_SECONDS, EVAL_TOKEN_BUDGET,
+HOST_DATA_ROOT, SKILLPACKS_DIR, ARTIFACT_ROOT).
 """
 
 from __future__ import annotations
@@ -56,6 +56,7 @@ def settings(tmp_path: Path, skillpacks_dir: Path) -> SimpleNamespace:
         SANDBOX_IMAGE="heg-test:latest",
         MONITOR_POLL_SECONDS=0.01,
         EVAL_TIMEOUT_SECONDS=5.0,
+        EVAL_TOKEN_BUDGET=200_000,
         HOST_DATA_ROOT="",
         SKILLPACKS_DIR=skillpacks_dir,
         ARTIFACT_ROOT=tmp_path / "artifacts",

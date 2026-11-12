@@ -2,7 +2,8 @@
 
 Flow (docs/orchestrator-plan.md §2): ``POST /api/runs`` registers a background
 task → :func:`draft_rubric` mints a run-level gateway cred (``sandbox_id=None``,
-no ``max_tokens`` so the run budget isn't consumed by drafting), calls
+``max_tokens`` = tokens already spent + ``EVAL_TOKEN_BUDGET`` so drafting keeps
+its own allowance), calls
 ``{GATEWAY_URL}/v1/chat/completions``, parses + validates the JSON rubric, and
 in ONE transaction inserts a ``draft`` Rubric row, moves the run to
 ``rubric_review``, and emits orchestrator checkpoint events. Any failure marks
@@ -27,6 +28,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from db.models import Rubric, Run
 from gateway.creds import mint_cred
+from gateway.metering import tokens_used
 
 from . import state_machine
 from .events import emit
@@ -379,13 +381,17 @@ async def draft_rubric(
             log.warning("draft_rubric: run %s not found", run_id)
             return
 
-        # Run-level cred: no sandbox_id, NO max_tokens (would 429 once the
-        # participants burn the shared run budget). TTL covers the call.
+        # Run-level cred: no sandbox_id; max_tokens = tokens already spent
+        # (~0 at draft time) + EVAL_TOKEN_BUDGET — an explicit allowance so
+        # drafting can't 429 on the shared default budget. TTL covers the call.
+        with session_factory() as session:
+            used = tokens_used(session, run.id)
         cred = mint_cred(
             run_id=run.id,
             sandbox_id=None,
             secret=settings.GATEWAY_CRED_SECRET,
             ttl_seconds=3600,
+            max_tokens=used + int(settings.EVAL_TOKEN_BUDGET),
         )
         model = settings.RUBRIC_MODEL or run.model_name
         content = await _request_rubric(

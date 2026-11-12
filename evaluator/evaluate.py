@@ -169,6 +169,10 @@ def _stage_eval_workspace(
     # Copy the candidate workspace CONTENTS (dirs_exist_ok into fresh dir).
     shutil.copytree(workspace_dir, eval_ws, dirs_exist_ok=True, symlinks=True)
 
+    # A candidate-authored scores.json must not survive staging — it would be
+    # mistaken for judge output if the eval agent dies before writing its own.
+    (eval_ws / SCORES_FILENAME).unlink(missing_ok=True)
+
     (eval_ws / "rubric.json").write_text(
         json.dumps(rubric, indent=2, ensure_ascii=False, default=str) + "\n",
         encoding="utf-8",
@@ -238,18 +242,12 @@ async def evaluate_sandbox(
     eval_root: Path | str | None = None,
     poll_interval_seconds: float = 2.0,
     image: str = DEFAULT_IMAGE,
-    # -- compatibility aliases (alternative spellings seen in design notes) --
-    evaluator_model: str | None = None,
-    cred: str | None = None,
-    artifact_workspace_path: Path | str | None = None,
 ) -> list[Score]:
     """Score one sandbox's artifact with a sandboxed judge agent.
 
     Plan §5 params are keyword-only and match the orchestrator contract;
     ``runtime``/``max_iters``/``eval_root``/``poll_interval_seconds``/
-    ``image`` are DI/test knobs, and ``evaluator_model``/``cred``/
-    ``artifact_workspace_path`` are accepted aliases for
-    ``model``/``gateway_cred``/``workspace_dir``.
+    ``image`` are DI/test knobs.
 
     Returns the persisted ``Score`` ORM rows (detached). Raises ``ValueError``
     on missing required inputs, ``FileNotFoundError`` when the artifact
@@ -259,18 +257,18 @@ async def evaluate_sandbox(
     run_uuid = _as_uuid(run_id, "run_id")
     sandbox_uuid = _as_uuid(sandbox_id, "sandbox_id")
 
-    model_name = (model or evaluator_model or "").strip()
-    cred_token = gateway_cred or cred
+    model_name = (model or "").strip()
+    cred_token = gateway_cred
     if not model_name:
-        raise ValueError("evaluate_sandbox: 'model' (evaluator_model) is required")
+        raise ValueError("evaluate_sandbox: 'model' is required")
     if not cred_token:
-        raise ValueError("evaluate_sandbox: 'gateway_cred' (cred) is required")
+        raise ValueError("evaluate_sandbox: 'gateway_cred' is required")
     if session_factory is None:
         raise ValueError("evaluate_sandbox: 'session_factory' is required")
     if not isinstance(rubric, dict) or not rubric:
         raise ValueError("evaluate_sandbox: 'rubric' must be a non-empty dict")
 
-    ws_dir = workspace_dir if workspace_dir is not None else artifact_workspace_path
+    ws_dir = workspace_dir
     art_dir = Path(artifact_dir) if artifact_dir is not None else None
     if ws_dir is None and art_dir is not None:
         ws_dir = art_dir / "workspace"
@@ -365,6 +363,11 @@ async def evaluate_sandbox(
                 "message": f"{type(exc).__name__}: {exc}",
             },
         )
+        # spawn may have raised after docker created the container — reap it.
+        try:
+            await asyncio.to_thread(rt.remove, eval_sid)
+        except Exception:
+            logger.debug("evaluator: no container to remove for %s", eval_sid, exc_info=True)
         raise
 
     last_status: dict[str, Any] = {"status": "unknown"}

@@ -233,8 +233,11 @@ def _mark_spawned(
         if sb is None:
             return
         sb.docker_container_id = container_id
-        sb.status = "running"
         sb.started_at = datetime.now(UTC)
+        try:
+            state_machine.transition(session, sb, "running")
+        except state_machine.InvalidTransition:
+            sb.status = "running"
         session.commit()
 
 
@@ -307,6 +310,13 @@ async def spawn_one(
         return sid
     except Exception as exc:
         log.exception("spawn_one: sandbox %s failed", sid)
+        # A container may already be running (spawn returned but the
+        # _mark_spawned write failed, or docker created then errored) — no
+        # monitor will ever watch a failed row, so reap it best-effort.
+        try:
+            await asyncio.to_thread(runtime.remove, str(sid))
+        except Exception:
+            log.debug("spawn_one: no container to remove for %s", sid, exc_info=True)
         _mark_spawn_failed(
             session_factory,
             run_id=run_id,

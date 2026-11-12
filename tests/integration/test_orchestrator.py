@@ -73,6 +73,7 @@ def env(tmp_path: Path):
         SANDBOX_IMAGE=SANDBOX_IMAGE,
         MONITOR_POLL_SECONDS=2.0,
         EVAL_TIMEOUT_SECONDS=5.0,
+        EVAL_TOKEN_BUDGET=200_000,
         HOST_DATA_ROOT="",
         SKILLPACKS_DIR=REPO_ROOT / "skillpacks",
         ARTIFACT_ROOT=tmp_path / "artifacts",

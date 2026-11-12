@@ -18,8 +18,9 @@ them. Everything below maps to existing code.
   gen, evaluator). Gateway budget is **per-run**: `metering.tokens_used`
   (`gateway/metering.py:43`) sums `llm_response` tokens across the run, and a
   cred's `max_tokens` claim sets the ceiling → participant creds get
-  `max_tokens=token_budget`; rubric/evaluator creds get **no** `max_tokens`
-  (else they'd 429 once participants burn the budget — note their tokens still
+  `max_tokens=token_budget`; rubric/evaluator creds get
+  `max_tokens = tokens_used(run) + EVAL_TOKEN_BUDGET` — an additive allowance
+  so they can't 429 once participants burn the budget (their tokens still
   count toward the run total; negligible).
 - **Skillpacks mount is all-or-nothing** (`sandbox/runtime.py` mounts all of
   `./skillpacks`). Per-config subsets need a staged dir + a new
@@ -102,7 +103,8 @@ Triggered by the background task started in `POST /api/runs` (not in-request —
 LLM call can take minutes on a 3B model).
 
 - `async def draft_rubric(run_id) -> None`: load run → mint run cred
-  (`sandbox_id=None`, `ttl=3600`, **no `max_tokens`**) → POST
+  (`sandbox_id=None`, `ttl=3600`, `max_tokens = tokens_used + EVAL_TOKEN_BUDGET`)
+  → POST
   `{settings.GATEWAY_URL}/v1/chat/completions` (httpx, `timeout=180`,
   `temperature=0.2`, `max_tokens=2048`, `stream=False`) with
   `model = settings.RUBRIC_MODEL or run.model_name` → parse → validate →
@@ -236,7 +238,8 @@ async def evaluate_sandbox(
     terminal_reason: str | None,
     model: str,                        # evaluator_model
     gateway_base_url: str,             # settings.GATEWAY_URL
-    gateway_cred: str,                 # run cred, sandbox_id=None, no max_tokens
+    gateway_cred: str,                 # per-eval cred, sandbox-scoped,
+                                       # max_tokens = spent + EVAL_TOKEN_BUDGET
     session_factory: sessionmaker,     # F7 writes Score rows + emits events
     timeout_seconds: float = 1800.0,
 ) -> list[Score]: ...                  # raises on failure
@@ -244,8 +247,10 @@ async def evaluate_sandbox(
 
 F7 writes `Score(sandbox_id, rubric_id, dimension, score, rationale)` rows and
 emits `source="evaluator"` events; whether it spawns its own sandbox is F7's
-business — the contract is transport-agnostic. Orchestrator mints **one**
-evaluator cred per run (fresh, `ttl=EVAL_TIMEOUT+600`, no `max_tokens`).
+business — the contract is transport-agnostic. Orchestrator mints a fresh
+evaluator cred **per sandbox** inside the eval loop (`sandbox_id` = the
+sandbox under evaluation, `ttl=EVAL_TIMEOUT+600`,
+`max_tokens = tokens_used + EVAL_TOKEN_BUDGET`).
 
 Run completion: per-sandbox eval exceptions → `error` event, continue. If
 total `Score` rows for the run == 0 → `run.status="failed"` + error event
@@ -266,7 +271,9 @@ total `Score` rows for the run == 0 → `run.status="failed"` + error event
 - **Duplicate submit:** no idempotency for MVP — each POST creates a run;
   UI disables double-submit. Note for post-MVP.
 - **Cred TTL:** participant `ttl = wall_clock + 3600`; rubric/evaluator creds
-  fresh at use, TTL ≥ their timeout. `max_tokens` only on participant creds.
+  fresh at use, TTL ≥ their timeout. `max_tokens` = run budget on participant
+  creds; `tokens_used + EVAL_TOKEN_BUDGET` (additive allowance) on
+  rubric/evaluator creds.
 - **`token_budget` is per-run**, not per-sandbox (gateway semantics). If
   per-sandbox budgets are wanted later, monitor sums per-sandbox
   `llm_response` tokens — flagged in open questions.

@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     # Monitor loop cadence + hard cap around the evaluator call.
     MONITOR_POLL_SECONDS: float = 5.0
     EVAL_TIMEOUT_SECONDS: float = 1800.0
+    # Token allowance for orchestrator-minted creds (rubric draft + per-eval
+    # judge). Carried as max_tokens = tokens already spent + this allowance,
+    # so it is independent of participant spend against the run budget.
+    EVAL_TOKEN_BUDGET: int = 200_000
     # Host path of ./data as seen by the docker daemon — set by compose
     # (HOST_DATA_ROOT=${PWD}/data) so sandbox -v sources resolve on the host.
     # Empty (host-run dev / tests) => paths pass through verbatim.

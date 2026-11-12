@@ -297,38 +297,29 @@ async def test_evaluate_missing_workspace_raises(seeded, session_factory, tmp_pa
 
 async def test_evaluate_requires_params(seeded, session_factory) -> None:
     with pytest.raises(ValueError, match="model"):
-        await _eval(seeded, session_factory, FakeRuntime(), model=None, evaluator_model=None)
+        await _eval(seeded, session_factory, FakeRuntime(), model=None)
     with pytest.raises(ValueError, match="gateway_cred"):
-        await _eval(seeded, session_factory, FakeRuntime(), gateway_cred=None, cred=None)
+        await _eval(seeded, session_factory, FakeRuntime(), gateway_cred=None)
     with pytest.raises(ValueError, match="rubric"):
         await _eval(seeded, session_factory, FakeRuntime(), rubric={})
     with pytest.raises(ValueError, match="session_factory"):
         await _eval(seeded, session_factory, FakeRuntime(), session_factory=None)
 
 
-async def test_evaluate_alias_params(seeded, session_factory) -> None:
-    """Design-brief spellings (evaluator_model/cred/artifact_workspace_path)
-    resolve to the same contract."""
-    fake = FakeRuntime()
-    rows = await evaluate_sandbox(
-        run_id=seeded["run_id"],
-        sandbox_id=seeded["sandbox_id"],
-        rubric=RUBRIC,
-        artifact_workspace_path=seeded["workspace"],  # alias for workspace_dir
-        evaluator_model="alias-model",  # alias for model
-        cred="heg.aliascred",  # alias for gateway_cred
-        session_factory=session_factory,
-        runtime=fake,
-        eval_root=seeded["eval_root"],
-        timeout_seconds=30,
-        poll_interval_seconds=0.01,
-    )
-    assert len(rows) == 3
-    spec = fake.specs[0]
-    assert spec.env["MODEL_NAME"] == "alias-model"
-    assert spec.env["GATEWAY_CRED"] == "heg.aliascred"
-    # rubric_id fell back to DB lookup (latest approved rubric for the run)
-    assert all(r.rubric_id == seeded["rubric_id"] for r in rows)
+async def test_candidate_scores_json_is_not_salvaged(
+    seeded, session_factory
+) -> None:
+    """A scores.json the CANDIDATE wrote must not be read as judge output —
+    staging drops it, so a judge that dies without writing yields
+    scores_missing, not fabricated scores."""
+    (seeded["workspace"] / "scores.json").write_text(json.dumps(SCORES_OBJ))
+    fake = FakeRuntime(scores_obj=None)  # judge never writes
+    rows = await _eval(seeded, session_factory, fake)
+    assert rows == []
+    assert _scores_in_db(session_factory) == []
+    events = _events_in_db(session_factory)
+    err = [e for e in events if e.type == "error" and e.source == "evaluator"]
+    assert err[0].payload["reason"] == "scores_missing"
 
 
 def test_sandbox_gateway_url_normalization() -> None:
