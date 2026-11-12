@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -253,8 +254,15 @@ def parse_scores_json(text: str) -> ParsedScores:
 
 
 def load_scores_file(path: Path) -> ParsedScores:
-    """Read + parse ``path``; raises :class:`ScoresFileError` on any failure."""
+    """Read + parse ``path``; raises :class:`ScoresFileError` on any failure.
+
+    ``path`` must be a regular file — the eval workspace is writable by the
+    judge sandbox, so symlinks/FIFOs/devices are rejected before opening
+    (``open()`` on a FIFO would block forever waiting for a writer).
+    """
     try:
+        if not stat.S_ISREG(Path(path).lstat().st_mode):
+            raise ScoresFileError(f"{path} is not a regular file")
         text = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         raise ScoresFileError(f"cannot read {path}: {exc}") from exc

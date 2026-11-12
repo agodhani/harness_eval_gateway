@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -153,6 +154,24 @@ def test_load_scores_file_roundtrip(tmp_path) -> None:
     parsed = load_scores_file(p)
     assert parsed.overall == 7.2
     assert OVERALL_DIMENSION == "overall"
+
+
+def test_load_scores_file_rejects_symlink(tmp_path) -> None:
+    real = tmp_path / "real.json"
+    real.write_text(json.dumps(GOOD))
+    (tmp_path / "scores.json").symlink_to(real)
+    with pytest.raises(ScoresFileError):
+        load_scores_file(tmp_path / "scores.json")
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX only")
+def test_load_scores_file_rejects_fifo(tmp_path) -> None:
+    # open() on a FIFO blocks until a writer appears; load must reject it
+    # without opening.
+    fifo = tmp_path / "scores.json"
+    os.mkfifo(fifo)
+    with pytest.raises(ScoresFileError):
+        load_scores_file(fifo)
 
 
 # ---------------------------------------------------------------------------

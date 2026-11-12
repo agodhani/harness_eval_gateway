@@ -9,6 +9,7 @@ exposes (spawn/status/stop/remove).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -320,6 +321,45 @@ async def test_candidate_scores_json_is_not_salvaged(
     events = _events_in_db(session_factory)
     err = [e for e in events if e.type == "error" and e.source == "evaluator"]
     assert err[0].payload["reason"] == "scores_missing"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX only")
+async def test_candidate_special_files_are_not_staged(
+    seeded, session_factory
+) -> None:
+    """FIFOs in the candidate workspace must not reach the eval workspace —
+    copytree's copy2 would block forever opening one."""
+    ws = seeded["workspace"]
+    os.mkfifo(ws / "pipe")
+    sub = ws / "sub"
+    sub.mkdir()
+    os.mkfifo(sub / "nested-pipe")
+
+    fake = FakeRuntime()
+    rows = await _eval(seeded, session_factory, fake)
+    assert len(rows) == 3
+    eval_ws = Path(fake.specs[0].workspace_host_path)
+    assert not os.path.lexists(eval_ws / "pipe")
+    assert (eval_ws / "sub").is_dir()
+    assert not os.path.lexists(eval_ws / "sub" / "nested-pipe")
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX only")
+async def test_judge_fifo_scores_is_rejected(seeded, session_factory) -> None:
+    """A non-regular scores.json left by the judge is rejected without being
+    opened — open() on a FIFO would block the api process forever."""
+
+    class FifoRuntime(FakeRuntime):
+        def spawn(self, spec):
+            super().spawn(spec)
+            os.mkfifo(Path(spec.workspace_host_path) / "scores.json")
+
+    rows = await _eval(seeded, session_factory, FifoRuntime(scores_obj=None))
+    assert rows == []
+    assert _scores_in_db(session_factory) == []
+    events = _events_in_db(session_factory)
+    err = [e for e in events if e.type == "error" and e.source == "evaluator"]
+    assert err[0].payload["reason"] == "scores_invalid"
 
 
 def test_sandbox_gateway_url_normalization() -> None:

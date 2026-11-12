@@ -41,7 +41,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -139,6 +141,25 @@ def _emit_event(
         )
 
 
+def _staging_ignore(dirpath: str, names: list[str]) -> set[str]:
+    """copytree ``ignore`` filter for the candidate workspace.
+
+    ``docker cp`` preserves special nodes, so only regular files, dirs, and
+    symlinks may stage — ``copy2`` on a FIFO would block the worker thread
+    forever and a device node could copy unbounded data.
+    """
+    ignored = set()
+    for name in names:
+        try:
+            mode = os.lstat(os.path.join(dirpath, name)).st_mode
+        except OSError:
+            ignored.add(name)
+            continue
+        if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
+            ignored.add(name)
+    return ignored
+
+
 def _stage_eval_workspace(
     *,
     eval_root: Path,
@@ -167,7 +188,13 @@ def _stage_eval_workspace(
     eval_ws.mkdir(parents=True)
 
     # Copy the candidate workspace CONTENTS (dirs_exist_ok into fresh dir).
-    shutil.copytree(workspace_dir, eval_ws, dirs_exist_ok=True, symlinks=True)
+    shutil.copytree(
+        workspace_dir,
+        eval_ws,
+        dirs_exist_ok=True,
+        symlinks=True,
+        ignore=_staging_ignore,
+    )
 
     # Candidate-authored files under reserved names must not survive staging:
     # scores.json would be mistaken for judge output, and the copy preserved
@@ -399,7 +426,7 @@ async def evaluate_sandbox(
     # ---- collect scores -----------------------------------------------------
     scores_path = eval_ws / SCORES_FILENAME
     try:
-        parsed = load_scores_file(scores_path)
+        parsed = await asyncio.to_thread(load_scores_file, scores_path)
     except ScoresFileError as exc:
         reason = "scores_missing" if not scores_path.exists() else "scores_invalid"
         _emit_event(
