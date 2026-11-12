@@ -13,14 +13,14 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | ID | Feature | Status | Primary code | Primary tests |
 |----|---------|--------|--------------|---------------|
 | F0 | Dev environment & scaffold | ✅ | `docker-compose.yml`, `db/`, `.github/workflows/ci.yml`, `web/e2e/` | `tests/test_smoke.py` |
-| F1 | Submission form → run spec | 🔲 | `web/app/submit/`, `api/routers/runs.py` | `tests/unit/api/test_runs.py` |
-| F2 | Orchestrator (matrix, rubric, lifecycle) | 🔲 | `orchestrator/` | `tests/unit/orchestrator/` |
+| F1 | Submission form → run spec | ✅ | `web/app/submit/`, `api/routers/runs.py` | `tests/unit/api/test_runs.py` |
+| F2 | Orchestrator (matrix, rubric, lifecycle) | ✅ | `orchestrator/` | `tests/unit/orchestrator/` |
 | F3 | AI gateway (proxy, metering, budgets) | ✅ | `gateway/` | `tests/unit/gateway/` |
 | F4 | Sandbox runtime (spawn, egress, snapshot, done) | ✅ | `sandbox/`, `data/artifacts/` | `tests/integration/test_sandbox.py` |
 | F5 | Miniloop harness + adapter + skill packs | ✅ | `adapters/miniloop/`, `skillpacks/` | `tests/unit/adapters/miniloop/` |
-| F6 | Event store + live timeline | 🚧 API done; UI pending | `api/routers/events.py`, `web/app/runs/[id]/timeline/` | `tests/unit/api/test_events.py` |
-| F7 | Evaluator sandbox (rubric scoring) | 🔲 | `evaluator/` | `tests/integration/test_evaluator.py` |
-| F8 | Results UI (matrix, scores, artifacts) | 🔲 | `web/app/runs/`, `api/routers/results.py` | `tests/e2e/` (later) |
+| F6 | Event store + live timeline | ✅ | `api/routers/events.py`, `web/app/runs/[id]/timeline/` | `tests/unit/api/test_events.py` |
+| F7 | Evaluator sandbox (rubric scoring) | ✅ | `evaluator/` | `tests/unit/evaluator/` |
+| F8 | Results UI (matrix, scores, artifacts) | ✅ | `web/app/runs/`, `api/routers/results.py` | `tests/unit/api/test_results.py` |
 
 ## Feature details
 
@@ -57,17 +57,19 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - Tests: `tests/unit/api/test_runs.py`
 - **Depends on:** F0
 
-### F2 — Orchestrator
+### F2 — Orchestrator ✅
 
 - **What:** run state machine (`submitted → rubric_review → provisioning →
   running → evaluating → done | failed`); matrix expansion (harness configs ×
   model); rubric draft generated via gateway → frozen on user approval;
   termination policy watcher (timeout, budget, stuck-loop, done signal).
 - **Where:** `orchestrator/` (`state_machine.py`, `lifecycle.py`,
-  `rubric.py`, `termination.py`), db `runs`/`sandboxes`/`rubrics`
+  `provision.py`, `monitor.py`, `rubric.py`, `runner.py`, `events.py`,
+  `adapters.py`), db `runs`/`sandboxes`/`rubrics`
 - **Verify:**
-  - Unit: `tests/unit/orchestrator/test_state_machine.py`,
-    `test_termination.py`, `test_rubric.py`
+  - Unit: `tests/unit/orchestrator/` (`test_state_machine.py`,
+    `test_lifecycle.py`, `test_monitor.py`, `test_provision.py`,
+    `test_rubric.py`)
   - Manual: submit → edit/approve rubric → sandboxes spawn → terminal states
     recorded correctly
 - **Depends on:** F3, F4, F5
@@ -123,43 +125,49 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - M2 e2e proven: in-sandbox run, 51 skills discovered, done_signal emitted
 - **Depends on:** F3, F4
 
-### F6 — Event store + live timeline 🚧 (API ✅ / UI pending)
+### F6 — Event store + live timeline ✅
 
 - **What:** append-only `events` table + ingestion API + query API + SSE
   stream; UI timeline page — live during run, replayable after with
-  timestamps. **API side done** (`api/routers/events.py`: ingest batch/single,
-  query w/ filters+pagination, SSE tail); UI timeline is Phase 2.
+  timestamps. API side (`api/routers/events.py`: ingest batch/single,
+  query w/ filters+pagination, SSE tail) + timeline UI both landed.
 - **Where:** `api/routers/events.py`, `api/schemas.py` (EventSource/EventType
-  enums), db `events`, `web/app/runs/[id]/timeline/` (pending)
+  enums), db `events`, `web/app/runs/[id]/timeline/`
 - **Verify:**
   - Unit: `tests/unit/api/test_events.py` + `test_event_types.py` (13+ tests)
   - Live: SSE verified via curl; M2 events persisted
-  - UI: pending Phase 2
+  - UI: run → timeline page shows live events
 - **Depends on:** F0 (ingestion slice unblocks F3)
 
-### F7 — Evaluator sandbox
+### F7 — Evaluator sandbox ✅
 
-- **What:** post-run sandboxed agent; loads artifact + frozen rubric; judges
-  via gateway (metered); writes score + rationale per rubric dimension
+- **What:** post-run sandboxed agent (same miniloop image as judge); loads
+  staged artifact copy + frozen rubric; judges via gateway (metered,
+  per-sandbox cred); writes score + rationale per rubric dimension
   (functional requirements, acceptance criteria, code quality, cyclomatic
-  complexity).
-- **Where:** `evaluator/`, db `scores`, `api/routers/results.py`
+  complexity); `scores.json` parsed into `Score` rows with salvage-mode
+  parsing; `EVAL_TRANSCRIPT.log` written for evidence.
+- **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
+  `prompts.py`), db `scores`, `api/routers/results.py`
 - **Verify:**
-  - Integration: `tests/integration/test_evaluator.py` — fixture artifact →
-    score rows cover all rubric dimensions
+  - Unit: `tests/unit/evaluator/` (`test_evaluate.py`, `test_scores.py`,
+    `test_prompts.py`) — mocked runtime; staging, timeout salvage, malformed
+    scores covered
   - Manual: scores + rationale visible on results page
 - **Depends on:** F2, F4, artifacts from a completed run
 
-### F8 — Results UI
+### F8 — Results UI ✅
 
 - **What:** run list; per-run matrix (sandbox × rubric dimension); score +
   rationale view; link to timeline replay; artifact download; flag when
   evaluator model == participant model.
-- **Where:** `web/app/runs/`, results components, `api/routers/results.py`
+- **Where:** `web/app/runs/` (list, detail, `results/`), results components,
+  `api/routers/results.py` (results + scores + artifact-download endpoints)
 - **Verify:**
   - UI: complete run → compare scores side-by-side → open timeline →
     download artifact
-  - Tests: `tests/e2e/` (Playwright, post-MVP)
+  - Unit: `tests/unit/api/test_results.py` (matrix, scores, download jail);
+    e2e: `tests/e2e/` (Playwright, post-MVP)
 - **Depends on:** F1, F6, F7
 
 ## Implementation sequence

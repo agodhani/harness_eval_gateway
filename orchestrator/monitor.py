@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -160,6 +161,11 @@ def _verdict(
 
 
 def _dir_size(path: Path) -> int:
+    # os.walk doesn't descend into symlinked dirs (followlinks=False) — the
+    # snapshot tree is candidate-authored, so rglob could escape the artifact
+    # dir through a planted symlink or spin on a cycle.
+    if path.is_symlink():
+        return 0
     if path.is_file():
         try:
             return path.stat().st_size
@@ -167,8 +173,11 @@ def _dir_size(path: Path) -> int:
             return 0
     total = 0
     if path.is_dir():
-        for f in path.rglob("*"):
-            if f.is_file():
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                f = Path(root) / name
+                if f.is_symlink() or not f.is_file():
+                    continue
                 try:
                     total += f.stat().st_size
                 except OSError:

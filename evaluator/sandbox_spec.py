@@ -75,7 +75,8 @@ def build_eval_env(
 
     ``EVENTS_INGEST_URL`` points at the gateway's ``/internal/events`` — the
     same egress path participant sandboxes use (cred auth stamps run/sandbox
-    ids; the eval cred is run-scoped so events land run-level).
+    ids; each per-eval cred carries the sandbox under evaluation, so judge
+    events land on that sandbox's timeline).
     """
     gw = sandbox_gateway_url(gateway_base_url)
     return miniloop_adapter.env(

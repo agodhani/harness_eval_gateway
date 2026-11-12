@@ -16,6 +16,7 @@ Pydantic models live here (not api/schemas.py) per Phase-2 ownership split.
 from __future__ import annotations
 
 import io
+import os
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -255,10 +256,16 @@ def _resolve_artifact_path(artifact: Artifact, jail: Path) -> Path | None:
 
 
 def _zip_dir(dirpath: Path) -> bytes:
+    # os.walk doesn't descend into symlinked dirs (followlinks=False) — the
+    # snapshotted workspace is candidate-authored, so rglob could escape the
+    # jail through a planted symlink. File symlinks are skipped outright.
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for p in sorted(dirpath.rglob("*")):
-            if p.is_file() and not p.is_symlink():
+        for root, _dirs, files in os.walk(dirpath):
+            for name in sorted(files):
+                p = Path(root) / name
+                if p.is_symlink() or not p.is_file():
+                    continue
                 zf.write(p, p.relative_to(dirpath))
     return buf.getvalue()
 

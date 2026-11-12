@@ -169,9 +169,17 @@ def _stage_eval_workspace(
     # Copy the candidate workspace CONTENTS (dirs_exist_ok into fresh dir).
     shutil.copytree(workspace_dir, eval_ws, dirs_exist_ok=True, symlinks=True)
 
-    # A candidate-authored scores.json must not survive staging — it would be
-    # mistaken for judge output if the eval agent dies before writing its own.
-    (eval_ws / SCORES_FILENAME).unlink(missing_ok=True)
+    # Candidate-authored files under reserved names must not survive staging:
+    # scores.json would be mistaken for judge output, and the copy preserved
+    # symlinks — a symlinked rubric.json/EVAL_*.md would redirect the writes
+    # below through the link to an arbitrary host path.
+    for reserved in (
+        SCORES_FILENAME,
+        "rubric.json",
+        "EVAL_PROMPT.md",
+        "EVAL_TRANSCRIPT.log",
+    ):
+        (eval_ws / reserved).unlink(missing_ok=True)
 
     (eval_ws / "rubric.json").write_text(
         json.dumps(rubric, indent=2, ensure_ascii=False, default=str) + "\n",
