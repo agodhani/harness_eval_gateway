@@ -246,6 +246,9 @@ or tests change.
 - Post-run rubric edits — modify the frozen rubric after a run and re-score
   with the updated rubric (keep score provenance per rubric version)
 - Cached `previewable` probe on results GET (currently a few stats per call)
+- dsh native helpers (spawn-helper, node-pty) — npm ≥11 blocks their
+  postinstall scripts; CLI works without them, but revisit `--allow-scripts`
+  for the dsh package set if evals hit TTY-dependent tasks
 
 ## Decisions log
 
