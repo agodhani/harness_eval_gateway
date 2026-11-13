@@ -234,6 +234,19 @@ def test_create_run_defaults(api) -> None:
     assert data["same_model_eval"] is True
 
 
+def test_create_run_multi_adapter(api) -> None:
+    """Phase 2.5: every registered adapter name validates at submit."""
+    body = _valid_body(
+        harness_configs=[
+            {"adapter": a}
+            for a in ("miniloop", "claude_code", "codex", "deepseek", "pi")
+        ]
+    )
+    data = _post_run(api.client, body)
+    adapters = [hc["adapter"] for hc in data["config"]["harness_configs"]]
+    assert adapters == ["miniloop", "claude_code", "codex", "deepseek", "pi"]
+
+
 def test_create_run_validation(api) -> None:
     client = api.client
     cases = [
