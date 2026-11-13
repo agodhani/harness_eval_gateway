@@ -271,6 +271,8 @@ or tests change.
   gateway :8081); `uv run pytest`; `uv run ruff check .`; web dev
   `cd web && npm run dev` (use `-p 3002` if :3000 is taken);
   e2e `cd web && E2E_PORT=3100 npm run test:e2e`.
+- `GET /api/runs/{id}/analytics?price_model=` (F9) serves per-sandbox metrics
+  + estimated cost; price table lives in `api/pricing.py` (`PRICE_TABLE`).
 - **Known issues (Phase 3 candidates):** event ingest has no retry/buffering —
   a sandbox emitting during an api restart loses early events; gateway emits
   best-effort. `heg-dev` static cred exists for dev only.

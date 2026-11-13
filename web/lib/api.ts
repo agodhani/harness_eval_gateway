@@ -451,6 +451,95 @@ export function getRunResults(runId: string): Promise<RunResults> {
   return request<RunResults>(`/api/runs/${encodeURIComponent(runId)}/results`);
 }
 
+// ---------------------------------------------------------------------------
+// analytics (F9)
+// ---------------------------------------------------------------------------
+
+/** USD-per-million-token rate for one model; `local` = free/local inference. */
+export interface ModelPrice {
+  input_per_mtok_usd: number;
+  output_per_mtok_usd: number;
+  local?: boolean;
+}
+
+export interface TokenUsage {
+  input: number;
+  output: number;
+  cache_read: number;
+  total: number;
+}
+
+export interface LatencyStats {
+  avg: number | null;
+  p95: number | null;
+  max: number | null;
+}
+
+export interface ToolCallStats {
+  total: number;
+  by_tool: Record<string, number>;
+}
+
+export interface SkillCallStats {
+  total: number;
+  by_skill: Record<string, number>;
+}
+
+/** Judge traffic attributed to the sandbox's stream (eval creds reuse the
+ * participant sandbox_id); partitioned out of participant metrics. */
+export interface EvaluatorActivity {
+  llm_turns: number;
+  tokens: { input: number; output: number; total: number };
+  estimated_cost_usd: number;
+}
+
+export interface SandboxAnalytics {
+  sandbox_id: string;
+  label: string;
+  harness_config: Record<string, unknown>;
+  status: string;
+  terminal_reason: string | null;
+  llm_turns: number;
+  tokens: TokenUsage;
+  latency_ms: LatencyStats;
+  tool_calls: ToolCallStats;
+  skill_calls: SkillCallStats;
+  shell_commands: number;
+  file_ops: number;
+  test_executions: number;
+  errors: number;
+  wall_clock_seconds: number;
+  estimated_cost_usd: number;
+  evaluator: EvaluatorActivity | null;
+}
+
+export interface RunAnalytics {
+  run_id: string;
+  model_name: string;
+  /** Which price_table entry `estimated_cost_usd` was computed at. */
+  price_model: string;
+  price_table: Record<string, ModelPrice>;
+  sandboxes: SandboxAnalytics[];
+}
+
+export function getRunAnalytics(runId: string, priceModel?: string): Promise<RunAnalytics> {
+  return request<RunAnalytics>(
+    `/api/runs/${encodeURIComponent(runId)}/analytics${qs({ price_model: priceModel })}`,
+  );
+}
+
+/** Client-side cost estimate: tokens × rate. Mirrors api/pricing.py. */
+export function estimateCostUsd(
+  price: ModelPrice,
+  tokens: { input: number; output: number },
+): number {
+  return (
+    (tokens.input * price.input_per_mtok_usd +
+      tokens.output * price.output_per_mtok_usd) /
+    1_000_000
+  );
+}
+
 export function getSandboxScores(sandboxId: string): Promise<ScoreOut[]> {
   return request<ScoreOut[]>(`/api/sandboxes/${encodeURIComponent(sandboxId)}/scores`);
 }

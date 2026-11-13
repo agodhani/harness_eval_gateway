@@ -21,6 +21,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F6 | Event store + live timeline | ✅ | `api/routers/events.py`, `web/app/runs/[id]/timeline/` | `tests/unit/api/test_events.py` |
 | F7 | Evaluator sandbox (rubric scoring) | ✅ | `evaluator/` | `tests/unit/evaluator/` |
 | F8 | Results UI (matrix, scores, artifacts) | ✅ | `web/app/runs/`, `api/routers/results.py` | `tests/unit/api/test_results.py` |
+| F9 | Run analytics (per-sandbox metrics + cost) | ✅ | `api/routers/analytics.py`, `api/pricing.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx` | `tests/unit/api/test_analytics.py` |
 
 ## Feature details
 
@@ -169,6 +170,28 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - Unit: `tests/unit/api/test_results.py` (matrix, scores, download jail);
     e2e: `tests/e2e/` (Playwright, post-MVP)
 - **Depends on:** F1, F6, F7
+
+### F9 — Run analytics ✅
+
+- **What:** `GET /api/runs/{id}/analytics?price_model=` — per-sandbox metrics
+  aggregated from the `events` stream: llm turns, token split
+  (in/out/cache/total), latency (avg/p95/max), tool-call + skill-invocation
+  breakdowns, shell/file/test/error counts, wall clock, estimated cost at a
+  selectable price model (`api/pricing.py` `PRICE_TABLE`; local models
+  flagged `local` → $0). Judge (evaluator) traffic shares the participant
+  sandbox_id via its cred, so it's split out at the `eval_started` checkpoint
+  and reported under `evaluator` rather than polluting participant numbers.
+  Results page gains an "Analytics" section — side-by-side comparison table +
+  price-model dropdown that recomputes cost client-side (no refetch).
+- **Where:** `api/pricing.py`, `api/routers/analytics.py`, response schemas
+  in `api/schemas.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx`,
+  `web/lib/api.ts` (`getRunAnalytics`, `estimateCostUsd`)
+- **Verify:**
+  - Unit: `tests/unit/api/test_analytics.py` (aggregation math, eval-phase
+    split, cost at known price model, defaults, 404/422, zero-event run)
+  - API: `curl localhost:8001/api/runs/<id>/analytics?price_model=gpt-4o`
+  - UI: results page → "Analytics" card → switch price model → cost updates
+- **Depends on:** F6 (events), F8 (results page)
 
 ## Implementation sequence
 

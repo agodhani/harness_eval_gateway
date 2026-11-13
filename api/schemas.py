@@ -13,6 +13,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from api.pricing import ModelPrice
+
 
 class EventSource(str, Enum):
     """Who produced the event (db Event.source)."""
@@ -194,3 +196,83 @@ class RunSummary(BaseModel):
     created_at: datetime
     finished_at: datetime | None
     sandbox_count: int
+
+
+# ---------------------------------------------------------------------------
+# F9 — run analytics (api/routers/analytics.py)
+# ---------------------------------------------------------------------------
+
+
+class TokenUsage(BaseModel):
+    """Aggregated token counts from a sandbox's llm_response events."""
+
+    input: int = 0
+    output: int = 0
+    cache_read: int = 0
+    total: int = 0
+
+
+class LatencyStats(BaseModel):
+    """LLM response latency stats in ms; all null when no llm_responses."""
+
+    avg: float | None = None
+    p95: float | None = None
+    max: float | None = None
+
+
+class ToolCallStats(BaseModel):
+    total: int = 0
+    by_tool: dict[str, int] = Field(default_factory=dict)
+
+
+class SkillCallStats(BaseModel):
+    total: int = 0
+    by_skill: dict[str, int] = Field(default_factory=dict)
+
+
+class EvaluatorActivity(BaseModel):
+    """Post-run judge activity attributed to this sandbox's event stream.
+
+    Eval creds carry the *participant* sandbox_id (so judge events land on the
+    same timeline), so judge traffic is partitioned out at the evaluator's
+    ``eval_started`` checkpoint and reported separately — otherwise the judge
+    (up to ~30 iters) would swamp the participant's llm_turns/tokens.
+    """
+
+    llm_turns: int = 0
+    tokens: TokenUsage = Field(default_factory=TokenUsage)
+    estimated_cost_usd: float = 0.0
+
+
+class SandboxAnalytics(BaseModel):
+    """Per-sandbox metrics for the analytics comparison table."""
+
+    sandbox_id: uuid.UUID
+    # Human label mirroring the results-matrix header (adapter · packs).
+    label: str = ""
+    harness_config: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    terminal_reason: str | None = None
+    llm_turns: int = 0
+    tokens: TokenUsage = Field(default_factory=TokenUsage)
+    latency_ms: LatencyStats = Field(default_factory=LatencyStats)
+    tool_calls: ToolCallStats = Field(default_factory=ToolCallStats)
+    skill_calls: SkillCallStats = Field(default_factory=SkillCallStats)
+    shell_commands: int = 0
+    file_ops: int = 0
+    test_executions: int = 0
+    errors: int = 0
+    wall_clock_seconds: float = 0.0
+    estimated_cost_usd: float = 0.0
+    evaluator: EvaluatorActivity | None = None
+
+
+class RunAnalytics(BaseModel):
+    """GET /api/runs/{run_id}/analytics response."""
+
+    run_id: uuid.UUID
+    model_name: str
+    # Which price_table entry ``estimated_cost_usd`` was computed at.
+    price_model: str
+    price_table: dict[str, ModelPrice] = Field(default_factory=dict)
+    sandboxes: list[SandboxAnalytics] = Field(default_factory=list)

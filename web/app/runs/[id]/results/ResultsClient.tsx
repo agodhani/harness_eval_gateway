@@ -35,6 +35,7 @@ import {
   statusTone,
   WarnNote,
 } from "@/components/ui";
+import AnalyticsSection from "./AnalyticsSection";
 
 const POLL_MS = 5_000;
 
@@ -376,6 +377,8 @@ export default function ResultsClient({ runId }: { runId: string }) {
                 </table>
               </div>
             </Card>
+
+            <AnalyticsSection runId={runId} />
 
             <Card title="Artifacts">
               <div className="table-wrap">
