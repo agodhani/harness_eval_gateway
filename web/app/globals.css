@@ -432,6 +432,65 @@ h3 {
   gap: 0.75rem;
 }
 
+/* combobox — free-text input + suggestion overlay (ComboInput) */
+.combo {
+  position: relative;
+}
+.combo .input {
+  padding-right: 2rem; /* room for the toggle chevron */
+}
+.combo__toggle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 1.9rem;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 0.62rem;
+  font-family: inherit;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.combo__toggle:hover:not(:disabled) {
+  color: var(--text);
+}
+.combo__toggle:disabled {
+  cursor: not-allowed;
+}
+.combo__list {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 60; /* above the sticky site-header (z-index: 50) */
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  max-height: 13rem;
+  overflow-y: auto;
+  list-style: none;
+}
+.combo__option {
+  padding: 0.45rem 0.7rem;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.combo__option:hover,
+.combo__option--active {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
 .check-list {
   display: flex;
   flex-wrap: wrap;
@@ -538,14 +597,13 @@ table.table {
    Notices
    ========================================================================== */
 
+/* Plain block layout — children are usually inline prose; a flex column would
+   stack every inline fragment (text node, <strong>, <code>) as its own row. */
 .notice {
   padding: 0.7rem 0.9rem;
   border-radius: var(--radius-sm);
   font-size: 0.88rem;
   border: 1px solid transparent;
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
 }
 .notice--info {
   background: var(--blue-soft);
@@ -566,10 +624,12 @@ table.table {
   background: var(--surface-2);
   border-color: var(--border);
   color: var(--text-dim);
-  flex-direction: row;
+  display: flex;
   align-items: center;
+  gap: 0.4rem;
 }
 .notice__detail {
+  margin-top: 0.25rem;
   font-family: var(--mono);
   font-size: 0.82rem;
   word-break: break-word;

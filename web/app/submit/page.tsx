@@ -18,6 +18,7 @@ import {
   type Budgets,
   type HarnessConfig,
 } from "@/lib/api";
+import { ComboInput } from "@/components/ComboInput";
 import { Badge, Card, ErrorNote, InfoNote } from "@/components/ui";
 
 const MODEL_SUGGESTIONS = ["qwen3:8b", "qwen2.5-coder:3b", "qwen2.5-coder:7b"];
@@ -171,20 +172,15 @@ export default function SubmitPage() {
               <label className="field__label" htmlFor="model_name">
                 Participant model <span className="faint">(required)</span>
               </label>
-              <input
+              <ComboInput
                 id="model_name"
-                className="input input--mono"
-                list="model-suggestions"
-                placeholder="qwen3:8b"
                 value={modelName}
-                onChange={(e) => setModelName(e.target.value)}
+                onChange={setModelName}
+                suggestions={MODEL_SUGGESTIONS}
+                placeholder="qwen3:8b"
                 disabled={submitting}
+                mono
               />
-              <datalist id="model-suggestions">
-                {MODEL_SUGGESTIONS.map((m) => (
-                  <option key={m} value={m} />
-                ))}
-              </datalist>
               {fieldErrors.model_name ? (
                 <span className="field__error">{fieldErrors.model_name}</span>
               ) : (
@@ -195,14 +191,14 @@ export default function SubmitPage() {
               <label className="field__label" htmlFor="evaluator_model">
                 Evaluator model
               </label>
-              <input
+              <ComboInput
                 id="evaluator_model"
-                className="input input--mono"
-                list="model-suggestions"
-                placeholder={modelName.trim() || "same as participant"}
                 value={evaluatorModel}
-                onChange={(e) => setEvaluatorModel(e.target.value)}
+                onChange={setEvaluatorModel}
+                suggestions={MODEL_SUGGESTIONS}
+                placeholder={modelName.trim() || "same as participant"}
                 disabled={submitting}
+                mono
               />
               {sameModelEval ? (
                 <InfoNote>

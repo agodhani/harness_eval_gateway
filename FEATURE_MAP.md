@@ -50,7 +50,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **What:** form captures task prompt, model, harness configs (miniloop +
   skill pack selections), evaluator model; `POST /api/runs` persists spec with
   status `submitted`.
-- **Where:** `web/app/submit/page.tsx` + form components,
+- **Where:** `web/app/submit/page.tsx`, `web/components/ComboInput.tsx`
+  (model suggestion dropdown), `web/app/globals.css` (`.combo*`),
   `api/routers/runs.py`, `api/schemas.py`, db `runs` table
 - **Verify:**
   - UI: fill form → submit → run appears with status `submitted`
