@@ -36,6 +36,7 @@ import {
   WarnNote,
 } from "@/components/ui";
 import AnalyticsSection from "./AnalyticsSection";
+import PreviewControls from "./PreviewControls";
 
 const POLL_MS = 5_000;
 
@@ -388,6 +389,7 @@ export default function ResultsClient({ runId }: { runId: string }) {
                       <th>Sandbox</th>
                       <th>Artifact path</th>
                       <th>Downloads</th>
+                      <th>Preview</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -421,6 +423,20 @@ export default function ResultsClient({ runId }: { runId: string }) {
                                 {sb.artifact_path
                                   ? "id not exposed by API yet"
                                   : "no artifact"}
+                              </span>
+                            )}
+                          </td>
+                          <td>
+                            {sb.artifact_path ? (
+                              <PreviewControls
+                                runId={runId}
+                                sandboxId={sb.sandbox_id}
+                                previewable={sb.previewable ?? false}
+                                candidates={sb.preview_candidates ?? []}
+                              />
+                            ) : (
+                              <span className="faint" style={{ fontSize: "0.8rem" }}>
+                                no artifact
                               </span>
                             )}
                           </td>

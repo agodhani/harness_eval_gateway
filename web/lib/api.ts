@@ -282,6 +282,14 @@ export interface SandboxResult {
   /** Optional artifact ids if/when the results API exposes them. */
   artifact_ids?: string[];
   artifacts?: { id: string; kind?: string; path?: string }[];
+  /** F12: snapshot workspace has a previewable entry point. */
+  previewable?: boolean;
+  preview_type?: string | null;
+  /**
+   * F12: every detected runnable entry, default-first — the UI renders a
+   * dropdown and POSTs {entry}. Empty + previewable=false = unsupported.
+   */
+  preview_candidates?: PreviewCandidate[];
 }
 
 export interface RunResults {
@@ -698,6 +706,62 @@ export function getSandboxScores(sandboxId: string): Promise<ScoreOut[]> {
 
 export function artifactDownloadUrl(artifactId: string): string {
   return `${API_BASE}/api/artifacts/${encodeURIComponent(artifactId)}/download`;
+}
+
+// ---------------------------------------------------------------------------
+// artifact preview (F12)
+// ---------------------------------------------------------------------------
+
+export interface PreviewCandidate {
+  /** Workspace-relative entry path, e.g. "index.html" or "game/main.py". */
+  entry: string;
+  /** Preview type — "static" | "desktop" (pygame via noVNC). */
+  type: string;
+}
+
+export interface PreviewOut {
+  preview_id: string;
+  run_id: string;
+  sandbox_id: string;
+  /** Preview type — "static" | "desktop" (pygame via noVNC); python-server planned. */
+  type: string;
+  /** Docker container status: created | running | exited | ... */
+  status: string;
+  url: string | null;
+  entry: string | null;
+  container: string;
+  created_at: string | null;
+  expires_at: string | null;
+}
+
+function previewPath(runId: string, sandboxId: string): string {
+  return `/api/runs/${encodeURIComponent(runId)}/sandboxes/${encodeURIComponent(sandboxId)}/preview`;
+}
+
+/** 404 when no preview exists — callers treat it as "not started". */
+export function getPreview(runId: string, sandboxId: string): Promise<PreviewOut> {
+  return request<PreviewOut>(previewPath(runId, sandboxId));
+}
+
+/**
+ * Idempotent per sandbox: returns the live preview if one already runs.
+ * `entry` (workspace-relative) picks an explicit entry point — for
+ * ambiguous scans or artifacts detection missed; `.html` → static,
+ * `.py` → desktop.
+ */
+export function startPreview(
+  runId: string,
+  sandboxId: string,
+  entry?: string,
+): Promise<PreviewOut> {
+  return request<PreviewOut>(previewPath(runId, sandboxId), {
+    method: "POST",
+    ...(entry ? { body: JSON.stringify({ entry }) } : {}),
+  });
+}
+
+export function stopPreview(runId: string, sandboxId: string): Promise<void> {
+  return request<void>(previewPath(runId, sandboxId), { method: "DELETE" });
 }
 
 /** Liveness probe for the "backend not ready" UI states. */
