@@ -328,18 +328,17 @@ or tests change.
   `--cpus`/`--memory`/`--pids-limit` bounds. A pinned `alpine/socat` sidecar
   (`heg.preview_role=proxy`, dumb TCP pipe — nothing for the artifact to
   exploit) straddles both nets and publishes the noVNC port on localhost.
-- **Desktop detection is conservative** — `.py` entries scanned at root +
-  ≤3 nested levels (hidden dirs, `_DESKTOP_SKIP_DIRS`, symlinks skipped):
-  named entries (`main.py`/`app.py`/`game.py`/`run.py`) or a dir containing
-  exactly one `.py`, each requiring pygame evidence *in the candidate file*
-  or in any scanned `requirements.txt` (comment lines stripped — `# pygame`
-  doesn't count). Exactly one candidate → auto-pick; multiple →
-  `preview_candidates` (no silent exec); zero → "not supported". An
-  explicit `entry=` POST param jails+validates a workspace-relative pick —
-  `.html`→static, `.py`→desktop (evidence bypassed: the pick IS the
-  disambiguation). Deps beyond baked-in pygame-ce can't install (no
-  egress) — the app fails at import and the runner exits visibly. Static
-  wins when both detectors match.
+- **Detection produces a typed candidate list, not a hidden pick** —
+  `scan_preview` returns every runnable entry (`.html` → static, evidenced
+  `.py` → desktop) ordered default-first; `plan`/`candidates[0]` is only
+  the dropdown's default. `.py` candidates need pygame evidence (file
+  imports pygame, OR entry-shaped + a non-comment requirements.txt line);
+  scanned at root + ≤3 nested levels with hidden/`_DESKTOP_SKIP_DIRS`/
+  symlinks skipped. `entry=` POST picks any workspace-relative file —
+  `.py` overrides evidence (the pick IS the disambiguation). Zero
+  candidates → UI shows disabled "not supported". Deps beyond baked-in
+  pygame-ce can't install (no egress) — the app fails at import and the
+  runner exits visibly. Static defaults when both match.
 - **Preview registry lives on docker labels**, not in memory or Postgres —
   restart-safe discovery + the TTL reaper (default 15 min) works
   out-of-process; runner+proxy share `heg.preview_id`, stop removes all.

@@ -248,24 +248,16 @@ async def start_preview(
                 detail=str(exc),
             ) from exc
     else:
-        scan = scan_preview(workspace)
-        plan = scan.plan
+        # No explicit pick → the scan's default (candidates[0]; results
+        # payload carries the full list for the UI's dropdown).
+        plan = scan_preview(workspace).plan
         if plan is None:
-            if scan.candidates:
-                detail = (
-                    "multiple candidate entries — re-POST with "
-                    f'{{"entry": "<path>"}}: {", ".join(scan.candidates)}'
-                )
-            else:
-                detail = (
-                    "no previewable artifact: expected index.html at the "
-                    "workspace root, a single root-level .html file, a "
-                    "unique */index.html one level down, or a pygame app "
-                    "(unambiguous .py entry + pygame evidence)"
-                )
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail=detail,
+                detail=(
+                    "no previewable artifact: expected a .html/.htm entry or "
+                    "a pygame app (.py entry with pygame evidence)"
+                ),
             )
 
     try:

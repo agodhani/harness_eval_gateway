@@ -7,11 +7,12 @@ auto-stops containers after ``PREVIEW_TTL_SECONDS`` (default 15 min).
 
 Design notes:
 
-- **Preview types.** ``detect_preview`` returns a :class:`PreviewPlan` whose
-  ``type`` selects the serving strategy. ``"static"`` serves
-  ``python -m http.server``; ``"desktop"`` executes the artifact (pygame —
-  see ``_detect_desktop`` for the conservative heuristic) on a virtual
-  display streamed via noVNC. The plan/label/API shape leaves room for
+- **Preview types.** ``scan_preview`` returns every runnable entry as
+  typed :class:`PreviewPlan` candidates (default-first; ``detect_preview``
+  returns just the default). ``"static"`` serves ``python -m http.server``;
+  ``"desktop"`` executes the artifact (pygame — see
+  ``_desktop_candidates`` for the evidence heuristic) on a virtual display
+  streamed via noVNC. The plan/label/API shape leaves room for
   ``python-server`` etc.
 - **Static network posture.** Static preview containers join a dedicated
   bridge network ``heg-preview`` — *not* ``heg-sandbox`` (which has the
@@ -257,46 +258,29 @@ def _nested_indexes(workspace: Path) -> list[Path]:
     return nested
 
 
-def _detect_static(workspace: Path) -> PreviewPlan | None:
-    """Find an unambiguous static entry point in a snapshot workspace.
+def _static_candidates(workspace: Path) -> list[PreviewPlan]:
+    """All static entries, ordered for default-first presentation.
 
-    Order (first match wins):
-    1. ``index.html``/``index.htm`` at the workspace root (case-insensitive).
-    2. A single other ``*.html``/``*.htm`` file at the root (``game.html``).
-    3. A unique ``*/index.html`` one level down (``dist/``, ``game/``) —
-       hidden dirs (``.git``) are skipped.
-
-    Anything ambiguous (multiple root html files, multiple nested indexes)
-    returns ``None`` → the API reports the sandbox as not previewable rather
-    than guessing. Symlinked entries/dirs are skipped outright: a candidate
-    could plant a symlink escaping the jail, and the jail check has already
-    happened by this point.
+    Order: root ``index.html``/``.htm`` first (case-insensitive), then other
+    root ``*.html`` files sorted, then ``*/index.html`` one level down
+    sorted — hidden dirs (``.git``) skipped, symlinks never followed.
     """
     root_html = _html_files(workspace)
-    for p in root_html:
-        if p.name.lower() in _INDEX_NAMES:
-            return PreviewPlan(type="static", entry=p.name)
-    if len(root_html) == 1:
-        return PreviewPlan(type="static", entry=root_html[0].name)
-
-    nested = _nested_indexes(workspace)
-    if len(nested) == 1:
-        return PreviewPlan(type="static", entry=str(nested[0].relative_to(workspace)))
-    return None
-
-
-def _static_candidates(workspace: Path) -> list[str]:
-    """Ambiguous static entries — only called when ``_detect_static`` found
-    no unique pick: multiple root ``*.html`` (no index) or multiple nested
-    ``*/index.html``. Returned as workspace-relative paths for the
-    entry-chooser / ``entry=`` override."""
-    root_html = _html_files(workspace)
-    if len(root_html) > 1:
-        return [p.name for p in root_html]
-    nested = _nested_indexes(workspace)
-    if len(nested) > 1:
-        return [str(p.relative_to(workspace)) for p in nested]
-    return []
+    plans: list[PreviewPlan] = [
+        PreviewPlan(type="static", entry=p.name)
+        for p in root_html
+        if p.name.lower() in _INDEX_NAMES
+    ]
+    plans += [
+        PreviewPlan(type="static", entry=p.name)
+        for p in root_html
+        if p.name.lower() not in _INDEX_NAMES
+    ]
+    plans += [
+        PreviewPlan(type="static", entry=str(p.relative_to(workspace)))
+        for p in _nested_indexes(workspace)
+    ]
+    return plans
 
 
 def _read_head(path: Path, cap: int = _READ_CAP) -> str:
@@ -361,22 +345,23 @@ def _py_files(dirpath: Path) -> list[Path]:
     ]
 
 
-def _detect_desktop(workspace: Path) -> tuple[PreviewPlan | None, list[str]]:
-    """Detect runnable GUI artifacts — pygame today (``type="desktop"``).
+def _desktop_candidates(workspace: Path) -> list[PreviewPlan]:
+    """All runnable pygame entries — the dropdown's ``desktop`` options.
 
-    Conservative on purpose — detection decides what gets *executed*:
+    Every ``*.py`` with pygame evidence is a candidate — no named-entry
+    shape required (the dropdown is the disambiguation mechanism):
 
-    - **Candidate entries** in each scanned dir (root + ≤3 levels, skipping
-      hidden/``_DESKTOP_SKIP_DIRS``/symlinked dirs): named entries
-      ``main.py``/``app.py``/``game.py``/``run.py``, else a dir containing
-      exactly one ``*.py``.
-    - **Evidence per candidate**: the candidate file itself imports pygame
-      (line-anchored — comments/docstrings at line start excepted), OR any
+    - the file **itself imports pygame** (line-anchored — comments can't
+      match), OR
+    - it is **entry-shaped** (named ``main.py``/``app.py``/``game.py``/
+      ``run.py``, or a dir containing exactly one ``*.py``) AND any
       ``requirements.txt`` within the scanned dirs names pygame on a real
-      (non-comment) line.
-    - **Ambiguity**: exactly one eligible candidate → auto-pick it.
-      Multiple → ``(None, candidates)`` — the caller picks via ``entry=``;
-      we never silently choose what to execute.
+      non-comment line.
+
+    Scanned dirs = root + ≤3 levels (``_DESKTOP_SKIP_DIRS``/hidden/symlinked
+    dirs skipped). Ordered for default-first presentation: shallower first,
+    named entries (in ``_DESKTOP_ENTRY_NAMES`` order) before others, then
+    path — so ``main.py`` beats ``lib/helpers.py``.
     """
     scan_dirs = _scan_dirs(workspace)
     req_evidence = False
@@ -386,62 +371,60 @@ def _detect_desktop(workspace: Path) -> tuple[PreviewPlan | None, list[str]]:
             req_evidence = True
             break
 
-    candidates: list[str] = []
+    candidates: list[tuple[int, int, str]] = []  # (depth, named_rank, rel)
     for d in scan_dirs:
         py = _py_files(d)
-        entries = [d / name for name in _DESKTOP_ENTRY_NAMES if (d / name) in py]
-        if not entries and len(py) == 1:
-            entries = py
-        for cand in entries:
-            if req_evidence or (
-                _PYGAME_IMPORT_RE.search(_read_head(cand)) is not None
-            ):
-                candidates.append(str(cand.relative_to(workspace)))
+        entry_shaped = {d / name for name in _DESKTOP_ENTRY_NAMES if (d / name) in py}
+        if len(py) == 1:
+            entry_shaped.add(py[0])
+        for cand in py:
+            rel = str(cand.relative_to(workspace))
+            own_evidence = _PYGAME_IMPORT_RE.search(_read_head(cand)) is not None
+            if not (own_evidence or (req_evidence and cand in entry_shaped)):
+                continue
+            try:
+                rank = _DESKTOP_ENTRY_NAMES.index(cand.name)
+            except ValueError:
+                rank = len(_DESKTOP_ENTRY_NAMES)
+            candidates.append((len(Path(rel).parts) - 1, rank, rel))
 
-    candidates = sorted(set(candidates))
-    if len(candidates) == 1:
-        return PreviewPlan(type="desktop", entry=candidates[0]), []
-    return None, candidates
+    candidates.sort()
+    return [PreviewPlan(type="desktop", entry=rel) for _, _, rel in candidates]
 
 
 @dataclass(frozen=True)
 class PreviewScan:
     """Full scan of a snapshot workspace.
 
-    ``plan`` — the auto-picked preview (``None`` when ambiguous/unsupported).
-    ``candidates`` — workspace-relative entry paths the user could pick via
-    the ``entry=`` override; populated only when ``plan`` is ``None`` and at
-    least two plausible entries exist (``.html`` files for static, evidence-
-    backed ``.py`` entries for desktop). Empty candidates + no plan = the
-    artifact simply isn't previewable today.
+    ``plan`` — the default pick (``candidates[0]``, ``None`` when nothing is
+    previewable). ``candidates`` — every detected runnable entry as typed
+    :class:`PreviewPlan` records, ordered default-first: static entries
+    (root index → root html → nested index), then desktop ``.py`` entries
+    (shallower → named → path). The UI renders this as the dropdown's
+    options; the user picks, never types paths.
     """
 
     plan: PreviewPlan | None
-    candidates: tuple[str, ...]
+    candidates: tuple[PreviewPlan, ...]
 
 
 def scan_preview(workspace: Path) -> PreviewScan:
-    """First match wins: ``static`` → ``desktop`` → ambiguous/none.
-
-    A workspace matching both previews as static — the safe/cheap default.
-    """
+    """Static candidates first, then desktop — ``candidates[0]`` is the
+    default pick, so a workspace matching both defaults to static while the
+    dropdown still offers the desktop entry."""
     if not workspace.is_dir():
         return PreviewScan(None, ())
-    plan = _detect_static(workspace)
-    if plan is not None:
-        return PreviewScan(plan, ())
-    plan, desk_candidates = _detect_desktop(workspace)
-    if plan is not None:
-        return PreviewScan(plan, ())
-    return PreviewScan(
-        None, tuple(sorted(desk_candidates + _static_candidates(workspace)))
+    candidates = (
+        *_static_candidates(workspace), *_desktop_candidates(workspace)
     )
+    return PreviewScan(candidates[0] if candidates else None, candidates)
 
 
 def detect_preview(workspace: Path) -> PreviewPlan | None:
-    """Auto-picked plan, or ``None`` (ambiguous or unsupported workspace).
+    """Default pick, or ``None`` (unsupported workspace).
 
-    Prefer :func:`scan_preview` when candidates are wanted for a chooser UI.
+    Prefer :func:`scan_preview` when the full candidate list is wanted —
+    this returns just the dropdown's default selection.
     """
     return scan_preview(workspace).plan
 

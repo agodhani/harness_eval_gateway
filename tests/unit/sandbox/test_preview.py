@@ -64,9 +64,11 @@ def test_detect_single_root_html(tmp_path: Path) -> None:
 
 
 def test_detect_ambiguous_root_html(tmp_path: Path) -> None:
+    """Multiple root html → first sorted is the default pick (all listed
+    as candidates for the dropdown)."""
     (tmp_path / "a.html").write_text("a")
     (tmp_path / "b.html").write_text("b")
-    assert detect_preview(tmp_path) is None
+    assert detect_preview(tmp_path) == PreviewPlan(type="static", entry="a.html")
 
 
 def test_detect_nested_index(tmp_path: Path) -> None:
@@ -83,7 +85,9 @@ def test_detect_ambiguous_nested_index(tmp_path: Path) -> None:
     (tmp_path / "a" / "index.html").write_text("a")
     (tmp_path / "b").mkdir()
     (tmp_path / "b" / "index.html").write_text("b")
-    assert detect_preview(tmp_path) is None
+    assert detect_preview(tmp_path) == PreviewPlan(
+        type="static", entry="a/index.html"
+    )
 
 
 def test_detect_skips_hidden_dirs(tmp_path: Path) -> None:
@@ -138,17 +142,16 @@ def test_detect_desktop_requirements_evidence(tmp_path: Path) -> None:
     assert plan == PreviewPlan(type="desktop", entry="main.py")
 
 
-def test_detect_desktop_evidence_must_be_in_candidate(tmp_path: Path) -> None:
-    """Sibling-file imports no longer count — evidence must be in the
-    candidate itself (thin-launcher false-positives trade for safety; the
-    entry= override remains the escape hatch)."""
+def test_detect_desktop_evidence_is_per_file(tmp_path: Path) -> None:
+    """engine.py importing pygame IS a candidate (file evidence, no named
+    shape needed); main.py without its own evidence is not offered."""
     (tmp_path / "main.py").write_text("import engine\n")
     (tmp_path / "engine.py").write_text("import pygame\n")
-    assert detect_preview(tmp_path) is None
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="desktop", entry="engine.py")
     from sandbox.preview import scan_preview
 
-    # engine.py isn't a named entry and the dir has >1 .py → no candidates.
-    assert scan_preview(tmp_path).candidates == ()
+    assert [c.entry for c in scan_preview(tmp_path).candidates] == ["engine.py"]
 
 
 def test_detect_desktop_no_evidence(tmp_path: Path) -> None:
@@ -157,11 +160,16 @@ def test_detect_desktop_no_evidence(tmp_path: Path) -> None:
     assert detect_preview(tmp_path) is None
 
 
-def test_detect_desktop_no_entry(tmp_path: Path) -> None:
-    """Pygame evidence without an unambiguous entry → not previewable."""
+def test_detect_desktop_multiple_py_evidenced(tmp_path: Path) -> None:
+    """Several non-named .py with pygame evidence → all candidates, first
+    sorted becomes the default."""
     (tmp_path / "engine.py").write_text("import pygame\n")
     (tmp_path / "sprites.py").write_text("import pygame\n")
-    assert detect_preview(tmp_path) is None
+    from sandbox.preview import scan_preview
+
+    scan = scan_preview(tmp_path)
+    assert scan.plan == PreviewPlan(type="desktop", entry="engine.py")
+    assert [c.entry for c in scan.candidates] == ["engine.py", "sprites.py"]
 
 
 def test_detect_desktop_comment_does_not_count(tmp_path: Path) -> None:
@@ -227,38 +235,41 @@ def test_detect_desktop_skips_irrelevant_dirs(tmp_path: Path, dirname: str) -> N
     assert detect_preview(tmp_path) is None
 
 
-def test_detect_desktop_ambiguous_returns_candidates(tmp_path: Path) -> None:
-    """Two eligible games → no auto-pick; both offered as candidates."""
+def test_detect_desktop_two_games_listed_default_first(tmp_path: Path) -> None:
+    """Two eligible games → both candidates; first sorted is the default."""
     for g in ("game1", "game2"):
         (tmp_path / g).mkdir()
         (tmp_path / g / "main.py").write_text("import pygame\n")
     from sandbox.preview import scan_preview
 
     scan = scan_preview(tmp_path)
-    assert scan.plan is None
-    assert scan.candidates == ("game1/main.py", "game2/main.py")
+    assert scan.plan == PreviewPlan(type="desktop", entry="game1/main.py")
+    assert [c.entry for c in scan.candidates] == [
+        "game1/main.py",
+        "game2/main.py",
+    ]
 
 
-def test_detect_desktop_two_named_entries_ambiguous(tmp_path: Path) -> None:
-    """main.py AND game.py in one dir = two candidates, no silent pick."""
+def test_detect_desktop_named_order_beats_alpha(tmp_path: Path) -> None:
+    """main.py (named rank 0) defaults over game.py (rank 2)."""
     (tmp_path / "main.py").write_text("import pygame\n")
     (tmp_path / "game.py").write_text("import pygame\n")
     from sandbox.preview import scan_preview
 
     scan = scan_preview(tmp_path)
-    assert scan.plan is None
-    assert scan.candidates == ("game.py", "main.py")
+    assert scan.plan == PreviewPlan(type="desktop", entry="main.py")
+    assert [c.entry for c in scan.candidates] == ["main.py", "game.py"]
 
 
-def test_detect_desktop_mixed_root_and_nested_ambiguous(tmp_path: Path) -> None:
+def test_detect_desktop_shallower_defaults(tmp_path: Path) -> None:
     (tmp_path / "main.py").write_text("import pygame\n")
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "main.py").write_text("import pygame\n")
     from sandbox.preview import scan_preview
 
     scan = scan_preview(tmp_path)
-    assert scan.plan is None
-    assert scan.candidates == ("main.py", "sub/main.py")
+    assert scan.plan == PreviewPlan(type="desktop", entry="main.py")
+    assert [c.entry for c in scan.candidates] == ["main.py", "sub/main.py"]
 
 
 def test_detect_desktop_requirements_comment_stripped(tmp_path: Path) -> None:
@@ -279,42 +290,63 @@ def test_detect_desktop_nested_requirements_evidence(tmp_path: Path) -> None:
     assert plan == PreviewPlan(type="desktop", entry="game/main.py")
 
 
-def test_detect_desktop_root_py_in_named_dir_no_named_entry(tmp_path: Path) -> None:
-    """Two non-named .py files in a dir = no candidate (can't pick)."""
+def test_detect_desktop_non_named_files_are_candidates(tmp_path: Path) -> None:
+    """Non-named .py files with pygame evidence are offered (no named-entry
+    shape required — the dropdown disambiguates)."""
     (tmp_path / "a.py").write_text("import pygame\n")
     (tmp_path / "b.py").write_text("import pygame\n")
-    assert detect_preview(tmp_path) is None
+    from sandbox.preview import scan_preview
+
+    scan = scan_preview(tmp_path)
+    assert scan.plan == PreviewPlan(type="desktop", entry="a.py")
+    assert [c.entry for c in scan.candidates] == ["a.py", "b.py"]
 
 
-def test_scan_candidates_static_ambiguous_html(tmp_path: Path) -> None:
-    """Ambiguous html files are offered as candidates too."""
+def test_scan_candidates_static_multiple_html(tmp_path: Path) -> None:
+    """Multiple root html → all candidates, first sorted is the default."""
     (tmp_path / "a.html").write_text("a")
     (tmp_path / "b.html").write_text("b")
     from sandbox.preview import scan_preview
 
     scan = scan_preview(tmp_path)
-    assert scan.plan is None
-    assert scan.candidates == ("a.html", "b.html")
+    assert scan.plan == PreviewPlan(type="static", entry="a.html")
+    assert [c.entry for c in scan.candidates] == ["a.html", "b.html"]
 
 
-def test_scan_candidates_ambiguous_nested_indexes(tmp_path: Path) -> None:
+def test_scan_candidates_multiple_nested_indexes(tmp_path: Path) -> None:
     for d in ("a", "b"):
         (tmp_path / d).mkdir()
         (tmp_path / d / "index.html").write_text("i")
     from sandbox.preview import scan_preview
 
     scan = scan_preview(tmp_path)
-    assert scan.plan is None
-    assert scan.candidates == ("a/index.html", "b/index.html")
+    assert scan.plan == PreviewPlan(type="static", entry="a/index.html")
+    assert [c.entry for c in scan.candidates] == [
+        "a/index.html",
+        "b/index.html",
+    ]
 
 
-def test_scan_candidates_empty_when_plan_found(tmp_path: Path) -> None:
+def test_scan_candidates_includes_default(tmp_path: Path) -> None:
+    """candidates always contains the plan's own entry (it's the default)."""
     (tmp_path / "index.html").write_text("x")
     from sandbox.preview import scan_preview
 
     scan = scan_preview(tmp_path)
     assert scan.plan == PreviewPlan(type="static", entry="index.html")
-    assert scan.candidates == ()
+    assert scan.candidates == (PreviewPlan(type="static", entry="index.html"),)
+
+
+def test_scan_mixed_static_and_desktop(tmp_path: Path) -> None:
+    """Static defaults, but the desktop entry is offered as a candidate."""
+    (tmp_path / "index.html").write_text("x")
+    (tmp_path / "main.py").write_text("import pygame\n")
+    from sandbox.preview import scan_preview
+
+    scan = scan_preview(tmp_path)
+    assert scan.plan == PreviewPlan(type="static", entry="index.html")
+    assert [c.entry for c in scan.candidates] == ["index.html", "main.py"]
+    assert [c.type for c in scan.candidates] == ["static", "desktop"]
 
 
 # ---------------------------------------------------------------------------

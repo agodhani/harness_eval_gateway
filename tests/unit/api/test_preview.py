@@ -224,9 +224,10 @@ def test_start_preview_not_previewable(
     assert "no previewable artifact" in resp.json()["detail"].lower()
 
 
-def test_start_preview_ambiguous_html(
+def test_start_preview_ambiguous_html_defaults(
     client: TestClient, run, artifact_root, fake_manager: FakeManager
 ) -> None:
+    """Multiple html → no-entry POST spawns the default (first sorted)."""
     _workspace(
         artifact_root,
         run["run_id"],
@@ -234,7 +235,8 @@ def test_start_preview_ambiguous_html(
         {"a.html": "a", "b.html": "b"},
     )
     resp = client.post(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
-    assert resp.status_code == 422
+    assert resp.status_code == 201
+    assert fake_manager.spawn_calls[0]["plan"].entry == "a.html"
 
 
 def test_start_preview_desktop(
@@ -465,7 +467,7 @@ def test_results_previewable_respects_jail(
 def test_results_preview_candidates(
     client: TestClient, run, artifact_root
 ) -> None:
-    """Ambiguous desktop detection → previewable=false + candidates list."""
+    """Multiple games → previewable (default pick) + typed candidates list."""
     _workspace(
         artifact_root,
         run["run_id"],
@@ -478,11 +480,11 @@ def test_results_preview_candidates(
     resp = client.get(f"/api/runs/{run['run_id']}/results")
     sandboxes = {s["sandbox_id"]: s for s in resp.json()["sandboxes"]}
     sb1 = sandboxes[str(run["sb1"])]
-    assert sb1["previewable"] is False
-    assert sb1["preview_type"] is None
-    assert sorted(sb1["preview_candidates"]) == [
-        "game1/main.py",
-        "game2/main.py",
+    assert sb1["previewable"] is True
+    assert sb1["preview_type"] == "desktop"
+    assert sb1["preview_candidates"] == [
+        {"entry": "game1/main.py", "type": "desktop"},
+        {"entry": "game2/main.py", "type": "desktop"},
     ]
     # unaffected sandbox: no candidates either
     assert sandboxes[str(run["sb2"])]["preview_candidates"] == []
@@ -547,10 +549,11 @@ def test_start_preview_entry_rejected(
     assert fake_manager.spawn_calls == []
 
 
-def test_start_preview_ambiguous_422_lists_candidates(
+def test_start_preview_no_entry_spawns_default(
     client: TestClient, run, artifact_root, fake_manager: FakeManager
 ) -> None:
-    """No entry + ambiguous scan → 422 whose detail lists the candidates."""
+    """No entry + multiple candidates → spawns the default (first sorted);
+    the UI's dropdown is the disambiguation, the server just uses its default."""
     _workspace(
         artifact_root,
         run["run_id"],
@@ -561,7 +564,44 @@ def test_start_preview_ambiguous_422_lists_candidates(
         },
     )
     resp = client.post(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
-    assert resp.status_code == 422
-    detail = resp.json()["detail"]
-    assert "game1/main.py" in detail and "game2/main.py" in detail
-    assert fake_manager.spawn_calls == []
+    assert resp.status_code == 201
+    assert fake_manager.spawn_calls[0]["plan"].entry == "game1/main.py"
+
+
+def test_start_preview_entry_picks_candidate(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """UI dropdown pick → POST {entry} spawns THAT candidate."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {
+            "game1/main.py": "import pygame\n",
+            "game2/main.py": "import pygame\n",
+        },
+    )
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"entry": "game2/main.py"},
+    )
+    assert resp.status_code == 201
+    assert fake_manager.spawn_calls[0]["plan"].entry == "game2/main.py"
+
+
+def test_start_preview_entry_desktop_over_static_default(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """index.html defaults to static, but entry=main.py picks desktop."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {"index.html": "x", "main.py": "import pygame\n"},
+    )
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"entry": "main.py"},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["type"] == "desktop"

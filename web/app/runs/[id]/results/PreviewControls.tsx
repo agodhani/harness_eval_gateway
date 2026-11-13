@@ -15,6 +15,7 @@ import {
   getPreview,
   startPreview,
   stopPreview,
+  type PreviewCandidate,
   type PreviewOut,
 } from "@/lib/api";
 
@@ -40,14 +41,14 @@ export default function PreviewControls({
   runId: string;
   sandboxId: string;
   previewable: boolean;
-  /** Workspace-relative entries when detection is ambiguous — a chooser
-   *  renders and the pick is POSTed as {entry}. */
-  candidates?: string[];
+  /** Every detected runnable entry, default-first — >1 renders a dropdown
+   *  and the pick is POSTed as {entry}. */
+  candidates?: PreviewCandidate[];
 }) {
   const [phase, setPhase] = useState<Phase>("checking");
   const [preview, setPreview] = useState<PreviewOut | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [pick, setPick] = useState<string>(candidates[0] ?? "");
+  const [pick, setPick] = useState<string>(candidates[0]?.entry ?? "");
 
   useEffect(() => {
     let cancelled = false;
@@ -153,28 +154,18 @@ export default function PreviewControls({
 
   return (
     <div className="chip-row">
-      {previewable ? (
-        <button
-          type="button"
-          className="btn btn--sm"
-          onClick={() => void start()}
-          disabled={busy}
-          title="Serve this sandbox's artifact in a throwaway container (new tab)"
-        >
-          {phase === "starting" ? "starting…" : "▶ Preview"}
-        </button>
-      ) : candidates.length > 0 ? (
+      {candidates.length > 1 ? (
         <>
           <select
             value={pick}
             onChange={(e) => setPick(e.target.value)}
             disabled={busy}
-            title="Multiple entry points detected — pick which to preview"
-            style={{ fontSize: "0.8rem", maxWidth: 180 }}
+            title="Entry point to preview — default is the auto-detected one"
+            style={{ fontSize: "0.8rem", maxWidth: 220 }}
           >
             {candidates.map((c) => (
-              <option key={c} value={c}>
-                {c}
+              <option key={c.entry} value={c.entry}>
+                {c.entry} ({c.type === "static" ? "site" : c.type})
               </option>
             ))}
           </select>
@@ -188,6 +179,16 @@ export default function PreviewControls({
             {phase === "starting" ? "starting…" : "▶ Preview"}
           </button>
         </>
+      ) : previewable ? (
+        <button
+          type="button"
+          className="btn btn--sm"
+          onClick={() => void start()}
+          disabled={busy}
+          title="Serve this sandbox's artifact in a throwaway container (new tab)"
+        >
+          {phase === "starting" ? "starting…" : "▶ Preview"}
+        </button>
       ) : (
         <>
           <button

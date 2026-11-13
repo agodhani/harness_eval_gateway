@@ -58,6 +58,13 @@ class ArtifactRef(BaseModel):
     path: str
 
 
+class PreviewCandidate(BaseModel):
+    """One detected runnable entry — {entry: workspace-relative path, type}."""
+
+    entry: str
+    type: str
+
+
 class SandboxResult(BaseModel):
     """One sandbox's evaluation outcome inside the run matrix."""
 
@@ -70,13 +77,14 @@ class SandboxResult(BaseModel):
     dimensions: dict[str, DimensionScore] = Field(default_factory=dict)
     overall: DimensionScore | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
-    # F10: whether the snapshot workspace has an auto-picked preview entry
-    # — drives the results-page Preview button. preview_candidates lists
-    # workspace-relative entries when detection is ambiguous (UI offers a
-    # chooser → POST {entry}); empty + previewable=false = unsupported.
+    # F10: whether the snapshot workspace has a previewable entry —
+    # drives the results-page Preview button. preview_candidates lists
+    # EVERY detected runnable entry, default-first (previewable/preview_type
+    # describe candidates[0]); the UI renders a dropdown + POST {entry}.
+    # Empty + previewable=false = unsupported.
     previewable: bool = False
     preview_type: str | None = None
-    preview_candidates: list[str] = Field(default_factory=list)
+    preview_candidates: list[PreviewCandidate] = Field(default_factory=list)
 
 
 class RunResults(BaseModel):
@@ -195,7 +203,12 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
                 previewable=plan is not None,
                 preview_type=plan.type if plan is not None else None,
                 preview_candidates=(
-                    list(scan.candidates) if scan is not None else []
+                    [
+                        PreviewCandidate(entry=c.entry, type=c.type)
+                        for c in scan.candidates
+                    ]
+                    if scan is not None
+                    else []
                 ),
             )
         )

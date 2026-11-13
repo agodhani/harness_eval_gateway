@@ -282,14 +282,14 @@ export interface SandboxResult {
   /** Optional artifact ids if/when the results API exposes them. */
   artifact_ids?: string[];
   artifacts?: { id: string; kind?: string; path?: string }[];
-  /** F10: snapshot workspace has an auto-picked preview entry point. */
+  /** F10: snapshot workspace has a previewable entry point. */
   previewable?: boolean;
   preview_type?: string | null;
   /**
-   * F10: workspace-relative entries when detection is ambiguous — UI shows
-   * a chooser and re-POSTs {entry}. Empty + previewable=false = unsupported.
+   * F10: every detected runnable entry, default-first — the UI renders a
+   * dropdown and POSTs {entry}. Empty + previewable=false = unsupported.
    */
-  preview_candidates?: string[];
+  preview_candidates?: PreviewCandidate[];
 }
 
 export interface RunResults {
@@ -711,6 +711,13 @@ export function artifactDownloadUrl(artifactId: string): string {
 // ---------------------------------------------------------------------------
 // artifact preview (F10)
 // ---------------------------------------------------------------------------
+
+export interface PreviewCandidate {
+  /** Workspace-relative entry path, e.g. "index.html" or "game/main.py". */
+  entry: string;
+  /** Preview type — "static" | "desktop" (pygame via noVNC). */
+  type: string;
+}
 
 export interface PreviewOut {
   preview_id: string;
