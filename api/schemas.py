@@ -201,6 +201,90 @@ class RunSummary(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# F10 — skillpack import (api/routers/skillpacks.py)
+# ---------------------------------------------------------------------------
+
+
+class SkillPackOut(BaseModel):
+    """GET /api/skillpacks item — one selectable pack (vendored or imported)."""
+
+    name: str
+    source: str  # "vendored" | "imported"
+    skill_count: int
+    skills: list[str] = Field(default_factory=list)
+    origin_url: str | None = None
+    imported_at: str | None = None
+
+
+class SkillpackDiscoverIn(BaseModel):
+    """POST /api/skillpacks/discover body — a GitHub link to scan."""
+
+    url: str = Field(min_length=1, max_length=2000)
+
+
+class DiscoveredSkill(BaseModel):
+    """One SKILL.md found in the repo — ``dir`` is the selection token."""
+
+    dir: str
+    name: str
+    description: str = ""
+    file_count: int = 0
+    has_frontmatter: bool = False
+
+
+class SkillpackDiscoverOut(BaseModel):
+    """POST /api/skillpacks/discover response — repo scan result."""
+
+    url: str  # canonical github URL actually scanned
+    repo: str  # "owner/repo"
+    ref: str  # resolved ref — reuse as import's ``ref`` pin
+    commit_sha: str | None = None
+    subpath: str  # scanned subtree ("" = repo root); file path for blob links
+    kind: str  # root | tree | blob
+    skills: list[DiscoveredSkill] = Field(default_factory=list)
+
+
+class SkillpackImportIn(BaseModel):
+    """POST /api/skillpacks/import body — persist a discover-selection.
+
+    ``pack_name`` is the target pack: a fresh name creates a new imported
+    pack; an existing *imported* pack gets the skills appended (the
+    "individual skills into an existing pack" flow). Vendored pack names are
+    rejected so imports can never shadow vendored packs.
+    """
+
+    url: str = Field(min_length=1, max_length=2000)
+    # Pin the discovered tree: resolved ref or commit_sha from the discover
+    # response. Pair with ``subpath`` when pinning a sha for a branch whose
+    # name contains slashes (its segment count differs from the URL's ref).
+    ref: str | None = Field(default=None, max_length=255)
+    subpath: str | None = Field(default=None, max_length=1000)
+    # Repo-relative skill dirs (``dir`` values from /discover) to import.
+    skills: list[str] = Field(min_length=1, max_length=64)
+    pack_name: str = Field(min_length=1, max_length=64)
+
+
+class ImportedSkill(BaseModel):
+    """One skill actually written to disk."""
+
+    source_dir: str  # repo-relative dir it came from
+    name: str  # frontmatter name (dir fallback)
+    dir: str  # final dir under <pack>/skills/
+    file_count: int
+    renamed: bool  # dir name was deduplicated (-2, -3…)
+
+
+class SkillpackImportOut(BaseModel):
+    """POST /api/skillpacks/import response."""
+
+    pack: str
+    source: str = "imported"
+    skill_count: int  # total skills in the pack post-write (merges append)
+    imported: list[ImportedSkill] = Field(default_factory=list)
+    issues: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # F9 — run analytics (api/routers/analytics.py)
 # ---------------------------------------------------------------------------
 

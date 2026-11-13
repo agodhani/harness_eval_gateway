@@ -15,13 +15,17 @@ import {
   createRun,
   DEFAULT_BUDGETS,
   listHarnesses,
+  listSkillPacks,
   SKILL_PACKS,
   type Budgets,
   type HarnessConfig,
   type HarnessManifest,
+  type SkillPack,
+  type SkillpackImportResult,
 } from "@/lib/api";
 import { ComboInput } from "@/components/ComboInput";
 import { Badge, Card, ErrorNote, InfoNote } from "@/components/ui";
+import { ImportSkillPackDialog } from "./ImportSkillPackDialog";
 
 const MODEL_SUGGESTIONS = ["qwen3:8b", "qwen2.5-coder:3b", "qwen2.5-coder:7b"];
 const MAX_CONFIGS = 8;
@@ -74,6 +78,68 @@ export default function SubmitPage() {
   const adapterLabel = (name: string) =>
     harnesses.find((h) => h.name === name)?.display_name ?? name;
 
+  // Selectable packs — vendored fallback until GET /api/skillpacks lands
+  // (imported packs only exist server-side). `importFor` = config key the
+  // open GitHub-import dialog applies to (null = closed).
+  const [packs, setPacks] = useState<SkillPack[]>(() =>
+    SKILL_PACKS.map((name) => ({
+      name,
+      source: "vendored",
+      skill_count: 0,
+      skills: [],
+      origin_url: null,
+      imported_at: null,
+    })),
+  );
+  const [importFor, setImportFor] = useState<number | null>(null);
+
+  useEffect(() => {
+    listSkillPacks()
+      .then((list) => {
+        if (list.length) setPacks(list);
+      })
+      .catch(() => {
+        /* API down — vendored fallback stays */
+      });
+  }, []);
+
+  const packNames = useMemo(() => new Set(packs.map((p) => p.name)), [packs]);
+
+  function onPackImported(result: SkillpackImportResult) {
+    const key = importFor;
+    // Refetch for accurate merged state (skills/count/origin on appends).
+    listSkillPacks()
+      .then(setPacks)
+      .catch(() => {
+        setPacks((prev) =>
+          prev.some((p) => p.name === result.pack)
+            ? prev
+            : [
+                ...prev,
+                {
+                  name: result.pack,
+                  source: "imported",
+                  skill_count: result.skill_count,
+                  skills: result.imported.map((s) => s.name),
+                  origin_url: null,
+                  imported_at: new Date().toISOString(),
+                },
+              ],
+        );
+      });
+    // Auto-select the imported pack in the config the dialog was opened from.
+    if (key !== null) {
+      setConfigs((cs) =>
+        cs.map((c) =>
+          c.key === key && !c.skill_packs.includes(result.pack)
+            ? { ...c, skill_packs: [...c.skill_packs, result.pack] }
+            : c,
+        ),
+      );
+    }
+    setImportFor(null);
+  }
+
   const effectiveEvaluator = evaluatorModel.trim() || modelName.trim();
   const sameModelEval = effectiveEvaluator !== "" && effectiveEvaluator === modelName.trim();
 
@@ -89,7 +155,7 @@ export default function SubmitPage() {
         errs[`cfg_${i}_adapter`] = `Unknown adapter "${c.adapter}".`;
       }
       for (const p of c.skill_packs) {
-        if (!SKILL_PACKS.includes(p)) errs[`cfg_${i}_packs`] = `Unknown skill pack "${p}".`;
+        if (!packNames.has(p)) errs[`cfg_${i}_packs`] = `Unknown skill pack "${p}".`;
       }
     });
     if (budgets.max_iters < 1 || budgets.max_iters > 1000)
@@ -99,7 +165,7 @@ export default function SubmitPage() {
     if (budgets.wall_clock_seconds < 60 || budgets.wall_clock_seconds > 86400)
       errs.wall_clock_seconds = "wall_clock_seconds must be 60–86400.";
     return errs;
-  }, [taskPrompt, modelName, configs, budgets, adapterNames]);
+  }, [taskPrompt, modelName, configs, budgets, adapterNames, packNames]);
 
   const isValid = Object.keys(validation).length === 0;
 
@@ -279,17 +345,36 @@ export default function SubmitPage() {
                     </select>
                   </div>
                   <div className="field">
-                    <label className="field__label">Skill packs</label>
+                    <label className="field__label">
+                      Skill packs{" "}
+                      <button
+                        type="button"
+                        className="btn btn--sm btn--ghost"
+                        onClick={() => setImportFor(cfg.key)}
+                        disabled={submitting}
+                        title="Import skills from a GitHub repo link"
+                      >
+                        + import from GitHub
+                      </button>
+                    </label>
                     <div className="check-list">
-                      {SKILL_PACKS.map((p) => (
-                        <label key={p} className="check-item">
+                      {packs.map((p) => (
+                        <label key={p.name} className="check-item">
                           <input
                             type="checkbox"
-                            checked={cfg.skill_packs.includes(p)}
-                            onChange={() => togglePack(cfg, p)}
+                            checked={cfg.skill_packs.includes(p.name)}
+                            onChange={() => togglePack(cfg, p.name)}
                             disabled={submitting}
                           />
-                          <code>{p}</code>
+                          <code>{p.name}</code>
+                          {p.source === "imported" ? (
+                            <Badge tone="violet" title={p.origin_url ?? "user-imported"}>
+                              imported
+                            </Badge>
+                          ) : null}
+                          {p.skill_count > 0 ? (
+                            <span className="faint">({p.skill_count})</span>
+                          ) : null}
                         </label>
                       ))}
                     </div>
@@ -407,6 +492,14 @@ export default function SubmitPage() {
           ) : null}
         </div>
       </form>
+
+      {importFor !== null ? (
+        <ImportSkillPackDialog
+          importedPacks={packs.filter((p) => p.source === "imported")}
+          onClose={() => setImportFor(null)}
+          onImported={onPackImported}
+        />
+      ) : null}
     </main>
   );
 }

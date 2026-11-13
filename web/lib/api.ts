@@ -104,7 +104,9 @@ export const EVENT_TYPES: readonly string[] = [
   "error",
 ];
 
-/** Vendored skill packs under ./skillpacks (dirs only — README.md excluded). */
+/** Vendored skill packs under ./skillpacks (dirs only — README.md excluded).
+ * Fallback for the submit form until GET /api/skillpacks responds — the API
+ * list additionally carries user-imported packs. */
 export const SKILL_PACKS: readonly string[] = [
   "superpowers",
   "mattpocock-skills",
@@ -564,6 +566,88 @@ export function estimateCostUsd(
       tokens.output * price.output_per_mtok_usd) /
     1_000_000
   );
+}
+
+// ---------------------------------------------------------------------------
+// skillpacks (F10 — vendored listing + GitHub import)
+// ---------------------------------------------------------------------------
+
+/** One selectable pack (vendored preset or user-imported from GitHub). */
+export interface SkillPack {
+  name: string;
+  source: "vendored" | "imported" | string;
+  skill_count: number;
+  skills: string[];
+  origin_url: string | null;
+  imported_at: string | null;
+}
+
+/** One SKILL.md discovered in a repo — `dir` is the selection token. */
+export interface DiscoveredSkill {
+  dir: string;
+  name: string;
+  description: string;
+  file_count: number;
+  has_frontmatter: boolean;
+}
+
+export interface SkillpackDiscoverResult {
+  url: string;
+  repo: string;
+  /** Resolved ref — pass back (or commit_sha) as `ref` on import to pin the tree. */
+  ref: string;
+  commit_sha: string | null;
+  subpath: string;
+  kind: "root" | "tree" | "blob" | string;
+  skills: DiscoveredSkill[];
+}
+
+export interface ImportedSkill {
+  source_dir: string;
+  name: string;
+  dir: string;
+  file_count: number;
+  renamed: boolean;
+}
+
+export interface SkillpackImportResult {
+  pack: string;
+  source: string;
+  skill_count: number;
+  imported: ImportedSkill[];
+  issues: string[];
+}
+
+export function listSkillPacks(): Promise<SkillPack[]> {
+  return request<SkillPack[]>("/api/skillpacks");
+}
+
+export function discoverSkillPack(url: string): Promise<SkillpackDiscoverResult> {
+  return request<SkillpackDiscoverResult>("/api/skillpacks/discover", {
+    method: "POST",
+    body: JSON.stringify({ url }),
+  });
+}
+
+export interface SkillpackImportRequest {
+  url: string;
+  skills: string[]; // DiscoveredSkill.dir values
+  pack_name: string;
+  ref?: string | null;
+  subpath?: string | null;
+}
+
+export function importSkillPack(body: SkillpackImportRequest): Promise<SkillpackImportResult> {
+  return request<SkillpackImportResult>("/api/skillpacks/import", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function deleteSkillPack(name: string): Promise<void> {
+  return request<void>(`/api/skillpacks/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
 }
 
 export function getSandboxScores(sandboxId: string): Promise<ScoreOut[]> {
