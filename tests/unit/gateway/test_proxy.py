@@ -14,7 +14,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from db.models import Event
+from db.models import Event, Run
 from gateway import metering
 from gateway.config import get_settings
 from gateway.creds import DEV_CRED_TOKEN, mint_cred
@@ -129,6 +129,12 @@ def ingest_posts(monkeypatch: pytest.MonkeyPatch) -> list[list[dict[str, Any]]]:
 def _seed_usage(run_id: uuid.UUID, total_tokens: int) -> None:
     session = get_session_factory()()
     try:
+        # events.run_id is a real FK — Postgres enforces it (and the api
+        # ingest endpoint validates the same invariant), so the parent run
+        # row must exist before usage rows can be seeded. The flush is
+        # explicit: no ORM relationship orders the run insert before events.
+        session.add(Run(id=run_id, task_prompt="test", model_name="test-model"))
+        session.flush()
         session.add(
             Event(
                 run_id=run_id,
