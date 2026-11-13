@@ -1,5 +1,5 @@
 /**
- * Screenshot capture for the F10 GitHub skillpack import PR.
+ * Screenshot capture for the F11 GitHub skillpack import PR.
  *
  * Usage:
  *   cd web && npx next dev -p 3111 &          # dev server (any free port)

@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * F10 — "Import from GitHub" dialog for the submit form.
+ * F11 — "Import from GitHub" dialog for the submit form.
  *
  * Flow: paste a GitHub link (repo root, /tree/<branch>/<path>, or a
  * SKILL.md /blob/ link) → POST /api/skillpacks/discover → pick discovered

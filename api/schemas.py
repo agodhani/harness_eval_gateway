@@ -201,7 +201,7 @@ class RunSummary(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# F10 — skillpack import (api/routers/skillpacks.py)
+# F11 — skillpack import (api/routers/skillpacks.py)
 # ---------------------------------------------------------------------------
 
 

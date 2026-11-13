@@ -55,7 +55,7 @@ timestamp) lives in each pack's `PACK.json`.
 3. Keep it small — trim binaries/assets but keep all `SKILL.md`,
    `references/`, and `scripts/` a skill depends on.
 
-## Imported packs (F10)
+## Imported packs (F11)
 
 Users can also import skills straight from a GitHub link in the submit form
 (`POST /api/skillpacks/discover` → `POST /api/skillpacks/import`). Those land

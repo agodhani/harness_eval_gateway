@@ -299,7 +299,7 @@ async def spawn_one(
             packs,
             runtime.state_dir / str(sid) / "skillpacks",
             source_root=settings.SKILLPACKS_DIR,
-            # User-imported packs live under the data tree (F10) — second
+            # User-imported packs live under the data tree (F11) — second
             # search root so they're stageable exactly like vendored ones.
             extra_roots=(imported_root(settings),),
         )

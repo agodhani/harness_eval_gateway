@@ -574,7 +574,7 @@ export function estimateCostUsd(
 }
 
 // ---------------------------------------------------------------------------
-// skillpacks (F10 — vendored listing + GitHub import)
+// skillpacks (F11 — vendored listing + GitHub import)
 // ---------------------------------------------------------------------------
 
 /** One selectable pack (vendored preset or user-imported from GitHub). */

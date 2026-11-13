@@ -1,4 +1,4 @@
-"""F10 — /api/skillpacks endpoints: list, discover, import, delete.
+"""F11 — /api/skillpacks endpoints: list, discover, import, delete.
 
 Hermetic: fake vendored packs dir, imported root under tmp_path (derived
 from ARTIFACT_ROOT like production), FakeFetcher for all GitHub traffic, and

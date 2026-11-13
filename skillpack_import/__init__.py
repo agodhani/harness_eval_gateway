@@ -1,4 +1,4 @@
-"""skillpack_import — user-imported skill packs from GitHub (F10).
+"""skillpack_import — user-imported skill packs from GitHub (F11).
 
 Imported packs are USER DATA: they live under ``data/skillpacks/`` (derived
 from ``ARTIFACT_ROOT.parent`` — the same data tree as artifacts and sandbox

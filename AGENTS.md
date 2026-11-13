@@ -197,7 +197,7 @@ adapters/      # harness adapters (miniloop first; cli adapters post-MVP)
 sandbox/       # image defs, workspace prep, done mechanism, event collector
 evaluator/     # rubric scoring agent
 skillpacks/    # vendored default packs: superpowers, mattpocock-skills, spec-kit
-skillpack_import/  # F10 GitHub import: codeload fetch, SKILL.md scan, pack store
+skillpack_import/  # F11 GitHub import: codeload fetch, SKILL.md scan, pack store
 web/           # Next.js app
 db/            # schema + Alembic migrations
 tests/         # unit / integration / e2e
@@ -224,7 +224,7 @@ or tests change.
 | F7 | Evaluator sandbox: rubric scoring + rationale |
 | F8 | Results UI: matrix, scores, timeline, artifacts |
 | F9 | Run analytics: per-sandbox metrics + estimated cost |
-| F10 | Skillpack import from GitHub (discover → select → import) |
+| F11 | Skillpack import from GitHub (discover → select → import) |
 
 ## Post-MVP roadmap
 
@@ -323,7 +323,7 @@ or tests change.
   e2e `cd web && E2E_PORT=3100 npm run test:e2e`.
 - `GET /api/runs/{id}/analytics?price_model=` (F9) serves per-sandbox metrics
   + estimated cost; price table lives in `api/pricing.py` (`PRICE_TABLE`).
-- `GET /api/skillpacks` (F10) lists vendored + imported packs (the submit
+- `GET /api/skillpacks` (F11) lists vendored + imported packs (the submit
   form's source of truth); `POST /api/skillpacks/discover` (GitHub URL →
   skills), `POST /api/skillpacks/import` (selection → `data/skillpacks/`;
   `mode` = `pack`|`merge`|`split`, collision → 409 `detail.suggested_name`),
@@ -331,6 +331,6 @@ or tests change.
 - **Known issues (Phase 3 candidates):** event ingest has no retry/buffering —
   a sandbox emitting during an api restart loses early events; gateway emits
   best-effort. `heg-dev` static cred exists for dev only. Unauthenticated
-  GitHub ref/sha resolution (F10) is best-effort under the ~60/hr
+  GitHub ref/sha resolution (F11) is best-effort under the ~60/hr
   api.github.com cap — imports still work via codeload tarball when it
   degrades.

@@ -1,4 +1,4 @@
-# F10 — Import skill packs from GitHub
+# F11 — Import skill packs from GitHub
 
 Users can paste a GitHub link into the submit form, discover the `SKILL.md`
 skills inside, select a subset, and import them — as one named pack, merged
@@ -6,8 +6,8 @@ into an existing pack, or split one-pack-per-skill. Imported packs are
 persisted under `data/skillpacks/`, listed alongside vendored packs, and
 staged into sandboxes at `/opt/skillpacks` like any other pack.
 
-Feature ID: **F10** (see `FEATURE_MAP.md`). Two commits on this branch:
-`b01f7e8` (core feature) + `3465fe8` (collision/mode follow-up).
+Feature ID: **F11** (see `FEATURE_MAP.md`). Two commits on this branch:
+`24c1565` (core feature) + `703bf14` (collision/mode follow-up).
 
 ![Skill packs section with "+ import from GitHub"](screenshots/p25-skillpack-import/01-submit-skillpacks.png)
 

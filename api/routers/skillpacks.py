@@ -1,4 +1,4 @@
-"""F10 — skillpack browsing + GitHub import (``/api/skillpacks*``).
+"""F11 — skillpack browsing + GitHub import (``/api/skillpacks*``).
 
 Endpoints:
 

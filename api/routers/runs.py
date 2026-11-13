@@ -112,7 +112,7 @@ def _validate_harness_configs(body: RunCreate) -> None:
     settings = get_settings()
     known_adapters = set(orch_adapters.adapter_names())
     # Pack names merge the vendored + imported roots into one namespace
-    # (imported packs under data/skillpacks — F10).
+    # (imported packs under data/skillpacks — F11).
     known_packs = set(
         provision.known_skillpacks(
             settings.SKILLPACKS_DIR, imported_root(settings)

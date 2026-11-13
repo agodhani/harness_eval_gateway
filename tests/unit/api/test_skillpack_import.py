@@ -1,4 +1,4 @@
-"""F10 — unit tests: GitHub URL parsing, tarball scan/extract, pack store,
+"""F11 — unit tests: GitHub URL parsing, tarball scan/extract, pack store,
 multi-root provisioning. Hermetic — no HTTP (FakeFetcher), no DB.
 """
 
