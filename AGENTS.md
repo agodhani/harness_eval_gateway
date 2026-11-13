@@ -236,6 +236,16 @@ or tests change.
 - Multi-host / K8s sandbox scaling
 - Auth, saved run templates, share links
 - Cross-run analytics & cost dashboards
+- Timeline-side analytics — per-sandbox metrics rendered alongside the
+  execution timeline or on event hover (cost/tokens/latency in context)
+- Lightweight artifact thumbnails — capture screenshots of produced artifacts
+  for at-a-glance review before spawning a full live preview sandbox
+- Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.
+  (executes candidate code → needs hardened isolation; approved direction)
+- Re-score runs — re-run the evaluator on stored artifacts
+- Post-run rubric edits — modify the frozen rubric after a run and re-score
+  with the updated rubric (keep score provenance per rubric version)
+- Cached `previewable` probe on results GET (currently a few stats per call)
 
 ## Decisions log
 
