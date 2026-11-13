@@ -140,9 +140,12 @@ def usage_from_sse(body: bytes, *, api: str) -> dict[str, int]:
     """Extract final usage from a captured SSE stream body.
 
     ``api`` is ``"anthropic"`` (``/v1/messages``: ``message_start`` carries
-    input-side tokens, ``message_delta`` reports cumulative output) or
+    input-side tokens, ``message_delta`` reports cumulative output),
     ``"responses"`` (``response.completed``/``response.incomplete`` carry the
-    final ``response.usage``). Non-SSE bodies fall back to the JSON extractors.
+    final ``response.usage``), or ``"openai"`` (chat-completions chunks: the
+    terminal ``chat.completion.chunk`` carries ``usage`` when the request set
+    ``stream_options.include_usage``). Non-SSE bodies fall back to the JSON
+    extractors.
     """
     import json as _json
 
@@ -150,6 +153,7 @@ def usage_from_sse(body: bytes, *, api: str) -> dict[str, int]:
     anthropic_in = 0
     anthropic_out = 0
     responses_usage: dict[str, int] = {}
+    openai_usage: dict[str, int] = {}
     saw_event = False
     for line in text.splitlines():
         line = line.strip()
@@ -177,14 +181,28 @@ def usage_from_sse(body: bytes, *, api: str) -> dict[str, int]:
                 saw_event = True
                 u = obj.get("usage") or {}
                 anthropic_out = max(anthropic_out, _to_int(u.get("output_tokens")))
-        elif etype in ("response.completed", "response.incomplete"):
+        elif api == "responses":
+            if etype in ("response.completed", "response.incomplete"):
+                saw_event = True
+                responses_usage = usage_from_responses_api(obj)
+        elif api == "openai" and obj.get("object") == "chat.completion.chunk":
             saw_event = True
-            responses_usage = usage_from_responses_api(obj)
+            # Usage arrives on the final chunk (include_usage) — keep the
+            # last populated one; content chunks carry usage=null.
+            if isinstance(obj.get("usage"), dict):
+                openai_usage = usage_from_response(obj)
     if api == "anthropic":
         if saw_event:
             return _usage_dict(anthropic_in, anthropic_out)
         try:
             return usage_from_anthropic(_json.loads(text))
+        except _json.JSONDecodeError:
+            return _usage_dict(0, 0)
+    if api == "openai":
+        if saw_event:
+            return openai_usage
+        try:
+            return usage_from_response(_json.loads(text))
         except _json.JSONDecodeError:
             return _usage_dict(0, 0)
     if saw_event:

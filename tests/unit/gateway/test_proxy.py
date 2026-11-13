@@ -231,16 +231,78 @@ def test_chat_completion_proxied_and_metered(
     assert resp_evt["sandbox_id"] == str(sandbox_id)
 
 
-def test_chat_forces_non_streaming(
+def test_chat_defaults_non_streaming(
     gw_client: TestClient, upstream: Any, emitted: list
 ) -> None:
+    """Callers that don't ask for SSE get the buffered non-streamed path."""
+    resp = gw_client.post(
+        "/v1/chat/completions",
+        json={**_CHAT_BODY, "stream": False},
+        headers=_auth(_cred()),
+    )
+    assert resp.status_code == 200
+    assert upstream["seen"][0]["json"]["stream"] is False
+
+
+_CHAT_SSE = (
+    'data: {"id":"chatcmpl-s","object":"chat.completion.chunk","choices":'
+    '[{"index":0,"delta":{"role":"assistant","content":"he"}}]}\n\n'
+    'data: {"id":"chatcmpl-s","object":"chat.completion.chunk","choices":'
+    '[{"index":0,"delta":{"content":"llo"},"finish_reason":"stop"}]}\n\n'
+    'data: {"id":"chatcmpl-s","object":"chat.completion.chunk","choices":[],'
+    '"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}\n\n'
+    "data: [DONE]\n\n"
+)
+
+
+def test_chat_streaming_passthrough_and_metered(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    """``stream: true`` callers (pi et al.) get a metered SSE pass-through."""
+    upstream["handler"] = lambda _req: httpx.Response(
+        200,
+        text=_CHAT_SSE,
+        headers={"content-type": "text/event-stream"},
+    )
     resp = gw_client.post(
         "/v1/chat/completions",
         json={**_CHAT_BODY, "stream": True},
         headers=_auth(_cred()),
     )
     assert resp.status_code == 200
-    assert upstream["seen"][0]["json"]["stream"] is False
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert resp.text == _CHAT_SSE
+
+    sent = upstream["seen"][0]
+    assert sent["url"].endswith("/v1/chat/completions")
+    # Stream flag preserved + usage chunk requested for metering.
+    assert sent["json"]["stream"] is True
+    assert sent["json"]["stream_options"]["include_usage"] is True
+    assert sent["json"]["num_ctx"] == 32_768
+
+    types = [c["type"] for c in emitted]
+    assert types == ["llm_request", "llm_response"]
+    usage = emitted[1]["payload"]["usage"]
+    assert usage == {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+
+
+def test_chat_streaming_preserves_caller_stream_options(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    upstream["handler"] = lambda _req: httpx.Response(
+        200, text="data: [DONE]\n\n", headers={"content-type": "text/event-stream"}
+    )
+    gw_client.post(
+        "/v1/chat/completions",
+        json={
+            **_CHAT_BODY,
+            "stream": True,
+            "stream_options": {"include_usage": True, "extra": 1},
+        },
+        headers=_auth(_cred()),
+    )
+    sent = upstream["seen"][0]["json"]
+    assert sent["stream_options"] == {"include_usage": True, "extra": 1}
 
 
 def test_chat_does_not_override_client_ollama_params(
@@ -492,6 +554,233 @@ def test_internal_done_status_default_and_auth(
     assert (
         gw_client.post("/internal/done", json={"summary": "x"}).status_code == 401
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.5 — protocol pass-throughs
+# ---------------------------------------------------------------------------
+
+_MESSAGES_BODY = {
+    "model": "test-model",
+    "max_tokens": 64,
+    "messages": [{"role": "user", "content": "hi"}],
+}
+
+_ANTHROPIC_OK = {
+    "id": "msg_test",
+    "type": "message",
+    "role": "assistant",
+    "content": [{"type": "text", "text": "hello"}],
+    "usage": {"input_tokens": 12, "output_tokens": 4},
+}
+
+_ANTHROPIC_SSE = (
+    'event: message_start\ndata: {"type":"message_start","message":'
+    '{"usage":{"input_tokens":9,"output_tokens":1}}}\n\n'
+    'event: content_block_delta\ndata: {"type":"content_block_delta",'
+    '"delta":{"type":"text_delta","text":"hi"}}\n\n'
+    'event: message_delta\ndata: {"type":"message_delta",'
+    '"usage":{"output_tokens":7}}\n\n'
+)
+
+_RESPONSES_OK = {
+    "id": "resp_test",
+    "object": "response",
+    "status": "completed",
+    "output": [],
+    "usage": {"input_tokens": 20, "output_tokens": 6, "total_tokens": 26},
+}
+
+
+def test_messages_requires_bearer(gw_client: TestClient) -> None:
+    assert gw_client.post("/v1/messages", json=_MESSAGES_BODY).status_code == 401
+    assert gw_client.post("/v1/responses", json={}).status_code == 401
+    assert gw_client.get("/v1/models").status_code == 401
+
+
+def test_messages_accepts_x_api_key(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    """Anthropic SDK convention: ``x-api-key`` carries the cred (dsh)."""
+    upstream["handler"] = lambda _req: httpx.Response(200, json=_ANTHROPIC_OK)
+    resp = gw_client.post(
+        "/v1/messages",
+        json=_MESSAGES_BODY,
+        headers={"x-api-key": _cred()},
+    )
+    assert resp.status_code == 200
+    assert [c["type"] for c in emitted] == ["llm_request", "llm_response"]
+
+
+def test_messages_nonstream_passthrough_and_metered(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    upstream["handler"] = lambda _req: httpx.Response(200, json=_ANTHROPIC_OK)
+    run_id, sandbox_id = uuid.uuid4(), uuid.uuid4()
+    resp = gw_client.post(
+        "/v1/messages",
+        json=_MESSAGES_BODY,
+        headers=_auth(_cred(run_id=run_id, sandbox_id=sandbox_id)),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["usage"]["output_tokens"] == 4
+
+    sent = upstream["seen"][0]
+    assert sent["url"].endswith("/v1/messages")
+    # Verbatim forward: no stream flag injected when the caller didn't set one.
+    assert "stream" not in sent["json"]
+    assert "num_ctx" not in sent["json"]
+
+    types = [c["type"] for c in emitted]
+    assert types == ["llm_request", "llm_response"]
+    usage = emitted[1]["payload"]["usage"]
+    assert usage == {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16}
+
+
+def test_messages_streaming_passthrough_and_metered(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    upstream["handler"] = lambda _req: httpx.Response(
+        200,
+        text=_ANTHROPIC_SSE,
+        headers={"content-type": "text/event-stream"},
+    )
+    resp = gw_client.post(
+        "/v1/messages",
+        json={**_MESSAGES_BODY, "stream": True},
+        headers=_auth(_cred()),
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    # Body passed through verbatim.
+    assert resp.text == _ANTHROPIC_SSE
+    # The request kept its stream flag upstream.
+    assert upstream["seen"][0]["json"]["stream"] is True
+    # Usage teed from the SSE stream: message_start input + final delta output.
+    types = [c["type"] for c in emitted]
+    assert types == ["llm_request", "llm_response"]
+    usage = emitted[1]["payload"]["usage"]
+    assert usage == {"prompt_tokens": 9, "completion_tokens": 7, "total_tokens": 16}
+
+
+def test_messages_budget_gate(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    run_id = uuid.uuid4()
+    _seed_usage(run_id, 100)
+    cred = _cred(run_id=run_id, max_tokens=50)
+    resp = gw_client.post(
+        "/v1/messages",
+        json=_MESSAGES_BODY,
+        headers=_auth(cred),
+    )
+    assert resp.status_code == 429
+    assert upstream["seen"] == []
+    assert [c["type"] for c in emitted] == ["error"]
+
+
+def test_count_tokens_unmetered(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    upstream["handler"] = lambda _req: httpx.Response(
+        200, json={"input_tokens": 42}
+    )
+    resp = gw_client.post(
+        "/v1/messages/count_tokens",
+        json=_MESSAGES_BODY,
+        headers=_auth(_cred()),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"input_tokens": 42}
+    assert upstream["seen"][0]["url"].endswith("/v1/messages/count_tokens")
+    # Not a generation call — no llm_request/llm_response emitted.
+    assert emitted == []
+
+
+def test_responses_passthrough_and_metered(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    upstream["handler"] = lambda _req: httpx.Response(200, json=_RESPONSES_OK)
+    resp = gw_client.post(
+        "/v1/responses",
+        json={"model": "test-model", "input": "hi", "max_output_tokens": 32},
+        headers=_auth(_cred()),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["usage"]["total_tokens"] == 26
+    assert upstream["seen"][0]["url"].endswith("/v1/responses")
+    types = [c["type"] for c in emitted]
+    assert types == ["llm_request", "llm_response"]
+    usage = emitted[1]["payload"]["usage"]
+    assert usage == {"prompt_tokens": 20, "completion_tokens": 6, "total_tokens": 26}
+
+
+def test_responses_stream_usage_tee(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    sse = (
+        'event: response.output_text.delta\ndata: {"type":'
+        '"response.output_text.delta","delta":"hi"}\n\n'
+        'event: response.completed\ndata: {"type":"response.completed",'
+        '"response":{"usage":{"input_tokens":8,"output_tokens":3}}}\n\n'
+    )
+    upstream["handler"] = lambda _req: httpx.Response(
+        200, text=sse, headers={"content-type": "text/event-stream"}
+    )
+    resp = gw_client.post(
+        "/v1/responses",
+        json={"model": "m", "input": "hi", "stream": True},
+        headers=_auth(_cred()),
+    )
+    assert resp.status_code == 200
+    assert resp.text == sse
+    usage = emitted[1]["payload"]["usage"]
+    assert usage == {"prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11}
+
+
+def test_responses_budget_gate(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    run_id = uuid.uuid4()
+    _seed_usage(run_id, 100)
+    cred = _cred(run_id=run_id, max_tokens=50)
+    resp = gw_client.post(
+        "/v1/responses",
+        json={"model": "m", "input": "hi", "max_output_tokens": 10},
+        headers=_auth(cred),
+    )
+    assert resp.status_code == 429
+    assert upstream["seen"] == []
+
+
+def test_list_models_passthrough(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    upstream["handler"] = lambda _req: httpx.Response(
+        200, json={"object": "list", "data": [{"id": "m1"}]}
+    )
+    resp = gw_client.get("/v1/models", headers=_auth(_cred()))
+    assert resp.status_code == 200
+    assert resp.json()["data"][0]["id"] == "m1"
+    assert upstream["seen"][0]["url"].endswith("/v1/models")
+    assert emitted == []  # probes are not metered
+
+
+def test_passthrough_upstream_error_emits(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    upstream["handler"] = lambda _req: httpx.Response(
+        500, json={"error": {"type": "overloaded_error", "message": "x"}}
+    )
+    resp = gw_client.post(
+        "/v1/messages", json=_MESSAGES_BODY, headers=_auth(_cred())
+    )
+    assert resp.status_code == 500
+    types = [c["type"] for c in emitted]
+    assert "llm_response" in types
+    assert "error" in types
+    err = next(c for c in emitted if c["type"] == "error")
+    assert err["payload"]["http_status"] == 500
 
 
 def test_ingest_forward_failure_returns_502(

@@ -4,10 +4,12 @@ Endpoints
 ---------
 ``GET  /health``                  — liveness.
 ``POST /v1/chat/completions``     — Bearer ``heg.*`` cred → budget gate →
-                                    forward to Ollama upstream (non-streaming)
-                                    → emit ``llm_request``/``llm_response``/
-                                    ``error`` events → return upstream
-                                    body+status verbatim.
+                                    forward to Ollama upstream; ``stream:
+                                    true`` callers get a metered SSE
+                                    pass-through, others a non-streamed
+                                    buffered response → emit ``llm_request``/
+                                    ``llm_response``/``error`` events →
+                                    return upstream body+status verbatim.
 ``POST /v1/messages``             — Anthropic Messages pass-through (Claude
                                     Code, dsh); same cred/budget/metering
                                     pipeline as chat completions, streaming
@@ -24,8 +26,9 @@ Endpoints
                                     ``done_signal`` event for the cred's
                                     run/sandbox.
 
-Auth: ``Authorization: Bearer <cred>`` where cred is ``heg-dev`` (static dev
-credential) or ``heg.<b64url-payload>.<b64url-hmac>`` (see gateway/creds.py).
+Auth: ``Authorization: Bearer <cred>`` (or Anthropic-style ``x-api-key``)
+where cred is ``heg-dev`` (static dev credential) or
+``heg.<b64url-payload>.<b64url-hmac>`` (see gateway/creds.py).
 ``/internal/events`` additionally accepts ``Bearer <INGEST_TOKEN>`` as a
 pass-through credential for producers that already carry run/sandbox ids —
 this matches the ingest token sandboxes may be configured with.
@@ -71,12 +74,31 @@ def _bearer_token(request: Request) -> str:
     return token.strip()
 
 
+def _credential_token(request: Request) -> str:
+    """Bearer token, falling back to Anthropic-style ``x-api-key``.
+
+    Anthropic-SDK clients (dsh's DeepSeek Messages adapter) send the
+    credential as ``x-api-key`` rather than ``Authorization: Bearer``.
+    """
+    auth = request.headers.get("authorization", "")
+    scheme, _, token = auth.partition(" ")
+    if scheme.lower() == "bearer" and token.strip():
+        return token.strip()
+    api_key = request.headers.get("x-api-key", "").strip()
+    if api_key:
+        return api_key
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="missing Bearer credential",
+    )
+
+
 def get_cred(request: Request) -> CredClaims:
     """Strict credential auth — used by the proxy and /internal/done."""
     settings = get_settings()
     try:
         return verify_cred(
-            _bearer_token(request), secret=settings.GATEWAY_CRED_SECRET
+            _credential_token(request), secret=settings.GATEWAY_CRED_SECRET
         )
     except CredError as exc:
         raise HTTPException(
@@ -166,6 +188,28 @@ async def chat_completions(
     claims: Annotated[CredClaims, Depends(get_cred)],
     upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
 ) -> Response:
+    # --- streaming callers (pi and other OpenAI-compatible CLIs always set
+    # stream:true and parse SSE — a forced non-streamed JSON body reads as an
+    # empty stream to them): pass through with a metering tee. The shared
+    # passthrough applies the budget gate + llm_request emit, so this branch
+    # must run before the non-streamed gate below.
+    if body.get("stream"):
+        out = dict(body)
+        # Ask the upstream for a terminal usage chunk so streamed calls stay
+        # metered (no-op for upstreams that ignore it).
+        stream_options = dict(out.get("stream_options") or {})
+        stream_options.setdefault("include_usage", True)
+        out["stream_options"] = stream_options
+        out.setdefault("num_ctx", 32_768)
+        out.setdefault("keep_alive", "30m")
+        return await _passthrough(
+            path="/v1/chat/completions",
+            api="openai",
+            body=out,
+            claims=claims,
+            upstream=upstream,
+        )
+
     # --- budget gate (before any upstream traffic) ---
     gated = await _budget_gate(claims, body)
     if gated is not None:
