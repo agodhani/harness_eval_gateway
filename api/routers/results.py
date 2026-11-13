@@ -33,7 +33,7 @@ from api.config import get_settings
 from api.deps import get_db
 from db.models import Artifact, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
-from sandbox.preview import detect_preview, resolve_workspace_dir
+from sandbox.preview import resolve_workspace_dir, scan_preview
 
 router = APIRouter(tags=["results"])
 
@@ -70,10 +70,13 @@ class SandboxResult(BaseModel):
     dimensions: dict[str, DimensionScore] = Field(default_factory=dict)
     overall: DimensionScore | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
-    # F10: whether the snapshot workspace has a previewable entry point
-    # (static html today) — drives the results-page Preview button.
+    # F10: whether the snapshot workspace has an auto-picked preview entry
+    # — drives the results-page Preview button. preview_candidates lists
+    # workspace-relative entries when detection is ambiguous (UI offers a
+    # chooser → POST {entry}); empty + previewable=false = unsupported.
     previewable: bool = False
     preview_type: str | None = None
+    preview_candidates: list[str] = Field(default_factory=list)
 
 
 class RunResults(BaseModel):
@@ -162,7 +165,8 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
             sandbox_id=str(sb.id),
             artifact_path=sb.artifact_path,
         )
-        plan = detect_preview(ws) if ws is not None else None
+        scan = scan_preview(ws) if ws is not None else None
+        plan = scan.plan if scan is not None else None
         dimensions: dict[str, DimensionScore] = {}
         overall: DimensionScore | None = None
         rubric_id: UUID | None = None
@@ -190,6 +194,9 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
                 ],
                 previewable=plan is not None,
                 preview_type=plan.type if plan is not None else None,
+                preview_candidates=(
+                    list(scan.candidates) if scan is not None else []
+                ),
             )
         )
 

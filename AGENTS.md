@@ -248,9 +248,10 @@ or tests change.
 - Re-score runs — re-run the evaluator on stored artifacts
 - Post-run rubric edits — modify the frozen rubric after a run and re-score
   with the updated rubric (keep score provenance per rubric version)
-- Preview `?type=` override (workspace matching multiple detectors always
-  gets static today), more desktop types (pyglet/arcade/tkinter — needs
-  baked deps or a wheelhouse mount), python-server previews
+- Preview `?type=` override (entry= picks the file but type still follows
+  the suffix; a workspace matching both detectors always gets static),
+  more desktop types (pyglet/arcade/tkinter — needs baked deps or a
+  wheelhouse mount), python-server previews
 - Cache `previewable`/`preview_type` probe on results GET (per-sandbox FS
   probe on every call — fine at MVP scale, revisit if pages get large)
 - dsh native helpers (spawn-helper, node-pty) — npm ≥11 blocks their
@@ -327,13 +328,18 @@ or tests change.
   `--cpus`/`--memory`/`--pids-limit` bounds. A pinned `alpine/socat` sidecar
   (`heg.preview_role=proxy`, dumb TCP pipe — nothing for the artifact to
   exploit) straddles both nets and publishes the noVNC port on localhost.
-- **Desktop detection is conservative** — an unambiguous root `.py` entry
-  (`main.py`/`app.py`/`game.py`/`run.py` or single root `.py`) AND explicit
-  pygame evidence (requirements.txt mention or a root `.py` import);
-  detection decides what gets *executed*, so no-evidence/ambiguous → not
-  previewable rather than run arbitrary code. Deps beyond baked-in
-  pygame-ce can't install (no egress) — the app fails at import and the
-  runner exits visibly. Static wins when both detectors match.
+- **Desktop detection is conservative** — `.py` entries scanned at root +
+  ≤3 nested levels (hidden dirs, `_DESKTOP_SKIP_DIRS`, symlinks skipped):
+  named entries (`main.py`/`app.py`/`game.py`/`run.py`) or a dir containing
+  exactly one `.py`, each requiring pygame evidence *in the candidate file*
+  or in any scanned `requirements.txt` (comment lines stripped — `# pygame`
+  doesn't count). Exactly one candidate → auto-pick; multiple →
+  `preview_candidates` (no silent exec); zero → "not supported". An
+  explicit `entry=` POST param jails+validates a workspace-relative pick —
+  `.html`→static, `.py`→desktop (evidence bypassed: the pick IS the
+  disambiguation). Deps beyond baked-in pygame-ce can't install (no
+  egress) — the app fails at import and the runner exits visibly. Static
+  wins when both detectors match.
 - **Preview registry lives on docker labels**, not in memory or Postgres —
   restart-safe discovery + the TTL reaper (default 15 min) works
   out-of-process; runner+proxy share `heg.preview_id`, stop removes all.

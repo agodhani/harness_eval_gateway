@@ -325,16 +325,31 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - `POST /api/runs/{run}/sandboxes/{sandbox}/preview` → `201
     {preview_id, url, type, status, entry, expires_at}`; idempotent (a live
     preview is returned as-is); `404` run/sandbox/workspace missing, `422`
-    no entry point / unsupported type, `502` docker failure.
+    no entry point / ambiguous (detail lists candidates) / unsupported
+    type, `502` docker failure. Optional body `{"entry": "rel/path"}`
+    picks an explicit entry — jailed to the workspace, must exist and be
+    non-symlinked; `.html`/`.htm` → static, `.py` → desktop (explicit
+    `.py` bypasses pygame evidence — the pick IS the disambiguation).
   - `GET .../preview` → current state (any status) or `404`; `DELETE
     .../preview` → `204` stop.
-- **Detection** (`sandbox/preview.py::detect_preview`): static checked
-  first (`index.html`/`.htm` at root → single root `*.html` → unique
-  `*/index.html` one level down), then desktop — an unambiguous root `.py`
-  entry (`main.py`/`app.py`/`game.py`/`run.py` or a single root `.py`) AND
-  explicit pygame evidence (`requirements.txt` mentions pygame, or a root
-  `.py` imports pygame). Ambiguous/no-evidence → not previewable; symlinks
-  never followed. A workspace matching both gets static (safe default).
+- **Detection** (`sandbox/preview.py::scan_preview` → `PreviewScan{plan,
+  candidates}`): static checked first (`index.html`/`.htm` at root →
+  single root `*.html` → unique `*/index.html` one level down), then
+  desktop — `.py` entries in the root and nested dirs up to **3 levels**
+  (BFS; hidden dirs, symlinks, and `_DESKTOP_SKIP_DIRS` —
+  node_modules/__pycache__/tests/venv/dist/build/docs/... — skipped).
+  Per dir: named entries `main.py`/`app.py`/`game.py`/`run.py`, else a
+  dir containing exactly one `.py`. Evidence **per candidate**: the file
+  itself imports pygame (line-anchored; comment lines can't match), OR
+  any `requirements.txt` within the scanned dirs names pygame on a real
+  non-comment line. Exactly one eligible candidate → auto-pick; multiple
+  → `plan=None` + `candidates` (never silently choose what to execute);
+  zero → not previewable. Ambiguous html entries are also returned as
+  candidates. A workspace matching both static and desktop gets static.
+- **UI**: `preview_candidates` rides `SandboxResult` → the results page
+  shows a `<select>` + Preview button (POSTs `{entry}`); `previewable`
+  → plain button; neither → a disabled button + "not supported" label
+  (artifact still downloadable — preview is an add-on).
 - **Static posture** (`_spawn_static`): `python:3.12-slim` running
   `python -m http.server` over the workspace bind-mounted `:ro`; nobody
   user, `--read-only` rootfs, `--cap-drop ALL`, `no-new-privileges`.
@@ -372,9 +387,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `web/app/runs/[id]/results/PreviewControls.tsx`
 - **Verify:**
   - Unit: `tests/unit/sandbox/test_preview.py` (static + desktop detection
-    shapes, jail, manager via stubbed docker — runner/proxy args, role
-    labels, stop-all) + `tests/unit/api/test_preview.py` (lifecycle,
-    reuse/replace, 404/422/502, desktop POST, checkpoint events)
+    — nested depth bound, skip-dirs, ambiguity→candidates, comment-stripped
+    requirements evidence, `plan_for_entry` jail/validation; manager via
+    stubbed docker — runner/proxy args, role labels, stop-all) +
+    `tests/unit/api/test_preview.py` (lifecycle, `entry=` override,
+    ambiguous→422-with-candidates, results `preview_candidates`)
   - Docker: `tests/integration/test_preview.py` (`@pytest.mark.docker` —
     static spawn → HTTP 200, localhost-only binding, reaper; desktop spawn
     builds `heg-preview-desktop` once per session → real pygame executes

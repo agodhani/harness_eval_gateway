@@ -138,12 +138,17 @@ def test_detect_desktop_requirements_evidence(tmp_path: Path) -> None:
     assert plan == PreviewPlan(type="desktop", entry="main.py")
 
 
-def test_detect_desktop_evidence_in_sibling_py(tmp_path: Path) -> None:
-    """Entry needn't import pygame itself — any root .py counts."""
+def test_detect_desktop_evidence_must_be_in_candidate(tmp_path: Path) -> None:
+    """Sibling-file imports no longer count — evidence must be in the
+    candidate itself (thin-launcher false-positives trade for safety; the
+    entry= override remains the escape hatch)."""
     (tmp_path / "main.py").write_text("import engine\n")
     (tmp_path / "engine.py").write_text("import pygame\n")
-    plan = detect_preview(tmp_path)
-    assert plan == PreviewPlan(type="desktop", entry="main.py")
+    assert detect_preview(tmp_path) is None
+    from sandbox.preview import scan_preview
+
+    # engine.py isn't a named entry and the dir has >1 .py → no candidates.
+    assert scan_preview(tmp_path).candidates == ()
 
 
 def test_detect_desktop_no_evidence(tmp_path: Path) -> None:
@@ -179,11 +184,198 @@ def test_detect_static_wins_over_desktop(tmp_path: Path) -> None:
     assert plan == PreviewPlan(type="static", entry="index.html")
 
 
-def test_detect_desktop_nested_py_not_found(tmp_path: Path) -> None:
-    """Nested entry points aren't auto-detected (root-level only)."""
+def test_detect_desktop_nested_main(tmp_path: Path) -> None:
+    """Nested dirs are scanned — game/main.py is a valid desktop entry."""
     (tmp_path / "game").mkdir()
     (tmp_path / "game" / "main.py").write_text("import pygame\n")
+    (tmp_path / "game" / "helper.py").write_text("x = 1\n")
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="desktop", entry="game/main.py")
+
+
+def test_detect_desktop_nested_single_py(tmp_path: Path) -> None:
+    """A dir containing exactly one .py — any name counts as the entry."""
+    (tmp_path / "game").mkdir()
+    (tmp_path / "game" / "breakout.py").write_text("from pygame import *\n")
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="desktop", entry="game/breakout.py")
+
+
+def test_detect_desktop_depth_3(tmp_path: Path) -> None:
+    d = tmp_path / "a" / "b" / "c"
+    d.mkdir(parents=True)
+    (d / "main.py").write_text("import pygame\n")
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="desktop", entry="a/b/c/main.py")
+
+
+def test_detect_desktop_depth_4_missed(tmp_path: Path) -> None:
+    """Scanning is bounded — entries deeper than 3 levels aren't found."""
+    d = tmp_path / "a" / "b" / "c" / "d"
+    d.mkdir(parents=True)
+    (d / "main.py").write_text("import pygame\n")
     assert detect_preview(tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "dirname", ["tests", "node_modules", "__pycache__", ".hidden", "venv", "dist"]
+)
+def test_detect_desktop_skips_irrelevant_dirs(tmp_path: Path, dirname: str) -> None:
+    d = tmp_path / dirname
+    d.mkdir()
+    (d / "main.py").write_text("import pygame\n")
+    assert detect_preview(tmp_path) is None
+
+
+def test_detect_desktop_ambiguous_returns_candidates(tmp_path: Path) -> None:
+    """Two eligible games → no auto-pick; both offered as candidates."""
+    for g in ("game1", "game2"):
+        (tmp_path / g).mkdir()
+        (tmp_path / g / "main.py").write_text("import pygame\n")
+    from sandbox.preview import scan_preview
+
+    scan = scan_preview(tmp_path)
+    assert scan.plan is None
+    assert scan.candidates == ("game1/main.py", "game2/main.py")
+
+
+def test_detect_desktop_two_named_entries_ambiguous(tmp_path: Path) -> None:
+    """main.py AND game.py in one dir = two candidates, no silent pick."""
+    (tmp_path / "main.py").write_text("import pygame\n")
+    (tmp_path / "game.py").write_text("import pygame\n")
+    from sandbox.preview import scan_preview
+
+    scan = scan_preview(tmp_path)
+    assert scan.plan is None
+    assert scan.candidates == ("game.py", "main.py")
+
+
+def test_detect_desktop_mixed_root_and_nested_ambiguous(tmp_path: Path) -> None:
+    (tmp_path / "main.py").write_text("import pygame\n")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "main.py").write_text("import pygame\n")
+    from sandbox.preview import scan_preview
+
+    scan = scan_preview(tmp_path)
+    assert scan.plan is None
+    assert scan.candidates == ("main.py", "sub/main.py")
+
+
+def test_detect_desktop_requirements_comment_stripped(tmp_path: Path) -> None:
+    """'# pygame' in requirements.txt is a comment — not evidence."""
+    (tmp_path / "main.py").write_text("print('hi')\n")
+    (tmp_path / "requirements.txt").write_text("# pygame is not needed here\n")
+    assert detect_preview(tmp_path) is None
+
+
+def test_detect_desktop_nested_requirements_evidence(tmp_path: Path) -> None:
+    """A requirements.txt inside the scanned tree counts as evidence."""
+    (tmp_path / "game").mkdir()
+    (tmp_path / "game" / "main.py").write_text("import engine\n")
+    (tmp_path / "game" / "requirements.txt").write_text(
+        "requests>=2\npygame-ce==2.5.3\n# a comment\n"
+    )
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="desktop", entry="game/main.py")
+
+
+def test_detect_desktop_root_py_in_named_dir_no_named_entry(tmp_path: Path) -> None:
+    """Two non-named .py files in a dir = no candidate (can't pick)."""
+    (tmp_path / "a.py").write_text("import pygame\n")
+    (tmp_path / "b.py").write_text("import pygame\n")
+    assert detect_preview(tmp_path) is None
+
+
+def test_scan_candidates_static_ambiguous_html(tmp_path: Path) -> None:
+    """Ambiguous html files are offered as candidates too."""
+    (tmp_path / "a.html").write_text("a")
+    (tmp_path / "b.html").write_text("b")
+    from sandbox.preview import scan_preview
+
+    scan = scan_preview(tmp_path)
+    assert scan.plan is None
+    assert scan.candidates == ("a.html", "b.html")
+
+
+def test_scan_candidates_ambiguous_nested_indexes(tmp_path: Path) -> None:
+    for d in ("a", "b"):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / "index.html").write_text("i")
+    from sandbox.preview import scan_preview
+
+    scan = scan_preview(tmp_path)
+    assert scan.plan is None
+    assert scan.candidates == ("a/index.html", "b/index.html")
+
+
+def test_scan_candidates_empty_when_plan_found(tmp_path: Path) -> None:
+    (tmp_path / "index.html").write_text("x")
+    from sandbox.preview import scan_preview
+
+    scan = scan_preview(tmp_path)
+    assert scan.plan == PreviewPlan(type="static", entry="index.html")
+    assert scan.candidates == ()
+
+
+# ---------------------------------------------------------------------------
+# plan_for_entry — explicit entry= override
+# ---------------------------------------------------------------------------
+
+
+def test_plan_for_entry_py_bypasses_evidence(tmp_path: Path) -> None:
+    """Explicit .py pick → desktop plan even without pygame evidence —
+    the user's pick IS the disambiguation (isolation is identical)."""
+    from sandbox.preview import plan_for_entry
+
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "demo.py").write_text("print('no pygame')\n")
+    assert detect_preview(tmp_path) is None  # detection missed it
+    plan = plan_for_entry(tmp_path, "scripts/demo.py")
+    assert plan == PreviewPlan(type="desktop", entry="scripts/demo.py")
+
+
+def test_plan_for_entry_html(tmp_path: Path) -> None:
+    from sandbox.preview import plan_for_entry
+
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "page.html").write_text("<h1>x</h1>")
+    plan = plan_for_entry(tmp_path, "dist/page.html")
+    assert plan == PreviewPlan(type="static", entry="dist/page.html")
+
+
+@pytest.mark.parametrize(
+    "bad", ["../escape.py", "/etc/passwd", "a/../../b.py", "", "  "]
+)
+def test_plan_for_entry_rejects_traversal(tmp_path: Path, bad: str) -> None:
+    from sandbox.preview import plan_for_entry
+
+    with pytest.raises(ValueError, match="invalid entry|escapes"):
+        plan_for_entry(tmp_path, bad)
+
+
+def test_plan_for_entry_missing_file(tmp_path: Path) -> None:
+    from sandbox.preview import plan_for_entry
+
+    with pytest.raises(ValueError, match="not found"):
+        plan_for_entry(tmp_path, "nope.py")
+
+
+def test_plan_for_entry_symlink(tmp_path: Path, tmp_path_factory) -> None:
+    from sandbox.preview import plan_for_entry
+
+    outside = tmp_path_factory.mktemp("out")
+    (outside / "main.py").write_text("import pygame")
+    (tmp_path / "main.py").symlink_to(outside / "main.py")
+    with pytest.raises(ValueError, match="symlink"):
+        plan_for_entry(tmp_path, "main.py")
+
+
+def test_plan_for_entry_bad_suffix(tmp_path: Path) -> None:
+    from sandbox.preview import plan_for_entry
+
+    (tmp_path / "readme.txt").write_text("hi")
+    with pytest.raises(ValueError, match="unsupported entry type"):
+        plan_for_entry(tmp_path, "readme.txt")
 
 
 # ---------------------------------------------------------------------------

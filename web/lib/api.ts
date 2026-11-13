@@ -282,9 +282,14 @@ export interface SandboxResult {
   /** Optional artifact ids if/when the results API exposes them. */
   artifact_ids?: string[];
   artifacts?: { id: string; kind?: string; path?: string }[];
-  /** F10: snapshot workspace has a previewable entry point (static html). */
+  /** F10: snapshot workspace has an auto-picked preview entry point. */
   previewable?: boolean;
   preview_type?: string | null;
+  /**
+   * F10: workspace-relative entries when detection is ambiguous — UI shows
+   * a chooser and re-POSTs {entry}. Empty + previewable=false = unsupported.
+   */
+  preview_candidates?: string[];
 }
 
 export interface RunResults {
@@ -731,9 +736,21 @@ export function getPreview(runId: string, sandboxId: string): Promise<PreviewOut
   return request<PreviewOut>(previewPath(runId, sandboxId));
 }
 
-/** Idempotent per sandbox: returns the live preview if one already runs. */
-export function startPreview(runId: string, sandboxId: string): Promise<PreviewOut> {
-  return request<PreviewOut>(previewPath(runId, sandboxId), { method: "POST" });
+/**
+ * Idempotent per sandbox: returns the live preview if one already runs.
+ * `entry` (workspace-relative) picks an explicit entry point — for
+ * ambiguous scans or artifacts detection missed; `.html` → static,
+ * `.py` → desktop.
+ */
+export function startPreview(
+  runId: string,
+  sandboxId: string,
+  entry?: string,
+): Promise<PreviewOut> {
+  return request<PreviewOut>(previewPath(runId, sandboxId), {
+    method: "POST",
+    ...(entry ? { body: JSON.stringify({ entry }) } : {}),
+  });
 }
 
 export function stopPreview(runId: string, sandboxId: string): Promise<void> {

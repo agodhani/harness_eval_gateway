@@ -35,14 +35,19 @@ export default function PreviewControls({
   runId,
   sandboxId,
   previewable,
+  candidates = [],
 }: {
   runId: string;
   sandboxId: string;
   previewable: boolean;
+  /** Workspace-relative entries when detection is ambiguous — a chooser
+   *  renders and the pick is POSTed as {entry}. */
+  candidates?: string[];
 }) {
   const [phase, setPhase] = useState<Phase>("checking");
   const [preview, setPreview] = useState<PreviewOut | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pick, setPick] = useState<string>(candidates[0] ?? "");
 
   useEffect(() => {
     let cancelled = false;
@@ -65,11 +70,11 @@ export default function PreviewControls({
     };
   }, [runId, sandboxId]);
 
-  async function start() {
+  async function start(entry?: string) {
     setPhase("starting");
     setError(null);
     try {
-      const p = await startPreview(runId, sandboxId);
+      const p = await startPreview(runId, sandboxId, entry);
       setPreview(p);
       setPhase("active");
       if (p.url) window.open(p.url, "_blank", "noopener,noreferrer");
@@ -144,26 +149,63 @@ export default function PreviewControls({
     );
   }
 
+  const busy = phase === "starting" || phase === "stopping";
+
   return (
     <div className="chip-row">
       {previewable ? (
         <button
           type="button"
           className="btn btn--sm"
-          onClick={start}
-          disabled={phase === "starting" || phase === "stopping"}
+          onClick={() => void start()}
+          disabled={busy}
           title="Serve this sandbox's artifact in a throwaway container (new tab)"
         >
           {phase === "starting" ? "starting…" : "▶ Preview"}
         </button>
+      ) : candidates.length > 0 ? (
+        <>
+          <select
+            value={pick}
+            onChange={(e) => setPick(e.target.value)}
+            disabled={busy}
+            title="Multiple entry points detected — pick which to preview"
+            style={{ fontSize: "0.8rem", maxWidth: 180 }}
+          >
+            {candidates.map((c) => (
+              <option key={c} value={c}>
+                {c}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="btn btn--sm"
+            onClick={() => void start(pick)}
+            disabled={busy || !pick}
+            title="Serve the selected entry in a throwaway container (new tab)"
+          >
+            {phase === "starting" ? "starting…" : "▶ Preview"}
+          </button>
+        </>
       ) : (
-        <span
-          className="faint"
-          style={{ fontSize: "0.8rem" }}
-          title="No previewable artifact — needs an HTML entry point or a pygame app (unambiguous root .py + pygame evidence)"
-        >
-          not previewable
-        </span>
+        <>
+          <button
+            type="button"
+            className="btn btn--sm"
+            disabled
+            title="Preview isn't supported for this artifact — it needs an HTML entry point or a pygame app. The artifact itself is fine and still downloadable above."
+          >
+            ▶ Preview
+          </button>
+          <span
+            className="faint"
+            style={{ fontSize: "0.75rem" }}
+            title="Preview supports static sites and pygame apps for now"
+          >
+            not supported
+          </span>
+        </>
       )}
       {preview && !LIVE_STATUSES.has(preview.status) ? (
         <span className="faint" style={{ fontSize: "0.75rem" }}>

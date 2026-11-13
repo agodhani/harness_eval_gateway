@@ -460,3 +460,108 @@ def test_results_previewable_respects_jail(
     resp = client.get(f"/api/runs/{run['run_id']}/results")
     sandboxes = {s["sandbox_id"]: s for s in resp.json()["sandboxes"]}
     assert sandboxes[str(run["sb1"])]["previewable"] is False
+
+
+def test_results_preview_candidates(
+    client: TestClient, run, artifact_root
+) -> None:
+    """Ambiguous desktop detection → previewable=false + candidates list."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {
+            "game1/main.py": "import pygame\n",
+            "game2/main.py": "import pygame\n",
+        },
+    )
+    resp = client.get(f"/api/runs/{run['run_id']}/results")
+    sandboxes = {s["sandbox_id"]: s for s in resp.json()["sandboxes"]}
+    sb1 = sandboxes[str(run["sb1"])]
+    assert sb1["previewable"] is False
+    assert sb1["preview_type"] is None
+    assert sorted(sb1["preview_candidates"]) == [
+        "game1/main.py",
+        "game2/main.py",
+    ]
+    # unaffected sandbox: no candidates either
+    assert sandboxes[str(run["sb2"])]["preview_candidates"] == []
+
+
+# ---------------------------------------------------------------------------
+# POST .../preview with {entry} override
+# ---------------------------------------------------------------------------
+
+
+def test_start_preview_entry_py_override(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """Explicit .py entry → desktop plan even where detection missed it
+    (no pygame evidence — the user's pick is the disambiguation)."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {"scripts/demo.py": "print('not pygame')\n"},
+    )
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"entry": "scripts/demo.py"},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["type"] == "desktop"
+    kw = fake_manager.spawn_calls[0]
+    assert kw["plan"].type == "desktop"
+    assert kw["plan"].entry == "scripts/demo.py"
+
+
+def test_start_preview_entry_html_override(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """Explicit .html entry → static plan (ambiguous workspace disambiguated)."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {"a.html": "a", "b.html": "b"},
+    )
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"entry": "b.html"},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["type"] == "static"
+    assert fake_manager.spawn_calls[0]["plan"].entry == "b.html"
+
+
+@pytest.mark.parametrize("bad", ["../escape.py", "/etc/passwd", "nope.py", "x.txt"])
+def test_start_preview_entry_rejected(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager, bad: str
+) -> None:
+    _workspace(artifact_root, run["run_id"], run["sb1"], {"x.txt": "hi"})
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"entry": bad},
+    )
+    assert resp.status_code == 422
+    assert fake_manager.spawn_calls == []
+
+
+def test_start_preview_ambiguous_422_lists_candidates(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """No entry + ambiguous scan → 422 whose detail lists the candidates."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {
+            "game1/main.py": "import pygame\n",
+            "game2/main.py": "import pygame\n",
+        },
+    )
+    resp = client.post(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "game1/main.py" in detail and "game2/main.py" in detail
+    assert fake_manager.spawn_calls == []

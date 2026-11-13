@@ -1,9 +1,13 @@
 """F10 — artifact preview endpoints: serve a sandbox's snapshot in a browser.
 
 - ``POST /api/runs/{run_id}/sandboxes/{sandbox_id}/preview`` — detect a
-  previewable artifact (static entry html today) and spawn a locked-down
-  serving container; returns ``{preview_id, url, type, status, expires_at}``.
-  Idempotent per sandbox: an already-live preview is returned as-is.
+  previewable artifact (static html entry, or a pygame app for desktop) and
+  spawn a locked-down serving container; returns ``{preview_id, url, type,
+  status, entry, expires_at}``. Idempotent per sandbox: an already-live
+  preview is returned as-is. Optional body ``{"entry": "rel/path"}`` picks
+  an explicit entry — for ambiguous scans (the 422 detail lists candidates)
+  or artifacts detection missed; ``.html``/``.htm`` → static, ``.py`` →
+  desktop, jailed to the workspace.
 - ``GET .../preview`` — current preview state (newest container), 404 when
   none exists.
 - ``DELETE .../preview`` — stop the preview container(s) for the sandbox.
@@ -30,7 +34,7 @@ from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -42,8 +46,9 @@ from orchestrator.events import emit
 from sandbox.preview import (
     Preview,
     PreviewManager,
-    detect_preview,
+    plan_for_entry,
     resolve_workspace_dir,
+    scan_preview,
 )
 
 log = logging.getLogger(__name__)
@@ -56,6 +61,20 @@ DbSession = Annotated[Session, Depends(get_db)]
 # ---------------------------------------------------------------------------
 # response model + manager singleton
 # ---------------------------------------------------------------------------
+
+
+class PreviewStart(BaseModel):
+    """Optional POST body — explicit entry point override.
+
+    ``entry`` is a workspace-relative path (``game/main.py``, ``index.html``)
+    jailed to the artifact workspace: must exist, not be a symlink, and end
+    in ``.html``/``.htm`` (→ static) or ``.py`` (→ desktop). It both picks
+    one of several detected candidates and reaches artifacts auto-detection
+    missed — an explicit ``.py`` bypasses pygame evidence (the pick IS the
+    disambiguation; isolation is identical either way).
+    """
+
+    entry: str | None = None
 
 
 class PreviewOut(BaseModel):
@@ -189,7 +208,12 @@ def _jail() -> Path:
     response_model=PreviewOut,
     status_code=status.HTTP_201_CREATED,
 )
-async def start_preview(run_id: UUID, sandbox_id: UUID, session: DbSession) -> PreviewOut:
+async def start_preview(
+    run_id: UUID,
+    sandbox_id: UUID,
+    session: DbSession,
+    body: Annotated[PreviewStart | None, Body()] = None,
+) -> PreviewOut:
     sb = _find_sandbox(session, run_id, sandbox_id)
     mgr = get_preview_manager()
 
@@ -213,17 +237,36 @@ async def start_preview(run_id: UUID, sandbox_id: UUID, session: DbSession) -> P
             status_code=status.HTTP_404_NOT_FOUND,
             detail="no snapshot workspace found for this sandbox",
         )
-    plan = detect_preview(workspace)
-    if plan is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(
-                "no previewable artifact: expected index.html at the workspace "
-                "root, a single root-level .html file, a unique */index.html "
-                "one level down, or a pygame app (unambiguous root .py entry "
-                "with pygame evidence)"
-            ),
-        )
+    entry = body.entry if body else None
+    if entry:
+        # Explicit pick: jailed to the workspace; suffix decides the type.
+        try:
+            plan = plan_for_entry(workspace, entry)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(exc),
+            ) from exc
+    else:
+        scan = scan_preview(workspace)
+        plan = scan.plan
+        if plan is None:
+            if scan.candidates:
+                detail = (
+                    "multiple candidate entries — re-POST with "
+                    f'{{"entry": "<path>"}}: {", ".join(scan.candidates)}'
+                )
+            else:
+                detail = (
+                    "no previewable artifact: expected index.html at the "
+                    "workspace root, a single root-level .html file, a "
+                    "unique */index.html one level down, or a pygame app "
+                    "(unambiguous .py entry + pygame evidence)"
+                )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=detail,
+            )
 
     try:
         preview = await asyncio.to_thread(

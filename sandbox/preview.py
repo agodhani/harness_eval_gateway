@@ -108,9 +108,29 @@ LIVE_STATUSES = frozenset({"created", "running", "restarting", "paused"})
 _HTML_SUFFIXES = frozenset({".html", ".htm"})
 _INDEX_NAMES = frozenset({"index.html", "index.htm"})
 
-# Desktop detection: unambiguous root entry point AND explicit pygame
-# evidence (requirements.txt mention or an `import pygame` in a root .py).
+# Desktop detection: an unambiguous .py entry (root or nested ≤3 levels) AND
+# explicit pygame evidence — a non-comment requirements.txt line mentioning
+# pygame/pygame-ce, or `import pygame`/`from pygame` in the candidate file.
 _DESKTOP_ENTRY_NAMES = ("main.py", "app.py", "game.py", "run.py")
+_DESKTOP_MAX_DEPTH = 3
+# Dirs never worth scanning for an artifact entry point.
+_DESKTOP_SKIP_DIRS = frozenset(
+    {
+        "node_modules",
+        "__pycache__",
+        "tests",
+        "test",
+        "venv",
+        "env",
+        "dist",
+        "build",
+        "docs",
+        "doc",
+        "site-packages",
+        "migrations",
+        "fixtures",
+    }
+)
 _PYGAME_REQ_RE = re.compile(r"pygame(?:-ce)?", re.IGNORECASE)
 _PYGAME_IMPORT_RE = re.compile(r"^\s*(?:import|from)\s+pygame\b", re.MULTILINE)
 _READ_CAP = 512 * 1024  # only the head of a file is scanned for evidence
@@ -220,6 +240,23 @@ def _html_files(dirpath: Path) -> list[Path]:
     ]
 
 
+def _nested_indexes(workspace: Path) -> list[Path]:
+    """``*/index.html`` files one level down (hidden/symlinked dirs skipped)."""
+    nested: list[Path] = []
+    try:
+        entries = sorted(workspace.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return []
+    for d in entries:
+        if d.name.startswith(".") or d.is_symlink() or not d.is_dir():
+            continue
+        for cand in _html_files(d):
+            if cand.name.lower() in _INDEX_NAMES:
+                nested.append(cand)
+                break
+    return nested
+
+
 def _detect_static(workspace: Path) -> PreviewPlan | None:
     """Find an unambiguous static entry point in a snapshot workspace.
 
@@ -242,21 +279,24 @@ def _detect_static(workspace: Path) -> PreviewPlan | None:
     if len(root_html) == 1:
         return PreviewPlan(type="static", entry=root_html[0].name)
 
-    nested: list[Path] = []
-    try:
-        entries = sorted(workspace.iterdir(), key=lambda p: p.name)
-    except OSError:
-        return None
-    for d in entries:
-        if d.name.startswith(".") or d.is_symlink() or not d.is_dir():
-            continue
-        for cand in _html_files(d):
-            if cand.name.lower() in _INDEX_NAMES:
-                nested.append(cand)
-                break
+    nested = _nested_indexes(workspace)
     if len(nested) == 1:
         return PreviewPlan(type="static", entry=str(nested[0].relative_to(workspace)))
     return None
+
+
+def _static_candidates(workspace: Path) -> list[str]:
+    """Ambiguous static entries — only called when ``_detect_static`` found
+    no unique pick: multiple root ``*.html`` (no index) or multiple nested
+    ``*/index.html``. Returned as workspace-relative paths for the
+    entry-chooser / ``entry=`` override."""
+    root_html = _html_files(workspace)
+    if len(root_html) > 1:
+        return [p.name for p in root_html]
+    nested = _nested_indexes(workspace)
+    if len(nested) > 1:
+        return [str(p.relative_to(workspace)) for p in nested]
+    return []
 
 
 def _read_head(path: Path, cap: int = _READ_CAP) -> str:
@@ -268,68 +308,186 @@ def _read_head(path: Path, cap: int = _READ_CAP) -> str:
         return ""
 
 
-def _detect_desktop(workspace: Path) -> PreviewPlan | None:
-    """Detect a runnable GUI artifact — pygame today (``type="desktop"``).
+def _req_mentions_pygame(path: Path) -> bool:
+    """``requirements.txt`` names pygame on a REAL line — comments (first
+    non-whitespace char ``#``) and blanks are stripped before matching."""
+    lines = [
+        line
+        for line in _read_head(path).splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+    return _PYGAME_REQ_RE.search("\n".join(lines)) is not None
 
-    Conservative on purpose — detection decides what gets *executed*:
-    - an **unambiguous entry point**: one of ``main.py``/``app.py``/
-      ``game.py``/``run.py`` at the workspace root, or a single root-level
-      ``*.py`` file (nested entry points are not auto-detected);
-    - AND **explicit pygame evidence**: ``requirements.txt`` mentions
-      pygame/pygame-ce, or a root ``*.py`` file imports pygame.
 
-    Anything short of both signals returns ``None`` — the API reports "not
-    previewable" rather than executing an arbitrary file. Only the first
-    ``_READ_CAP`` bytes of each candidate file are scanned.
+def _scan_dirs(workspace: Path) -> list[Path]:
+    """Workspace root + dirs up to ``_DESKTOP_MAX_DEPTH`` levels down (BFS).
+
+    Hidden dirs, symlinks, and ``_DESKTOP_SKIP_DIRS`` (``.git`` is hidden,
+    ``node_modules``/``__pycache__``/``tests``/``venv``/… are named) are
+    skipped — they're never the artifact's entry point.
     """
+    dirs = [workspace]
+    frontier = [workspace]
+    for _depth in range(_DESKTOP_MAX_DEPTH):
+        nxt: list[Path] = []
+        for d in frontier:
+            try:
+                entries = sorted(d.iterdir(), key=lambda p: p.name)
+            except OSError:
+                continue
+            for e in entries:
+                if (
+                    e.is_dir()
+                    and not e.is_symlink()
+                    and not e.name.startswith(".")
+                    and e.name not in _DESKTOP_SKIP_DIRS
+                ):
+                    dirs.append(e)
+                    nxt.append(e)
+        frontier = nxt
+    return dirs
+
+
+def _py_files(dirpath: Path) -> list[Path]:
+    """Regular ``*.py`` files directly inside ``dirpath``, name-sorted."""
     try:
-        entries = sorted(workspace.iterdir(), key=lambda p: p.name)
+        entries = sorted(dirpath.iterdir(), key=lambda p: p.name)
     except OSError:
-        return None
-    root_py = [
+        return []
+    return [
         p
         for p in entries
         if p.is_file() and not p.is_symlink() and p.suffix == ".py"
     ]
 
-    entry: Path | None = None
-    for name in _DESKTOP_ENTRY_NAMES:
-        cand = workspace / name
-        if cand in root_py:
-            entry = cand
-            break
-    if entry is None and len(root_py) == 1:
-        entry = root_py[0]
-    if entry is None:
-        return None
 
-    req = workspace / "requirements.txt"
-    evidence = (
-        req.is_file()
-        and not req.is_symlink()
-        and _PYGAME_REQ_RE.search(_read_head(req)) is not None
+def _detect_desktop(workspace: Path) -> tuple[PreviewPlan | None, list[str]]:
+    """Detect runnable GUI artifacts — pygame today (``type="desktop"``).
+
+    Conservative on purpose — detection decides what gets *executed*:
+
+    - **Candidate entries** in each scanned dir (root + ≤3 levels, skipping
+      hidden/``_DESKTOP_SKIP_DIRS``/symlinked dirs): named entries
+      ``main.py``/``app.py``/``game.py``/``run.py``, else a dir containing
+      exactly one ``*.py``.
+    - **Evidence per candidate**: the candidate file itself imports pygame
+      (line-anchored — comments/docstrings at line start excepted), OR any
+      ``requirements.txt`` within the scanned dirs names pygame on a real
+      (non-comment) line.
+    - **Ambiguity**: exactly one eligible candidate → auto-pick it.
+      Multiple → ``(None, candidates)`` — the caller picks via ``entry=``;
+      we never silently choose what to execute.
+    """
+    scan_dirs = _scan_dirs(workspace)
+    req_evidence = False
+    for d in scan_dirs:
+        req = d / "requirements.txt"
+        if req.is_file() and not req.is_symlink() and _req_mentions_pygame(req):
+            req_evidence = True
+            break
+
+    candidates: list[str] = []
+    for d in scan_dirs:
+        py = _py_files(d)
+        entries = [d / name for name in _DESKTOP_ENTRY_NAMES if (d / name) in py]
+        if not entries and len(py) == 1:
+            entries = py
+        for cand in entries:
+            if req_evidence or (
+                _PYGAME_IMPORT_RE.search(_read_head(cand)) is not None
+            ):
+                candidates.append(str(cand.relative_to(workspace)))
+
+    candidates = sorted(set(candidates))
+    if len(candidates) == 1:
+        return PreviewPlan(type="desktop", entry=candidates[0]), []
+    return None, candidates
+
+
+@dataclass(frozen=True)
+class PreviewScan:
+    """Full scan of a snapshot workspace.
+
+    ``plan`` — the auto-picked preview (``None`` when ambiguous/unsupported).
+    ``candidates`` — workspace-relative entry paths the user could pick via
+    the ``entry=`` override; populated only when ``plan`` is ``None`` and at
+    least two plausible entries exist (``.html`` files for static, evidence-
+    backed ``.py`` entries for desktop). Empty candidates + no plan = the
+    artifact simply isn't previewable today.
+    """
+
+    plan: PreviewPlan | None
+    candidates: tuple[str, ...]
+
+
+def scan_preview(workspace: Path) -> PreviewScan:
+    """First match wins: ``static`` → ``desktop`` → ambiguous/none.
+
+    A workspace matching both previews as static — the safe/cheap default.
+    """
+    if not workspace.is_dir():
+        return PreviewScan(None, ())
+    plan = _detect_static(workspace)
+    if plan is not None:
+        return PreviewScan(plan, ())
+    plan, desk_candidates = _detect_desktop(workspace)
+    if plan is not None:
+        return PreviewScan(plan, ())
+    return PreviewScan(
+        None, tuple(sorted(desk_candidates + _static_candidates(workspace)))
     )
-    if not evidence:
-        evidence = any(
-            _PYGAME_IMPORT_RE.search(_read_head(p)) is not None for p in root_py
-        )
-    if not evidence:
-        return None
-    return PreviewPlan(type="desktop", entry=entry.name)
 
 
 def detect_preview(workspace: Path) -> PreviewPlan | None:
-    """First match wins: ``static`` → ``desktop`` → ``None``.
+    """Auto-picked plan, or ``None`` (ambiguous or unsupported workspace).
 
-    A workspace matching both (index.html AND a pygame entry) previews as
-    static — the safe/cheap default; a ``?type=`` override could come later.
+    Prefer :func:`scan_preview` when candidates are wanted for a chooser UI.
     """
-    if not workspace.is_dir():
-        return None
-    plan = _detect_static(workspace)
-    if plan is not None:
-        return plan
-    return _detect_desktop(workspace)
+    return scan_preview(workspace).plan
+
+
+def plan_for_entry(workspace: Path, raw_entry: str) -> PreviewPlan:
+    """Resolve an explicit ``entry=`` override into a :class:`PreviewPlan`.
+
+    The entry is jailed to ``workspace``: must be a relative path (no ``..``,
+    not absolute), resolve inside it, exist as a regular non-symlinked file,
+    and have a recognized suffix — ``.html``/``.htm`` → ``static``, ``.py``
+    → ``desktop``. Anything else raises ``ValueError`` (router maps to 422).
+
+    Note: an explicit ``.py`` entry bypasses pygame evidence — the user's
+    pick IS the disambiguation; the executed artifact runs under the same
+    isolation regardless.
+    """
+    raw = raw_entry.strip()
+    rel_path = Path(raw)
+    if (
+        not raw
+        or rel_path.is_absolute()
+        or ".." in rel_path.parts
+        or any(not p or p == "." for p in rel_path.parts)
+    ):
+        raise ValueError(f"invalid entry path {raw_entry!r}")
+    rel = str(rel_path)
+    cand = workspace / rel
+    if cand.is_symlink():
+        raise ValueError(f"entry {raw_entry!r} is a symlink — not previewable")
+    try:
+        ws = workspace.resolve()
+        resolved = cand.resolve()
+    except OSError as exc:
+        raise ValueError(f"entry {raw_entry!r} could not be resolved") from exc
+    if resolved != ws and ws not in resolved.parents:
+        raise ValueError(f"entry {raw_entry!r} escapes the workspace")
+    if not cand.is_file():
+        raise ValueError(f"entry {raw_entry!r} not found in the workspace")
+    suffix = cand.suffix.lower()
+    if suffix in _HTML_SUFFIXES:
+        return PreviewPlan(type="static", entry=rel)
+    if suffix == ".py":
+        return PreviewPlan(type="desktop", entry=rel)
+    raise ValueError(
+        f"unsupported entry type {cand.suffix!r} — want .html/.htm or .py"
+    )
 
 
 def _preview_url(
