@@ -9,9 +9,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from api.pricing import ModelPrice
 
@@ -198,6 +198,113 @@ class RunSummary(BaseModel):
     created_at: datetime
     finished_at: datetime | None
     sandbox_count: int
+
+
+# ---------------------------------------------------------------------------
+# F11 — skillpack import (api/routers/skillpacks.py)
+# ---------------------------------------------------------------------------
+
+
+class SkillPackOut(BaseModel):
+    """GET /api/skillpacks item — one selectable pack (vendored or imported)."""
+
+    name: str
+    source: str  # "vendored" | "imported"
+    skill_count: int
+    skills: list[str] = Field(default_factory=list)
+    origin_url: str | None = None
+    imported_at: str | None = None
+
+
+class SkillpackDiscoverIn(BaseModel):
+    """POST /api/skillpacks/discover body — a GitHub link to scan."""
+
+    url: str = Field(min_length=1, max_length=2000)
+
+
+class DiscoveredSkill(BaseModel):
+    """One SKILL.md found in the repo — ``dir`` is the selection token."""
+
+    dir: str
+    name: str
+    description: str = ""
+    file_count: int = 0
+    has_frontmatter: bool = False
+
+
+class SkillpackDiscoverOut(BaseModel):
+    """POST /api/skillpacks/discover response — repo scan result."""
+
+    url: str  # canonical github URL actually scanned
+    repo: str  # "owner/repo"
+    ref: str  # resolved ref — reuse as import's ``ref`` pin
+    commit_sha: str | None = None
+    subpath: str  # scanned subtree ("" = repo root); file path for blob links
+    kind: str  # root | tree | blob
+    skills: list[DiscoveredSkill] = Field(default_factory=list)
+
+
+class SkillpackImportIn(BaseModel):
+    """POST /api/skillpacks/import body — persist a discover-selection.
+
+    ``mode`` selects the target layout:
+
+    - ``"pack"`` — all selected skills land in ONE pack named ``pack_name``.
+      If the name is already taken (vendored or imported) the request fails
+      with a 409 whose ``detail`` is ``{"kind": "name_conflict", "name",
+      "suggested_name", "source"}`` — resend with ``pack_name`` set to the
+      suggested/edited name (the confirm-and-rename flow).
+    - ``"merge"`` — skills are appended into the existing *imported* pack
+      ``pack_name`` (created when absent). Vendored targets are rejected:
+      appending to vendored packs is never allowed.
+    - ``"split"`` — every selected skill becomes its own pack named after
+      the skill dir; colliding names are auto-renamed (``x`` → ``x-2``)
+      and reported in the response. ``pack_name`` is ignored.
+    """
+
+    url: str = Field(min_length=1, max_length=2000)
+    # Pin the discovered tree: resolved ref or commit_sha from the discover
+    # response. Pair with ``subpath`` when pinning a sha for a branch whose
+    # name contains slashes (its segment count differs from the URL's ref).
+    ref: str | None = Field(default=None, max_length=255)
+    subpath: str | None = Field(default=None, max_length=1000)
+    # Repo-relative skill dirs (``dir`` values from /discover) to import.
+    skills: list[str] = Field(min_length=1, max_length=64)
+    pack_name: str = Field(default="", max_length=64)
+    mode: Literal["pack", "merge", "split"] = "pack"
+
+    @model_validator(mode="after")
+    def _pack_name_required(self) -> SkillpackImportIn:
+        if self.mode in ("pack", "merge") and not self.pack_name.strip():
+            raise ValueError(f"pack_name is required for mode={self.mode!r}")
+        return self
+
+
+class ImportedSkill(BaseModel):
+    """One skill actually written to disk."""
+
+    source_dir: str  # repo-relative dir it came from
+    name: str  # frontmatter name (dir fallback)
+    dir: str  # final dir under <pack>/skills/
+    file_count: int
+    renamed: bool  # dir name was deduplicated (-2, -3…)
+
+
+class PackImportResult(BaseModel):
+    """One pack created/merged by an import call."""
+
+    pack: str
+    source: str = "imported"
+    skill_count: int  # total skills in the pack post-write (merges append)
+    imported: list[ImportedSkill] = Field(default_factory=list)
+    issues: list[str] = Field(default_factory=list)
+
+
+class SkillpackImportOut(BaseModel):
+    """POST /api/skillpacks/import response — one entry per pack touched
+    (length 1 for ``pack``/``merge``, one per skill for ``split``)."""
+
+    packs: list[PackImportResult]
 
 
 # ---------------------------------------------------------------------------

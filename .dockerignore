@@ -9,6 +9,7 @@ __pycache__
 data/artifacts/*
 !data/artifacts/.gitkeep
 data/sandboxes/
+data/skillpacks/
 data/eval/
 
 # Node / Next.js

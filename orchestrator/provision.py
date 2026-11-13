@@ -27,6 +27,7 @@ from db.models import Run, Sandbox
 from gateway.creds import mint_cred
 from sandbox.runtime import SandboxRuntime
 from sandbox.spec import SandboxSpec
+from skillpack_import.store import imported_root
 
 from . import state_machine
 from .adapters import adapter_image, get_adapter
@@ -51,13 +52,18 @@ CRED_TTL_GRACE_SECONDS = 3600
 # ---------------------------------------------------------------------------
 
 
-def known_skillpacks(skillpacks_dir: str | Path) -> list[str]:
-    """Directory names under ``skillpacks_dir`` — the valid ``skill_packs``
-    values at submit time. Non-directories (README.md etc.) are excluded."""
-    root = Path(skillpacks_dir)
-    if not root.is_dir():
-        return []
-    return sorted(p.name for p in root.iterdir() if p.is_dir())
+def known_skillpacks(*roots: str | Path) -> list[str]:
+    """Directory names under the given pack roots — the valid ``skill_packs``
+    values at submit time. Multiple roots (vendored ``skillpacks/`` plus the
+    imported ``data/skillpacks/``) merge into one namespace; non-directories
+    (README.md etc.) are excluded."""
+    names: set[str] = set()
+    for r in roots:
+        root = Path(r)
+        if not root.is_dir():
+            continue
+        names.update(p.name for p in root.iterdir() if p.is_dir())
+    return sorted(names)
 
 
 def stage_skillpacks(
@@ -65,21 +71,37 @@ def stage_skillpacks(
     dest_dir: str | Path,
     *,
     source_root: str | Path,
+    extra_roots: tuple[str | Path, ...] = (),
 ) -> Path:
     """Copy the selected pack dirs into ``dest_dir`` (real copies — symlinks
     don't survive bind mounts). Always returns ``dest_dir`` (created even for
     an empty selection so the sandbox sees an empty packs root, NOT the full
-    default mount)."""
+    default mount).
+
+    Each pack name is resolved against ``source_root`` first, then
+    ``extra_roots`` in order — imported packs live in the data tree
+    (``data/skillpacks/``), vendored ones in the repo tree. Pack names are
+    unique across roots (imports reject vendored-name collisions), so the
+    search order only matters as a defensive default.
+    """
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
-    root = Path(source_root)
+    roots = [Path(source_root), *(Path(r) for r in extra_roots)]
     for name in pack_names:
-        src = root / name
-        if not src.is_dir():
-            raise ValueError(f"unknown skill pack {name!r} under {root}")
-        # Guard against anything weird slipping past submit validation.
-        if src.resolve().parent != root.resolve():
-            raise ValueError(f"skill pack {name!r} escapes {root}")
+        src: Path | None = None
+        for root in roots:
+            cand = root / name
+            if not cand.is_dir():
+                continue
+            # Guard against anything weird slipping past submit validation.
+            if cand.resolve().parent != root.resolve():
+                raise ValueError(f"skill pack {name!r} escapes {root}")
+            src = cand
+            break
+        if src is None:
+            raise ValueError(
+                f"unknown skill pack {name!r} under {[str(r) for r in roots]}"
+            )
         shutil.copytree(src, dest / name, dirs_exist_ok=True)
     return dest
 
@@ -277,6 +299,9 @@ async def spawn_one(
             packs,
             runtime.state_dir / str(sid) / "skillpacks",
             source_root=settings.SKILLPACKS_DIR,
+            # User-imported packs live under the data tree (F11) — second
+            # search root so they're stageable exactly like vendored ones.
+            extra_roots=(imported_root(settings),),
         )
 
         cred = mint_sandbox_cred(

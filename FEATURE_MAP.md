@@ -23,6 +23,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F8 | Results UI (matrix, scores, artifacts) | ✅ | `web/app/runs/`, `api/routers/results.py` | `tests/unit/api/test_results.py` |
 | F9 | Run analytics (per-sandbox metrics + cost) | ✅ | `api/routers/analytics.py`, `api/pricing.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx` | `tests/unit/api/test_analytics.py` |
 | F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
+| F11 | Skillpack import from GitHub | ✅ | `skillpack_import/`, `api/routers/skillpacks.py`, `web/app/submit/ImportSkillPackDialog.tsx` | `tests/unit/api/test_skillpacks.py`, `test_skillpack_import.py` |
 
 ## Feature details
 
@@ -245,6 +246,72 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     file and exited `harness_complete`; Pi streamed real
     `/v1/chat/completions` traffic through the gateway
 - **Depends on:** F3 (protocol endpoints), F4 (sandbox runtime), F5 (pattern)
+
+### F11 — Skillpack import from GitHub ✅
+
+- **What:** users paste a GitHub link — repo root
+  (`github.com/owner/repo`), subdirectory (`…/tree/<branch>/<path>`), or a
+  direct `SKILL.md` (`…/blob/<branch>/<path>/SKILL.md`, also
+  `raw.githubusercontent.com`) — the backend scans a codeload tarball for
+  `SKILL.md` files (frontmatter name/description parsed), the user picks a
+  subset, and imports via one of three `mode`s: `pack` (all skills into one
+  NEW named pack — a taken name returns **409 + structured
+  `detail.suggested_name`** for the confirm-and-rename flow), `merge`
+  (skills appended into an existing imported pack; vendored targets
+  rejected), or `split` (each selected skill becomes its own pack named
+  after the skill dir, auto-renamed `-2`/`-3` on collision and reported in
+  the response). Imported packs live under
+  **`data/skillpacks/<pack>/`** — the data tree, NOT the vendored
+  `skillpacks/` (which is committed + baked into the api image; `data/` is
+  gitignored and bind-mounted at `/data` in compose). They merge into one
+  name namespace with vendored packs everywhere: `GET /api/skillpacks`,
+  submit-time `skill_packs` validation, and provisioning staging (selected
+  packs copy into the per-sandbox dir mounted at `/opt/skillpacks`).
+- **Where:**
+  - `skillpack_import/github.py` — `parse_github_url` (accepted shapes),
+    `fetch_repo` (codeload tarball; ambiguous slash-refs probed
+    longest-first — GitHub's own longest-match; `HEAD` resolves default
+    branch), `scan_skills` / `extract_skill_files` (size-capped), sha
+    resolution via `api.github.com` `git/ref` + `commits` (best-effort —
+    `commit_sha` lands in `PACK.json` provenance and lets imports pin the
+    exact tree discovered).
+  - `skillpack_import/store.py` — `imported_root(settings)` (=
+    `ARTIFACT_ROOT.parent/"skillpacks"`, overridable via
+    `IMPORTED_SKILLPACKS_DIR`), `list_packs` (counts via the same
+    `SkillCatalog` the sandbox loader uses), `write_pack` (sanitize names,
+    per-dir dedup `-2`/`-3`, `PACK.json` manifest, all-or-nothing rollback),
+    `delete_pack`.
+  - `api/routers/skillpacks.py` — `GET /api/skillpacks`,
+    `POST …/discover`, `POST …/import` (201; modes pack/merge/split,
+    collision → `{"kind": "name_conflict", "name", "suggested_name",
+    "source"}`), `DELETE …/{name}` (imported only; vendored → 409).
+    `store.suggest_pack_name` finds the first free `name-2`/`name-3`.
+    Fetcher is an injectable FastAPI dep (`get_fetcher`) — tests never
+    touch the network.
+  - `api/config.py` — `GITHUB_TOKEN` (optional PAT → Bearer on GitHub
+    calls; private repos best-effort), `IMPORTED_SKILLPACKS_DIR`.
+  - `orchestrator/provision.py` — `known_skillpacks(*roots)` merges roots;
+    `stage_skillpacks(..., extra_roots=)` resolves packs vendored-first
+    then imported.
+  - Web: `web/lib/api.ts` (`listSkillPacks`, `discoverSkillPack`,
+    `importSkillPack`, `deleteSkillPack`), submit page fetches the pack
+    list dynamically (vendored const is just the fallback), per-config
+    "+ import from GitHub" button → `ImportSkillPackDialog` (URL →
+    discover → checkbox select → mode radio: new pack / existing imported
+    pack / one-pack-per-skill; name collision shows a rename notice
+    prefilled with the api's `suggested_name`), modal styles in
+    `globals.css`.
+- **Verify:**
+  - Unit: `tests/unit/api/test_skillpack_import.py` (URL shapes, ref
+    probing w/ FakeFetcher, tarball scan/extract, store dedup/merge/
+    traversal, multi-root provision) + `tests/unit/api/test_skillpacks.py`
+    (endpoints: list/discover/import/delete, error statuses, dedup, and
+    imported pack passing `POST /api/runs` validation).
+  - API: `POST /api/skillpacks/discover {"url": "https://github.com/anthropics/skills"}`
+    → skills; `POST /api/skillpacks/import` → files under `data/skillpacks/<pack>/`.
+  - UI: submit → "+ import from GitHub" → paste link → pick skills →
+    import → pack shows with an "imported" badge, selectable per config.
+- **Depends on:** F5 (pack layout/loader), F4 (staging/mount path)
 
 ## Implementation sequence
 

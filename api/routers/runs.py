@@ -33,6 +33,7 @@ from orchestrator import adapters as orch_adapters
 from orchestrator import events as orch_events
 from orchestrator import provision, runner, state_machine
 from orchestrator.rubric import RubricContent
+from skillpack_import.store import imported_root
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -108,8 +109,15 @@ def _get_run_or_404(session: Session, run_id: uuid.UUID) -> Run:
 
 
 def _validate_harness_configs(body: RunCreate) -> None:
+    settings = get_settings()
     known_adapters = set(orch_adapters.adapter_names())
-    known_packs = set(provision.known_skillpacks(get_settings().SKILLPACKS_DIR))
+    # Pack names merge the vendored + imported roots into one namespace
+    # (imported packs under data/skillpacks — F11).
+    known_packs = set(
+        provision.known_skillpacks(
+            settings.SKILLPACKS_DIR, imported_root(settings)
+        )
+    )
     problems: list[str] = []
     for i, hc in enumerate(body.harness_configs):
         if hc.adapter not in known_adapters:

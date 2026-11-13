@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.config import get_settings
-from api.routers import analytics, events, harnesses, health, results, runs
+from api.routers import analytics, events, harnesses, health, results, runs, skillpacks
 from orchestrator import runner
 
 
@@ -45,6 +45,7 @@ def create_app() -> FastAPI:
     app.include_router(runs.router)
     app.include_router(results.router)
     app.include_router(analytics.router)
+    app.include_router(skillpacks.router)
     return app
 
 

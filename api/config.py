@@ -56,6 +56,15 @@ class Settings(BaseSettings):
     # Anchored to the repo root so it resolves inside the api image (/app)
     # and in host-run dev alike.
     SKILLPACKS_DIR: Path = Path(__file__).resolve().parents[1] / "skillpacks"
+    # Root for USER-IMPORTED skill packs (F11). None => derived from
+    # ARTIFACT_ROOT as <data>/skillpacks (sibling of artifacts/ + sandboxes/,
+    # so compose's ./data:/data mount + SandboxRuntime.to_host_path cover it).
+    # Set explicitly to relocate the imported-packs root.
+    IMPORTED_SKILLPACKS_DIR: Path | None = None
+    # Optional GitHub token for skillpack discovery/import — raises the
+    # unauthenticated 60/hr api limit and unlocks private repos (best-effort;
+    # codeload accepts a Bearer token). Public repos work without it.
+    GITHUB_TOKEN: str = ""
 
     LOG_LEVEL: str = "INFO"
 

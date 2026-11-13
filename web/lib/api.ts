@@ -104,7 +104,9 @@ export const EVENT_TYPES: readonly string[] = [
   "error",
 ];
 
-/** Vendored skill packs under ./skillpacks (dirs only — README.md excluded). */
+/** Vendored skill packs under ./skillpacks (dirs only — README.md excluded).
+ * Fallback for the submit form until GET /api/skillpacks responds — the API
+ * list additionally carries user-imported packs. */
 export const SKILL_PACKS: readonly string[] = [
   "superpowers",
   "mattpocock-skills",
@@ -309,21 +311,26 @@ export class ApiError extends Error {
   status: number;
   /** Parsed `detail` from a FastAPI error body, when present. */
   detail: string;
+  /** Raw `detail` value — for structured errors like name_conflict. */
+  rawDetail: unknown;
 
-  constructor(status: number, detail: string) {
+  constructor(status: number, detail: string, rawDetail?: unknown) {
     super(`API ${status}: ${detail}`);
     this.name = "ApiError";
     this.status = status;
     this.detail = detail;
+    this.rawDetail = rawDetail;
   }
 }
 
 async function parseError(res: Response): Promise<ApiError> {
   let detail = `${res.status} ${res.statusText}`;
+  let raw: unknown;
   try {
     const body: unknown = await res.json();
     if (body && typeof body === "object") {
       const d = (body as { detail?: unknown }).detail;
+      raw = d;
       if (typeof d === "string") detail = d;
       else if (Array.isArray(d)) {
         // FastAPI 422 validation errors: list of {loc, msg}.
@@ -346,7 +353,7 @@ async function parseError(res: Response): Promise<ApiError> {
   } catch {
     // non-JSON error body — keep status text
   }
-  return new ApiError(res.status, detail);
+  return new ApiError(res.status, detail, raw);
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -564,6 +571,125 @@ export function estimateCostUsd(
       tokens.output * price.output_per_mtok_usd) /
     1_000_000
   );
+}
+
+// ---------------------------------------------------------------------------
+// skillpacks (F11 — vendored listing + GitHub import)
+// ---------------------------------------------------------------------------
+
+/** One selectable pack (vendored preset or user-imported from GitHub). */
+export interface SkillPack {
+  name: string;
+  source: "vendored" | "imported" | string;
+  skill_count: number;
+  skills: string[];
+  origin_url: string | null;
+  imported_at: string | null;
+}
+
+/** One SKILL.md discovered in a repo — `dir` is the selection token. */
+export interface DiscoveredSkill {
+  dir: string;
+  name: string;
+  description: string;
+  file_count: number;
+  has_frontmatter: boolean;
+}
+
+export interface SkillpackDiscoverResult {
+  url: string;
+  repo: string;
+  /** Resolved ref — pass back (or commit_sha) as `ref` on import to pin the tree. */
+  ref: string;
+  commit_sha: string | null;
+  subpath: string;
+  kind: "root" | "tree" | "blob" | string;
+  skills: DiscoveredSkill[];
+}
+
+export interface ImportedSkill {
+  source_dir: string;
+  name: string;
+  dir: string;
+  file_count: number;
+  renamed: boolean;
+}
+
+/** One pack created/merged by an import call. */
+export interface PackImportResult {
+  pack: string;
+  source: string;
+  skill_count: number;
+  imported: ImportedSkill[];
+  issues: string[];
+}
+
+export interface SkillpackImportResult {
+  /** One entry per pack touched — >1 only for mode "split". */
+  packs: PackImportResult[];
+}
+
+/** Structured 409 detail for pack-name collisions (confirm-and-rename). */
+export interface SkillpackNameConflict {
+  kind: "name_conflict";
+  message: string;
+  name: string;
+  source: "vendored" | "imported";
+  suggested_name: string | null;
+}
+
+/** Extract the collision payload from an import 409, if it is one. */
+export function nameConflictOf(err: unknown): SkillpackNameConflict | null {
+  if (err instanceof ApiError && err.status === 409) {
+    const d = err.rawDetail;
+    if (
+      d !== null &&
+      typeof d === "object" &&
+      (d as { kind?: unknown }).kind === "name_conflict"
+    ) {
+      return d as SkillpackNameConflict;
+    }
+  }
+  return null;
+}
+
+export function listSkillPacks(): Promise<SkillPack[]> {
+  return request<SkillPack[]>("/api/skillpacks");
+}
+
+export function discoverSkillPack(url: string): Promise<SkillpackDiscoverResult> {
+  return request<SkillpackDiscoverResult>("/api/skillpacks/discover", {
+    method: "POST",
+    body: JSON.stringify({ url }),
+  });
+}
+
+export interface SkillpackImportRequest {
+  url: string;
+  skills: string[]; // DiscoveredSkill.dir values
+  /**
+   * "pack" (default) — one pack named pack_name; taken name → 409 +
+   * suggested_name (confirm-and-rename). "merge" — append into an existing
+   * imported pack. "split" — one pack per skill, auto-renamed on collision.
+   */
+  mode?: "pack" | "merge" | "split";
+  /** Required for pack/merge, ignored for split. */
+  pack_name?: string;
+  ref?: string | null;
+  subpath?: string | null;
+}
+
+export function importSkillPack(body: SkillpackImportRequest): Promise<SkillpackImportResult> {
+  return request<SkillpackImportResult>("/api/skillpacks/import", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function deleteSkillPack(name: string): Promise<void> {
+  return request<void>(`/api/skillpacks/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
 }
 
 export function getSandboxScores(sandboxId: string): Promise<ScoreOut[]> {
