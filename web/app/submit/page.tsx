@@ -107,32 +107,34 @@ export default function SubmitPage() {
 
   function onPackImported(result: SkillpackImportResult) {
     const key = importFor;
+    const newPacks = result.packs;
     // Refetch for accurate merged state (skills/count/origin on appends).
     listSkillPacks()
       .then(setPacks)
       .catch(() => {
-        setPacks((prev) =>
-          prev.some((p) => p.name === result.pack)
-            ? prev
-            : [
-                ...prev,
-                {
-                  name: result.pack,
-                  source: "imported",
-                  skill_count: result.skill_count,
-                  skills: result.imported.map((s) => s.name),
-                  origin_url: null,
-                  imported_at: new Date().toISOString(),
-                },
-              ],
-        );
+        setPacks((prev) => {
+          const have = new Set(prev.map((p) => p.name));
+          const missing = newPacks
+            .filter((r) => !have.has(r.pack))
+            .map((r) => ({
+              name: r.pack,
+              source: "imported",
+              skill_count: r.skill_count,
+              skills: r.imported.map((s) => s.name),
+              origin_url: null,
+              imported_at: new Date().toISOString(),
+            }));
+          return [...prev, ...missing];
+        });
       });
-    // Auto-select the imported pack in the config the dialog was opened from.
+    // Auto-select the imported pack(s) in the config the dialog opened from
+    // (split mode can produce several — all get selected).
     if (key !== null) {
+      const names = newPacks.map((r) => r.pack);
       setConfigs((cs) =>
         cs.map((c) =>
-          c.key === key && !c.skill_packs.includes(result.pack)
-            ? { ...c, skill_packs: [...c.skill_packs, result.pack] }
+          c.key === key
+            ? { ...c, skill_packs: [...new Set([...c.skill_packs, ...names])] }
             : c,
         ),
       );

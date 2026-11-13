@@ -42,16 +42,42 @@ class PackStoreError(Exception):
     """Typed store failure; ``kind`` maps to an HTTP status in the router.
 
     Kinds: ``invalid_name`` (pack/skill name fails the safety regex),
-    ``name_conflict`` (pack name already taken by a vendored pack),
+    ``name_conflict`` (pack name already taken — see ``NameConflictError``),
     ``unknown_selection`` (requested skill dirs missing / no SKILL.md),
     ``not_found`` (delete of an absent pack), ``vendored_protected``
-    (delete attempted on a vendored pack), ``empty`` (nothing to write).
+    (delete/merge attempted on a vendored pack), ``empty`` (nothing to
+    write).
     """
 
     def __init__(self, kind: str, detail: str) -> None:
         super().__init__(detail)
         self.kind = kind
         self.detail = detail
+
+
+class NameConflictError(PackStoreError):
+    """``name_conflict`` carrying the structured payload the UI needs for
+    its confirm-and-rename flow: the taken ``name``, where it was found
+    (``source``: ``"vendored"`` | ``"imported"``), and the suggested next
+    free name (``name-2``, ``name-3``… — ``None`` when unknown, e.g. the
+    defense-in-depth check inside ``write_pack`` where the imported-name
+    set isn't in scope).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        source: str,
+        suggested_name: str | None = None,
+    ) -> None:
+        super().__init__(
+            "name_conflict",
+            f"a pack named {name!r} already exists ({source})",
+        )
+        self.name = name
+        self.source = source
+        self.suggested_name = suggested_name
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +130,40 @@ def _dedupe(existing: set[str], want: str) -> str:
     while f"{want}-{i}" in existing:
         i += 1
     return f"{want}-{i}"
+
+
+_TRAILING_NUM_RE = re.compile(r"^(.*?)-(\d+)$")
+
+
+def suggest_pack_name(taken: set[str], base: str) -> str:
+    """First free pack name: ``base`` itself, else ``base-2``, ``base-3``…
+
+    A base already ending in ``-<digits>`` continues from that number
+    (``x-9`` taken → ``x-10``). The stem is truncated so results stay
+    within the 64-char name budget.
+    """
+    if base not in taken:
+        return base
+    m = _TRAILING_NUM_RE.match(base)
+    stem, i = (m.group(1), int(m.group(2)) + 1) if m else (base, 2)
+    for _ in range(10_000):
+        cand = f"{stem[: max(1, 64 - len(str(i)) - 1)]}-{i}"
+        if cand not in taken:
+            return cand
+        i += 1
+    raise PackStoreError("name_conflict", f"no free pack name derived from {base!r}")
+
+
+def existing_pack_names(root: str | Path) -> set[str]:
+    """Directory names under a pack root (empty for a missing root)."""
+    p = Path(root)
+    return {d.name for d in p.iterdir() if d.is_dir()} if p.is_dir() else set()
+
+
+def pack_name_for_skill(source_dir: str) -> str:
+    """Pack name derived from a skill's repo dir — split mode names each
+    pack after its skill (``skills/frontend-design`` → ``frontend-design``)."""
+    return _sanitize_skill_dir(source_dir, fallback="skill")
 
 
 # ---------------------------------------------------------------------------
@@ -272,10 +332,7 @@ def write_pack(
     """
     pack_name = sanitize_dir_name(pack_name)
     if vendored_names and pack_name in vendored_names:
-        raise PackStoreError(
-            "name_conflict",
-            f"{pack_name!r} is a vendored pack — pick another name",
-        )
+        raise NameConflictError(pack_name, source="vendored")
     if not payloads:
         raise PackStoreError("empty", "no skills selected")
 

@@ -254,8 +254,13 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   direct `SKILL.md` (`…/blob/<branch>/<path>/SKILL.md`, also
   `raw.githubusercontent.com`) — the backend scans a codeload tarball for
   `SKILL.md` files (frontmatter name/description parsed), the user picks a
-  subset, and imports either as a NEW named pack or appended into an
-  existing imported pack ("single skills"). Imported packs live under
+  subset, and imports via one of three `mode`s: `pack` (all skills into one
+  NEW named pack — a taken name returns **409 + structured
+  `detail.suggested_name`** for the confirm-and-rename flow), `merge`
+  (skills appended into an existing imported pack; vendored targets
+  rejected), or `split` (each selected skill becomes its own pack named
+  after the skill dir, auto-renamed `-2`/`-3` on collision and reported in
+  the response). Imported packs live under
   **`data/skillpacks/<pack>/`** — the data tree, NOT the vendored
   `skillpacks/` (which is committed + baked into the api image; `data/` is
   gitignored and bind-mounted at `/data` in compose). They merge into one
@@ -277,9 +282,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     per-dir dedup `-2`/`-3`, `PACK.json` manifest, all-or-nothing rollback),
     `delete_pack`.
   - `api/routers/skillpacks.py` — `GET /api/skillpacks`,
-    `POST …/discover`, `POST …/import` (201), `DELETE …/{name}` (imported
-    only; vendored → 409). Fetcher is an injectable FastAPI dep
-    (`get_fetcher`) — tests never touch the network.
+    `POST …/discover`, `POST …/import` (201; modes pack/merge/split,
+    collision → `{"kind": "name_conflict", "name", "suggested_name",
+    "source"}`), `DELETE …/{name}` (imported only; vendored → 409).
+    `store.suggest_pack_name` finds the first free `name-2`/`name-3`.
+    Fetcher is an injectable FastAPI dep (`get_fetcher`) — tests never
+    touch the network.
   - `api/config.py` — `GITHUB_TOKEN` (optional PAT → Bearer on GitHub
     calls; private repos best-effort), `IMPORTED_SKILLPACKS_DIR`.
   - `orchestrator/provision.py` — `known_skillpacks(*roots)` merges roots;
@@ -289,8 +297,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     `importSkillPack`, `deleteSkillPack`), submit page fetches the pack
     list dynamically (vendored const is just the fallback), per-config
     "+ import from GitHub" button → `ImportSkillPackDialog` (URL →
-    discover → checkbox select → new-pack name or existing imported pack),
-    modal styles in `globals.css`.
+    discover → checkbox select → mode radio: new pack / existing imported
+    pack / one-pack-per-skill; name collision shows a rename notice
+    prefilled with the api's `suggested_name`), modal styles in
+    `globals.css`.
 - **Verify:**
   - Unit: `tests/unit/api/test_skillpack_import.py` (URL shapes, ref
     probing w/ FakeFetcher, tarball scan/extract, store dedup/merge/

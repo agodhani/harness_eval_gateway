@@ -363,6 +363,44 @@ def test_write_pack_rejects_vendored_name(tmp_path: Path) -> None:
     assert ei.value.kind == "name_conflict"
 
 
+# ---------------------------------------------------------------------------
+# suggest_pack_name / pack-name helpers
+# ---------------------------------------------------------------------------
+
+
+def test_suggest_pack_name_first_free() -> None:
+    assert store.suggest_pack_name({"a"}, "a") == "a-2"
+    assert store.suggest_pack_name({"a", "a-2"}, "a") == "a-3"
+    assert store.suggest_pack_name(set(), "free") == "free"
+
+
+def test_suggest_pack_name_continues_numbered_stem() -> None:
+    assert store.suggest_pack_name({"x-9"}, "x-9") == "x-10"
+    assert store.suggest_pack_name({"x", "x-2"}, "x") == "x-3"
+
+
+def test_suggest_pack_name_truncates_long_stem() -> None:
+    base = "n" * 64
+    cand = store.suggest_pack_name({base}, base)
+    assert len(cand) <= 64
+    assert cand.startswith("n" * 62)
+
+
+def test_existing_pack_names(tmp_path: Path) -> None:
+    root = tmp_path / "imp"
+    (root / "p1" / "skills").mkdir(parents=True)
+    (root / "p2").mkdir()
+    (root / "file.txt").write_text("not a dir")
+    assert store.existing_pack_names(root) == {"p1", "p2"}
+    assert store.existing_pack_names(tmp_path / "nope") == set()
+
+
+def test_pack_name_for_skill() -> None:
+    assert store.pack_name_for_skill("skills/frontend-design") == "frontend-design"
+    assert store.pack_name_for_skill("group/nested/deep") == "deep"
+    assert store.pack_name_for_skill("weird name!") == "weird-name"
+
+
 def test_write_pack_rejects_no_skill_md(tmp_path: Path) -> None:
     with pytest.raises(store.PackStoreError) as ei:
         store.write_pack(

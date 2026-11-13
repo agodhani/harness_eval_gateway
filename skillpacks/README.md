@@ -63,3 +63,6 @@ under **`data/skillpacks/<pack>/`** — the gitignored data tree, NOT this
 vendored directory — and are listed/staged alongside vendored packs through
 the same name namespace (imported names may not collide with vendored ones).
 Imported packs get a `PACK.json` with `source: "github-import"` + provenance.
+Unauthenticated ref/sha resolution against api.github.com is best-effort
+(~60 req/hr cap); imports still work via codeload tarball when it degrades —
+a `GITHUB_TOKEN` env var on the api raises limits and enables private repos.

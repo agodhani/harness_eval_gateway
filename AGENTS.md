@@ -294,9 +294,13 @@ or tests change.
 - **Imported skill packs (F11) live under `data/skillpacks/`**, not the
   vendored `skillpacks/` tree — vendored packs are committed and baked into
   the api image (ephemeral FS in compose), while `data/` is gitignored and
-  bind-mounted at `/data`. Imported + vendored share ONE name namespace
-  (imports reject vendored-name collisions) so `skill_packs` values resolve
-  unambiguously across both roots; staging searches vendored first.
+  bind-mounted at `/data`. Imported + vendored share ONE name namespace so
+  `skill_packs` values resolve unambiguously across both roots; staging
+  searches vendored first. Import `mode`s: `pack` = one new pack (taken name
+  → 409 + `detail.suggested_name` — the UI's confirm-and-rename flow; never
+  silently merge), `merge` = append into an existing imported pack (vendored
+  targets rejected), `split` = one pack per skill, auto-renamed
+  `x-2`/`x-3` on collision.
 - **GitHub import fetches codeload tarballs** (one request per repo — no
   `api.github.com` rate-limit dependency); `/tree/<branch>/<path>` refs are
   ambiguous (branch names may contain slashes) so candidates probe
@@ -321,8 +325,12 @@ or tests change.
   + estimated cost; price table lives in `api/pricing.py` (`PRICE_TABLE`).
 - `GET /api/skillpacks` (F10) lists vendored + imported packs (the submit
   form's source of truth); `POST /api/skillpacks/discover` (GitHub URL →
-  skills), `POST /api/skillpacks/import` (selection → `data/skillpacks/`),
+  skills), `POST /api/skillpacks/import` (selection → `data/skillpacks/`;
+  `mode` = `pack`|`merge`|`split`, collision → 409 `detail.suggested_name`),
   `DELETE /api/skillpacks/{name}` (imported only).
 - **Known issues (Phase 3 candidates):** event ingest has no retry/buffering —
   a sandbox emitting during an api restart loses early events; gateway emits
-  best-effort. `heg-dev` static cred exists for dev only.
+  best-effort. `heg-dev` static cred exists for dev only. Unauthenticated
+  GitHub ref/sha resolution (F10) is best-effort under the ~60/hr
+  api.github.com cap — imports still work via codeload tarball when it
+  degrades.

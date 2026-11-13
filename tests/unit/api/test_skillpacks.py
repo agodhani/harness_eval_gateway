@@ -247,10 +247,11 @@ def _do_import(client, **overrides) -> dict:
 
 def test_import_as_new_pack(api) -> None:
     data = _do_import(api.client, skills=["skills/linting", "group/nested/deep"])
-    assert data["pack"] == "gh-pack"
-    assert data["source"] == "imported"
-    assert data["skill_count"] == 2
-    imported = {i["source_dir"]: i for i in data["imported"]}
+    pack = data["packs"][0]
+    assert pack["pack"] == "gh-pack"
+    assert pack["source"] == "imported"
+    assert pack["skill_count"] == 2
+    imported = {i["source_dir"]: i for i in pack["imported"]}
     assert imported["skills/linting"]["dir"] == "linting"
     assert imported["skills/linting"]["file_count"] == 3
     assert imported["group/nested/deep"]["dir"] == "deep"
@@ -263,17 +264,172 @@ def test_import_as_new_pack(api) -> None:
 
 def test_import_appends_to_existing_pack(api) -> None:
     _do_import(api.client, skills=["skills/linting"])
-    data = _do_import(api.client, skills=["skills/formatting"])
-    assert data["skill_count"] == 2
+    data = _do_import(api.client, skills=["skills/formatting"], mode="merge")
+    assert data["packs"][0]["skill_count"] == 2
     assert (api.imported_root / "gh-pack" / "skills" / "formatting").is_dir()
 
 
 def test_import_same_skill_dedupes(api) -> None:
     _do_import(api.client, skills=["skills/linting"])
-    data = _do_import(api.client, skills=["skills/linting"])
-    assert data["imported"][0]["dir"] == "linting-2"
-    assert data["imported"][0]["renamed"] is True
-    assert data["skill_count"] == 2
+    data = _do_import(api.client, skills=["skills/linting"], mode="merge")
+    assert data["packs"][0]["imported"][0]["dir"] == "linting-2"
+    assert data["packs"][0]["imported"][0]["renamed"] is True
+    assert data["packs"][0]["skill_count"] == 2
+
+
+def test_merge_rejects_vendored_target(api) -> None:
+    resp = api.client.post(
+        "/api/skillpacks/import",
+        json={
+            "url": "github.com/acme/repo",
+            "skills": ["skills/linting"],
+            "pack_name": "pack-a",
+            "mode": "merge",
+        },
+    )
+    assert resp.status_code == 409
+    assert "vendored" in resp.json()["detail"]
+
+
+def test_import_requires_pack_name(api) -> None:
+    for mode in ("pack", "merge"):
+        resp = api.client.post(
+            "/api/skillpacks/import",
+            json={
+                "url": "github.com/acme/repo",
+                "skills": ["skills/linting"],
+                "mode": mode,
+            },
+        )
+        assert resp.status_code == 422, f"mode={mode} -> {resp.status_code}"
+
+
+# -- confirm-and-rename collision flow -------------------------------------
+
+
+def test_import_collision_returns_suggestion(api) -> None:
+    _do_import(api.client)  # gh-pack exists
+    resp = api.client.post(
+        "/api/skillpacks/import",
+        json={
+            "url": "github.com/acme/repo",
+            "skills": ["skills/linting"],
+            "pack_name": "gh-pack",
+            "mode": "pack",
+        },
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["kind"] == "name_conflict"
+    assert detail["name"] == "gh-pack"
+    assert detail["source"] == "imported"
+    assert detail["suggested_name"] == "gh-pack-2"
+
+
+def test_import_vendored_collision_suggests(api) -> None:
+    resp = api.client.post(
+        "/api/skillpacks/import",
+        json={
+            "url": "github.com/acme/repo",
+            "skills": ["skills/linting"],
+            "pack_name": "pack-a",
+        },
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["kind"] == "name_conflict"
+    assert detail["source"] == "vendored"
+    assert detail["suggested_name"] == "pack-a-2"
+
+
+def test_import_rename_retry_succeeds(api) -> None:
+    _do_import(api.client)
+    data = _do_import(api.client, pack_name="gh-pack-2")
+    assert data["packs"][0]["pack"] == "gh-pack-2"
+    assert (api.imported_root / "gh-pack-2").is_dir()
+
+
+def test_import_suggestion_increments(api) -> None:
+    _do_import(api.client)  # gh-pack
+    _do_import(api.client, pack_name="gh-pack-2")
+    resp = api.client.post(
+        "/api/skillpacks/import",
+        json={
+            "url": "github.com/acme/repo",
+            "skills": ["skills/linting"],
+            "pack_name": "gh-pack",
+        },
+    )
+    assert resp.json()["detail"]["suggested_name"] == "gh-pack-3"
+
+
+# -- split mode: each skill becomes its own pack ---------------------------
+
+
+def test_split_imports_each_skill_as_pack(api) -> None:
+    data = _do_import(
+        api.client,
+        skills=["skills/linting", "skills/formatting"],
+        pack_name="",  # ignored for split
+        mode="split",
+    )
+    names = [p["pack"] for p in data["packs"]]
+    assert names == ["formatting", "linting"]  # sorted by source dir
+    for p in data["packs"]:
+        assert p["skill_count"] == 1
+        assert p["imported"][0]["dir"] == p["pack"]
+    assert (api.imported_root / "linting" / "skills" / "linting").is_dir()
+    assert (api.imported_root / "formatting" / "skills" / "formatting").is_dir()
+
+
+def test_split_auto_renames_collisions(api) -> None:
+    _do_import(api.client, pack_name="linting")  # imported "linting" exists
+    data = _do_import(
+        api.client,
+        skills=["skills/linting", "skills/formatting"],
+        mode="split",
+    )
+    assert [p["pack"] for p in data["packs"]] == ["formatting", "linting-2"]
+    assert "linting-2" in data["packs"][1]["issues"][0]
+
+
+def test_split_avoids_vendored_names(api) -> None:
+    files = {
+        "skills/pack-a/SKILL.md": SKILL_MD.format(name="demo", desc="d"),
+    }
+    app.dependency_overrides[skillpacks_router.get_fetcher] = lambda: FakeFetcher(
+        make_tarball(files), ok_refs=None
+    )
+    try:
+        data = _do_import(
+            api.client,
+            url="github.com/acme/repo",
+            skills=["skills/pack-a"],
+            mode="split",
+        )
+        assert data["packs"][0]["pack"] == "pack-a-2"
+    finally:
+        app.dependency_overrides[skillpacks_router.get_fetcher] = lambda: api.fetcher
+
+
+def test_split_dedupes_same_basename(api) -> None:
+    files = {
+        "a/x/SKILL.md": SKILL_MD.format(name="xa", desc="d"),
+        "b/x/SKILL.md": SKILL_MD.format(name="xb", desc="d"),
+    }
+    app.dependency_overrides[skillpacks_router.get_fetcher] = lambda: FakeFetcher(
+        make_tarball(files), ok_refs=None
+    )
+    try:
+        data = _do_import(
+            api.client,
+            url="github.com/acme/repo",
+            skills=["a/x", "b/x"],
+            mode="split",
+        )
+        assert [p["pack"] for p in data["packs"]] == ["x", "x-2"]
+    finally:
+        app.dependency_overrides[skillpacks_router.get_fetcher] = lambda: api.fetcher
 
 
 def test_import_rejects_vendored_name(api) -> None:
@@ -286,7 +442,7 @@ def test_import_rejects_vendored_name(api) -> None:
         },
     )
     assert resp.status_code == 409
-    assert "vendored" in resp.json()["detail"]
+    assert resp.json()["detail"]["kind"] == "name_conflict"
 
 
 def test_import_rejects_bad_pack_name(api) -> None:

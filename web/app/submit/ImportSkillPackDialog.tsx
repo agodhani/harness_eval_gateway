@@ -5,15 +5,18 @@
  *
  * Flow: paste a GitHub link (repo root, /tree/<branch>/<path>, or a
  * SKILL.md /blob/ link) → POST /api/skillpacks/discover → pick discovered
- * skills → import either as a NEW named pack or appended INTO an existing
- * imported pack (the "single skills" path). On success the parent adds the
- * pack to the harness config's selection.
+ * skills → import as (a) one NEW named pack (name collision → 409 + the
+ * api's suggested_name prefills a rename retry), (b) skills appended INTO
+ * an existing imported pack, or (c) one pack per selected skill
+ * (auto-renamed on collision). On success the parent adds the resulting
+ * pack(s) to the harness config's selection.
  */
 import { useMemo, useState } from "react";
 import {
   ApiError,
   discoverSkillPack,
   importSkillPack,
+  nameConflictOf,
   type DiscoveredSkill,
   type SkillPack,
   type SkillpackDiscoverResult,
@@ -22,6 +25,14 @@ import {
 import { ErrorNote, InfoNote } from "@/components/ui";
 
 type Step = "url" | "select";
+type ImportMode = "new" | "existing" | "split";
+
+/** Last name_conflict hit — drives the rename-prefill + notice. */
+interface Collision {
+  attempted: string;
+  suggested: string;
+  source: "vendored" | "imported";
+}
 
 const PLACEHOLDER =
   "github.com/owner/repo · …/tree/<branch>/<path> · …/blob/<branch>/…/SKILL.md";
@@ -42,9 +53,10 @@ export function ImportSkillPackDialog({
   const [error, setError] = useState<string | null>(null);
   const [discovery, setDiscovery] = useState<SkillpackDiscoverResult | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [mode, setMode] = useState<"new" | "existing">("new");
+  const [mode, setMode] = useState<ImportMode>("new");
   const [packName, setPackName] = useState("");
   const [existingPack, setExistingPack] = useState(importedPacks[0]?.name ?? "");
+  const [collision, setCollision] = useState<Collision | null>(null);
 
   const suggestedName = useMemo(() => {
     if (!discovery) return "";
@@ -54,7 +66,10 @@ export function ImportSkillPackDialog({
 
   const targetPack = mode === "new" ? packName.trim() || suggestedName : existingPack;
   const canImport =
-    !busy && discovery !== null && selected.size > 0 && targetPack.length > 0;
+    !busy &&
+    discovery !== null &&
+    selected.size > 0 &&
+    (mode === "split" || targetPack.length > 0);
 
   async function onDiscover() {
     setError(null);
@@ -84,17 +99,31 @@ export function ImportSkillPackDialog({
     if (!discovery || !canImport) return;
     setError(null);
     setBusy(true);
+    const apiMode = mode === "new" ? "pack" : mode === "existing" ? "merge" : "split";
     try {
       const result = await importSkillPack({
         url: url.trim(),
         ref: discovery.commit_sha ?? discovery.ref,
         subpath: discovery.subpath || null,
         skills: [...selected],
-        pack_name: targetPack,
+        mode: apiMode,
+        ...(mode === "split" ? {} : { pack_name: targetPack }),
       });
       onImported(result);
     } catch (err) {
-      setError(err instanceof ApiError ? err.detail : "Import failed.");
+      const conflict = nameConflictOf(err);
+      if (conflict) {
+        // Confirm-and-rename: prefill the suggested free name; the user can
+        // edit it — a still-colliding retry just re-arms this notice.
+        setCollision({
+          attempted: conflict.name,
+          suggested: conflict.suggested_name ?? `${conflict.name}-2`,
+          source: conflict.source,
+        });
+        setPackName(conflict.suggested_name ?? `${conflict.name}-2`);
+      } else {
+        setError(err instanceof ApiError ? err.detail : "Import failed.");
+      }
       setBusy(false);
     }
   }
@@ -190,6 +219,13 @@ export function ImportSkillPackDialog({
 
               <div className="field">
                 <label className="field__label">Import into</label>
+                {collision ? (
+                  <ErrorNote title="Name taken">
+                    A pack named <code>{collision.attempted}</code> already exists
+                    {collision.source === "vendored" ? " (vendored)" : ""} — import
+                    as <code>{collision.suggested}</code> instead, or edit the name.
+                  </ErrorNote>
+                ) : null}
                 <div className="check-list" style={{ flexDirection: "column", gap: "0.5rem" }}>
                   <label className="check-item">
                     <input
@@ -205,7 +241,10 @@ export function ImportSkillPackDialog({
                       style={{ width: "16rem", display: "inline-block" }}
                       placeholder={suggestedName || "my-skills"}
                       value={packName}
-                      onChange={(e) => setPackName(e.target.value)}
+                      onChange={(e) => {
+                        setPackName(e.target.value);
+                        setCollision(null);
+                      }}
                       onClick={() => setMode("new")}
                       disabled={busy}
                     />
@@ -243,10 +282,31 @@ export function ImportSkillPackDialog({
                       No imported packs yet — a new one will be created.
                     </span>
                   )}
+                  <label className="check-item">
+                    <input
+                      type="radio"
+                      name="import-mode"
+                      checked={mode === "split"}
+                      onChange={() => setMode("split")}
+                      disabled={busy}
+                    />
+                    Each selected skill as its own pack
+                  </label>
                 </div>
                 <span className="field__hint">
-                  Saved under <code>data/skillpacks/{targetPack || "…"}</code> — selectable
-                  in every harness config, staged into sandboxes like vendored packs.
+                  {mode === "split" ? (
+                    <>
+                      Packs are named after each skill (e.g.{" "}
+                      <code>data/skillpacks/{discovery.skills[0]?.name ?? "skill"}</code>);
+                      names already taken get a <code>-2</code>/<code>-3</code> suffix.
+                    </>
+                  ) : (
+                    <>
+                      Saved under <code>data/skillpacks/{targetPack || "…"}</code> —
+                      selectable in every harness config, staged into sandboxes like
+                      vendored packs.
+                    </>
+                  )}
                 </span>
               </div>
 

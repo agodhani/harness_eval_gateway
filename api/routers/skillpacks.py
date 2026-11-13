@@ -8,9 +8,11 @@ Endpoints:
 - ``POST /api/skillpacks/discover`` — scan a GitHub link (repo root,
   ``/tree/<branch>/<path>``, ``/blob/<branch>/<path>/SKILL.md`` or
   ``raw.githubusercontent.com``), returning the SKILL.md candidates.
-- ``POST /api/skillpacks/import`` — persist the selected skills into a named
-  pack under the imported root (new pack, or append into an existing
-  imported pack for the "single skills" flow).
+- ``POST /api/skillpacks/import`` — persist the selected skills: ``mode=pack``
+  writes one named pack (taken name → 409 + ``suggested_name`` for the
+  rename-confirm flow); ``mode=merge`` appends into an existing imported
+  pack; ``mode=split`` creates one pack per skill (auto-renamed on
+  collision).
 - ``DELETE /api/skillpacks/{name}`` — remove an imported pack (vendored
   packs are protected).
 
@@ -33,6 +35,7 @@ from api.config import get_settings
 from api.schemas import (
     DiscoveredSkill,
     ImportedSkill,
+    PackImportResult,
     SkillpackDiscoverIn,
     SkillpackDiscoverOut,
     SkillpackImportIn,
@@ -82,9 +85,19 @@ def _fetch_err(exc: github.FetchError) -> HTTPException:
 
 
 def _store_err(exc: store.PackStoreError) -> HTTPException:
+    detail: str | dict[str, object] = exc.detail
+    if isinstance(exc, store.NameConflictError):
+        # Structured so the UI can run its confirm-and-rename flow.
+        detail = {
+            "kind": exc.kind,
+            "message": exc.detail,
+            "name": exc.name,
+            "source": exc.source,
+            "suggested_name": exc.suggested_name,
+        }
     return HTTPException(
         status_code=_STORE_STATUS.get(exc.kind, status.HTTP_500_INTERNAL_SERVER_ERROR),
-        detail=exc.detail,
+        detail=detail,
     )
 
 
@@ -191,14 +204,27 @@ async def import_skillpack(
     settings = get_settings()
     try:
         target = github.parse_github_url(body.url)
-        pack_name = store.sanitize_dir_name(body.pack_name)
         imp_root = store.imported_root(settings)
         vendored_names = set(provision.known_skillpacks(settings.SKILLPACKS_DIR))
-        if pack_name in vendored_names:
-            raise store.PackStoreError(
-                "name_conflict",
-                f"{pack_name!r} is a vendored pack — pick another name",
-            )
+        # One pack-name namespace across both roots (see AGENTS.md).
+        taken = vendored_names | store.existing_pack_names(imp_root)
+
+        # Pack-target resolution happens BEFORE the fetch so a colliding
+        # name fails fast — the UI re-submits with the renamed pack_name.
+        pack_name: str | None = None
+        if body.mode != "split":
+            pack_name = store.sanitize_dir_name(body.pack_name)
+            if body.mode == "pack" and pack_name in taken:
+                raise store.NameConflictError(
+                    pack_name,
+                    source="vendored" if pack_name in vendored_names else "imported",
+                    suggested_name=store.suggest_pack_name(taken, pack_name),
+                )
+            if body.mode == "merge" and pack_name in vendored_names:
+                raise store.PackStoreError(
+                    "vendored_protected",
+                    f"{pack_name!r} is a vendored pack — can't append to it",
+                )
 
         snap = await github.fetch_repo(
             target,
@@ -221,41 +247,72 @@ async def import_skillpack(
                 f"skill dirs not found in {snap.repo}@{snap.ref}: "
                 + ", ".join(repr(d) for d in missing),
             )
-        payloads = [
-            store.SkillPayload(source_dir=d, files=extracted[d])
-            for d in sorted(wanted)
-        ]
-        result = await asyncio.to_thread(
-            store.write_pack,
-            imp_root,
-            pack_name,
-            payloads,
-            provenance={
-                "url": snap.canonical_url or body.url,
-                "repo": snap.repo,
-                "ref": snap.ref,
-                "commit_sha": snap.commit_sha,
-            },
-            vendored_names=vendored_names,
-        )
+
+        provenance = {
+            "url": snap.canonical_url or body.url,
+            "repo": snap.repo,
+            "ref": snap.ref,
+            "commit_sha": snap.commit_sha,
+        }
+        results: list[store.ImportedPackResult] = []
+        if body.mode == "split":
+            # Each skill → its own pack named after the skill dir; taken
+            # names auto-rename (x → x-2, x-3…) — reported via issues.
+            for d in sorted(wanted):
+                want = store.pack_name_for_skill(d)
+                free = store.suggest_pack_name(taken, want)
+                res = await asyncio.to_thread(
+                    store.write_pack,
+                    imp_root,
+                    free,
+                    [store.SkillPayload(source_dir=d, files=extracted[d])],
+                    provenance=provenance,
+                    vendored_names=vendored_names,
+                )
+                if free != want:
+                    res.issues.insert(
+                        0, f"pack name {want!r} taken — imported as {free!r}"
+                    )
+                taken.add(free)
+                results.append(res)
+        else:
+            payloads = [
+                store.SkillPayload(source_dir=d, files=extracted[d])
+                for d in sorted(wanted)
+            ]
+            results.append(
+                await asyncio.to_thread(
+                    store.write_pack,
+                    imp_root,
+                    pack_name or "",
+                    payloads,
+                    provenance=provenance,
+                    vendored_names=vendored_names,
+                )
+            )
     except github.FetchError as exc:
         raise _fetch_err(exc) from exc
     except store.PackStoreError as exc:
         raise _store_err(exc) from exc
 
     log.info(
-        "imported %d skill(s) from %s@%s into pack %r",
-        len(result.imported),
+        "imported %d skill(s) from %s@%s -> packs %s",
+        sum(len(r.imported) for r in results),
         snap.repo,
         snap.ref,
-        result.pack,
+        [r.pack for r in results],
     )
     return SkillpackImportOut(
-        pack=result.pack,
-        source=result.source,
-        skill_count=result.skill_count,
-        imported=[ImportedSkill(**vars(i)) for i in result.imported],
-        issues=result.issues,
+        packs=[
+            PackImportResult(
+                pack=r.pack,
+                source=r.source,
+                skill_count=r.skill_count,
+                imported=[ImportedSkill(**vars(i)) for i in r.imported],
+                issues=r.issues,
+            )
+            for r in results
+        ]
     )
 
 
