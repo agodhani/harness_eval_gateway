@@ -1,4 +1,4 @@
-"""Artifact preview — serve a snapshot workspace from a locked-down container (F10).
+"""Artifact preview — serve a snapshot workspace from a locked-down container (F12).
 
 Product flow: results page "Preview" button → ``POST .../preview`` → this
 module spawns a tiny static-file container bound to an ephemeral localhost

@@ -7,7 +7,7 @@ decided in F1).
 Lifespan runs ``orchestrator.runner.startup_sweep`` on boot (reconcile DB
 state after an api restart — in-process tasks die with the process) and
 ``runner.shutdown`` on exit (cancel in-flight orchestration tasks). It also
-starts/stops the artifact-preview TTL reaper (F10).
+starts/stops the artifact-preview TTL reaper (F12).
 """
 
 from contextlib import asynccontextmanager

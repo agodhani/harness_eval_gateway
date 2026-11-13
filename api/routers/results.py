@@ -77,7 +77,7 @@ class SandboxResult(BaseModel):
     dimensions: dict[str, DimensionScore] = Field(default_factory=dict)
     overall: DimensionScore | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
-    # F10: whether the snapshot workspace has a previewable entry —
+    # F12: whether the snapshot workspace has a previewable entry —
     # drives the results-page Preview button. preview_candidates lists
     # EVERY detected runnable entry, default-first (previewable/preview_type
     # describe candidates[0]); the UI renders a dropdown + POST {entry}.
@@ -165,7 +165,7 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
     jail = _artifact_jail()
     results: list[SandboxResult] = []
     for sb in sandboxes:
-        # F10: cheap FS probe so the UI only offers Preview when the snapshot
+        # F12: cheap FS probe so the UI only offers Preview when the snapshot
         # workspace actually has a detectable entry point.
         ws = resolve_workspace_dir(
             jail=jail,

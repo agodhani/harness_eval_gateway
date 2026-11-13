@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     # codeload accepts a Bearer token). Public repos work without it.
     GITHUB_TOKEN: str = ""
 
-    # --- Artifact preview (F10) ---
+    # --- Artifact preview (F12) ---
     # Static-preview container image (`python -m http.server`); shares the
     # python:3.12-slim base with the api/sandbox images — no extra pull.
     PREVIEW_IMAGE: str = "python:3.12-slim"

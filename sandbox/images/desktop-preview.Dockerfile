@@ -1,4 +1,4 @@
-# Desktop artifact preview image (F10) — build context is the REPO ROOT:
+# Desktop artifact preview image (F12) — build context is the REPO ROOT:
 #   docker build -f sandbox/images/desktop-preview.Dockerfile \
 #       -t heg-preview-desktop:latest .
 #

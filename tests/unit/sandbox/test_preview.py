@@ -1,4 +1,4 @@
-"""F10 artifact-preview unit tests — detection, jail resolution, manager.
+"""F12 artifact-preview unit tests — detection, jail resolution, manager.
 
 ``detect_preview`` / ``resolve_workspace_dir`` are pure filesystem — exercised
 against tmp_path workspace shapes. ``PreviewManager`` is tested with a stubbed

@@ -282,11 +282,11 @@ export interface SandboxResult {
   /** Optional artifact ids if/when the results API exposes them. */
   artifact_ids?: string[];
   artifacts?: { id: string; kind?: string; path?: string }[];
-  /** F10: snapshot workspace has a previewable entry point. */
+  /** F12: snapshot workspace has a previewable entry point. */
   previewable?: boolean;
   preview_type?: string | null;
   /**
-   * F10: every detected runnable entry, default-first — the UI renders a
+   * F12: every detected runnable entry, default-first — the UI renders a
    * dropdown and POSTs {entry}. Empty + previewable=false = unsupported.
    */
   preview_candidates?: PreviewCandidate[];
@@ -709,7 +709,7 @@ export function artifactDownloadUrl(artifactId: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// artifact preview (F10)
+// artifact preview (F12)
 // ---------------------------------------------------------------------------
 
 export interface PreviewCandidate {

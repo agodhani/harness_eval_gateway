@@ -1,4 +1,4 @@
-"""F10 — artifact preview endpoints: serve a sandbox's snapshot in a browser.
+"""F12 — artifact preview endpoints: serve a sandbox's snapshot in a browser.
 
 - ``POST /api/runs/{run_id}/sandboxes/{sandbox_id}/preview`` — detect a
   previewable artifact (static html entry, or a pygame app for desktop) and

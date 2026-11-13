@@ -1,4 +1,4 @@
-"""F10 artifact-preview integration tests — require a live Docker daemon.
+"""F12 artifact-preview integration tests — require a live Docker daemon.
 
 Marked ``docker``; run with ``uv run pytest -m docker`` or
 ``uv run pytest tests/integration/test_preview.py``.

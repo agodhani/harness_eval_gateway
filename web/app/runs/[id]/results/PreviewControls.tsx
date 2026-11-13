@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * F10 — per-sandbox artifact preview controls on the results page.
+ * F12 — per-sandbox artifact preview controls on the results page.
  *
  * On mount, GETs the current preview state (a container may still be running
  * from a previous session — previews live on docker labels, api restarts

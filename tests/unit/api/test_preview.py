@@ -1,4 +1,4 @@
-"""Artifact-preview endpoint tests (F10).
+"""Artifact-preview endpoint tests (F12).
 
 Runs against in-memory sqlite via the shared conftest app. The PreviewManager
 is replaced with a fake (no docker); ARTIFACT_ROOT is monkeypatched to a tmp
