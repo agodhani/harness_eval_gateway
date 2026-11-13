@@ -48,6 +48,9 @@ services:
       # --- Orchestrator (F2) ---
       # HMAC secret for minting sandbox/evaluator creds — MUST match gateway.
       GATEWAY_CRED_SECRET: dev-secret-change-me
+      # Judge allowance on top of run spend-at-mint — generous so concurrent
+      # participant burn can't starve evaluation (see run 1258852a).
+      EVAL_TOKEN_BUDGET: "2000000"
       # Host path of ./data as the docker daemon sees it. Sandbox -v sources
       # (/data/sandboxes/...) are rewritten to this by SandboxRuntime so bind
       # mounts resolve on the host. Requires `docker compose` run from the
