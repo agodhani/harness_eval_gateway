@@ -6,7 +6,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from db.models import Event
+from db.models import Event, Run
 from gateway import metering
 from gateway.config import get_settings
 from gateway.creds import CredClaims
@@ -18,7 +18,21 @@ def _session() -> Session:
     return get_session_factory()()
 
 
+def _ensure_run(session: Session, run_id: uuid.UUID) -> None:
+    """Insert the parent Run row if absent.
+
+    ``events.run_id`` is a real FK — Postgres enforces it (and the api ingest
+    endpoint validates the same invariant), so seeded events need a run row.
+    The flush is explicit: there is no ORM relationship Run→Event, so the
+    unit of work would not otherwise order the run insert before events.
+    """
+    if session.get(Run, run_id) is None:
+        session.add(Run(id=run_id, task_prompt="test", model_name="test-model"))
+        session.flush()
+
+
 def _add_event(session: Session, run_id: uuid.UUID, type_: str, payload: dict) -> None:
+    _ensure_run(session, run_id)
     session.add(
         Event(
             run_id=run_id,

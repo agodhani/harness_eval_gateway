@@ -32,6 +32,31 @@ class Settings(BaseSettings):
     # Root of the local artifact store: ./data/artifacts/<run_id>/<sandbox_id>/
     ARTIFACT_ROOT: Path = Path("./data/artifacts")
 
+    # --- Orchestrator (F2) ---
+    # HMAC secret for minting run/sandbox gateway creds — MUST match the
+    # gateway service's GATEWAY_CRED_SECRET or sandbox traffic 401s.
+    GATEWAY_CRED_SECRET: str = "dev-secret-change-me"
+    # Optional override for the rubric-drafting model; empty => use each run's
+    # participant model_name (keeps MVP single-model, metered uniformly).
+    RUBRIC_MODEL: str = ""
+    # Sandbox image spawned per harness config.
+    SANDBOX_IMAGE: str = "heg-sandbox:latest"
+    # Monitor loop cadence + hard cap around the evaluator call.
+    MONITOR_POLL_SECONDS: float = 5.0
+    EVAL_TIMEOUT_SECONDS: float = 1800.0
+    # Token allowance for orchestrator-minted creds (rubric draft + per-eval
+    # judge). Carried as max_tokens = tokens already spent + this allowance,
+    # so it is independent of participant spend against the run budget.
+    EVAL_TOKEN_BUDGET: int = 200_000
+    # Host path of ./data as seen by the docker daemon — set by compose
+    # (HOST_DATA_ROOT=${PWD}/data) so sandbox -v sources resolve on the host.
+    # Empty (host-run dev / tests) => paths pass through verbatim.
+    HOST_DATA_ROOT: str = ""
+    # Vendored skill-pack presets; validated at submit + staged per sandbox.
+    # Anchored to the repo root so it resolves inside the api image (/app)
+    # and in host-run dev alike.
+    SKILLPACKS_DIR: Path = Path(__file__).resolve().parents[1] / "skillpacks"
+
     LOG_LEVEL: str = "INFO"
 
 

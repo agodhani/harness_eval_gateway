@@ -66,6 +66,9 @@ class AgentConfig:
     keep_alive: str = "30m"
     compact_ratio: float = 0.7
     request_timeout: float = 600.0
+    # Optional harness-config axis (F2): extra instructions appended to the
+    # system prompt verbatim — e.g. comparing skill packs vs. prompt tweaks.
+    system_prompt_extra: str = ""
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> AgentConfig:
@@ -99,6 +102,7 @@ class AgentConfig:
             events_ingest_url=(env.get("EVENTS_INGEST_URL") or "").strip() or None,
             ingest_token=(env.get("INGEST_TOKEN") or "").strip() or None,
             max_iters=max_iters,
+            system_prompt_extra=(env.get("SYSTEM_PROMPT_EXTRA") or "").strip(),
         )
 
 
@@ -597,6 +601,10 @@ def main(argv: list[str] | None = None) -> int:
             catalog_lines=skills.catalog_lines(),
             has_skills=bool(skills.entries),
         )
+        if cfg.system_prompt_extra:
+            system_prompt += (
+                "\n\n## Additional instructions\n" + cfg.system_prompt_extra
+            )
         emitter.emit(
             "run_started",
             {

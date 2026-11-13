@@ -116,6 +116,7 @@ class SandboxRuntime:
         gateway_container: str | None = None,
         artifact_root: str | Path | None = None,
         state_dir: str | Path | None = None,
+        host_data_root: str | Path | None = None,
     ) -> None:
         self.network = network
         self.gateway_container = (
@@ -138,6 +139,53 @@ class SandboxRuntime:
         else:
             # data/sandboxes/ — sibling of data/artifacts/.
             self.state_dir = self.artifact_root.parent / "sandboxes"
+
+        # Host-path translation for bind-mount sources. When the api runs
+        # inside a container (compose), the paths it sees under the data tree
+        # (e.g. /data/sandboxes/...) are NOT valid on the docker daemon's
+        # filesystem — the daemon needs the corresponding HOST path. Compose
+        # sets HOST_DATA_ROOT to the host's ./data dir; paths under the data
+        # roots below are rewritten before being passed to ``docker run -v``.
+        # Unset (host-run dev, tests) => identity mapping.
+        raw_host = (
+            host_data_root
+            if host_data_root is not None
+            else os.environ.get("HOST_DATA_ROOT")
+        )
+        self.host_data_root = Path(raw_host).expanduser() if raw_host else None
+        # Container-side dirs that host_data_root mirrors: the artifact root's
+        # parent (the "data" dir: artifacts/ + sandboxes/ siblings) plus the
+        # state dir's parent in case a custom state_dir lives elsewhere.
+        self._data_roots: tuple[Path, ...] = tuple(
+            dict.fromkeys(
+                p for p in (self.artifact_root.parent, self.state_dir.parent) if p
+            )
+        )
+
+    def to_host_path(self, path: str | Path) -> Path:
+        """Map a spawning-process path to the docker-daemon-visible path.
+
+        Paths under a known data root (``artifact_root.parent`` /
+        ``state_dir.parent``) are rebased onto ``host_data_root``; everything
+        else — and ALL paths when ``host_data_root`` is unset — passes through
+        unchanged. Used for ``-v`` sources only; container-side file ops keep
+        using the original path.
+        """
+        p = Path(path)
+        if self.host_data_root is None:
+            return p
+        for root in self._data_roots:
+            try:
+                rel = p.relative_to(root)
+            except ValueError:
+                continue
+            return self.host_data_root / rel
+        logger.debug(
+            "to_host_path: %r is not under data roots %r — using verbatim",
+            p,
+            self._data_roots,
+        )
+        return p
 
     # ------------------------------------------------------------------
     # docker CLI plumbing
@@ -348,18 +396,42 @@ class SandboxRuntime:
         ]
         for key, value in env.items():
             args += ["-e", f"{key}={value}"]
-        args += ["-v", f"{ws}:/workspace"]
-        # Read-only skill packs mount — skipped (debug-logged) if the host
-        # dir is absent so sandboxes still spawn on a stripped checkout.
-        if _SKILLPACKS_HOST_DIR.is_dir():
+        # -v sources must be paths the docker DAEMON can see — translate
+        # container-side data paths through host_data_root (identity on
+        # host-run dev where the daemon shares our filesystem).
+        args += ["-v", f"{self.to_host_path(ws)}:/workspace"]
+        # Read-only skill packs mount. ``spec.skillpacks_host_path`` lets the
+        # orchestrator stage a per-config subset; ``None`` falls back to the
+        # repo's full ./skillpacks tree. Skipped (debug-logged) if the dir is
+        # absent so sandboxes still spawn on a stripped checkout.
+        packs_dir = (
+            Path(spec.skillpacks_host_path)
+            if spec.skillpacks_host_path is not None
+            else _SKILLPACKS_HOST_DIR
+        )
+        # Containerized runtime (host_data_root set): the repo fallback
+        # (/app/skillpacks inside the api image) is NOT a host-daemon path —
+        # mounting it verbatim would fail or auto-create a stray dir on the
+        # host. Only explicit (orchestrator-staged, data-tree) paths are
+        # trusted in that mode.
+        default_pack_unusable = (
+            spec.skillpacks_host_path is None and self.host_data_root is not None
+        )
+        if default_pack_unusable:
+            logger.debug(
+                "skipping default skillpacks mount: %r is not host-visible "
+                "in a containerized runtime (spec.skillpacks_host_path unset)",
+                packs_dir,
+            )
+        elif packs_dir.is_dir():
             args += [
                 "-v",
-                f"{_SKILLPACKS_HOST_DIR}:{SKILLPACKS_CONTAINER_ROOT}:ro",
+                f"{self.to_host_path(packs_dir)}:{SKILLPACKS_CONTAINER_ROOT}:ro",
             ]
         else:
             logger.debug(
                 "skillpacks dir %r not found — skipping %s mount",
-                _SKILLPACKS_HOST_DIR,
+                packs_dir,
                 SKILLPACKS_CONTAINER_ROOT,
             )
         args += [spec.image]
@@ -394,6 +466,7 @@ class SandboxRuntime:
         started_at: str,
     ) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        ws_path = Path(spec.workspace_host_path).resolve()
         payload = {
             "sandbox_id": spec.sandbox_id,
             "run_id": spec.run_id,
@@ -401,7 +474,9 @@ class SandboxRuntime:
             "container_id": container_id,
             "image": spec.image,
             "env": _redact_env(env),
-            "workspace_host_path": str(Path(spec.workspace_host_path).resolve()),
+            "workspace_host_path": str(ws_path),
+            # What was actually passed to `docker run -v` (daemon-side path).
+            "workspace_mount_source": str(self.to_host_path(ws_path)),
             "started_at": started_at,
         }
         path = self.state_dir / f"{spec.sandbox_id}.json"
@@ -473,6 +548,47 @@ class SandboxRuntime:
             return
         self._docker(["rm", "-f", name])
 
+    def remove_run_containers(self, run_id: str) -> int:
+        """``docker rm -f`` every container labelled ``heg.run_id=<run_id>``.
+
+        Best-effort orphan cleanup for the orchestrator's startup sweep —
+        in-process tasks die with the api process, so containers spawned by a
+        previous life of a ``running`` run are reaped by label. Returns the
+        number of containers removed.
+        """
+        proc = self._docker(
+            ["ps", "-aq", "--filter", f"label=heg.run_id={run_id}"],
+            check=False,
+        )
+        ids = [c for c in proc.stdout.split() if c]
+        for cid in ids:
+            self._docker(["rm", "-f", cid], check=False)
+        if ids:
+            logger.info("removed %d orphan container(s) for run %s", len(ids), run_id)
+        return len(ids)
+
+    def logs(self, sandbox_id: str, *, tail: int = 200) -> str:
+        """``docker logs --tail N`` for a sandbox — stdout + stderr merged.
+
+        ``docker logs`` writes container stdout to our stdout and stderr to
+        our stderr; the streams are concatenated (stdout block first) since
+        callers scan line-wise for markers like ``MINILOOP_RESULT``.
+        Tolerates a missing container (returns whatever docker printed).
+        """
+        name = self.container_name(sandbox_id)
+        proc = subprocess.run(
+            ["docker", "logs", "--tail", str(tail), name],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        out = proc.stdout or ""
+        err = proc.stderr or ""
+        if out and err:
+            return out + ("" if out.endswith("\n") else "\n") + err
+        return out + err
+
     # ------------------------------------------------------------------
     # artifacts
     # ------------------------------------------------------------------
@@ -507,6 +623,14 @@ class SandboxRuntime:
         if workspace_dir.exists():
             shutil.rmtree(workspace_dir)
 
+        # NOTE: unlike ``docker run -v`` sources (daemon-resolved, hence
+        # to_host_path), ``docker cp``'s LOCAL destination is resolved in the
+        # CALLING CLIENT's filesystem — the CLI streams the archive and
+        # extracts it where it runs. Inside the api container that means the
+        # container-side path (/data/artifacts/...) is correct: it exists via
+        # the ./data bind mount and the extracted files land on the host
+        # through the same mount. Passing the host-translated path would fail
+        # ("directory does not exist") because /Users/... isn't mounted here.
         self._docker(["cp", f"{name}:/workspace", str(workspace_dir)], timeout=300)
 
         # docker logs writes container stdout->CLI stdout, stderr->CLI stderr;
