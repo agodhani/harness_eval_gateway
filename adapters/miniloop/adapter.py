@@ -29,6 +29,21 @@ DOCKERFILE_REPO_PATH = "sandbox/images/miniloop.Dockerfile"
 # Terminal states miniloop can emit on its MINILOOP_RESULT line.
 TERMINAL_STATES = ("agent_done", "harness_complete", "stuck_loop", "error")
 
+#: Registry manifest for GET /api/harnesses (Phase 2.5). Miniloop keeps the
+#: configured SANDBOX_IMAGE rather than declaring its own tag, so ``image``
+#: stays absent here — adapter_image() falls back for it.
+MANIFEST = {
+    "name": "miniloop",
+    "display_name": "Miniloop (built-in)",
+    "description": (
+        "Custom minimal tool-call loop (shell, file read/write, done) running "
+        "on the configured SANDBOX_IMAGE; reference harness + evaluator image"
+    ),
+    "llm_protocol": "openai-chat-completions",
+    "cli": "python -m miniloop",
+    "requires": ["gateway:/v1/chat/completions"],
+}
+
 
 def image_spec() -> dict[str, Any]:
     """Describe the sandbox image for this harness.

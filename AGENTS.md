@@ -268,6 +268,23 @@ or tests change.
   3 consecutive identical tool calls.
 - No auth — local single-user tool; docker-compose topology; sandboxes
   spawned via host Docker socket.
+- **Phase 2.5 — pluggable CLI-harness adapters**: `adapters/common` shim
+  (stdlib-only) writes each CLI's native config, launches it in JSONL mode,
+  translates records → normalized events, prints `HEG_RESULT`. Registry in
+  `orchestrator/adapters.py` covers miniloop, codex, claude_code, pi,
+  deepseek; `GET /api/harnesses` serves manifests to the submit form.
+- **Gateway protocol fan-out**: `/v1/messages` (+`count_tokens`) for
+  Anthropic-SDK CLIs, `/v1/responses` for Codex, `/v1/models` for probes —
+  pass-throughs that preserve `stream` with a metering tee
+  (`usage_from_sse`). `/v1/chat/completions` now honors `stream: true` the
+  same way (pi streams unconditionally; the old force-`stream:false`
+  returned a bare JSON body its SSE reader dropped as an empty response).
+- **CLI image pattern**: node:slim base + `python3` for the shim + pinned
+  npm CLI + `adapters/` under `/opt/harness` + `done` at `/usr/local/bin`.
+  npm install happens before COPY so dependency layers cache. DeepSeek's
+  `dsh` needs node >=24.9 → `node:24-slim` (others stay on 22).
+- **`done` invocation**: bare `done` is a shell keyword in sh/bash — prompts
+  instruct harnesses to run `/usr/local/bin/done` (or `command done`).
 
 ## Working conventions
 

@@ -8,15 +8,17 @@
  * model_name required, ≥1 harness config, known adapter/skill-pack names.
  */
 import { useRouter } from "next/navigation";
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   ADAPTERS,
   ApiError,
   createRun,
   DEFAULT_BUDGETS,
+  listHarnesses,
   SKILL_PACKS,
   type Budgets,
   type HarnessConfig,
+  type HarnessManifest,
 } from "@/lib/api";
 import { ComboInput } from "@/components/ComboInput";
 import { Badge, Card, ErrorNote, InfoNote } from "@/components/ui";
@@ -47,6 +49,30 @@ export default function SubmitPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  // Harness registry from GET /api/harnesses; static ADAPTERS is the fallback
+  // when the API isn't running (page convention: degrade gracefully).
+  const [harnesses, setHarnesses] = useState<HarnessManifest[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    listHarnesses()
+      .then((ms) => {
+        if (!cancelled && ms.length > 0) setHarnesses(ms);
+      })
+      .catch(() => {
+        /* offline fallback: static ADAPTERS list */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const adapterNames = useMemo(
+    () => (harnesses.length > 0 ? harnesses.map((h) => h.name) : [...ADAPTERS]),
+    [harnesses],
+  );
+  const adapterLabel = (name: string) =>
+    harnesses.find((h) => h.name === name)?.display_name ?? name;
 
   const effectiveEvaluator = evaluatorModel.trim() || modelName.trim();
   const sameModelEval = effectiveEvaluator !== "" && effectiveEvaluator === modelName.trim();
@@ -59,7 +85,7 @@ export default function SubmitPage() {
     if (!modelName.trim()) errs.model_name = "Model name is required.";
     if (configs.length === 0) errs.configs = "At least one harness config is required.";
     configs.forEach((c, i) => {
-      if (!ADAPTERS.includes(c.adapter)) {
+      if (!adapterNames.includes(c.adapter)) {
         errs[`cfg_${i}_adapter`] = `Unknown adapter "${c.adapter}".`;
       }
       for (const p of c.skill_packs) {
@@ -73,7 +99,7 @@ export default function SubmitPage() {
     if (budgets.wall_clock_seconds < 60 || budgets.wall_clock_seconds > 86400)
       errs.wall_clock_seconds = "wall_clock_seconds must be 60–86400.";
     return errs;
-  }, [taskPrompt, modelName, configs, budgets]);
+  }, [taskPrompt, modelName, configs, budgets, adapterNames]);
 
   const isValid = Object.keys(validation).length === 0;
 
@@ -245,9 +271,9 @@ export default function SubmitPage() {
                       onChange={(e) => updateConfig(cfg.key, { adapter: e.target.value })}
                       disabled={submitting}
                     >
-                      {ADAPTERS.map((a) => (
+                      {adapterNames.map((a) => (
                         <option key={a} value={a}>
-                          {a}
+                          {adapterLabel(a)}
                         </option>
                       ))}
                     </select>

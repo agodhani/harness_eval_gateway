@@ -7,6 +7,7 @@ spawns ``codex exec --json`` and streams translated events.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from adapters.codex.config import write_config
@@ -25,12 +26,18 @@ ARGV = [
 def main() -> int:
     cfg = ShimConfig.from_env()
     argv = [*ARGV, build_task_text(cfg)]
+    # The cred reaches codex via env_key=HEG_API_KEY in config.toml. The
+    # adapter's env() sets it, but inject it here too so the image is
+    # self-contained even if only GATEWAY_CRED was provided.
+    child_env = dict(os.environ)
+    child_env.setdefault("HEG_API_KEY", cfg.cred)
     return run_shim(
         harness="codex",
         cfg=cfg,
         argv=argv,
         translate=translate_obj,
         setup=write_config,
+        env=child_env,
     )
 
 

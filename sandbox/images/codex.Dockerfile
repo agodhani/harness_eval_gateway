@@ -20,13 +20,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
+# Pinned CLI version (manifest: adapters/codex/adapter.py).
+RUN npm install -g @openai/codex@0.169.0
+
 WORKDIR /opt/harness
 COPY adapters/ /opt/harness/adapters/
 COPY sandbox/images/done /usr/local/bin/done
 RUN chmod +x /usr/local/bin/done
-
-# Pinned CLI version (manifest: adapters/codex/adapter.py).
-RUN npm install -g @openai/codex@0.169.0
 
 RUN useradd -m agent && mkdir -p /workspace && chown agent /workspace
 USER agent

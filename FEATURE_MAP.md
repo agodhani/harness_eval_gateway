@@ -22,6 +22,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F7 | Evaluator sandbox (rubric scoring) | ✅ | `evaluator/` | `tests/unit/evaluator/` |
 | F8 | Results UI (matrix, scores, artifacts) | ✅ | `web/app/runs/`, `api/routers/results.py` | `tests/unit/api/test_results.py` |
 | F9 | Run analytics (per-sandbox metrics + cost) | ✅ | `api/routers/analytics.py`, `api/pricing.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx` | `tests/unit/api/test_analytics.py` |
+| F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
 
 ## Feature details
 
@@ -47,16 +48,23 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 ### F1 — Submission form → run spec
 
-- **What:** form captures task prompt, model, harness configs (miniloop +
-  skill pack selections), evaluator model; `POST /api/runs` persists spec with
-  status `submitted`.
-- **Where:** `web/app/submit/page.tsx`, `web/components/ComboInput.tsx`
-  (model suggestion dropdown), `web/app/globals.css` (`.combo*`),
-  `api/routers/runs.py`, `api/schemas.py`, db `runs` table
+- **What:** form captures task prompt, model, harness configs (adapter +
+  skill pack selections — five adapters available, F10), evaluator model;
+  `POST /api/runs` persists spec with status `submitted`. The adapter
+  dropdown is populated live from `GET /api/harnesses` (static fallback list
+  when the API is unreachable); model inputs use the ComboInput suggestion
+  dropdown.
+- **Where:** `web/app/submit/page.tsx` + form components,
+  `web/components/ComboInput.tsx` (model suggestion dropdown),
+  `web/app/globals.css` (`.combo*`),
+  `web/lib/api.ts` (`listHarnesses`, `HarnessManifest`, `ADAPTERS`),
+  `api/routers/runs.py`, `api/routers/harnesses.py`, `api/schemas.py`,
+  db `runs` table
 - **Verify:**
   - UI: fill form → submit → run appears with status `submitted`
   - API: `POST /api/runs` → 201 + run id; invalid spec → 422
-  - Tests: `tests/unit/api/test_runs.py`
+  - Tests: `tests/unit/api/test_runs.py` (incl. `test_create_run_multi_adapter`),
+    `tests/unit/api/test_harnesses.py`
 - **Depends on:** F0
 
 ### F2 — Orchestrator ✅
@@ -79,19 +87,27 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 ### F3 — AI gateway ✅
 
 - **What:** OpenAI-compatible `/v1/chat/completions` endpoint → Ollama
-  upstream; per-run/sandbox HMAC credentials (`heg.<b64>.<sig>`); records
-  tokens in/out, latency, failures; token budgets (429 + `error` event);
-  emits `llm_request`/`llm_response`/`error` events. `/internal/events`
-  (harness-event proxy, cred or ingest-token auth) + `/internal/done`
-  (done_signal) for sandbox egress. Anthropic-compatible endpoint post-MVP.
+  upstream — non-streaming by default, metered SSE pass-through when the
+  caller sets `stream: true` (pi and other OpenAI-compatible CLIs stream
+  unconditionally); Anthropic Messages `/v1/messages` +
+  `/v1/messages/count_tokens` (Claude Code, dsh) and OpenAI Responses
+  `/v1/responses` (Codex) pass-throughs, streaming preserved with a metering
+  tee; `GET /v1/models` for CLI probes; per-run/sandbox HMAC credentials
+  (`heg.<b64>.<sig>`); records tokens in/out, latency, failures; token
+  budgets (429 + `error` event); emits `llm_request`/`llm_response`/`error`
+  events. `/internal/events` (harness-event proxy, cred or ingest-token
+  auth) + `/internal/done` (done_signal) for sandbox egress.
 - **Where:** `gateway/` (`main.py`, `creds.py`, `metering.py`, `deps.py`,
   `config.py`, `mint_cred.py` CLI), compose service `gateway` (:8081→8080)
 - **Verify:**
-  - Unit: `tests/unit/gateway/` (creds, metering, proxy — hermetic)
+  - Unit: `tests/unit/gateway/` (creds, metering, proxy — hermetic; protocol
+    pass-throughs + SSE usage normalization covered)
   - Manual: mint cred (`uv run python -m gateway.mint_cred`) →
     `curl localhost:8081/v1/chat/completions` → completion + event rows
   - M2 e2e proven: sandbox→gateway→Ollama→events (see run
-    `a58dd3de-1b71-4c4e-9a06-ad5d2ce5210e` in dev DB)
+    `a58dd3de-1b71-4c4e-9a06-ad5d2ce5210e` in dev DB); P2.5 live e2e: real
+    `/v1/responses` (Codex), `/v1/messages` (Claude), streamed
+    `/v1/chat/completions` (Pi) through the gateway to Ollama
 - **Depends on:** F0 + F6 ingestion endpoint
 
 ### F4 — Sandbox runtime ✅
@@ -193,6 +209,42 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - API: `curl localhost:8001/api/runs/<id>/analytics?price_model=gpt-4o`
   - UI: results page → "Analytics" card → switch price model → cost updates
 - **Depends on:** F6 (events), F8 (results page)
+
+### F10 — Multi-harness adapters ✅
+
+- **What:** pluggable adapter registry so runs can compare real harness CLIs,
+  not just miniloop configs. Registered adapters: `miniloop`, `codex`
+  (@openai/codex), `claude_code` (@anthropic-ai/claude-code), `pi`
+  (@mariozechner/pi-coding-agent), `deepseek` (@deepseek-ai/dsh). A shared
+  stdlib-only shim (`adapters/common/`) runs inside each image: writes the
+  harness's native config pointing at the gateway, launches the CLI in
+  machine-readable JSONL mode, translates native records → normalized
+  events, posts them to `/internal/events`, emits `terminal_state` + prints
+  `HEG_RESULT {…}`. Per-adapter Docker images pin the npm CLI version;
+  `orchestrator/provision.py` resolves each config's image from
+  `image_spec()["image"]` (miniloop keeps the `SANDBOX_IMAGE` fallback).
+  `GET /api/harnesses` serves adapter manifests (display name, LLM protocol,
+  CLI, image) for the submit form; `HarnessConfigIn.adapter` validates
+  against the registry. Design doc: `docs/p25-harness-adapters.md`.
+- **Where:** `adapters/common/` (`runner.py`, `contract.py`),
+  `adapters/{codex,claude_code,pi,deepseek}/` (`adapter.py`, `config.py`,
+  `translate.py`, `__main__.py`), `orchestrator/adapters.py`,
+  `orchestrator/provision.py`, `sandbox/images/{codex,claude_code,pi,
+  deepseek}.Dockerfile`, `api/routers/harnesses.py`
+- **Verify:**
+  - Unit: `tests/unit/adapters/test_adapter_contract.py` (contract across all
+    adapters: manifest, image_spec, env, launch, translation → valid
+    `EventType`s, `HEG_RESULT` parsing) + per-adapter tests under
+    `tests/unit/adapters/<name>/`
+  - API: `tests/unit/api/test_harnesses.py`, multi-adapter submit in
+    `test_runs.py::test_create_run_multi_adapter`
+  - Docker: `tests/integration/test_adapter_images.py` (`-m docker`) — CLI
+    binary runs + shim always prints `HEG_RESULT`
+  - Live e2e proven (isolated gateway+sandbox topology): Codex via
+    `/v1/responses` and Claude Code via `/v1/messages` each created the task
+    file and exited `harness_complete`; Pi streamed real
+    `/v1/chat/completions` traffic through the gateway
+- **Depends on:** F3 (protocol endpoints), F4 (sandbox runtime), F5 (pattern)
 
 ## Implementation sequence
 

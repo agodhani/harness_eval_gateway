@@ -65,6 +65,13 @@ New gateway surface:
   calls it for context management; not metered).
 - `POST /v1/responses` — OpenAI Responses proxy (stream + non-stream).
 - `GET /v1/models` — thin cred-auth pass-through (CLIs probe it).
+- `/v1/chat/completions` honors `stream: true` (metered SSE tee +
+  `stream_options.include_usage` injection); callers without `stream` keep
+  the buffered non-streamed path. Verified necessary live: pi's
+  `openai-completions` provider hard-codes `stream: true` and its SSE reader
+  treats a forced-JSON body as an empty assistant turn.
+- Auth additionally accepts `x-api-key` — Anthropic-SDK convention; dsh's
+  Messages adapter sends the credential there, not in `Authorization`.
 
 ## Adapter registry + manifest
 
@@ -135,7 +142,7 @@ Event mapping conventions across CLI harnesses:
 ### codex (`heg-sandbox-codex:latest`)
 
 - Shim writes `$CODEX_HOME/config.toml`:
-  `model`, `model_provider = "heg"`, `disable_response_storage = true`,
+  `model`, `model_provider = "heg"`,
   `[model_providers.heg] base_url = "$GATEWAY_BASE_URL/v1",
   env_key = "HEG_API_KEY", wire_api = "responses"`.
 - Env: `HEG_API_KEY=$GATEWAY_CRED`, `CODEX_HOME`, `CI`/`CODEX_SANDBOX` left
@@ -172,12 +179,18 @@ Event mapping conventions across CLI harnesses:
 
 - Env: `DEEPSEEK_API_KEY=$GATEWAY_CRED`, `DEEPSEEK_BASE_URL=$GATEWAY_BASE_URL`,
   `DSH_HOME=/home/agent/.dsh`.
-- Shim best-effort writes `$DSH_HOME/profiles/headless/cordis.patch.yml`
-  configuring the `dsh-llm-deepseek` api-key route (`apiKeyEnv`, `baseURL`)
-  and `@deepseek-ai/dsh-agent-default-model` (`provider`, `model`) — dsh is a
-  plugin composition so model/provider selection is config-driven. Flagged:
-  exact baseURL path dsh appends is unverified (DeepSeek's official API is
-  Anthropic-messages-compatible; our `/v1/messages` should match).
+- Shim writes `$DSH_HOME/profiles/headless/cordis.patch.yml` — a top-level
+  **YAML array of cordis loader patch entries** (`{id, config}` replaces a
+  config row wholesale; `{id, disabled}` toggles; `{insert: [...]}` appends;
+  see `applyPatches` in `@deepseek-ai/dsh-app-boot`). Verified against
+  `dsh --profile headless --dump-default-config` entry ids:
+  `llm-deepseek` (`@deepseek-ai/dsh-llm-deepseek-api-key`, provider
+  `deepseek-official`) gets `baseURL`/`apiKeyEnv`/`maxTokens`;
+  `agent-default-model` gets `provider: deepseek-official` + the run model.
+- `maxTokens` is clamped (default 16384, `DSH_MAX_TOKENS` override): dsh's
+  256k default exceeds the run budget gate's `max_tokens` estimate →
+  instant 429.
+- dsh requires `node >=24.9` → its image uses `node:24-slim` (others 22).
 - `dsh --profile headless --json --permission-mode danger-full-access
   --approval-policy never "<task>"`.
 - Events: `session`→checkpoint, `tool_call`→tool_call/shell_command/file_op,
@@ -201,11 +214,18 @@ egress is `http://gateway:8080`.
 
 ## Known gaps / follow-ups
 
-- dsh baseURL path + cordis.patch.yml row shape are best-effort (documented);
-  if dsh's deepseek route appends `/anthropic/v1/messages` instead of
-  `/v1/messages`, either the env needs adjusting or the gateway needs an
-  alias route — verify on first live run.
+- Resolved on first live runs: cordis.patch.yml row shape (patch-entry
+  array), `x-api-key` credential header, dsh `maxTokens` budget clash, pi
+  streaming, `done` as a shell keyword (prompt footer now requires
+  `/usr/local/bin/done`). All four adapters proven live end-to-end on an
+  isolated gateway+sandbox topology (real Ollama `qwen3:8b` traffic,
+  artifact file created, `HEG_RESULT` terminal markers).
 - CLI harnesses can't honour `max_iters`; wall-clock/token budgets still cap
   them (documented in manifest + UI copy).
 - `skill_packs` for CLI harnesses = read-only mount + prompt hint (no native
   skill invocation) — `skill_invocation` events stay miniloop-only.
+- npm >=11 blocks postinstall scripts by default; dsh's
+  `@deepseek-ai/dsh-subprocess-local` spawn-helper install script is
+  skipped — the CLI still runs (verified live) but native subprocess/pty
+  helpers are unbuilt. If dsh needs them later, add `--allow-scripts` for
+  its package set in the Dockerfile.

@@ -189,9 +189,11 @@ def build_task_text(cfg: ShimConfig, *, extra_inline: bool = True) -> str:
             "SKILL.md files and apply them when useful."
         )
     footer.append(
-        "- When the task is fully complete, run `done \"<short summary>\"` "
-        "(a `done` binary is on PATH — invoke it as `done` or "
-        "/usr/local/bin/done). Then stop."
+        "- When the task is fully complete, signal completion by running "
+        '`/usr/local/bin/done "<short summary>"` — IMPORTANT: `done` is a '
+        "shell keyword in sh/bash, so you MUST invoke the binary by its full "
+        "path /usr/local/bin/done (or `command done`); a bare `done ...` "
+        "fails with a syntax error. Then stop."
     )
     parts.append("\n".join(footer))
     if extra_inline and cfg.system_prompt_extra:

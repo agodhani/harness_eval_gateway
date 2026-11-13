@@ -27,9 +27,20 @@ class TestConfig:
         path = config.write_config(cfg)
         text = path.read_text()
         assert path == tmp_path / ".dsh" / "profiles" / "headless" / "cordis.patch.yml"
+        # Loader patch-list shape: {id, config} rows replacing targeted config.
+        assert "- id: llm-deepseek" in text
         assert 'baseURL: "http://gateway:8080"' in text
-        assert 'apiKey: "${DEEPSEEK_API_KEY}"' in text
+        assert 'apiKeyEnv: "DEEPSEEK_API_KEY"' in text
+        assert "- id: agent-default-model" in text
+        assert 'provider: deepseek-official' in text
         assert 'model: "qwen2.5-coder:3b"' in text
+        # Output cap clamps dsh's 256k default so requests pass the budget gate.
+        assert "maxTokens: 16384" in text
+
+    def test_overlay_max_tokens_env(self, tmp_path):
+        cfg = _cfg(tmp_path, DSH_MAX_TOKENS="4096")
+        text = config.write_config(cfg).read_text()
+        assert "maxTokens: 4096" in text
 
     def test_dsh_home_default(self, tmp_path):
         cfg = _cfg(tmp_path, DSH_HOME="")

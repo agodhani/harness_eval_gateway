@@ -34,7 +34,6 @@ class TestConfig:
         assert 'base_url = "http://gateway:8080/v1"' in text
         assert 'env_key = "HEG_API_KEY"' in text
         assert 'model_provider = "heg"' in text
-        assert "disable_response_storage = true" in text
 
     def test_escapes_quotes(self, tmp_path):
         cfg = _cfg(tmp_path, MODEL_NAME='evil"model')

@@ -16,20 +16,22 @@
 #   DSH_HOME           /home/agent/.dsh (profile overlay lives there)
 #   EVENTS_INGEST_URL  optional direct event-ingest endpoint
 
-FROM node:22-slim
+# dsh requires node >= 24.9.0 (@deepseek-ai/dsh@0.2.2-rc.1 engines) —
+# the other CLI images stay on node:22-slim.
+FROM node:24-slim
 
 # python3 runs the adapter shim; git is a standard agent workspace tool.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
+# Pinned CLI version (manifest: adapters/deepseek/adapter.py).
+RUN npm install -g @deepseek-ai/dsh@0.2.2-rc.1
+
 WORKDIR /opt/harness
 COPY adapters/ /opt/harness/adapters/
 COPY sandbox/images/done /usr/local/bin/done
 RUN chmod +x /usr/local/bin/done
-
-# Pinned CLI version (manifest: adapters/deepseek/adapter.py).
-RUN npm install -g @deepseek-ai/dsh@0.2.2-rc.1
 
 RUN useradd -m agent && mkdir -p /workspace && chown agent /workspace
 USER agent

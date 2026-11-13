@@ -17,8 +17,6 @@ from adapters.common.runner import ShimConfig
 CONFIG_TOML_TEMPLATE = '''\
 model = "{model}"
 model_provider = "heg"
-# Ollama's /v1/responses is stateless — no server-side response store.
-disable_response_storage = true
 
 [model_providers.heg]
 name = "harness_eval_gateway"

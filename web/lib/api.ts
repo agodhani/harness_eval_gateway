@@ -111,8 +111,34 @@ export const SKILL_PACKS: readonly string[] = [
   "spec-kit",
 ];
 
-/** Only harness adapter available in MVP. */
-export const ADAPTERS: readonly string[] = ["miniloop"];
+/** Registered harness adapters (orchestrator/adapters.py). The submit form
+ * prefers live manifests from {@link listHarnesses}; this static list is the
+ * offline fallback when the API is unreachable. */
+export const ADAPTERS: readonly string[] = [
+  "miniloop",
+  "claude_code",
+  "codex",
+  "deepseek",
+  "pi",
+];
+
+/** Adapter manifest as served by GET /api/harnesses (Phase 2.5). */
+export interface HarnessManifest {
+  name: string;
+  display_name?: string;
+  description?: string;
+  llm_protocol?: string;
+  cli?: string;
+  cli_version?: string;
+  install?: string;
+  image?: string;
+  requires?: string[];
+  [key: string]: unknown;
+}
+
+export function listHarnesses(): Promise<HarnessManifest[]> {
+  return request<HarnessManifest[]>("/api/harnesses");
+}
 
 /** Canonical rubric dimensions the evaluator scores against. */
 export const CANONICAL_DIMENSIONS: readonly string[] = [
