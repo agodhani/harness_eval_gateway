@@ -100,6 +100,17 @@ export default function PreviewControls({
     const expiry = expiryLabel(preview.expires_at);
     return (
       <div className="chip-row">
+        <span
+          className="faint"
+          style={{ fontSize: "0.75rem" }}
+          title={
+            preview.type === "desktop"
+              ? "Desktop preview — the artifact executes in an isolated container (no egress), streamed via noVNC"
+              : "Static preview — workspace files served read-only, nothing executed"
+          }
+        >
+          {preview.type === "desktop" ? "🖥 desktop" : preview.type}
+        </span>
         {preview.url ? (
           <a
             className="chip"
@@ -149,7 +160,7 @@ export default function PreviewControls({
         <span
           className="faint"
           style={{ fontSize: "0.8rem" }}
-          title="No index.html / single-entry html detected in the workspace"
+          title="No previewable artifact — needs an HTML entry point or a pygame app (unambiguous root .py + pygame evidence)"
         >
           not previewable
         </span>

@@ -24,7 +24,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F9 | Run analytics (per-sandbox metrics + cost) | ✅ | `api/routers/analytics.py`, `api/pricing.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx` | `tests/unit/api/test_analytics.py` |
 | F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
 | F11 | Skillpack import from GitHub | ✅ | `skillpack_import/`, `api/routers/skillpacks.py`, `web/app/submit/ImportSkillPackDialog.tsx` | `tests/unit/api/test_skillpacks.py`, `test_skillpack_import.py` |
-| F12 | Artifact preview (static html in a container) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
+| F12 | Artifact preview (static html + desktop/pygame via noVNC, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
 
 ## Feature details
 
@@ -316,50 +316,77 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 ### F12 — Artifact preview ✅
 
-- **What:** "Preview" button per sandbox on the results page → serves the
-  snapshot workspace in a throwaway container so the user can see/play the
-  artifact (e.g. a 2048 html page) in a new browser tab. Static sites only
-  (human checkpoint before python-server / pygame-desktop types).
+- **What:** "Preview" button per sandbox on the results page → serves or
+  *runs* the snapshot workspace in a throwaway container so the user can
+  see/play the artifact in a new browser tab. Types: `"static"` (html) and
+  `"desktop"` (pygame executed under Xvnc, streamed via noVNC).
   - `GET /api/runs/{run}/results` → per-sandbox `previewable` +
     `preview_type` (cheap FS probe of the jailed workspace).
   - `POST /api/runs/{run}/sandboxes/{sandbox}/preview` → `201
     {preview_id, url, type, status, entry, expires_at}`; idempotent (a live
     preview is returned as-is); `404` run/sandbox/workspace missing, `422`
-    no entry point, `502` docker failure.
+    no entry point / unsupported type, `502` docker failure.
   - `GET .../preview` → current state (any status) or `404`; `DELETE
     .../preview` → `204` stop.
-- **Detection** (`sandbox/preview.py::detect_preview`): `index.html`/`.htm`
-  at root → single root `*.html` → unique `*/index.html` one level down;
-  ambiguous → not previewable. Symlinks never followed.
-- **Container posture** (`PreviewManager.spawn`): `python:3.12-slim` running
+- **Detection** (`sandbox/preview.py::detect_preview`): static checked
+  first (`index.html`/`.htm` at root → single root `*.html` → unique
+  `*/index.html` one level down), then desktop — an unambiguous root `.py`
+  entry (`main.py`/`app.py`/`game.py`/`run.py` or a single root `.py`) AND
+  explicit pygame evidence (`requirements.txt` mentions pygame, or a root
+  `.py` imports pygame). Ambiguous/no-evidence → not previewable; symlinks
+  never followed. A workspace matching both gets static (safe default).
+- **Static posture** (`_spawn_static`): `python:3.12-slim` running
   `python -m http.server` over the workspace bind-mounted `:ro`; nobody
   user, `--read-only` rootfs, `--cap-drop ALL`, `no-new-privileges`.
   Dedicated bridge `heg-preview` (NOT `--internal` — Docker silently drops
   published ports on internal networks, verified) with
   `enable_ip_masquerade=false` (egress block on Linux; inert on Docker
   Desktop). Port publishes on `127.0.0.1` ephemeral only — no LAN exposure.
+- **Desktop posture** (`_spawn_desktop` — executes candidate code, so
+  stricter): the runner sits alone on `--internal` `heg-desktop` (zero
+  egress, zero published ports, only peer = its own proxy) with
+  `--cpus`/`--memory`/`--pids-limit` bounds (`PREVIEW_DESKTOP_*` defaults
+  1 / 512m / 256), cap-drop ALL, no-new-privileges, nobody. A pinned
+  `alpine/socat:1.8.1.3` sidecar (`heg.preview_role=proxy`) straddles
+  `heg-desktop` + `heg-preview` — a dumb TCP pipe publishing `127.0.0.1`
+  port → runner's websockify `:6080` (noVNC UI at `/vnc.html`). The runner
+  image `heg-preview-desktop` (`sandbox/images/desktop-preview.Dockerfile`,
+  repo-root build context) bundles TigerVNC Xvnc + novnc + websockify +
+  pygame-ce; candidate deps beyond pygame can't install (no egress) — the
+  app fails at import and the runner exits visibly. Artifact is mounted
+  `:ro` then copied to writable `/work` (games may save state).
 - **Registry = docker labels** (`heg.preview*`) — `list()`/`get` rebuild
   state via `docker inspect`, so api restarts lose nothing; expiry rides a
-  label so the reaper works out-of-process. TTL `PREVIEW_TTL_SECONDS`
-  (default 900) enforced by an asyncio reaper started in the FastAPI
-  lifespan (`PREVIEW_REAP_SECONDS`, default 30s).
+  label so the reaper works out-of-process. Runner + proxy share
+  `heg.preview_id`; `heg.preview_role` distinguishes them and `stop()`
+  removes every labeled container. TTL `PREVIEW_TTL_SECONDS` (default 900)
+  enforced by an asyncio reaper (`PREVIEW_REAP_SECONDS`, default 30s).
 - **Jail:** `resolve_workspace_dir` reuses the download-jail rule —
   `artifact_path` or `<ARTIFACT_ROOT>/<run>/<sandbox>` must resolve inside
   `ARTIFACT_ROOT`, and `workspace` must not be a symlink escaping it.
 - **Where:** `sandbox/preview.py`, `api/routers/preview.py` (+ reaper),
   `api/config.py` (`PREVIEW_*`), `api/routers/results.py` (previewable flag),
+  `sandbox/images/desktop-preview.Dockerfile` +
+  `desktop-preview-entrypoint.sh`,
   `web/lib/api.ts` (`getPreview`/`startPreview`/`stopPreview`, `PreviewOut`),
   `web/app/runs/[id]/results/PreviewControls.tsx`
 - **Verify:**
-  - Unit: `tests/unit/sandbox/test_preview.py` (detection shapes, jail,
-    manager via stubbed docker) + `tests/unit/api/test_preview.py`
-    (lifecycle, reuse/replace, 404/422/502, jail 404, checkpoint events,
-    results flag)
+  - Unit: `tests/unit/sandbox/test_preview.py` (static + desktop detection
+    shapes, jail, manager via stubbed docker — runner/proxy args, role
+    labels, stop-all) + `tests/unit/api/test_preview.py` (lifecycle,
+    reuse/replace, 404/422/502, desktop POST, checkpoint events)
   - Docker: `tests/integration/test_preview.py` (`@pytest.mark.docker` —
-    real spawn → HTTP 200 + asset, localhost-only binding, reaper)
-  - Manual: results page → "Preview" → game opens in new tab; "■ stop";
-    container auto-removed after TTL (`docker ps -a --filter
-    label=heg.preview=1`)
+    static spawn → HTTP 200, localhost-only binding, reaper; desktop spawn
+    builds `heg-preview-desktop` once per session → real pygame executes
+    (PYGAME_OK in logs), runner on internal net with limits, sidecar
+    publishes localhost:6080, vnc.html 200, both containers cleaned)
+  - Manual: results page → "Preview" on a pygame artifact → noVNC desktop
+    opens in new tab; "■ stop". Build image first:
+    `docker build -f sandbox/images/desktop-preview.Dockerfile -t
+    heg-preview-desktop:latest .`
+  - Note: `previewable`/`preview_type` probe runs per-sandbox on every
+    results GET — fine at MVP scale; could be cached later if results
+    pages grow large.
 - **Depends on:** F4 (runtime plumbing/host-path translation), F8 (results
   page + artifact store layout)
 

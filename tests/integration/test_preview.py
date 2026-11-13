@@ -191,3 +191,144 @@ def test_reap_expired_removes_container(
     finally:
         manager.stop(preview.preview_id)  # belt: tolerate already-removed
         shutil.rmtree(artifact_ws["jail"], ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# desktop previews (executes candidate code — internal net + socat sidecar)
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DESKTOP_IMAGE = "heg-preview-desktop:latest"
+PROXY_IMAGE = "alpine/socat:1.8.1.3"
+DESKTOP_DOCKERFILE = REPO_ROOT / "sandbox/images/desktop-preview.Dockerfile"
+
+_PYGAME_APP = """\
+import os, time
+os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+import pygame
+pygame.init()
+screen = pygame.display.set_mode((320, 240))
+screen.fill((20, 120, 60))
+print("PYGAME_OK", flush=True)
+end = time.time() + 45
+while time.time() < end:
+    for e in pygame.event.get():
+        pass
+    pygame.display.flip()
+    time.sleep(0.05)
+"""
+
+
+@pytest.fixture(scope="session")
+def desktop_image() -> str:
+    """Build heg-preview-desktop once per test session (daemon caches layers).
+
+    First build is heavy (apt tigervnc/novnc + pip websockify/pygame-ce);
+    subsequent runs hit the layer cache. If your daemon lacks buildkit/network
+    for the build, `docker build` manually:
+      docker build -f sandbox/images/desktop-preview.Dockerfile \\
+          -t heg-preview-desktop:latest .
+    """
+    if _docker("image", "inspect", DESKTOP_IMAGE).returncode != 0:
+        proc = subprocess.run(
+            [
+                "docker",
+                "build",
+                "-f",
+                str(DESKTOP_DOCKERFILE),
+                "-t",
+                DESKTOP_IMAGE,
+                str(REPO_ROOT),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+        if proc.returncode != 0:
+            pytest.fail(
+                f"failed to build {DESKTOP_IMAGE}:\n{proc.stderr[-3000:]}"
+            )
+    if _docker("image", "inspect", PROXY_IMAGE).returncode != 0:
+        proc = _docker("pull", PROXY_IMAGE)
+        if proc.returncode != 0:
+            pytest.fail(f"failed to pull {PROXY_IMAGE}:\n{proc.stderr[-2000:]}")
+    return DESKTOP_IMAGE
+
+
+def _wait_log_marker(container: str, marker: str, seconds: float = 30) -> str:
+    deadline = time.monotonic() + seconds
+    logs = ""
+    while time.monotonic() < deadline:
+        proc = _docker("logs", container)
+        logs = proc.stdout + proc.stderr  # app tracebacks land on stderr
+        if marker in logs:
+            return logs
+        info = json.loads(_docker("inspect", container).stdout)[0]
+        if info["State"]["Status"] == "exited":
+            return logs
+        time.sleep(0.5)
+    return logs
+
+
+def test_desktop_preview_pygame(
+    manager: PreviewManager, desktop_image: str, tmp_path: Path
+) -> None:
+    """Runner on --internal net executes a pygame app; socat sidecar serves noVNC."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "main.py").write_text(_PYGAME_APP)
+
+    plan = detect_preview(ws)
+    assert plan is not None and plan.type == "desktop" and plan.entry == "main.py"
+
+    preview = manager.spawn(
+        run_id="r",
+        sandbox_id="s",
+        serve_dir=ws,
+        plan=plan,
+        ttl_seconds=300,
+    )
+    try:
+        assert preview.type == "desktop" and preview.port is not None
+        assert preview.url is not None and "/vnc.html" in preview.url
+
+        # Runner: internal net only, no published ports, resource bounds.
+        info = json.loads(_docker("inspect", preview.container).stdout)[0]
+        nets = set(info["NetworkSettings"]["Networks"])
+        assert nets == {"heg-desktop"}
+        assert not (info["NetworkSettings"]["Ports"] or {}), (
+            "runner must not publish ports — the proxy does"
+        )
+        host = info["HostConfig"]
+        assert host["NanoCpus"] == 1_000_000_000  # --cpus 1
+        assert host["Memory"] == 512 * 1024 * 1024
+        assert host["PidsLimit"] == 256
+        desk = json.loads(_docker("network", "inspect", "heg-desktop").stdout)[0]
+        assert desk["Internal"] is True
+
+        # Proxy: straddles both nets, port bound to localhost only.
+        proxy = json.loads(
+            _docker("inspect", f"{preview.container}-proxy").stdout
+        )[0]
+        assert set(proxy["NetworkSettings"]["Networks"]) == {
+            PREVIEW_NETWORK,
+            "heg-desktop",
+        }
+        bindings = proxy["NetworkSettings"]["Ports"]["6080/tcp"]
+        assert {b["HostIp"] for b in bindings} == {"127.0.0.1"}
+
+        # The app actually ran — candidate code executed under Xvnc.
+        logs = _wait_log_marker(preview.container, "PYGAME_OK")
+        assert "PYGAME_OK" in logs
+
+        # noVNC web UI reachable through the sidecar.
+        code, body = _wait_http(preview.url)
+        assert code == 200, f"noVNC page returned {code}: {body[:200]}"
+    finally:
+        assert manager.stop(preview.preview_id)
+    # BOTH containers gone — no orphaned proxy.
+    assert manager.get(preview.preview_id) is None
+    assert (
+        _docker("inspect", f"{preview.container}-proxy").returncode != 0
+    )

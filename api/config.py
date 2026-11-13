@@ -78,6 +78,17 @@ class Settings(BaseSettings):
     PREVIEW_REAP_SECONDS: float = 30.0
     # Published-port bind address — localhost only; previews are not LAN-visible.
     PREVIEW_BIND_HOST: str = "127.0.0.1"
+    # --- Desktop previews (executes candidate code — pygame via noVNC) ---
+    # Runner image: repo-built, TigerVNC + noVNC/websockify + pygame-ce.
+    PREVIEW_DESKTOP_IMAGE: str = "heg-preview-desktop:latest"
+    # Sidecar that publishes the runner's noVNC port (dumb TCP pipe).
+    PREVIEW_PROXY_IMAGE: str = "alpine/socat:1.8.1.3"
+    # Internal net for desktop runners — zero egress; only peer = own proxy.
+    PREVIEW_DESKTOP_NETWORK: str = "heg-desktop"
+    # Resource bounds on executed candidate code.
+    PREVIEW_DESKTOP_CPUS: str = "1"
+    PREVIEW_DESKTOP_MEMORY: str = "512m"
+    PREVIEW_DESKTOP_PIDS: int = 256
 
     LOG_LEVEL: str = "INFO"
 

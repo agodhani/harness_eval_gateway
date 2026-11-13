@@ -18,6 +18,9 @@ import pytest
 
 from sandbox.preview import (
     CONTAINER_PORT,
+    DESKTOP_ARTIFACT_ROOT,
+    DESKTOP_CONTAINER_PORT,
+    DESKTOP_NETWORK,
     PREVIEW_NETWORK,
     SERVE_ROOT,
     Preview,
@@ -101,6 +104,85 @@ def test_detect_ignores_symlinked_dir(tmp_path: Path, tmp_path_factory) -> None:
     outside = tmp_path_factory.mktemp("outside")
     (outside / "index.html").write_text("outside")
     (tmp_path / "site").symlink_to(outside, target_is_directory=True)
+    assert detect_preview(tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# detect_preview — desktop (pygame) workspaces
+# ---------------------------------------------------------------------------
+
+
+def test_detect_desktop_main_py_imports_pygame(tmp_path: Path) -> None:
+    (tmp_path / "main.py").write_text("import pygame\npygame.init()\n")
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="desktop", entry="main.py")
+
+
+def test_detect_desktop_from_pygame(tmp_path: Path) -> None:
+    (tmp_path / "game.py").write_text("from pygame import sprite\n")
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="desktop", entry="game.py")
+
+
+def test_detect_desktop_single_py(tmp_path: Path) -> None:
+    (tmp_path / "thing.py").write_text("import pygame\n")
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="desktop", entry="thing.py")
+
+
+def test_detect_desktop_requirements_evidence(tmp_path: Path) -> None:
+    """requirements.txt mentioning pygame-ce counts even without an import."""
+    (tmp_path / "main.py").write_text("import engine\n")  # thin launcher
+    (tmp_path / "requirements.txt").write_text("pygame-ce==2.5.3\n")
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="desktop", entry="main.py")
+
+
+def test_detect_desktop_evidence_in_sibling_py(tmp_path: Path) -> None:
+    """Entry needn't import pygame itself — any root .py counts."""
+    (tmp_path / "main.py").write_text("import engine\n")
+    (tmp_path / "engine.py").write_text("import pygame\n")
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="desktop", entry="main.py")
+
+
+def test_detect_desktop_no_evidence(tmp_path: Path) -> None:
+    """A bare main.py is NOT executed — fail safe on missing pygame signal."""
+    (tmp_path / "main.py").write_text("print('hi')\n")
+    assert detect_preview(tmp_path) is None
+
+
+def test_detect_desktop_no_entry(tmp_path: Path) -> None:
+    """Pygame evidence without an unambiguous entry → not previewable."""
+    (tmp_path / "engine.py").write_text("import pygame\n")
+    (tmp_path / "sprites.py").write_text("import pygame\n")
+    assert detect_preview(tmp_path) is None
+
+
+def test_detect_desktop_comment_does_not_count(tmp_path: Path) -> None:
+    (tmp_path / "main.py").write_text("# import pygame  # was used before\n")
+    assert detect_preview(tmp_path) is None
+
+
+def test_detect_desktop_symlinked_entry(tmp_path: Path, tmp_path_factory) -> None:
+    outside = tmp_path_factory.mktemp("outside")
+    (outside / "main.py").write_text("import pygame\n")
+    (tmp_path / "main.py").symlink_to(outside / "main.py")
+    assert detect_preview(tmp_path) is None
+
+
+def test_detect_static_wins_over_desktop(tmp_path: Path) -> None:
+    """index.html + main.py → static (safe default, no guessing/executing)."""
+    (tmp_path / "index.html").write_text("<h1>x</h1>")
+    (tmp_path / "main.py").write_text("import pygame\n")
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="static", entry="index.html")
+
+
+def test_detect_desktop_nested_py_not_found(tmp_path: Path) -> None:
+    """Nested entry points aren't auto-detected (root-level only)."""
+    (tmp_path / "game").mkdir()
+    (tmp_path / "game" / "main.py").write_text("import pygame\n")
     assert detect_preview(tmp_path) is None
 
 
@@ -192,10 +274,18 @@ class FakeRuntime:
     ) -> None:
         self.calls: list[list[str]] = []
         self.inspect_rows = inspect_rows or []
+        # inspect routing by container id — needed when runner + proxy differ
+        self.rows_by_id: dict[str, dict] = {}
         self.ps_ids: list[str] = []
+        self.proxy_ps_ids: list[str] = []  # ps filtered on heg.preview_role=proxy
+        # per-preview_id ps routing: {pid: [ids]} — falls back to ps_ids
+        self.ps_by_preview_id: dict[str, list[str]] = {}
         self.run_container_id = "cid123"
         self.networks: set[str] = set()
+        self.images: set[str] = set()
         self.internal = internal
+        self.run_calls = 0
+        self.fail_run_at: int | None = None  # raise on the Nth `docker run`
 
     def to_host_path(self, path: str | Path) -> Path:
         return Path(path)
@@ -214,12 +304,43 @@ class FakeRuntime:
             out = json.dumps([{"Internal": self.internal}]) if rc == 0 else ""
         elif args[:2] == ["network", "create"]:
             self.networks.add(args[-1])
+        elif args[:2] == ["network", "connect"]:
+            pass
+        elif args[:2] == ["image", "inspect"]:
+            rc = 0 if args[2] in self.images else 1
         elif args[:2] == ["ps", "-aq"]:
-            out = "\n".join(self.ps_ids)
+            filters = [args[i + 1] for i, a in enumerate(args) if a == "--filter"]
+            if any("heg.preview_role=proxy" in f for f in filters):
+                out = "\n".join(self.proxy_ps_ids)
+            elif any(f.startswith("name=") for f in filters):
+                out = ""  # name-collision probe — fresh names never exist
+            else:
+                pid_filter = next(
+                    (
+                        f.removeprefix("label=heg.preview_id=")
+                        for f in filters
+                        if f.startswith("label=heg.preview_id=")
+                    ),
+                    None,
+                )
+                if pid_filter is not None and pid_filter in self.ps_by_preview_id:
+                    out = "\n".join(self.ps_by_preview_id[pid_filter])
+                else:
+                    out = "\n".join(self.ps_ids)
         elif args[0] == "inspect" and len(args) > 1:
-            out = json.dumps(self.inspect_rows)
+            if self.rows_by_id:
+                out = json.dumps(
+                    [self.rows_by_id[i] for i in args[1:] if i in self.rows_by_id]
+                )
+            else:
+                out = json.dumps(self.inspect_rows)
         elif args[0] == "run":
-            out = self.run_container_id + "\n"
+            self.run_calls += 1
+            if self.fail_run_at is not None and self.run_calls == self.fail_run_at:
+                rc = 1
+                err = "simulated run failure"
+            else:
+                out = self.run_container_id + "\n"
         elif args[0] == "rm":
             pass
         if check and rc != 0:
@@ -304,6 +425,7 @@ def test_spawn_args_and_preview(tmp_path: Path) -> None:
     fake = FakeRuntime(
         inspect_rows=[_inspect_row(labels=_labels())]
     )
+    fake.ps_ids = ["cid123"]  # label query finds the just-spawned container
     mgr = _manager(fake, image="img:test", bind_host="127.0.0.1", ttl_seconds=60)
     preview = mgr.spawn(
         run_id="r1",
@@ -343,7 +465,7 @@ def test_spawn_rejects_unknown_type(tmp_path: Path) -> None:
             run_id="r1",
             sandbox_id="s1",
             serve_dir=tmp_path,
-            plan=PreviewPlan(type="desktop", entry="main.py"),
+            plan=PreviewPlan(type="python-server", entry="app.py"),
         )
     assert not [c for c in fake.calls if c[0] == "run"]
 
@@ -448,6 +570,9 @@ def test_reap_expired_only_removes_past_ttl() -> None:
         ]
     )
     fake.ps_ids = ["old", "new"]
+    # stop(PID_OLD) queries by preview_id label — only "old" matches.
+    fake.ps_by_preview_id[PID_OLD] = ["old"]
+    fake.ps_by_preview_id[PID_NEW] = ["new"]
     mgr = _manager(fake)
     removed = mgr.reap_expired()
     assert removed == 1
@@ -491,3 +616,181 @@ def test_preview_dataclass_live_property() -> None:
     }
     assert Preview(status="running", **base).live
     assert not Preview(status="exited", **base).live
+
+
+# ---------------------------------------------------------------------------
+# PreviewManager — desktop spawn (runner on internal net + socat sidecar)
+# ---------------------------------------------------------------------------
+
+PID_DESK = "55555555-5555-5555-5555-555555555555"
+
+
+def _desktop_fake() -> FakeRuntime:
+    """Runner row (no published port) + proxy row (publishes 6080)."""
+    runner = _inspect_row(
+        container_id="cid123",
+        name="/heg-prev-dead",
+        port=None,
+        labels=_labels(
+            **{
+                "heg.preview_id": PID_DESK,
+                "heg.preview_type": "desktop",
+                "heg.preview_entry": "main.py",
+                "heg.preview_role": "runner",
+            }
+        ),
+    )
+    proxy = _inspect_row(
+        container_id="cidproxy",
+        name="/heg-prev-dead-proxy",
+        port=None,
+        labels=_labels(
+            **{
+                "heg.preview_id": PID_DESK,
+                "heg.preview_type": "desktop",
+                "heg.preview_role": "proxy",
+            }
+        ),
+    )
+    proxy["NetworkSettings"] = {
+        "Ports": {
+            f"{DESKTOP_CONTAINER_PORT}/tcp": [
+                {"HostIp": "127.0.0.1", "HostPort": "49555"}
+            ]
+        }
+    }
+    fake = FakeRuntime()
+    fake.rows_by_id = {"cid123": runner, "cidproxy": proxy}
+    fake.ps_ids = ["cid123", "cidproxy"]  # both share the preview_id label
+    fake.proxy_ps_ids = ["cidproxy"]
+    fake.images.add("heg-preview-desktop:latest")
+    return fake
+
+
+def test_spawn_desktop_runner_args(tmp_path: Path) -> None:
+    fake = _desktop_fake()
+    mgr = _manager(
+        fake,
+        desktop_cpus="1.5",
+        desktop_memory="256m",
+        desktop_pids=64,
+    )
+    mgr.spawn(
+        run_id="r1",
+        sandbox_id="s1",
+        serve_dir=tmp_path,
+        plan=PreviewPlan(type="desktop", entry="main.py"),
+    )
+    runs = [c for c in fake.calls if c[0] == "run"]
+    assert len(runs) == 2
+    runner, proxy = runs[0], runs[1]
+
+    # Runner: internal net, NO published port, resource bounds, :ro mount.
+    assert runner[runner.index("--network") + 1] == DESKTOP_NETWORK
+    assert "-p" not in runner
+    assert runner[runner.index("--cpus") + 1] == "1.5"
+    assert runner[runner.index("--memory") + 1] == "256m"
+    assert runner[runner.index("--pids-limit") + 1] == "64"
+    assert runner[runner.index("-v") + 1] == f"{tmp_path}:{DESKTOP_ARTIFACT_ROOT}:ro"
+    envs = [runner[i + 1] for i, v in enumerate(runner) if v == "-e"]
+    assert "APP_ENTRY=main.py" in envs
+    for flag in ("--cap-drop", "--security-opt", "--user"):
+        assert flag in runner
+    labels = [runner[i + 1] for i, v in enumerate(runner) if v == "--label"]
+    assert "heg.preview_role=runner" in labels
+    assert "heg.preview_type=desktop" in labels
+    assert "heg-preview-desktop:latest" in runner
+
+    # Internal network ensured (--internal create).
+    connect = next(c for c in fake.calls if c[:2] == ["network", "connect"])
+    assert connect[2] == DESKTOP_NETWORK
+    creates = [c for c in fake.calls if c[:2] == ["network", "create"]]
+    desk_create = next(c for c in creates if DESKTOP_NETWORK in c)
+    assert "--internal" in desk_create
+
+    # Proxy: publishable net + socat pipe args, proxy role label.
+    assert proxy[proxy.index("--network") + 1] == PREVIEW_NETWORK
+    assert proxy[proxy.index("-p") + 1] == f"127.0.0.1::{DESKTOP_CONTAINER_PORT}"
+    assert "alpine/socat:1.8.1.3" in proxy
+    tail = proxy[proxy.index("alpine/socat:1.8.1.3") :]
+    assert f"TCP-LISTEN:{DESKTOP_CONTAINER_PORT},fork,reuseaddr" in tail
+    assert tail[-1].startswith("TCP:heg-prev-") and tail[-1].endswith(":6080")
+    plabels = [proxy[i + 1] for i, v in enumerate(proxy) if v == "--label"]
+    assert "heg.preview_role=proxy" in plabels
+
+
+def test_spawn_desktop_resolves_port_and_url(tmp_path: Path) -> None:
+    fake = _desktop_fake()
+    preview = _manager(fake).spawn(
+        run_id="r1",
+        sandbox_id="s1",
+        serve_dir=tmp_path,
+        plan=PreviewPlan(type="desktop", entry="main.py"),
+    )
+    assert preview.type == "desktop"
+    assert preview.port == 49555
+    assert preview.url == "http://localhost:49555/vnc.html?autoconnect=true&resize=scale"
+    assert preview.live
+
+
+def test_spawn_desktop_missing_image(tmp_path: Path) -> None:
+    fake = FakeRuntime()  # no images
+    mgr = _manager(fake)
+    with pytest.raises(RuntimeError, match="not found"):
+        mgr.spawn(
+            run_id="r1",
+            sandbox_id="s1",
+            serve_dir=tmp_path,
+            plan=PreviewPlan(type="desktop", entry="main.py"),
+        )
+    assert not [c for c in fake.calls if c[0] == "run"]
+
+
+def test_spawn_desktop_proxy_failure_cleans_runner(tmp_path: Path) -> None:
+    fake = _desktop_fake()
+    fake.fail_run_at = 2  # runner runs, proxy fails
+    mgr = _manager(fake)
+    with pytest.raises(RuntimeError):
+        mgr.spawn(
+            run_id="r1",
+            sandbox_id="s1",
+            serve_dir=tmp_path,
+            plan=PreviewPlan(type="desktop", entry="main.py"),
+        )
+    rm = next(c for c in fake.calls if c[0] == "rm")
+    assert rm[:2] == ["rm", "-f"]
+    assert len(rm) == 4  # runner + proxy names
+
+
+def test_row_to_preview_skips_proxy_rows() -> None:
+    proxy = _inspect_row(
+        labels=_labels(**{"heg.preview_role": "proxy", "heg.preview_id": PID_DESK})
+    )
+    fake = FakeRuntime(inspect_rows=[proxy])
+    fake.ps_ids = ["x"]
+    assert _manager(fake).list() == []
+
+
+def test_get_desktop_preview_inspects_both_ids() -> None:
+    fake = _desktop_fake()
+    fake.ps_ids = ["cid123", "cidproxy"]  # runner + proxy under one preview_id
+    preview = _manager(fake).get(PID_DESK)
+    assert preview is not None
+    assert preview.type == "desktop" and preview.port == 49555
+
+
+def test_stop_removes_all_labeled_containers() -> None:
+    fake = FakeRuntime()
+    fake.ps_ids = ["runner", "proxy"]
+    assert _manager(fake).stop("pid") is True
+    rm = next(c for c in fake.calls if c[0] == "rm")
+    assert rm == ["rm", "-f", "runner", "proxy"]
+
+
+def test_desktop_url_shape() -> None:
+    from sandbox.preview import _preview_url
+
+    assert (
+        _preview_url(9999, "main.py", "desktop")
+        == "http://localhost:9999/vnc.html?autoconnect=true&resize=scale"
+    )

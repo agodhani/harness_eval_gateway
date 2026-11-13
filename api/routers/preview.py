@@ -14,9 +14,11 @@ restart of the api loses nothing; ``start_reaper`` (wired into the FastAPI
 lifespan) enforces the TTL for expired/orphaned containers.
 
 Extensibility: ``PreviewOut.type`` mirrors :class:`sandbox.preview.PreviewPlan`.
-``static`` is the only spawner today; ``python-server``/``desktop`` (pygame via
-noVNC) plug into ``PreviewManager.spawn`` + ``detect_preview`` later without
-changing this contract.
+Implemented spawners: ``static`` (http.server) and ``desktop`` (pygame executed
+under Xvnc, streamed via noVNC through a socat sidecar — the runner sits on an
+``--internal`` net with zero egress). ``python-server`` plugs into
+``PreviewManager.spawn`` + ``detect_preview`` later without changing this
+contract.
 """
 
 from __future__ import annotations
@@ -60,7 +62,7 @@ class PreviewOut(BaseModel):
     preview_id: UUID
     run_id: UUID
     sandbox_id: UUID
-    type: str  # "static" today; future: python-server, desktop
+    type: str  # static | desktop; future: python-server
     status: str  # docker container status: created|running|exited|...
     url: str | None = None
     entry: str | None = None
@@ -102,6 +104,12 @@ def get_preview_manager() -> PreviewManager:
             network=settings.PREVIEW_NETWORK,
             bind_host=settings.PREVIEW_BIND_HOST,
             ttl_seconds=settings.PREVIEW_TTL_SECONDS,
+            desktop_image=settings.PREVIEW_DESKTOP_IMAGE,
+            proxy_image=settings.PREVIEW_PROXY_IMAGE,
+            desktop_network=settings.PREVIEW_DESKTOP_NETWORK,
+            desktop_cpus=settings.PREVIEW_DESKTOP_CPUS,
+            desktop_memory=settings.PREVIEW_DESKTOP_MEMORY,
+            desktop_pids=settings.PREVIEW_DESKTOP_PIDS,
         )
     return _manager
 
@@ -211,8 +219,9 @@ async def start_preview(run_id: UUID, sandbox_id: UUID, session: DbSession) -> P
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=(
                 "no previewable artifact: expected index.html at the workspace "
-                "root, a single root-level .html file, or a unique */index.html "
-                "one level down"
+                "root, a single root-level .html file, a unique */index.html "
+                "one level down, or a pygame app (unambiguous root .py entry "
+                "with pygame evidence)"
             ),
         )
 
@@ -224,6 +233,10 @@ async def start_preview(run_id: UUID, sandbox_id: UUID, session: DbSession) -> P
             serve_dir=workspace,
             plan=plan,
         )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

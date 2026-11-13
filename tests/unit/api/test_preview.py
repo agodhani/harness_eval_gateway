@@ -71,6 +71,11 @@ class FakeManager:
         self.spawn_calls.append(kw)
         if self.spawn_error is not None:
             raise self.spawn_error
+        url = (
+            "http://localhost:49321/vnc.html?autoconnect=true&resize=scale"
+            if kw["plan"].type == "desktop"
+            else "http://localhost:49321/"
+        )
         preview = Preview(
             preview_id=str(uuid.uuid4()),
             run_id=kw["run_id"],
@@ -80,7 +85,7 @@ class FakeManager:
             status="running",
             port=49321,
             entry=kw["plan"].entry,
-            url="http://localhost:49321/",
+            url=url,
             created_at=datetime.now(UTC),
             expires_at=datetime.now(UTC),
         )
@@ -232,6 +237,27 @@ def test_start_preview_ambiguous_html(
     assert resp.status_code == 422
 
 
+def test_start_preview_desktop(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """Pygame evidence + unambiguous entry → type=desktop, noVNC url."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {"main.py": "import pygame\npygame.init()\n", "requirements.txt": "pygame-ce\n"},
+    )
+    resp = client.post(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["type"] == "desktop"
+    assert body["entry"] == "main.py"
+    assert "/vnc.html" in (body["url"] or "")
+    kw = fake_manager.spawn_calls[0]
+    assert kw["plan"].type == "desktop"
+    assert kw["plan"].entry == "main.py"
+
+
 def test_start_preview_spawn_failure(
     client: TestClient, run, artifact_root, fake_manager: FakeManager
 ) -> None:
@@ -240,6 +266,17 @@ def test_start_preview_spawn_failure(
     resp = client.post(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
     assert resp.status_code == 502
     assert "docker daemon unreachable" in resp.json()["detail"]
+
+
+def test_start_preview_spawn_unsupported_type(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """A plan type the manager can't spawn → 422 (not 502)."""
+    _workspace(artifact_root, run["run_id"], run["sb1"], {"index.html": "x"})
+    fake_manager.spawn_error = ValueError("unsupported preview type 'future'")
+    resp = client.post(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
+    assert resp.status_code == 422
+    assert "unsupported preview type" in resp.json()["detail"]
 
 
 def test_start_preview_404s(

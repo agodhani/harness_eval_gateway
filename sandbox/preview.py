@@ -8,27 +8,40 @@ auto-stops containers after ``PREVIEW_TTL_SECONDS`` (default 15 min).
 Design notes:
 
 - **Preview types.** ``detect_preview`` returns a :class:`PreviewPlan` whose
-  ``type`` selects the serving strategy. Only ``"static"`` is implemented
-  (``python -m http.server``); the plan/label/API shape deliberately leaves
-  room for ``python-server`` / ``desktop`` (pygame via noVNC — post-checkpoint).
-- **Network isolation.** Preview containers join a dedicated bridge network
-  ``heg-preview`` — *not* ``heg-sandbox`` (which has the gateway attached).
-  Docker cannot publish ports on ``--internal`` networks (the binding is
-  silently dropped — verified: ``docker inspect`` shows ``{"8000/tcp":[]}``),
-  so "internal net + reachable port" is impossible; the chosen posture is a
-  dedicated bridge with the port bound to ``127.0.0.1`` (host-local only) and
-  ``enable_ip_masquerade=false`` (blocks outbound NAT on Linux; inert on
-  Docker Desktop). The hardening flags carry the weight: nobody user,
-  read-only rootfs, cap-drop ALL, no-new-privileges, and a pinned image
-  running ``http.server`` — no candidate code executes inside the container.
+  ``type`` selects the serving strategy. ``"static"`` serves
+  ``python -m http.server``; ``"desktop"`` executes the artifact (pygame —
+  see ``_detect_desktop`` for the conservative heuristic) on a virtual
+  display streamed via noVNC. The plan/label/API shape leaves room for
+  ``python-server`` etc.
+- **Static network posture.** Static preview containers join a dedicated
+  bridge network ``heg-preview`` — *not* ``heg-sandbox`` (which has the
+  gateway attached). Docker cannot publish ports on ``--internal`` networks
+  (the binding is silently dropped — verified: ``docker inspect`` shows
+  ``{"8000/tcp":[]}``), so "internal net + reachable port" is impossible;
+  the chosen posture is a dedicated bridge with the port bound to
+  ``127.0.0.1`` (host-local only) and ``enable_ip_masquerade=false`` (blocks
+  outbound NAT on Linux; inert on Docker Desktop). The hardening flags carry
+  the weight: nobody user, read-only rootfs, cap-drop ALL, no-new-privileges,
+  and a pinned image running ``http.server`` — no candidate code executes.
+- **Desktop isolation.** Desktop previews *execute* candidate code, so the
+  posture is stricter: the runner sits alone on a dedicated ``--internal``
+  network ``heg-desktop`` (zero egress, zero published ports, only peer =
+  its own proxy) with ``--cpus``/``--memory``/``--pids-limit`` bounds. A
+  pinned ``alpine/socat`` sidecar — a dumb TCP pipe, nothing for the artifact
+  to exploit — straddles ``heg-desktop`` + ``heg-preview`` and publishes the
+  noVNC port on localhost. The api-side alternative was rejected: it would
+  require the api to join the runner's network (giving candidate code a path
+  to the control plane) and hand-roll websocket proxying.
 - **Jail.** ``resolve_workspace_dir`` reuses the download-jail pattern from
   ``api/routers/results.py``: the served directory must resolve inside
   ``ARTIFACT_ROOT`` — ``..`` escapes and symlinked ``workspace`` dirs that
   resolve outside are rejected. The artifact dir is bind-mounted read-only.
 - **Registry = docker labels.** Every preview container carries
-  ``heg.preview=1`` + id/run/sandbox/type/entry/expiry labels, so a restart
-  of the api loses nothing: ``list()`` rebuilds state from ``docker inspect``
-  and the reaper still enforces expiry written on the container itself.
+  ``heg.preview=1`` + id/run/sandbox/type/entry/expiry/role labels, so a
+  restart of the api loses nothing: ``list()`` rebuilds state from
+  ``docker inspect`` and the reaper still enforces expiry written on the
+  container itself. Runner and proxy share ``heg.preview_id``; the
+  ``heg.preview_role`` label distinguishes them.
 - Sync like :class:`sandbox.runtime.SandboxRuntime` (docker CLI is sync);
   the api wraps calls in ``asyncio.to_thread``.
 """
@@ -38,6 +51,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -58,6 +72,20 @@ DEFAULT_TTL_SECONDS = 900.0
 CONTAINER_PORT = 8000
 SERVE_ROOT = "/srv/artifact"
 
+# --- desktop previews (pygame etc. — executes candidate code) ---------------
+# The RUNNER container goes on a dedicated --internal network: zero egress,
+# zero reachable peers except its own proxy sidecar (the only way in). The
+# proxy straddles heg-desktop + heg-preview (the bridge that can publish a
+# localhost port) and is a dumb TCP pipe — alpine/socat, no HTTP parsing.
+DESKTOP_NETWORK = "heg-desktop"
+DEFAULT_DESKTOP_IMAGE = "heg-preview-desktop:latest"
+DEFAULT_PROXY_IMAGE = "alpine/socat:1.8.1.3"
+DESKTOP_CONTAINER_PORT = 6080  # websockify (noVNC web + ws) inside the runner
+DESKTOP_ARTIFACT_ROOT = "/srv/artifact-ro"  # :ro mount; entrypoint copies to /work
+DEFAULT_DESKTOP_CPUS = "1"
+DEFAULT_DESKTOP_MEMORY = "512m"
+DEFAULT_DESKTOP_PIDS = 256
+
 # Labels — ``heg.preview`` marks manager ownership; the rest rebuild Preview
 # state after an api restart (and let the reaper enforce TTL out-of-process).
 LABEL_MANAGED = "heg.preview"
@@ -67,12 +95,25 @@ LABEL_SANDBOX_ID = "heg.sandbox_id"
 LABEL_TYPE = "heg.preview_type"
 LABEL_ENTRY = "heg.preview_entry"
 LABEL_EXPIRES_AT = "heg.preview_expires_at"  # epoch seconds
+# runner = the container doing the work (http.server / the app); proxy = the
+# desktop sidecar that publishes the port. Containers without the label
+# (pre-role previews) count as runners.
+LABEL_ROLE = "heg.preview_role"
+ROLE_RUNNER = "runner"
+ROLE_PROXY = "proxy"
 
 #: Container statuses where the preview is (or will shortly be) serving.
 LIVE_STATUSES = frozenset({"created", "running", "restarting", "paused"})
 
 _HTML_SUFFIXES = frozenset({".html", ".htm"})
 _INDEX_NAMES = frozenset({"index.html", "index.htm"})
+
+# Desktop detection: unambiguous root entry point AND explicit pygame
+# evidence (requirements.txt mention or an `import pygame` in a root .py).
+_DESKTOP_ENTRY_NAMES = ("main.py", "app.py", "game.py", "run.py")
+_PYGAME_REQ_RE = re.compile(r"pygame(?:-ce)?", re.IGNORECASE)
+_PYGAME_IMPORT_RE = re.compile(r"^\s*(?:import|from)\s+pygame\b", re.MULTILINE)
+_READ_CAP = 512 * 1024  # only the head of a file is scanned for evidence
 
 
 @dataclass(frozen=True)
@@ -81,9 +122,10 @@ class PreviewPlan:
 
     ``type == "static"`` → serve the whole workspace dir over HTTP; ``entry``
     is the docroot-relative entry point (``"index.html"``, ``"game.html"``,
-    ``"dist/index.html"``). Future types (``python-server``, ``desktop``)
-    extend this rather than the API shape — ``PreviewOut`` already carries
-    ``type``/``url``/``entry``.
+    ``"dist/index.html"``). ``type == "desktop"`` → execute ``entry`` (a
+    root-level ``.py``) on a virtual display streamed via noVNC. Future
+    types (``python-server``) extend this rather than the API shape —
+    ``PreviewOut`` already carries ``type``/``url``/``entry``.
     """
 
     type: str
@@ -178,7 +220,7 @@ def _html_files(dirpath: Path) -> list[Path]:
     ]
 
 
-def detect_preview(workspace: Path) -> PreviewPlan | None:
+def _detect_static(workspace: Path) -> PreviewPlan | None:
     """Find an unambiguous static entry point in a snapshot workspace.
 
     Order (first match wins):
@@ -193,9 +235,6 @@ def detect_preview(workspace: Path) -> PreviewPlan | None:
     could plant a symlink escaping the jail, and the jail check has already
     happened by this point.
     """
-    if not workspace.is_dir():
-        return None
-
     root_html = _html_files(workspace)
     for p in root_html:
         if p.name.lower() in _INDEX_NAMES:
@@ -220,10 +259,87 @@ def detect_preview(workspace: Path) -> PreviewPlan | None:
     return None
 
 
-def _preview_url(port: int | None, entry: str | None) -> str | None:
-    """Browser URL for a preview — entry dir for indexes, file path otherwise."""
+def _read_head(path: Path, cap: int = _READ_CAP) -> str:
+    """First ``cap`` bytes of a file, decoded leniently ("" on error)."""
+    try:
+        with path.open("rb") as fh:
+            return fh.read(cap).decode("utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def _detect_desktop(workspace: Path) -> PreviewPlan | None:
+    """Detect a runnable GUI artifact — pygame today (``type="desktop"``).
+
+    Conservative on purpose — detection decides what gets *executed*:
+    - an **unambiguous entry point**: one of ``main.py``/``app.py``/
+      ``game.py``/``run.py`` at the workspace root, or a single root-level
+      ``*.py`` file (nested entry points are not auto-detected);
+    - AND **explicit pygame evidence**: ``requirements.txt`` mentions
+      pygame/pygame-ce, or a root ``*.py`` file imports pygame.
+
+    Anything short of both signals returns ``None`` — the API reports "not
+    previewable" rather than executing an arbitrary file. Only the first
+    ``_READ_CAP`` bytes of each candidate file are scanned.
+    """
+    try:
+        entries = sorted(workspace.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return None
+    root_py = [
+        p
+        for p in entries
+        if p.is_file() and not p.is_symlink() and p.suffix == ".py"
+    ]
+
+    entry: Path | None = None
+    for name in _DESKTOP_ENTRY_NAMES:
+        cand = workspace / name
+        if cand in root_py:
+            entry = cand
+            break
+    if entry is None and len(root_py) == 1:
+        entry = root_py[0]
+    if entry is None:
+        return None
+
+    req = workspace / "requirements.txt"
+    evidence = (
+        req.is_file()
+        and not req.is_symlink()
+        and _PYGAME_REQ_RE.search(_read_head(req)) is not None
+    )
+    if not evidence:
+        evidence = any(
+            _PYGAME_IMPORT_RE.search(_read_head(p)) is not None for p in root_py
+        )
+    if not evidence:
+        return None
+    return PreviewPlan(type="desktop", entry=entry.name)
+
+
+def detect_preview(workspace: Path) -> PreviewPlan | None:
+    """First match wins: ``static`` → ``desktop`` → ``None``.
+
+    A workspace matching both (index.html AND a pygame entry) previews as
+    static — the safe/cheap default; a ``?type=`` override could come later.
+    """
+    if not workspace.is_dir():
+        return None
+    plan = _detect_static(workspace)
+    if plan is not None:
+        return plan
+    return _detect_desktop(workspace)
+
+
+def _preview_url(
+    port: int | None, entry: str | None, preview_type: str = "static"
+) -> str | None:
+    """Browser URL for a preview — entry dir/file for static, noVNC for desktop."""
     if port is None:
         return None
+    if preview_type == "desktop":
+        return f"http://localhost:{port}/vnc.html?autoconnect=true&resize=scale"
     if not entry:
         return f"http://localhost:{port}/"
     base = entry.rsplit("/", 1)[-1]
@@ -265,6 +381,12 @@ class PreviewManager:
         network: str = PREVIEW_NETWORK,
         bind_host: str = DEFAULT_BIND_HOST,
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
+        desktop_image: str | None = None,
+        proxy_image: str | None = None,
+        desktop_network: str = DESKTOP_NETWORK,
+        desktop_cpus: str = DEFAULT_DESKTOP_CPUS,
+        desktop_memory: str = DEFAULT_DESKTOP_MEMORY,
+        desktop_pids: int = DEFAULT_DESKTOP_PIDS,
     ) -> None:
         self._rt = runtime or SandboxRuntime()
         self.image = (
@@ -273,6 +395,12 @@ class PreviewManager:
         self.network = network
         self.bind_host = bind_host
         self.ttl_seconds = ttl_seconds
+        self.desktop_image = desktop_image or DEFAULT_DESKTOP_IMAGE
+        self.proxy_image = proxy_image or DEFAULT_PROXY_IMAGE
+        self.desktop_network = desktop_network
+        self.desktop_cpus = desktop_cpus
+        self.desktop_memory = desktop_memory
+        self.desktop_pids = desktop_pids
 
     # -- docker plumbing (delegates to the composed runtime) -----------------
 
@@ -323,6 +451,42 @@ class PreviewManager:
                 self.network,
             )
 
+    def _ensure_desktop_network(self) -> None:
+        """Create the INTERNAL desktop-runner network if missing (idempotent).
+
+        ``heg-desktop`` is the isolation boundary for executed artifacts:
+        ``--internal`` means no outbound route and no published ports — the
+        runner can reach only its own socat proxy sidecar. An existing
+        network that is NOT internal is a security misconfiguration (the
+        runner would have egress) — logged loudly.
+        """
+        proc = self._docker(
+            ["network", "inspect", self.desktop_network], check=False
+        )
+        if proc.returncode != 0:
+            self._docker(
+                [
+                    "network",
+                    "create",
+                    "--internal",
+                    "--driver",
+                    "bridge",
+                    self.desktop_network,
+                ]
+            )
+            logger.info("created internal docker network %r", self.desktop_network)
+            return
+        try:
+            info = json.loads(proc.stdout)[0]
+        except (json.JSONDecodeError, IndexError):
+            info = {}
+        if not info.get("Internal", False):
+            logger.warning(
+                "docker network %r exists but is NOT internal — desktop "
+                "preview runners will have external egress!",
+                self.desktop_network,
+            )
+
     # -- spawn ---------------------------------------------------------------
 
     def spawn(
@@ -334,18 +498,15 @@ class PreviewManager:
         plan: PreviewPlan,
         ttl_seconds: float | None = None,
     ) -> Preview:
-        """``docker run -d`` one hardened preview container; returns the Preview.
+        """Spawn the container(s) for ``plan``; returns the live Preview.
 
-        Only ``plan.type == "static"`` is implemented: ``python -m http.server``
-        over the read-only bind-mounted workspace. The container is hardened
-        for candidate-authored content: nobody user, read-only rootfs, all
-        capabilities dropped, no-new-privileges, dedicated bridge network with
-        the port bound to ``self.bind_host`` (localhost).
+        - ``static``: one hardened ``python -m http.server`` container.
+        - ``desktop``: a runner on the internal ``heg-desktop`` net executing
+          the artifact under Xvnc/noVNC, plus a socat proxy sidecar straddling
+          ``heg-desktop`` + ``heg-preview`` that publishes a localhost port.
+
+        Unknown types raise ``ValueError`` — the router maps it to 422.
         """
-        if plan.type != "static":
-            raise ValueError(
-                f"unsupported preview type {plan.type!r} (only 'static' is implemented)"
-            )
         self.ensure_network()
 
         preview_id = str(uuid.uuid4())
@@ -358,56 +519,31 @@ class PreviewManager:
 
         ttl = ttl_seconds if ttl_seconds is not None else self.ttl_seconds
         expires_epoch = time.time() + ttl
-        args = [
-            "run",
-            "-d",
-            "--name",
-            name,
-            "--network",
-            self.network,
-            "--restart",
-            "no",
-            # Hardening: the served content is candidate-authored.
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--user",
-            "65534:65534",  # nobody — needs no writes (http.server is read-only)
-            "-p",
-            f"{self.bind_host}::{CONTAINER_PORT}",  # ephemeral localhost port
-            "-v",
-            f"{self._rt.to_host_path(serve_dir)}:{SERVE_ROOT}:ro",
-            "--label",
-            f"{LABEL_MANAGED}=1",
-            "--label",
-            f"{LABEL_PREVIEW_ID}={preview_id}",
-            "--label",
-            f"{LABEL_RUN_ID}={run_id}",
-            "--label",
-            f"{LABEL_SANDBOX_ID}={sandbox_id}",
-            "--label",
-            f"{LABEL_TYPE}={plan.type}",
-            "--label",
-            f"{LABEL_ENTRY}={plan.entry}",
-            "--label",
-            f"{LABEL_EXPIRES_AT}={expires_epoch:.0f}",
-            self.image,
-            "python",
-            "-m",
-            "http.server",
-            str(CONTAINER_PORT),
-            "--directory",
-            SERVE_ROOT,
-            "--bind",
-            "0.0.0.0",
-        ]
-        proc = self._docker(args, timeout=180)
-        container_id = proc.stdout.strip()
-        preview = self._inspect_ids([container_id])
-        if preview:
-            return preview[0]
+        labels = self._labels(
+            preview_id=preview_id,
+            run_id=run_id,
+            sandbox_id=sandbox_id,
+            plan=plan,
+            expires_epoch=expires_epoch,
+        )
+
+        if plan.type == "static":
+            self._spawn_static(
+                name=name, serve_dir=serve_dir, labels=labels
+            )
+        elif plan.type == "desktop":
+            self._spawn_desktop(
+                name=name,
+                serve_dir=serve_dir,
+                plan=plan,
+                labels=labels,
+            )
+        else:
+            raise ValueError(f"unsupported preview type {plan.type!r}")
+
+        preview = self.get(preview_id)
+        if preview is not None:
+            return preview
         # Inspect raced the daemon — return what we know; GET re-inspects.
         return Preview(
             preview_id=preview_id,
@@ -423,6 +559,190 @@ class PreviewManager:
             expires_at=datetime.fromtimestamp(expires_epoch, UTC),
         )
 
+    def _labels(
+        self,
+        *,
+        preview_id: str,
+        run_id: str,
+        sandbox_id: str,
+        plan: PreviewPlan,
+        expires_epoch: float,
+        role: str = ROLE_RUNNER,
+    ) -> list[str]:
+        """Flat ``[--label, k=v, ...]`` args — the restart-safe registry."""
+        pairs = [
+            (LABEL_MANAGED, "1"),
+            (LABEL_PREVIEW_ID, preview_id),
+            (LABEL_RUN_ID, run_id),
+            (LABEL_SANDBOX_ID, sandbox_id),
+            (LABEL_TYPE, plan.type),
+            (LABEL_ENTRY, plan.entry or ""),
+            (LABEL_EXPIRES_AT, f"{expires_epoch:.0f}"),
+            (LABEL_ROLE, role),
+        ]
+        args: list[str] = []
+        for k, v in pairs:
+            args += ["--label", f"{k}={v}"]
+        return args
+
+    def _spawn_static(
+        self, *, name: str, serve_dir: Path, labels: list[str]
+    ) -> None:
+        """``python -m http.server`` over the :ro bind-mounted workspace.
+
+        Hardened for candidate-authored content: nobody user, read-only
+        rootfs, all capabilities dropped, no-new-privileges, dedicated bridge
+        network with the port bound to ``self.bind_host`` (localhost).
+        """
+        args = [
+            "run",
+            "-d",
+            "--name",
+            name,
+            "--network",
+            self.network,
+            "--restart",
+            "no",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--user",
+            "65534:65534",  # nobody — needs no writes (http.server is read-only)
+            "-p",
+            f"{self.bind_host}::{CONTAINER_PORT}",  # ephemeral localhost port
+            "-v",
+            f"{self._rt.to_host_path(serve_dir)}:{SERVE_ROOT}:ro",
+            *labels,
+            self.image,
+            "python",
+            "-m",
+            "http.server",
+            str(CONTAINER_PORT),
+            "--directory",
+            SERVE_ROOT,
+            "--bind",
+            "0.0.0.0",
+        ]
+        self._docker(args, timeout=180)
+
+    def _spawn_desktop(
+        self,
+        *,
+        name: str,
+        serve_dir: Path,
+        plan: PreviewPlan,
+        labels: list[str],
+    ) -> None:
+        """Runner on the INTERNAL net + socat proxy sidecar publishing the port.
+
+        The runner *executes* candidate code, so unlike a static preview it
+        gets zero egress: ``--internal`` ``heg-desktop`` with its only peer
+        being its own proxy. ``socat`` is a dumb TCP pipe — no HTTP parsing,
+        nothing for the artifact to exploit — and is the only container with
+        a published port (bound to localhost on ``heg-preview``). CPU/memory/
+        pids limits bound what the candidate code can burn.
+        """
+        self._ensure_desktop_network()
+        if (
+            self._docker(
+                ["image", "inspect", self.desktop_image], check=False
+            ).returncode
+            != 0
+        ):
+            raise RuntimeError(
+                f"desktop preview image {self.desktop_image!r} not found — "
+                f"build it: docker build -f "
+                f"sandbox/images/desktop-preview.Dockerfile "
+                f"-t {self.desktop_image} ."
+            )
+
+        runner_args = [
+            "run",
+            "-d",
+            "--name",
+            name,
+            "--network",
+            self.desktop_network,  # internal: no egress, no published ports
+            "--restart",
+            "no",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--user",
+            "65534:65534",
+            "--cpus",
+            self.desktop_cpus,
+            "--memory",
+            self.desktop_memory,
+            "--pids-limit",
+            str(self.desktop_pids),
+            "-e",
+            f"APP_ENTRY={plan.entry}",
+            "-e",
+            "HOME=/tmp",
+            "-v",
+            f"{self._rt.to_host_path(serve_dir)}:{DESKTOP_ARTIFACT_ROOT}:ro",
+            *labels,
+            self.desktop_image,
+        ]
+        proxy_name = f"{name}-proxy"
+        # The proxy's FIRST network must be the publishable bridge — docker
+        # only honors -p on the gateway network the container starts on.
+        proxy_args = [
+            "run",
+            "-d",
+            "--name",
+            proxy_name,
+            "--network",
+            self.network,
+            "--restart",
+            "no",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--user",
+            "65534:65534",
+            "-p",
+            f"{self.bind_host}::{DESKTOP_CONTAINER_PORT}",
+            *self._labels_as_args(labels, role=ROLE_PROXY),
+            self.proxy_image,
+            "TCP-LISTEN:" + str(DESKTOP_CONTAINER_PORT) + ",fork,reuseaddr",
+            f"TCP:{name}:{DESKTOP_CONTAINER_PORT}",
+        ]
+        try:
+            self._docker(runner_args, timeout=180)
+            self._docker(proxy_args, timeout=180)
+            self._docker(
+                ["network", "connect", self.desktop_network, proxy_name],
+                timeout=30,
+            )
+        except Exception:
+            # Don't leak a half-spawned pair.
+            self._docker(["rm", "-f", name, proxy_name], check=False)
+            raise
+
+    @staticmethod
+    def _labels_as_args(labels: list[str], *, role: str) -> list[str]:
+        """Clone label args swapping in a different ``heg.preview_role``."""
+        out: list[str] = []
+        for i, arg in enumerate(labels):
+            if (
+                arg == "--label"
+                and i + 1 < len(labels)
+                and labels[i + 1].startswith(f"{LABEL_ROLE}=")
+            ):
+                out += [arg, f"{LABEL_ROLE}={role}"]
+                continue
+            if arg.startswith(f"{LABEL_ROLE}="):
+                continue
+            out.append(arg)
+        return out
+
     # -- inspect / registry --------------------------------------------------
 
     def _row_to_preview(self, row: dict[str, Any]) -> Preview | None:
@@ -434,18 +754,25 @@ class PreviewManager:
             uuid.UUID(preview_id)  # API responses parse it — reject label forgeries
         except ValueError:
             return None
+        if labels.get(LABEL_ROLE) == ROLE_PROXY:
+            return None  # proxy sidecars aren't previews — the runner is
         state = row.get("State") or {}
         status = str(state.get("Status") or "unknown")
 
+        preview_type = labels.get(LABEL_TYPE) or "static"
         port: int | None = None
-        bindings = (
-            (row.get("NetworkSettings") or {}).get("Ports") or {}
-        ).get(f"{CONTAINER_PORT}/tcp") or []
-        if bindings and bindings[0].get("HostPort"):
-            try:
-                port = int(bindings[0]["HostPort"])
-            except (TypeError, ValueError):
-                port = None
+        if preview_type == "desktop":
+            # The published port lives on the proxy sidecar, not the runner.
+            port = self._proxy_port(preview_id)
+        else:
+            bindings = (
+                (row.get("NetworkSettings") or {}).get("Ports") or {}
+            ).get(f"{CONTAINER_PORT}/tcp") or []
+            if bindings and bindings[0].get("HostPort"):
+                try:
+                    port = int(bindings[0]["HostPort"])
+                except (TypeError, ValueError):
+                    port = None
 
         created = _parse_ts(row.get("Created"))
         expires: datetime | None = None
@@ -466,15 +793,45 @@ class PreviewManager:
             preview_id=preview_id,
             run_id=labels.get(LABEL_RUN_ID) or "",
             sandbox_id=labels.get(LABEL_SANDBOX_ID) or "",
-            type=labels.get(LABEL_TYPE) or "static",
+            type=preview_type,
             container=str(row.get("Name") or "").lstrip("/"),
             status=status,
             port=port,
             entry=entry,
-            url=_preview_url(port, entry),
+            url=_preview_url(port, entry, preview_type),
             created_at=created,
             expires_at=expires,
         )
+
+    def _proxy_port(self, preview_id: str) -> int | None:
+        """Published host port of a desktop preview's proxy sidecar."""
+        proc = self._docker(
+            [
+                "ps",
+                "-aq",
+                "--filter",
+                f"label={LABEL_PREVIEW_ID}={preview_id}",
+                "--filter",
+                f"label={LABEL_ROLE}={ROLE_PROXY}",
+            ],
+            check=False,
+        )
+        ids = proc.stdout.split()
+        if not ids:
+            return None
+        info = self._docker(["inspect", ids[0]], check=False)
+        if info.returncode != 0:
+            return None
+        try:
+            row = json.loads(info.stdout)[0]
+            bindings = (
+                (row.get("NetworkSettings") or {}).get("Ports") or {}
+            ).get(f"{DESKTOP_CONTAINER_PORT}/tcp") or []
+            if bindings and bindings[0].get("HostPort"):
+                return int(bindings[0]["HostPort"])
+        except (json.JSONDecodeError, IndexError, TypeError, ValueError):
+            return None
+        return None
 
     def _inspect_ids(self, container_ids: list[str]) -> list[Preview]:
         if not container_ids:
@@ -512,7 +869,9 @@ class PreviewManager:
             check=False,
         )
         ids = proc.stdout.split()
-        previews = self._inspect_ids(ids[:1])
+        # ids may include proxy sidecars (same preview_id label) —
+        # _row_to_preview skips them, so inspect the whole set.
+        previews = self._inspect_ids(ids)
         return previews[0] if previews else None
 
     def get_for_sandbox(self, sandbox_id: str) -> Preview | None:
@@ -523,7 +882,11 @@ class PreviewManager:
     # -- stop / reap ---------------------------------------------------------
 
     def stop(self, preview_id: str) -> bool:
-        """``docker rm -f`` the preview container; False when already gone."""
+        """``docker rm -f`` ALL containers of a preview (runner + sidecars).
+
+        A desktop preview is two containers sharing ``heg.preview_id``; the
+        label filter finds both, so orphaned proxies can't outlive runners.
+        """
         proc = self._docker(
             ["ps", "-aq", "--filter", f"label={LABEL_PREVIEW_ID}={preview_id}"],
             check=False,
@@ -531,8 +894,8 @@ class PreviewManager:
         ids = proc.stdout.split()
         if not ids:
             return False
-        self._docker(["rm", "-f", ids[0]], check=False)
-        logger.info("stopped preview %s (container %.12s)", preview_id, ids[0])
+        self._docker(["rm", "-f", *ids], check=False)
+        logger.info("stopped preview %s (%d container(s))", preview_id, len(ids))
         return True
 
     def reap_expired(self, now: float | None = None) -> int:

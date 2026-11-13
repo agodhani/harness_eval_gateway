@@ -248,7 +248,11 @@ or tests change.
 - Re-score runs — re-run the evaluator on stored artifacts
 - Post-run rubric edits — modify the frozen rubric after a run and re-score
   with the updated rubric (keep score provenance per rubric version)
-- Cached `previewable` probe on results GET (currently a few stats per call)
+- Preview `?type=` override (workspace matching multiple detectors always
+  gets static today), more desktop types (pyglet/arcade/tkinter — needs
+  baked deps or a wheelhouse mount), python-server previews
+- Cache `previewable`/`preview_type` probe on results GET (per-sandbox FS
+  probe on every call — fine at MVP scale, revisit if pages get large)
 - dsh native helpers (spawn-helper, node-pty) — npm ≥11 blocks their
   postinstall scripts; CLI works without them, but revisit `--allow-scripts`
   for the dsh package set if evals hit TTY-dependent tasks
@@ -308,18 +312,31 @@ or tests change.
   for provenance + import pinning. `GITHUB_TOKEN` (env) is sent as a Bearer
   token when set — private repos work best-effort; proper token UX is a
   follow-up.
-- **Artifact preview (F12) ships static-only** — `PreviewPlan.type` +
-  `PreviewOut.type` leave room for `python-server`/`desktop` (pygame via
-  noVNC) after an explicit human checkpoint.
+- **Artifact preview (F12) ships static + desktop** — `PreviewPlan.type` +
+  `PreviewOut.type` leave room for `python-server` next. Static = serve
+  files; desktop = execute pygame under Xvnc/noVNC.
 - Preview containers get their **own dedicated bridge `heg-preview`**, not
   `heg-sandbox` and not `--internal` — Docker silently drops published ports
   on internal networks (verified), so "isolated + host-reachable" is
   impossible; port binds `127.0.0.1` only, masquerade disabled (Linux),
-  container hardened (nobody/read-only/cap-drop/no-new-priv). Desktop
-  streaming types may revisit isolation.
+  container hardened (nobody/read-only/cap-drop/no-new-priv).
+- **Desktop previews isolate the runner, not the serving hop**: the
+  executed artifact runs alone on `--internal` `heg-desktop` (zero egress —
+  api-side proxying was rejected: the api would join the runner's net,
+  giving candidate code a path to the control plane) with
+  `--cpus`/`--memory`/`--pids-limit` bounds. A pinned `alpine/socat` sidecar
+  (`heg.preview_role=proxy`, dumb TCP pipe — nothing for the artifact to
+  exploit) straddles both nets and publishes the noVNC port on localhost.
+- **Desktop detection is conservative** — an unambiguous root `.py` entry
+  (`main.py`/`app.py`/`game.py`/`run.py` or single root `.py`) AND explicit
+  pygame evidence (requirements.txt mention or a root `.py` import);
+  detection decides what gets *executed*, so no-evidence/ambiguous → not
+  previewable rather than run arbitrary code. Deps beyond baked-in
+  pygame-ce can't install (no egress) — the app fails at import and the
+  runner exits visibly. Static wins when both detectors match.
 - **Preview registry lives on docker labels**, not in memory or Postgres —
   restart-safe discovery + the TTL reaper (default 15 min) works
-  out-of-process.
+  out-of-process; runner+proxy share `heg.preview_id`, stop removes all.
 - One live preview per sandbox (POST is idempotent — re-clicking returns the
   existing preview); dead containers are cleared on respawn.
 

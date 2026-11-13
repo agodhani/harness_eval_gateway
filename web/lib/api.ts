@@ -711,7 +711,7 @@ export interface PreviewOut {
   preview_id: string;
   run_id: string;
   sandbox_id: string;
-  /** Preview type — "static" today; python-server/desktop planned. */
+  /** Preview type — "static" | "desktop" (pygame via noVNC); python-server planned. */
   type: string;
   /** Docker container status: created | running | exited | ... */
   status: string;
