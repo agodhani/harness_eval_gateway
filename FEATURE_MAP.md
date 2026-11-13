@@ -24,6 +24,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F9 | Run analytics (per-sandbox metrics + cost) | ✅ | `api/routers/analytics.py`, `api/pricing.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx` | `tests/unit/api/test_analytics.py` |
 | F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
 | F11 | Skillpack import from GitHub | ✅ | `skillpack_import/`, `api/routers/skillpacks.py`, `web/app/submit/ImportSkillPackDialog.tsx` | `tests/unit/api/test_skillpacks.py`, `test_skillpack_import.py` |
+| F12 | Artifact preview (static html in a container) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
 
 ## Feature details
 
@@ -312,6 +313,55 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - UI: submit → "+ import from GitHub" → paste link → pick skills →
     import → pack shows with an "imported" badge, selectable per config.
 - **Depends on:** F5 (pack layout/loader), F4 (staging/mount path)
+
+### F12 — Artifact preview ✅
+
+- **What:** "Preview" button per sandbox on the results page → serves the
+  snapshot workspace in a throwaway container so the user can see/play the
+  artifact (e.g. a 2048 html page) in a new browser tab. Static sites only
+  (human checkpoint before python-server / pygame-desktop types).
+  - `GET /api/runs/{run}/results` → per-sandbox `previewable` +
+    `preview_type` (cheap FS probe of the jailed workspace).
+  - `POST /api/runs/{run}/sandboxes/{sandbox}/preview` → `201
+    {preview_id, url, type, status, entry, expires_at}`; idempotent (a live
+    preview is returned as-is); `404` run/sandbox/workspace missing, `422`
+    no entry point, `502` docker failure.
+  - `GET .../preview` → current state (any status) or `404`; `DELETE
+    .../preview` → `204` stop.
+- **Detection** (`sandbox/preview.py::detect_preview`): `index.html`/`.htm`
+  at root → single root `*.html` → unique `*/index.html` one level down;
+  ambiguous → not previewable. Symlinks never followed.
+- **Container posture** (`PreviewManager.spawn`): `python:3.12-slim` running
+  `python -m http.server` over the workspace bind-mounted `:ro`; nobody
+  user, `--read-only` rootfs, `--cap-drop ALL`, `no-new-privileges`.
+  Dedicated bridge `heg-preview` (NOT `--internal` — Docker silently drops
+  published ports on internal networks, verified) with
+  `enable_ip_masquerade=false` (egress block on Linux; inert on Docker
+  Desktop). Port publishes on `127.0.0.1` ephemeral only — no LAN exposure.
+- **Registry = docker labels** (`heg.preview*`) — `list()`/`get` rebuild
+  state via `docker inspect`, so api restarts lose nothing; expiry rides a
+  label so the reaper works out-of-process. TTL `PREVIEW_TTL_SECONDS`
+  (default 900) enforced by an asyncio reaper started in the FastAPI
+  lifespan (`PREVIEW_REAP_SECONDS`, default 30s).
+- **Jail:** `resolve_workspace_dir` reuses the download-jail rule —
+  `artifact_path` or `<ARTIFACT_ROOT>/<run>/<sandbox>` must resolve inside
+  `ARTIFACT_ROOT`, and `workspace` must not be a symlink escaping it.
+- **Where:** `sandbox/preview.py`, `api/routers/preview.py` (+ reaper),
+  `api/config.py` (`PREVIEW_*`), `api/routers/results.py` (previewable flag),
+  `web/lib/api.ts` (`getPreview`/`startPreview`/`stopPreview`, `PreviewOut`),
+  `web/app/runs/[id]/results/PreviewControls.tsx`
+- **Verify:**
+  - Unit: `tests/unit/sandbox/test_preview.py` (detection shapes, jail,
+    manager via stubbed docker) + `tests/unit/api/test_preview.py`
+    (lifecycle, reuse/replace, 404/422/502, jail 404, checkpoint events,
+    results flag)
+  - Docker: `tests/integration/test_preview.py` (`@pytest.mark.docker` —
+    real spawn → HTTP 200 + asset, localhost-only binding, reaper)
+  - Manual: results page → "Preview" → game opens in new tab; "■ stop";
+    container auto-removed after TTL (`docker ps -a --filter
+    label=heg.preview=1`)
+- **Depends on:** F4 (runtime plumbing/host-path translation), F8 (results
+  page + artifact store layout)
 
 ## Implementation sequence
 

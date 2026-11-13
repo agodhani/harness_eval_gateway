@@ -282,6 +282,9 @@ export interface SandboxResult {
   /** Optional artifact ids if/when the results API exposes them. */
   artifact_ids?: string[];
   artifacts?: { id: string; kind?: string; path?: string }[];
+  /** F10: snapshot workspace has a previewable entry point (static html). */
+  previewable?: boolean;
+  preview_type?: string | null;
 }
 
 export interface RunResults {
@@ -698,6 +701,43 @@ export function getSandboxScores(sandboxId: string): Promise<ScoreOut[]> {
 
 export function artifactDownloadUrl(artifactId: string): string {
   return `${API_BASE}/api/artifacts/${encodeURIComponent(artifactId)}/download`;
+}
+
+// ---------------------------------------------------------------------------
+// artifact preview (F10)
+// ---------------------------------------------------------------------------
+
+export interface PreviewOut {
+  preview_id: string;
+  run_id: string;
+  sandbox_id: string;
+  /** Preview type — "static" today; python-server/desktop planned. */
+  type: string;
+  /** Docker container status: created | running | exited | ... */
+  status: string;
+  url: string | null;
+  entry: string | null;
+  container: string;
+  created_at: string | null;
+  expires_at: string | null;
+}
+
+function previewPath(runId: string, sandboxId: string): string {
+  return `/api/runs/${encodeURIComponent(runId)}/sandboxes/${encodeURIComponent(sandboxId)}/preview`;
+}
+
+/** 404 when no preview exists — callers treat it as "not started". */
+export function getPreview(runId: string, sandboxId: string): Promise<PreviewOut> {
+  return request<PreviewOut>(previewPath(runId, sandboxId));
+}
+
+/** Idempotent per sandbox: returns the live preview if one already runs. */
+export function startPreview(runId: string, sandboxId: string): Promise<PreviewOut> {
+  return request<PreviewOut>(previewPath(runId, sandboxId), { method: "POST" });
+}
+
+export function stopPreview(runId: string, sandboxId: string): Promise<void> {
+  return request<void>(previewPath(runId, sandboxId), { method: "DELETE" });
 }
 
 /** Liveness probe for the "backend not ready" UI states. */

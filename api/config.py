@@ -66,6 +66,19 @@ class Settings(BaseSettings):
     # codeload accepts a Bearer token). Public repos work without it.
     GITHUB_TOKEN: str = ""
 
+    # --- Artifact preview (F10) ---
+    # Static-preview container image (`python -m http.server`); shares the
+    # python:3.12-slim base with the api/sandbox images — no extra pull.
+    PREVIEW_IMAGE: str = "python:3.12-slim"
+    # Dedicated bridge for preview containers (only peers = other previews).
+    # Can't be --internal: Docker drops published ports on internal networks.
+    PREVIEW_NETWORK: str = "heg-preview"
+    # Auto-stop TTL for preview containers + the reaper's sweep cadence.
+    PREVIEW_TTL_SECONDS: int = 900
+    PREVIEW_REAP_SECONDS: float = 30.0
+    # Published-port bind address — localhost only; previews are not LAN-visible.
+    PREVIEW_BIND_HOST: str = "127.0.0.1"
+
     LOG_LEVEL: str = "INFO"
 
 

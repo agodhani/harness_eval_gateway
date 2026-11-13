@@ -33,6 +33,7 @@ from api.config import get_settings
 from api.deps import get_db
 from db.models import Artifact, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
+from sandbox.preview import detect_preview, resolve_workspace_dir
 
 router = APIRouter(tags=["results"])
 
@@ -69,6 +70,10 @@ class SandboxResult(BaseModel):
     dimensions: dict[str, DimensionScore] = Field(default_factory=dict)
     overall: DimensionScore | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
+    # F10: whether the snapshot workspace has a previewable entry point
+    # (static html today) — drives the results-page Preview button.
+    previewable: bool = False
+    preview_type: str | None = None
 
 
 class RunResults(BaseModel):
@@ -146,8 +151,18 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
     for art in artifacts:
         artifacts_by_sandbox.setdefault(art.sandbox_id, []).append(art)
 
+    jail = _artifact_jail()
     results: list[SandboxResult] = []
     for sb in sandboxes:
+        # F10: cheap FS probe so the UI only offers Preview when the snapshot
+        # workspace actually has a detectable entry point.
+        ws = resolve_workspace_dir(
+            jail=jail,
+            run_id=str(run_id),
+            sandbox_id=str(sb.id),
+            artifact_path=sb.artifact_path,
+        )
+        plan = detect_preview(ws) if ws is not None else None
         dimensions: dict[str, DimensionScore] = {}
         overall: DimensionScore | None = None
         rubric_id: UUID | None = None
@@ -173,6 +188,8 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
                     ArtifactRef(id=a.id, kind=a.kind, path=a.path)
                     for a in artifacts_by_sandbox.get(sb.id, [])
                 ],
+                previewable=plan is not None,
+                preview_type=plan.type if plan is not None else None,
             )
         )
 

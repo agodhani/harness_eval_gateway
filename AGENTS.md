@@ -308,6 +308,20 @@ or tests change.
   for provenance + import pinning. `GITHUB_TOKEN` (env) is sent as a Bearer
   token when set — private repos work best-effort; proper token UX is a
   follow-up.
+- **Artifact preview (F12) ships static-only** — `PreviewPlan.type` +
+  `PreviewOut.type` leave room for `python-server`/`desktop` (pygame via
+  noVNC) after an explicit human checkpoint.
+- Preview containers get their **own dedicated bridge `heg-preview`**, not
+  `heg-sandbox` and not `--internal` — Docker silently drops published ports
+  on internal networks (verified), so "isolated + host-reachable" is
+  impossible; port binds `127.0.0.1` only, masquerade disabled (Linux),
+  container hardened (nobody/read-only/cap-drop/no-new-priv). Desktop
+  streaming types may revisit isolation.
+- **Preview registry lives on docker labels**, not in memory or Postgres —
+  restart-safe discovery + the TTL reaper (default 15 min) works
+  out-of-process.
+- One live preview per sandbox (POST is idempotent — re-clicking returns the
+  existing preview); dead containers are cleared on respawn.
 
 ## Working conventions
 
