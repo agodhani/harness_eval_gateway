@@ -105,11 +105,13 @@ class EventOut(BaseModel):
 class HarnessConfigIn(BaseModel):
     """One sandbox configuration in a run's comparison matrix.
 
-    MVP varies harness *configuration*, not harnesses: ``adapter`` picks the
-    harness adapter (only ``miniloop`` today), ``skill_packs`` selects which
-    vendored packs under ``./skillpacks`` are staged into the sandbox, and
-    ``system_prompt_extra`` appends run-specific instructions to the system
-    prompt (another comparison axis).
+    ``adapter`` picks the harness adapter — ``miniloop`` plus the Phase 2.5
+    CLI harnesses (``codex``, ``claude_code``, ``pi``, ``deepseek``; see
+    ``orchestrator/adapters.py`` and ``GET /api/harnesses``). ``skill_packs``
+    selects which vendored packs under ``./skillpacks`` are staged into the
+    sandbox, and ``system_prompt_extra`` appends run-specific instructions
+    (native ``--append-system-prompt`` where the harness has one, otherwise
+    inlined into the task prompt footer — another comparison axis).
     """
 
     adapter: str = "miniloop"

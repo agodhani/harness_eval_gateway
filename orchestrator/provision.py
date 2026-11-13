@@ -29,7 +29,7 @@ from sandbox.runtime import SandboxRuntime
 from sandbox.spec import SandboxSpec
 
 from . import state_machine
-from .adapters import get_adapter
+from .adapters import adapter_image, get_adapter
 from .events import emit
 
 log = logging.getLogger(__name__)
@@ -293,12 +293,15 @@ async def spawn_one(
             max_iters=budgets["max_iters"],
             system_prompt_extra=harness_config.get("system_prompt_extra"),
         )
+        # Adapter-declared image wins (Phase 2.5: each CLI harness ships its
+        # own image); miniloop and adapters without an ``image`` key keep the
+        # configured SANDBOX_IMAGE so evaluator/dev overrides still apply.
         spec = build_spec(
             sandbox_id=sid,
             run=run,
             harness_config=harness_config,
             runtime=runtime,
-            image=settings.SANDBOX_IMAGE,
+            image=adapter_image(adapter, settings.SANDBOX_IMAGE),
             env=env,
         )
 

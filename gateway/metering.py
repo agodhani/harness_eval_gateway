@@ -61,16 +61,18 @@ def token_budget(claims: CredClaims, settings: GatewaySettings) -> int:
 
 
 def max_tokens_estimate(body: dict[str, Any]) -> int:
-    """Best-effort token estimate for a chat request: its ``max_tokens``.
+    """Best-effort token estimate: ``max_tokens`` (chat/Anthropic) or
+    ``max_output_tokens`` (OpenAI Responses API).
 
     Absent/invalid values estimate 0 — the gate then only rejects runs whose
     recorded usage already exceeds the budget.
     """
-    mt = body.get("max_tokens")
-    if isinstance(mt, bool):
-        return 0
-    if isinstance(mt, (int, float)) and mt > 0:
-        return int(mt)
+    for key in ("max_tokens", "max_output_tokens"):
+        mt = body.get(key)
+        if isinstance(mt, bool):
+            continue
+        if isinstance(mt, (int, float)) and mt > 0:
+            return int(mt)
     return 0
 
 
@@ -91,6 +93,106 @@ def usage_from_response(response_json: Any) -> dict[str, int]:
         "completion_tokens": completion,
         "total_tokens": total,
     }
+
+
+def _to_int(v: Any) -> int:
+    return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+
+def _usage_dict(prompt: int, completion: int) -> dict[str, int]:
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+    }
+
+
+def usage_from_anthropic(response_json: Any) -> dict[str, int]:
+    """Normalize an Anthropic ``/v1/messages`` usage object to token counts."""
+    usage = response_json.get("usage") if isinstance(response_json, dict) else None
+    if not isinstance(usage, dict):
+        usage = {}
+    # Input-side tokens: fresh input plus cache-read/context tokens.
+    prompt = _to_int(usage.get("input_tokens")) + _to_int(
+        usage.get("cache_read_input_tokens")
+    )
+    return _usage_dict(prompt, _to_int(usage.get("output_tokens")))
+
+
+def usage_from_responses_api(response_json: Any) -> dict[str, int]:
+    """Normalize an OpenAI ``/v1/responses`` usage object to token counts."""
+    if isinstance(response_json, dict):
+        # Non-streamed bodies: top-level ``usage``; streamed ``response.*``
+        # events nest it under ``response``.
+        usage = response_json.get("usage")
+        if usage is None and isinstance(response_json.get("response"), dict):
+            usage = response_json["response"].get("usage")
+    else:
+        usage = None
+    if not isinstance(usage, dict):
+        usage = {}
+    return _usage_dict(
+        _to_int(usage.get("input_tokens")), _to_int(usage.get("output_tokens"))
+    )
+
+
+def usage_from_sse(body: bytes, *, api: str) -> dict[str, int]:
+    """Extract final usage from a captured SSE stream body.
+
+    ``api`` is ``"anthropic"`` (``/v1/messages``: ``message_start`` carries
+    input-side tokens, ``message_delta`` reports cumulative output) or
+    ``"responses"`` (``response.completed``/``response.incomplete`` carry the
+    final ``response.usage``). Non-SSE bodies fall back to the JSON extractors.
+    """
+    import json as _json
+
+    text = body.decode("utf-8", errors="replace")
+    anthropic_in = 0
+    anthropic_out = 0
+    responses_usage: dict[str, int] = {}
+    saw_event = False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:") :].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            obj = _json.loads(data)
+        except _json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        etype = obj.get("type")
+        if api == "anthropic":
+            if etype == "message_start":
+                saw_event = True
+                u = (obj.get("message") or {}).get("usage") or {}
+                anthropic_in += _to_int(u.get("input_tokens")) + _to_int(
+                    u.get("cache_read_input_tokens")
+                )
+                anthropic_out += _to_int(u.get("output_tokens"))
+            elif etype == "message_delta":
+                saw_event = True
+                u = obj.get("usage") or {}
+                anthropic_out = max(anthropic_out, _to_int(u.get("output_tokens")))
+        elif etype in ("response.completed", "response.incomplete"):
+            saw_event = True
+            responses_usage = usage_from_responses_api(obj)
+    if api == "anthropic":
+        if saw_event:
+            return _usage_dict(anthropic_in, anthropic_out)
+        try:
+            return usage_from_anthropic(_json.loads(text))
+        except _json.JSONDecodeError:
+            return _usage_dict(0, 0)
+    if saw_event:
+        return responses_usage
+    try:
+        return usage_from_responses_api(_json.loads(text))
+    except _json.JSONDecodeError:
+        return _usage_dict(0, 0)
 
 
 async def post_ingest_events(events: list[dict[str, Any]]) -> tuple[int, Any]:

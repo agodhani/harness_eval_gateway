@@ -8,6 +8,15 @@ Endpoints
                                     → emit ``llm_request``/``llm_response``/
                                     ``error`` events → return upstream
                                     body+status verbatim.
+``POST /v1/messages``             — Anthropic Messages pass-through (Claude
+                                    Code, dsh); same cred/budget/metering
+                                    pipeline as chat completions, streaming
+                                    preserved with a metering tee.
+``POST /v1/messages/count_tokens``— Anthropic token-count preflight (plain
+                                    pass-through, no llm events — it is not a
+                                    generation call).
+``POST /v1/responses``            — OpenAI Responses pass-through (Codex CLI).
+``GET  /v1/models``               — model list pass-through (CLIs probe it).
 ``POST /internal/events``         — sandbox-facing event ingest (cred-stamped
                                     run/sandbox ids) → forwards to the
                                     control-plane ``/api/events/ingest``.
@@ -34,7 +43,7 @@ from typing import Annotated, Any
 import httpx
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from api.schemas import EventSource, EventType
@@ -157,41 +166,10 @@ async def chat_completions(
     claims: Annotated[CredClaims, Depends(get_cred)],
     upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
 ) -> Response:
-    settings = get_settings()
-
     # --- budget gate (before any upstream traffic) ---
-    run_uuid = metering.uuid_or_none(claims.run_id)
-    if run_uuid is not None:
-        used = await asyncio.to_thread(_tokens_used, run_uuid)
-        estimate = metering.max_tokens_estimate(body)
-        limit = metering.token_budget(claims, settings)
-        if used + estimate > limit:
-            await metering.emit_error(
-                claims,
-                stage="budget",
-                reason="budget_exceeded",
-                message=(
-                    f"run token budget exceeded: used={used} "
-                    f"+ estimated={estimate} > limit={limit}"
-                ),
-                http_status=status.HTTP_429_TOO_MANY_REQUESTS,
-                used_tokens=used,
-                budget=limit,
-            )
-            return JSONResponse(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                content={
-                    "error": {
-                        "message": (
-                            "run token budget exceeded "
-                            f"(used={used}, estimate={estimate}, limit={limit})"
-                        ),
-                        "type": "budget_exceeded",
-                        "used_tokens": used,
-                        "budget": limit,
-                    }
-                },
-            )
+    gated = await _budget_gate(claims, body)
+    if gated is not None:
+        return gated
 
     # --- prepare upstream request: force non-streaming, inject defaults ---
     out = dict(body)
@@ -245,6 +223,212 @@ async def chat_completions(
             latency_ms=latency_ms,
         )
 
+    return Response(
+        content=upstream_resp.content,
+        status_code=upstream_resp.status_code,
+        headers={
+            "content-type": upstream_resp.headers.get(
+                "content-type", "application/json"
+            )
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.5 — protocol pass-throughs (Anthropic messages / OpenAI responses)
+# ---------------------------------------------------------------------------
+
+
+async def _budget_gate(claims: CredClaims, body: dict[str, Any]) -> JSONResponse | None:
+    """Shared run-token-budget gate; returns a 429 response or None (pass)."""
+    settings = get_settings()
+    run_uuid = metering.uuid_or_none(claims.run_id)
+    if run_uuid is None:
+        return None
+    used = await asyncio.to_thread(_tokens_used, run_uuid)
+    estimate = metering.max_tokens_estimate(body)
+    limit = metering.token_budget(claims, settings)
+    if used + estimate <= limit:
+        return None
+    await metering.emit_error(
+        claims,
+        stage="budget",
+        reason="budget_exceeded",
+        message=(
+            f"run token budget exceeded: used={used} "
+            f"+ estimated={estimate} > limit={limit}"
+        ),
+        http_status=status.HTTP_429_TOO_MANY_REQUESTS,
+        used_tokens=used,
+        budget=limit,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={
+            "error": {
+                "message": (
+                    "run token budget exceeded "
+                    f"(used={used}, estimate={estimate}, limit={limit})"
+                ),
+                "type": "budget_exceeded",
+                "used_tokens": used,
+                "budget": limit,
+            }
+        },
+    )
+
+
+async def _passthrough(
+    *,
+    path: str,
+    api: str,
+    body: dict[str, Any],
+    claims: CredClaims,
+    upstream: httpx.AsyncClient,
+    meter: bool = True,
+) -> Response:
+    """Forward ``body`` to ``upstream`` ``path`` verbatim; meter the outcome.
+
+    Unlike ``/v1/chat/completions`` (which forces non-streaming), the caller's
+    ``stream`` flag is preserved — Anthropic/Responses clients (Claude Code,
+    dsh, Codex) stream by default, and a rewritten content-type would break
+    their SDK parsers. Streamed bodies are tee'd: chunks pass through as they
+    arrive and the captured bytes yield the final usage for the
+    ``llm_response`` event once the stream ends.
+    """
+    if meter:
+        gated = await _budget_gate(claims, body)
+        if gated is not None:
+            return gated
+        await metering.emit_llm_request(claims, body)
+
+    started = time.monotonic()
+    try:
+        req = upstream.build_request("POST", path, json=body)
+        upstream_resp = await upstream.send(req, stream=True)
+    except httpx.HTTPError as exc:
+        latency_ms = int((time.monotonic() - started) * 1000)
+        if meter:
+            await metering.emit_error(
+                claims,
+                stage="upstream",
+                message=f"{type(exc).__name__}: {exc}",
+                latency_ms=latency_ms,
+            )
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={
+                "error": {
+                    "message": f"upstream request failed: {exc}",
+                    "type": "upstream_error",
+                }
+            },
+        )
+
+    async def _aiter():
+        chunks: list[bytes] = []
+        try:
+            async for chunk in upstream_resp.aiter_bytes():
+                if meter:
+                    chunks.append(chunk)
+                yield chunk
+        finally:
+            latency_ms = int((time.monotonic() - started) * 1000)
+            try:
+                if meter:
+                    captured = b"".join(chunks)
+                    usage = metering.usage_from_sse(captured, api=api)
+                    await metering.emit_llm_response(
+                        claims,
+                        model=body.get("model"),
+                        usage=usage,
+                        latency_ms=latency_ms,
+                        http_status=upstream_resp.status_code,
+                    )
+                    if not 200 <= upstream_resp.status_code < 300:
+                        await metering.emit_error(
+                            claims,
+                            stage="upstream",
+                            message=captured.decode("utf-8", errors="replace")[:500],
+                            http_status=upstream_resp.status_code,
+                            latency_ms=latency_ms,
+                        )
+            finally:
+                await upstream_resp.aclose()
+
+    return StreamingResponse(
+        _aiter(),
+        status_code=upstream_resp.status_code,
+        headers={
+            "content-type": upstream_resp.headers.get(
+                "content-type", "application/json"
+            )
+        },
+    )
+
+
+@router.post("/v1/messages")
+async def anthropic_messages(
+    body: Annotated[dict[str, Any], Body()],
+    claims: Annotated[CredClaims, Depends(get_cred)],
+    upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
+) -> Response:
+    """Anthropic Messages API → Ollama's native /v1/messages (Claude, dsh)."""
+    return await _passthrough(
+        path="/v1/messages",
+        api="anthropic",
+        body=body,
+        claims=claims,
+        upstream=upstream,
+    )
+
+
+@router.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(
+    body: Annotated[dict[str, Any], Body()],
+    claims: Annotated[CredClaims, Depends(get_cred)],
+    upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
+) -> Response:
+    """Token-count preflight — forwarded un-metered (not a generation call)."""
+    return await _passthrough(
+        path="/v1/messages/count_tokens",
+        api="anthropic",
+        body=body,
+        claims=claims,
+        upstream=upstream,
+        meter=False,
+    )
+
+
+@router.post("/v1/responses")
+async def openai_responses(
+    body: Annotated[dict[str, Any], Body()],
+    claims: Annotated[CredClaims, Depends(get_cred)],
+    upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
+) -> Response:
+    """OpenAI Responses API → Ollama's native /v1/responses (Codex CLI)."""
+    return await _passthrough(
+        path="/v1/responses",
+        api="responses",
+        body=body,
+        claims=claims,
+        upstream=upstream,
+    )
+
+
+@router.get("/v1/models")
+async def list_models(
+    claims: Annotated[CredClaims, Depends(get_cred)],
+    upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
+) -> Response:
+    """Model list — harness CLIs probe it; not metered."""
+    try:
+        upstream_resp = await upstream.get("/v1/models")
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={"error": {"message": f"upstream request failed: {exc}"}},
+        )
     return Response(
         content=upstream_resp.content,
         status_code=upstream_resp.status_code,
