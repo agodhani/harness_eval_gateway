@@ -246,7 +246,22 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `GET /api/harnesses` serves adapter manifests (display name, LLM protocol,
   CLI, image) for the submit form; `HarnessConfigIn.adapter` validates
   against the registry. Design doc: `docs/p25-harness-adapters.md`.
-- **Where:** `adapters/common/` (`runner.py`, `contract.py`),
+- **Hook/plugin telemetry (PR17):** harnesses with a documented native hook
+  surface report higher-fidelity events through the shared receiver
+  `adapters/common/hooks.py` (`python3 -m adapters.common.hooks <adapter>
+  [json]` — stdin payload for Claude Code hooks, argv for Codex `notify` and
+  pi's extension forwarder). Each hooked adapter ships `translate_hook`
+  beside `translate_obj` in `translate.py` + a `MANIFEST["hooks"]` line;
+  emitted payloads are stamped `via: "hook"`. Coverage: `claude_code`
+  settings.json hooks (`PostToolUse` → `tool_result` — outcome detail the
+  stream translation drops; `SessionStart/End`, `Stop`, `SubagentStop`,
+  `Notification`, `PreCompact` → `checkpoint`), `codex` `notify`
+  (`agent-turn-complete` → `checkpoint` with `last-assistant-message`), `pi`
+  generated `extensions/heg-events.ts` (`tool_execution_end` →
+  `tool_result`). `deepseek`/`miniloop` stay translated-only. The receiver
+  always exits 0 and mirrors to stderr (stdout can feed back into agent
+  context for some claude hook events).
+- **Where:** `adapters/common/` (`runner.py`, `contract.py`, `hooks.py`),
   `adapters/{codex,claude_code,pi,deepseek}/` (`adapter.py`, `config.py`,
   `translate.py`, `__main__.py`), `orchestrator/adapters.py`,
   `orchestrator/provision.py`, `sandbox/images/{codex,claude_code,pi,
@@ -254,8 +269,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Verify:**
   - Unit: `tests/unit/adapters/test_adapter_contract.py` (contract across all
     adapters: manifest, image_spec, env, launch, translation → valid
-    `EventType`s, `HEG_RESULT` parsing) + per-adapter tests under
-    `tests/unit/adapters/<name>/`
+    `EventType`s, `HEG_RESULT` parsing, hook-manifest ↔ `translate_hook`
+    pairing) + per-adapter tests under `tests/unit/adapters/<name>/` +
+    `tests/unit/adapters/common/test_hooks.py` (receiver: payload parsing,
+    via-stamping, ingest POST, exit-0 guarantee)
   - API: `tests/unit/api/test_harnesses.py`, multi-adapter submit in
     `test_runs.py::test_create_run_multi_adapter`
   - Docker: `tests/integration/test_adapter_images.py` (`-m docker`) — CLI

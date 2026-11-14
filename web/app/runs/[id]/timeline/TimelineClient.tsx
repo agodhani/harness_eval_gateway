@@ -106,6 +106,21 @@ function summarize(ev: EventOut): React.ReactNode {
         </>
       );
     }
+    case "tool_result": {
+      const code = num(p.exit_code);
+      const bad = p.is_error === true || (code != null && code !== 0);
+      return (
+        <>
+          result <code>{str(p.name) || "?"}</code>
+          {code != null ? (
+            <> · <Badge tone={bad ? "red" : "green"}>exit {code}</Badge></>
+          ) : null}
+          {p.is_error === true && code == null ? <Badge tone="red">error</Badge> : null}
+          {num(p.duration_ms) != null ? <span className="faint"> {Math.round(num(p.duration_ms)!)}ms</span> : null}
+          {p.output ? <span className="cmd muted"> {truncate(str(p.output), 120)}</span> : null}
+        </>
+      );
+    }
     case "shell_command": {
       const code = num(p.exit_code);
       const timedOut = p.timed_out === true;

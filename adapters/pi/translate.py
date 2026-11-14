@@ -210,3 +210,40 @@ def translate_events(lines: Any) -> list[dict[str, Any]]:
     from adapters.common.runner import translate_lines
 
     return translate_lines(lines, translate_obj)
+
+
+# ---------------------------------------------------------------------------
+# Extension hook (PR17) — argv JSON via adapters.common.hooks
+# ---------------------------------------------------------------------------
+
+
+def translate_hook(obj: dict[str, Any]) -> list[dict[str, Any]]:
+    """One pi extension-forwarded payload → normalized events.
+
+    Envelope (``config._EXTENSION_TS``):
+    ``{"hook_event_name": <pi event name>, "event": <event object>}``.
+    ``tool_execution_end`` → ``tool_result`` — the result payload the ``--mode
+    json`` translation drops into a thin checkpoint to avoid double-counting
+    the matching ``tool_execution_start`` event.
+    """
+    if obj.get("hook_event_name") != "tool_execution_end":
+        return []
+    event = obj.get("event")
+    if not isinstance(event, dict):
+        return []
+    payload: dict[str, Any] = {
+        "name": event.get("toolName") or event.get("name") or event.get("tool"),
+        "tool_call_id": (
+            event.get("toolCallId") or event.get("tool_call_id") or event.get("id")
+        ),
+        "is_error": bool(event.get("isError") or event.get("is_error")),
+        "duration_ms": event.get("durationMs") or event.get("duration_ms"),
+    }
+    if event.get("result") is not None:
+        payload["output"] = _truncate(event.get("result"))
+    return [
+        {
+            "type": "tool_result",
+            "payload": {k: v for k, v in payload.items() if v is not None},
+        }
+    ]

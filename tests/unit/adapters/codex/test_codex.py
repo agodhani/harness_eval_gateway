@@ -6,7 +6,7 @@ import json
 
 from adapters.codex import adapter, config
 from adapters.codex.__main__ import ARGV, main
-from adapters.codex.translate import translate_events, translate_obj
+from adapters.codex.translate import translate_events, translate_hook, translate_obj
 from adapters.common.runner import ShimConfig
 
 
@@ -39,6 +39,17 @@ class TestConfig:
         cfg = _cfg(tmp_path, MODEL_NAME='evil"model')
         text = config.write_config(cfg).read_text()
         assert 'model = "evil\\"model"' in text
+
+    def test_notify_hook_top_level(self, tmp_path):
+        """notify must sit above the first [table] — codex ignores it
+        inside project configs and inside tables."""
+        text = config.write_config(_cfg(tmp_path)).read_text()
+        notify_line = f"notify = {json.dumps(config.NOTIFY_ARGV)}"
+        assert notify_line in text
+        first_table = text.index("[model_providers")
+        assert text.index("notify") < first_table
+        # The receiver argv is the shared hook module for this adapter.
+        assert config.NOTIFY_ARGV[:3] == ["python3", "-m", "adapters.common.hooks"]
 
 
 class TestEnvLaunch:
@@ -139,6 +150,39 @@ class TestTranslate:
         assert translate_obj({"type": "item.started", "item": {}}) == []
         assert translate_obj({"type": "item.completed", "item": {"type": "reasoning"}}) == []
         assert translate_obj({"type": "unrelated"}) == []
+
+
+class TestHooks:
+    """``notify`` payloads (argv JSON) → normalized events (PR17)."""
+
+    def test_agent_turn_complete(self):
+        ev = translate_hook(
+            {
+                "type": "agent-turn-complete",
+                "thread-id": "th1",
+                "turn-id": "0",
+                "cwd": "/workspace",
+                "input-messages": ["build a thing"],
+                "last-assistant-message": "Created app.py and verified it.",
+            }
+        )
+        assert len(ev) == 1
+        assert ev[0]["type"] == "checkpoint"
+        p = ev[0]["payload"]
+        assert p["stage"] == "agent_turn_complete"
+        assert p["thread_id"] == "th1"
+        assert p["turn_id"] == "0"
+        assert p["input_message_count"] == 1
+        assert "app.py" in p["last_assistant_message"]
+
+    def test_minimal_payload(self):
+        ev = translate_hook({"type": "agent-turn-complete"})
+        assert ev[0]["payload"]["stage"] == "agent_turn_complete"
+        assert "last_assistant_message" not in ev[0]["payload"]
+
+    def test_other_types_dropped(self):
+        assert translate_hook({"type": "approval-requested"}) == []
+        assert translate_hook({}) == []
 
     def test_stream_with_marker(self):
         lines = [

@@ -6,7 +6,7 @@ import json
 
 from adapters.claude_code import adapter, config
 from adapters.claude_code.__main__ import _argv
-from adapters.claude_code.translate import translate_obj
+from adapters.claude_code.translate import translate_hook, translate_obj
 from adapters.common.runner import ShimConfig
 
 
@@ -40,6 +40,21 @@ class TestConfig:
         assert state["customKey"] == 1
         assert state["hasCompletedOnboarding"] is True
         assert state["theme"] == "dark"  # defaults overwrite onboarding keys
+
+    def test_hooks_registered(self, tmp_path):
+        settings = json.loads(config.write_config(_cfg(tmp_path))[1].read_text())
+        hooks = settings["hooks"]
+        assert set(hooks) == set(config.HOOK_EVENTS)
+        # PostToolUse is the fidelity win — tool outcomes the stream drops.
+        assert "PostToolUse" in hooks
+        for event, blocks in hooks.items():
+            assert len(blocks) == 1
+            assert blocks[0]["matcher"] == ""
+            cmd = blocks[0]["hooks"][0]
+            assert cmd["type"] == "command"
+            assert cmd["command"] == config.HOOK_COMMAND
+            assert "adapters.common.hooks" in cmd["command"]
+            assert event  # non-empty hook name
 
 
 class TestEnvLaunch:
@@ -187,3 +202,115 @@ class TestTranslate:
     def test_unknown_skipped(self):
         assert translate_obj({"type": "rate_limit_event"}) == []
         assert translate_obj({"type": "system", "subtype": "api_retry"}) == []
+
+
+class TestHooks:
+    """settings.json hook payloads (stdin JSON) → normalized events (PR17)."""
+
+    def test_post_tool_use_bash_dict_response(self):
+        ev = translate_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "s1",
+                "tool_name": "Bash",
+                "tool_use_id": "toolu_1",
+                "tool_input": {"command": "make test"},
+                "tool_response": {
+                    "stdout": "12 passed",
+                    "stderr": "",
+                    "returnCode": 0,
+                },
+                "duration_ms": 1540,
+            }
+        )
+        assert len(ev) == 1
+        assert ev[0]["type"] == "tool_result"
+        p = ev[0]["payload"]
+        assert p["name"] == "Bash"
+        assert p["tool_use_id"] == "toolu_1"
+        assert p["exit_code"] == 0
+        assert p["duration_ms"] == 1540
+        assert "12 passed" in p["output"]
+
+    def test_post_tool_use_string_response(self):
+        ev = translate_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "tool_response": "file contents here",
+            }
+        )
+        p = ev[0]["payload"]
+        assert p["name"] == "Read"
+        assert p["output"] == "file contents here"
+        assert "exit_code" not in p
+
+    def test_post_tool_use_error_flag(self):
+        ev = translate_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_response": {"is_error": True, "output": "boom"},
+            }
+        )
+        assert ev[0]["payload"]["is_error"] is True
+
+    def test_session_lifecycle(self):
+        ev = translate_hook(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "s1",
+                "source": "startup",
+                "model": "m",
+            }
+        )
+        assert ev[0]["payload"]["stage"] == "session_start"
+        assert ev[0]["payload"]["source"] == "startup"
+        ev = translate_hook(
+            {
+                "hook_event_name": "SessionEnd",
+                "session_id": "s1",
+                "reason": "exit",
+            }
+        )
+        assert ev[0]["payload"]["stage"] == "session_end"
+
+    def test_stop_and_subagent_stop(self):
+        ev = translate_hook(
+            {"hook_event_name": "Stop", "session_id": "s1", "stop_hook_active": False}
+        )
+        assert ev[0]["payload"]["stage"] == "stop"
+        ev = translate_hook(
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": "s1",
+                "agent_id": "a1",
+                "agent_type": "general-purpose",
+            }
+        )
+        assert ev[0]["payload"]["stage"] == "subagent_stop"
+        assert ev[0]["payload"]["agent_type"] == "general-purpose"
+
+    def test_notification_and_precompact(self):
+        ev = translate_hook(
+            {
+                "hook_event_name": "Notification",
+                "session_id": "s1",
+                "message": "Claude needs your permission",
+            }
+        )
+        assert ev[0]["payload"]["stage"] == "notification"
+        assert "permission" in ev[0]["payload"]["message"]
+        ev = translate_hook(
+            {"hook_event_name": "PreCompact", "session_id": "s1", "trigger": "auto"}
+        )
+        assert ev[0]["type"] == "checkpoint"
+        assert ev[0]["payload"]["stage"] == "pre_compact"
+        assert ev[0]["payload"]["trigger"] == "auto"
+
+    def test_unregistered_hooks_dropped(self):
+        # PreToolUse/UserPromptSubmit duplicate stream records — not registered.
+        assert translate_hook({"hook_event_name": "PreToolUse"}) == []
+        assert translate_hook({"hook_event_name": "UserPromptSubmit"}) == []
+        assert translate_hook({"hook_event_name": "Mystery"}) == []
+        assert translate_hook({}) == []

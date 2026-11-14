@@ -229,3 +229,31 @@ egress is `http://gateway:8080`.
   skipped — the CLI still runs (verified live) but native subprocess/pty
   helpers are unbuilt. If dsh needs them later, add `--allow-scripts` for
   its package set in the Dockerfile.
+
+## PR17 — native hook/plugin telemetry
+
+Beyond translated stdout, three of the four CLIs expose a documented
+hook/plugin surface; each lands on the shared receiver
+`adapters/common/hooks.py` (`python3 -m adapters.common.hooks <adapter>
+[json]`), which routes payloads through the adapter's `translate_hook` and
+emits them via `EventSink` with `via: "hook"` stamped into the payload. The
+receiver **always exits 0** and mirrors normalized JSONL to **stderr**, not
+stdout — claude feeds `SessionStart`/`UserPromptSubmit` hook stdout back
+into the agent's context, so stdout must stay clean. `tool_result` (new
+EventType) carries tool *outcomes* — fidelity the stream translators
+deliberately drop to avoid double-counting `tool_call`/`shell_command`/
+`file_op` events.
+
+| Adapter | Mechanism | Coverage added |
+|---|---|---|
+| `claude_code` | `~/.claude/settings.json` `hooks` → command hooks, JSON on **stdin** (`hook_event_name`, `session_id`, `tool_name`, `tool_input`, `tool_response`, `tool_use_id`, `duration_ms`, `source`, …) | `PostToolUse` → `tool_result`; `SessionStart`/`SessionEnd`/`Stop`/`SubagentStop`/`Notification`/`PreCompact` → `checkpoint`. `PreToolUse`/`UserPromptSubmit` deliberately unregistered — they duplicate stream records (and their stdout feeds agent context). |
+| `codex` | `notify` top-level key in `config.toml` — argv array; codex appends one JSON arg (**argv, not stdin**). Fires `agent-turn-complete` only. | → `checkpoint(agent_turn_complete)` incl. `last-assistant-message` — the final agent text the `--json` item stream never emits. |
+| `pi` | Generated extension `$PI_CODING_AGENT_DIR/extensions/heg-events.ts` — pi auto-discovers `extensions/*.ts`; the forwarder `execFileSync`s the receiver with `{"hook_event_name", "event"}` on argv. Observer-only, swallows all errors. | `tool_execution_end` → `tool_result` (result payload + `isError` + `durationMs` — the stream's end record keeps only a thin checkpoint). |
+| `deepseek` | none used — dsh's plugin system is the cordis loader (`cordis.patch.yml` inserts rows by id); there is no documented observer/hook API to hang telemetry on | stays translated-only |
+| `miniloop` | n/a — our own agent emits first-class events natively | — |
+
+Opt-in convention for future adapters (e.g. aider): add
+`translate_hook(obj)` to the adapter's `translate.py`, declare
+`MANIFEST["hooks"]`, wire the CLI's native mechanism to invoke
+`python3 -m adapters.common.hooks <name>`. The contract test asserts the
+manifest ↔ `translate_hook` pairing.

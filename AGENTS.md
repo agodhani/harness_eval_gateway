@@ -136,8 +136,9 @@ done skill pack) that signals the orchestrator — `agent_done` is distinct from
 
 - **sources**: `gateway`, `harness`, `sandbox`, `evaluator`, `orchestrator`
 - **types**: `llm_request`, `llm_response` (tokens in/out, cache r/w, latency,
-  cost, model), `tool_call`, `shell_command`, `file_op`, `test_execution`,
-  `checkpoint`, `skill_invocation`, `done_signal`, `error`, `run_started`,
+  cost, model), `tool_call`, `tool_result` (hook-sourced tool outcomes),
+  `shell_command`, `file_op`, `test_execution`, `checkpoint`,
+  `skill_invocation`, `done_signal`, `error`, `run_started`,
   `terminal_state`, `context_compacted`, `miniloop_result` (authoritative
   list: `api/schemas.py::EventType` — a contract test AST-scans emitters)
 
@@ -145,6 +146,21 @@ Gateway events are captured passively from the request/response stream.
 Agent-level events (tool calls, shell, file ops) are produced by the harness
 adapter translating native output (e.g. Claude Code `--output-format
 stream-json`, Aider logs) or harness hooks where available.
+
+**Hook events (PR17):** harnesses with a native hook/plugin surface register
+the shared receiver `python3 -m adapters.common.hooks <adapter>` — payload
+JSON arrives on stdin (Claude Code `settings.json` hooks) or argv (Codex
+`notify`, pi's generated `heg-events.ts` extension), the adapter's
+`translate_hook` normalizes it, and events POST to `/internal/events` with
+`via: "hook"` stamped into the payload. The receiver always exits 0 and
+mirrors JSONL to stderr only (Claude injects SessionStart/UserPromptSubmit
+hook stdout into agent context). Hooked today: `claude_code` (PostToolUse →
+`tool_result`; session lifecycle → `checkpoint`), `codex`
+(agent-turn-complete → `checkpoint` incl. `last-assistant-message`), `pi`
+(tool_execution_end → `tool_result`). `deepseek` (no stable observer/plugin
+API — cordis loader internals only) and `miniloop` (our own agent, already
+first-class) stay on the translated path; new adapters opt in by adding
+`translate_hook` + a `MANIFEST["hooks"]` line (contract-tested pairing).
 
 ## Harness adapter contract
 
@@ -156,6 +172,9 @@ Each adapter provides:
 - `launch(task_prompt)` — start the agent loop (non-interactive mode)
 - `translate_events(stream)` → normalized `Event[]`
 - `completion_signal()` — how `done` / loop-completion is detected
+- *(optional)* `translate_hook` in `adapters/<name>/translate.py` + a
+  `MANIFEST["hooks"]` descriptor — wires the harness's native hook/plugin
+  surface into `adapters.common.hooks` (see Event model § hook events)
 
 **MVP adapter:** `miniloop` — our custom minimal coding agent (tool-call
 loop: shell exec, file read/write, `done`). Post-MVP adapters: Claude Code
@@ -234,7 +253,6 @@ or tests change.
 - Model-vs-model comparisons (multi-model matrices)
 - Objective scoring: build/test execution, coverage, static analysis
 - Automated test-suite generation as eval target
-- Higher-fidelity instrumentation via harness hooks/plugins
 - Gateway response caching / deterministic replay
 - Multi-host / K8s sandbox scaling
 - Memory-aware spawn scheduling — gate `spawn_one` on host memory pressure
@@ -322,6 +340,15 @@ or tests change.
   `dsh` needs node >=24.9 → `node:24-slim` (others stay on 22).
 - **`done` invocation**: bare `done` is a shell keyword in sh/bash — prompts
   instruct harnesses to run `/usr/local/bin/done` (or `command done`).
+- **PR17 — hook/plugin telemetry lane**: `adapters/common/hooks.py` is the
+  shared receiver (`python3 -m adapters.common.hooks <adapter> [json]`) for
+  native hooks — claude_code `settings.json` hooks (stdin), codex `notify`
+  (argv), pi's generated extension forwarder (argv). Normalization stays in
+  Python via each adapter's `translate_hook` (contract-tested); events carry
+  `via: "hook"`. New `tool_result` EventType reports tool *outcomes* — the
+  detail translated streams drop to avoid double-counting tool calls. Hook
+  choice per CLI follows documented surfaces only (dsh/miniloop untranslated
+  paths unchanged).
 - **Imported skill packs (F11) live under `data/skillpacks/`**, not the
   vendored `skillpacks/` tree — vendored packs are committed and baked into
   the api image (ephemeral FS in compose), while `data/` is gitignored and

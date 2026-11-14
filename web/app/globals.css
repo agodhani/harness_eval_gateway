@@ -957,6 +957,10 @@ table.table {
 .evc-ev__type[data-type="tool_call"] {
   color: var(--text);
 }
+.tl-type[data-type="tool_result"],
+.evc-ev__type[data-type="tool_result"] {
+  color: var(--blue);
+}
 .tl-type[data-type="shell_command"],
 .tl-type[data-type="checkpoint"],
 .tl-type[data-type="file_op"],
