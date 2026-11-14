@@ -357,6 +357,11 @@ export default function ResultsClient({ runId }: { runId: string }) {
                             </Link>
                             <Badge tone={statusTone(sb.status)}>{sb.status}</Badge>
                           </div>
+                          {sb.name ? (
+                            <div className="dim-name" title={sb.name}>
+                              {sb.name}
+                            </div>
+                          ) : null}
                           <div className="dim-desc">
                             {harnessConfigLabel(sb.harness_config)}
                           </div>
@@ -454,7 +459,14 @@ export default function ResultsClient({ runId }: { runId: string }) {
                         (sb.artifacts ?? []).map((a) => a.id).filter(Boolean);
                       return (
                         <tr key={sb.sandbox_id}>
-                          <td className="num">{shortId(sb.sandbox_id)}</td>
+                          <td className="num" title={sb.sandbox_id}>
+                            {shortId(sb.sandbox_id)}
+                            {sb.name ? (
+                              <div className="faint" style={{ fontSize: "0.7rem" }}>
+                                {sb.name}
+                              </div>
+                            ) : null}
+                          </td>
                           <td className="mono" style={{ fontSize: "0.78rem", wordBreak: "break-all" }}>
                             {sb.artifact_path ?? <span className="faint">—</span>}
                           </td>

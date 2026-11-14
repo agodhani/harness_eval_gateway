@@ -237,6 +237,7 @@ or tests change.
 | F11 | Skillpack import from GitHub (discover → select → import) |
 | F12 | Artifact preview (static html + desktop/pygame via noVNC) |
 | F13 | Graphical analysis page + cross-run trends (recharts) |
+| F14 | Submit UX: live model picker + install, named harness configs |
 
 ## Post-MVP roadmap
 
@@ -258,14 +259,7 @@ or tests change.
   spawn scheduling this bounds concurrent sandboxes when >2 would exceed
   headroom for the loaded model
 - Auth, saved run templates, share links
-- Dynamic model picker — populate the submit form's model suggestions from
-  `ollama list` (gateway `/v1/models` pass-through already exists) instead of
-  the hardcoded `MODEL_SUGGESTIONS`, plus an install option (api endpoint →
-  `ollama pull`, stream pull progress into the UI)
-- Named harness configs — optional per-config label set at submit, persisted
-  onto the sandbox and surfaced in the timeline filter, results matrix, and
-  analytics so same-adapter sandboxes are distinguishable; default to
-  `<adapter>-<sandbox short id>` when left blank
+- ~~Dynamic model picker~~ + ~~named harness configs~~ — **landed as F14**
 - Cross-run analytics & cost dashboards
 - Timeline-side analytics — per-sandbox metrics rendered alongside the
   execution timeline or on event hover (cost/tokens/latency in context)
@@ -402,6 +396,22 @@ or tests change.
   cross-run trends endpoint (`GET /api/analytics/runs`) prices each point at
   its own run's resolved price unless `?price_model=` forces uniform
   repricing — same "estimate, not billing" framing as F9.
+- **Model catalog/install ride the gateway, not Ollama direct (F14)** — the
+  api mints a run-null `heg.*` cred to call `GET /v1/models`, which keeps the
+  provider abstraction (Ollama today, OpenRouter next) behind the gateway;
+  the gateway stamps `X-HEG-Provider` so the UI only offers install when the
+  upstream can `ollama pull` (`POST /v1/models/pull` → `/api/pull`, 501
+  otherwise). Pull is **control-plane only**: creds carrying a `sandbox_id`
+  (every participant/evaluator cred, and `heg-dev`) get 403 — only
+  run-scoped service creds (`sandbox_id=None`) may pull; the body is
+  allowlisted to `name`/`model` (+ forced `stream`, `insecure` dropped) and
+  the upstream client is pinned to Ollama (`get_ollama_client`) so pull can
+  never follow per-model routing. Pull progress streams end-to-end as
+  NDJSON — never buffered.
+- **Sandbox names are persisted, not derived (F14)** — `HarnessConfigIn.name`
+  (≤64, whitespace-normalized) lands on `sandboxes.name`; `spawn_one` fills
+  blanks with `<adapter>-<shortid>` once the UUID exists. All UI surfaces
+  read the column — no per-component re-derivation to drift.
 
 ## Working conventions
 

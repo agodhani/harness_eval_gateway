@@ -226,6 +226,11 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
                     </span>
                     <Badge tone={statusTone(sb.status)}>{sb.status}</Badge>
                   </div>
+                  {sb.name ? (
+                    <div className="dim-name" title={sb.name}>
+                      {sb.name}
+                    </div>
+                  ) : null}
                   <div className="dim-desc">{sb.label}</div>
                 </th>
               ))}

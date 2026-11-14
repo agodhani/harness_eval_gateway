@@ -32,7 +32,7 @@ import {
   type RunResults,
   type RunTrends,
 } from "@/lib/api";
-import { formatNum, formatUsd, shortId } from "@/lib/format";
+import { formatNum, formatUsd, shortId, truncate } from "@/lib/format";
 import {
   Badge,
   Card,
@@ -151,6 +151,19 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     [loaded, data.results],
   );
 
+  /** F14 — configured sandbox name (`<adapter>-<shortid>` default), else
+   * the short id for pre-migration NULL rows; truncated for chart labels. */
+  const nameOf = useCallback(
+    (id: string) =>
+      truncate(
+        sbs.find((s) => s.sandbox_id === id)?.name ??
+          resSandboxes.find((s) => s.sandbox_id === id)?.name ??
+          shortId(id),
+        24,
+      ),
+    [sbs, resSandboxes],
+  );
+
   /** Stable sandbox order — analytics order, else results order — so every
    * chart colors a given sandbox identically. */
   const sbSeries: Series[] = useMemo(() => {
@@ -159,10 +172,10 @@ export default function AnalysisClient({ runId }: { runId: string }) {
       : resSandboxes.map((s) => s.sandbox_id);
     return order.map((id, i) => ({
       key: id,
-      name: shortId(id),
+      name: nameOf(id),
       color: SANDBOX_COLORS[i % SANDBOX_COLORS.length],
     }));
-  }, [sbs, resSandboxes]);
+  }, [sbs, resSandboxes, nameOf]);
 
   const labelOf = useCallback(
     (id: string) =>
@@ -218,22 +231,22 @@ export default function AnalysisClient({ runId }: { runId: string }) {
   const tokenRows: Row[] = useMemo(
     () =>
       sbs.map((sb) => ({
-        name: shortId(sb.sandbox_id),
+        name: nameOf(sb.sandbox_id),
         input: sb.tokens.input,
         output: sb.tokens.output,
       })),
-    [sbs],
+    [sbs, nameOf],
   );
 
   const latencyRows: Row[] = useMemo(
     () =>
       sbs.map((sb) => ({
-        name: shortId(sb.sandbox_id),
+        name: nameOf(sb.sandbox_id),
         avg: sb.latency_ms.avg ?? 0,
         p95: sb.latency_ms.p95 ?? 0,
         max: sb.latency_ms.max ?? 0,
       })),
-    [sbs],
+    [sbs, nameOf],
   );
 
   // Cost recompute — mirrors the server: participant at the selected price,
@@ -248,22 +261,22 @@ export default function AnalysisClient({ runId }: { runId: string }) {
   const costRows: Row[] = useMemo(
     () =>
       sbs.map((sb, i) => ({
-        name: shortId(sb.sandbox_id),
+        name: nameOf(sb.sandbox_id),
         color: SANDBOX_COLORS[i % SANDBOX_COLORS.length],
         value: price ? estimateCostUsd(price, sb.tokens) : 0,
       })),
-    [sbs, price],
+    [sbs, price, nameOf],
   );
 
   const splitRows: Row[] = useMemo(
     () =>
       sbs.map((sb) => ({
-        name: shortId(sb.sandbox_id),
+        name: nameOf(sb.sandbox_id),
         participant: price ? estimateCostUsd(price, sb.tokens) : 0,
         evaluator:
           sb.evaluator && evalPrice ? estimateCostUsd(evalPrice, sb.evaluator.tokens) : 0,
       })),
-    [sbs, price, evalPrice],
+    [sbs, price, evalPrice, nameOf],
   );
 
   /** Tool-call mix: top-N tool names across sandboxes + "other". */
@@ -278,7 +291,7 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     const top = ranked.slice(0, TOOL_TOP_N).map(([t]) => t);
     const rest = new Set(ranked.slice(TOOL_TOP_N).map(([t]) => t));
     const rows = sbs.map((sb) => {
-      const row: Row = { name: shortId(sb.sandbox_id) };
+      const row: Row = { name: nameOf(sb.sandbox_id) };
       let other = 0;
       for (const [t, c] of Object.entries(sb.tool_calls.by_tool)) {
         if (rest.has(t)) other += c;
@@ -294,7 +307,7 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     }));
     if (rest.size) series.push({ key: "other", name: "other", color: C.faint });
     return { toolRows: rows, toolSeries: series };
-  }, [sbs]);
+  }, [sbs, nameOf]);
 
   /** Cross-run trend rows — oldest → newest for a left-to-right timeline. */
   const trendRows: Row[] = useMemo(() => {
@@ -381,7 +394,7 @@ export default function AnalysisClient({ runId }: { runId: string }) {
                 <p className="chart-legend">
                   Σ dimensions leader{leaders.ids.length > 1 ? "s (tie)" : ""}:{" "}
                   <strong style={{ color: "var(--accent)" }}>
-                    {leaders.ids.map((id) => shortId(id)).join(", ")} (
+                    {leaders.ids.map((id) => nameOf(id)).join(", ")} (
                     {Math.round(leaders.sum * 10) / 10})
                   </strong>
                 </p>

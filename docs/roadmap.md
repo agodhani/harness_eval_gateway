@@ -81,7 +81,7 @@ PR2 and PR6 landed). Max safe concurrency ≈ 9 lanes.
 
 ## PR cards
 
-### PR1 — Submit-form UX
+### PR1 — Submit-form UX ✅ landed (F14)
 - **Scope:** dynamic model picker (replace hardcoded `MODEL_SUGGESTIONS`
   with live list from gateway `/v1/models` — pass-through exists; add an
   api proxy route e.g. `GET /api/models` → `GATEWAY_URL`); model install

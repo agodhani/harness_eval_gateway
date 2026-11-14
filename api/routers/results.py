@@ -82,6 +82,9 @@ class SandboxResult(BaseModel):
 
     sandbox_id: UUID
     harness_config: dict[str, Any] = Field(default_factory=dict)
+    # Config label from the sandbox row (PR1 named harness configs); NULL
+    # on sandboxes that predate the column.
+    name: str | None = None
     status: str
     terminal_reason: str | None = None
     artifact_path: str | None = None
@@ -232,6 +235,7 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
             SandboxResult(
                 sandbox_id=sb.id,
                 harness_config=sb.harness_config or {},
+                name=sb.name,
                 status=sb.status,
                 terminal_reason=sb.terminal_reason,
                 artifact_path=sb.artifact_path,
