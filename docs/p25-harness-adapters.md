@@ -205,9 +205,11 @@ Event mapping conventions across CLI harnesses:
   the workspace repo and auto-commits applied edits — the commits double
   as `Commit <sha>` checkpoint events and a reviewable git log in the
   artifact). `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env supplies identity.
-- Shim writes `$HOME/.aider.conf.yml` (aider reads CWD → git-root → HOME;
-  HOME wins among conf files and keeps the file out of the workspace
-  artifact): `openai-api-base: <gw>/v1`, `model`/`weak-model:
+- Shim writes `$HOME/.aider.conf.yml` — configargparse merges conf files
+  home → git-root → CWD, so a conf in the workspace would actually
+  *override* the shim's; relying on HOME is only safe because the sandbox
+  workspace starts conf-free (and it keeps the file out of the artifact).
+  Contents: `openai-api-base: <gw>/v1`, `model`/`weak-model:
   openai/<model>` (the `openai/` prefix is aider's litellm route to
   OpenAI-compatible endpoints; weak-model covers commit messages +
   history summarization — pinning it to the run model keeps the

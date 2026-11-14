@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import yaml
+
 from adapters.aider import adapter, config
 from adapters.aider.__main__ import _argv
 from adapters.aider.translate import translate_events, translate_obj, translate_text
@@ -26,44 +28,47 @@ class TestConfig:
         path = config.write_config(cfg)
         assert path == tmp_path / ".aider.conf.yml"
         text = path.read_text()
+        # Parse the machine-consumed config and assert typed semantics —
+        # substring checks can't reject `pretty: "false"` (truthy string).
+        data = yaml.safe_load(text)
         # Provider wiring: openai/ prefix + /v1 base → gateway chat completions.
-        assert 'openai-api-base: "http://gateway:8080/v1"' in text
-        assert 'model: "openai/qwen2.5-coder:3b"' in text
+        assert data["openai-api-base"] == "http://gateway:8080/v1"
+        assert data["model"] == "openai/qwen2.5-coder:3b"
         # weak-model covers commit msgs + summarization — same model keeps
         # the comparison axis clean.
-        assert 'weak-model: "openai/qwen2.5-coder:3b"' in text
+        assert data["weak-model"] == "openai/qwen2.5-coder:3b"
         # Headless hardening.
-        for line in (
-            "yes-always: true",
-            "auto-commits: true",
-            "suggest-shell-commands: true",
-            "detect-urls: false",
-            "check-update: false",
-            "show-release-notes: false",
-            "analytics-disable: true",
-            "pretty: false",
-            "stream: false",
-            "fancy-input: false",
+        for key, want in (
+            ("yes-always", True),
+            ("auto-commits", True),
+            ("suggest-shell-commands", True),
+            ("detect-urls", False),
+            ("check-update", False),
+            ("show-release-notes", False),
+            ("analytics-disable", True),
+            ("pretty", False),
+            ("stream", False),
+            ("fancy-input", False),
         ):
-            assert line in text
+            assert data[key] is want, key
         # History files relocated out of the workspace artifact.
-        assert f'chat-history-file: "{tmp_path}/.aider.chat.history.md"' in text
-        assert f'input-history-file: "{tmp_path}/.aider.input.history"' in text
-        assert f'llm-history-file: "{tmp_path}/.aider.llm.history.txt"' in text
+        assert data["chat-history-file"] == f"{tmp_path}/.aider.chat.history.md"
+        assert data["input-history-file"] == f"{tmp_path}/.aider.input.history"
+        assert data["llm-history-file"] == f"{tmp_path}/.aider.llm.history.txt"
         # The per-sandbox cred never lands on disk.
         assert "heg.test" not in text
 
     def test_conf_no_model_omits_model_lines(self, tmp_path):
         cfg = _cfg(tmp_path, MODEL_NAME="")
-        text = config.write_config(cfg).read_text()
-        assert "\nmodel:" not in text
-        assert "weak-model:" not in text
-        assert 'openai-api-base: "http://gateway:8080/v1"' in text
+        data = yaml.safe_load(config.write_config(cfg).read_text())
+        assert "model" not in data
+        assert "weak-model" not in data
+        assert data["openai-api-base"] == "http://gateway:8080/v1"
 
     def test_conf_escapes_quotes(self, tmp_path):
         cfg = _cfg(tmp_path, MODEL_NAME='we"ird')
-        text = config.write_config(cfg).read_text()
-        assert 'model: "openai/we\\"ird"' in text
+        data = yaml.safe_load(config.write_config(cfg).read_text())
+        assert data["model"] == 'openai/we"ird'
 
 
 class TestEnvLaunch:
@@ -144,6 +149,11 @@ class TestTranslateText:
         assert ev[0]["payload"]["reason"] == "gitignore"
         ev = translate_text("Skipping edits to /etc/passwd")
         assert ev[0]["payload"]["reason"] is None
+        ev = translate_text("Did not apply edit to f.py")
+        assert ev[0]["payload"]["stage"] == "edit_skipped"
+        assert ev[0]["payload"]["reason"] is None
+        ev = translate_text("Did not apply edit to f.py (--dry-run)")
+        assert ev[0]["payload"]["reason"] == "dry_run"
         ev = translate_text("The LLM did not conform to the edit format.")
         assert ev[0]["type"] == "error"
         assert ev[0]["payload"]["stage"] == "edit_format"
