@@ -26,7 +26,8 @@ append-mostly; rebase on main before merge.
   (`think`/`num_ctx`/`keep_alive`/`options`) stripped for hosted providers;
   tests pin `UPSTREAM_PROVIDER=ollama` in `tests/conftest.py`. OpenRouter
   only serves `/v1/chat/completions` + `/v1/models` — `/v1/messages` and
-  `/v1/responses` 404 there (claude_code/codex need ollama). Verified free
+  `/v1/responses` 404 there (claude_code/codex needed ollama until PR12
+  routing). Verified free
   ids: `particle-ai/particle-1:free`, `inclusionai/ling-3.2-flash:free`,
   `dots-studio/dots-3-note-preview:free`. Mandatory-reasoning models (ernie,
   lfm) 400 on miniloop's `reasoning_effort:"none"`.

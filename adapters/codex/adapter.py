@@ -24,7 +24,7 @@ MANIFEST = {
     "display_name": "OpenAI Codex CLI",
     "description": (
         "codex exec --json in a Node sandbox; model traffic is the OpenAI "
-        "Responses API proxied by the AI gateway to Ollama"
+        "Responses API proxied by the AI gateway"
     ),
     "llm_protocol": "openai-responses",
     "cli": "codex",

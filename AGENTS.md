@@ -226,7 +226,7 @@ or tests change.
 | F0 | Dev environment & scaffold |
 | F1 | Submission form → run spec |
 | F2 | Orchestrator: matrix, rubric gen, lifecycle |
-| F3 | AI gateway: OpenAI-compatible proxy → Ollama, telemetry, budgets |
+| F3 | AI gateway: OpenAI-compatible proxy → upstream providers (Ollama default), telemetry, budgets |
 | F4 | Sandbox runtime: spawn, egress lockdown, snapshots, done mechanism |
 | F5 | Miniloop harness + adapter + default skill packs |
 | F6 | Event store + live timeline (SSE) + replay |
