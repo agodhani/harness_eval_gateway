@@ -1,4 +1,4 @@
-"""Prompt assets for the evaluator sandbox (F7).
+"""Prompt assets for the evaluator sandbox (F7) + test-suite generation (PR8).
 
 Two artifacts are staged into the eval workspace:
 
@@ -11,6 +11,11 @@ The prompt is generated per evaluation so it embeds the *actual* rubric
 dimensions (name/title/description/scale) — the judge still reads
 ``rubric.json`` for criteria detail, but the dimension list is spelled out
 here to reduce the chance a small model skips a dimension.
+
+PR8 adds ``TESTGEN_SYSTEM_PROMPT`` + ``build_testgen_prompt`` — the
+control-plane generation call that writes a pytest suite for the submission
+(run against it in the locked exec container; the suite is evaluator output,
+not judge input).
 """
 
 from __future__ import annotations
@@ -92,8 +97,14 @@ scoring. Your job is to read the rubric and the submission, then produce
   file sizes, language mix (parse-only static analysis), and — when an
   "Executed checks" section is present — the submission's build/test/
   coverage results measured by running it inside a locked, network-less
-  sandbox container. **`analysis.json`** is the machine-readable form of
-  the same report.
+  sandbox container, and — when a "Generated test suite" section is
+  present — pass/fail counts for a pytest suite written by an LLM test
+  generator (not by the candidate) and executed against the submission in
+  the same locked container. **`analysis.json`** is the machine-readable
+  form of the same report.
+- **`generated_tests/`** *(if present)* — the raw generated suite whose
+  results `ANALYSIS.md` summarizes. Evaluator-authored, not candidate work;
+  read it to judge what was actually verified.
 - **`EVAL_TRANSCRIPT.log`** *(if present)* — the candidate agent's run
   transcript. Reference only; it is NOT part of the submission.
 - **`EVAL_PROMPT.md`** — this file.
@@ -155,9 +166,19 @@ same object. Valid JSON in this schema:
    `acceptance_criteria` — a submission that fails to build or has failing
    tests is not fully working; cite the counts (e.g. 'build ok, 5/5 tests
    pass, 82% coverage').
-5. **Never modify candidate files.** The only file you create is
+5. **Use the generated-suite pass rate.** When a "Generated test suite"
+   section is present, an LLM (not the candidate) wrote pytest tests for the
+   task's stated behavior and they ran against the submission: the pass
+   rate is objective evidence for `functional_requirements` and
+   `acceptance_criteria` — a submission failing generated behavioral checks
+   is likely missing required behavior. Caveat: generated tests can
+   themselves be wrong — check `generated_tests/` or the report's failing
+   names when a failure looks like a test bug rather than a submission bug,
+   and weigh accordingly. Cite the counts (e.g. 'generated suite 7/10
+   passed, 70% coverage').
+6. **Never modify candidate files.** The only file you create is
    `scores.json`.
-6. After writing `scores.json`, read it back and confirm it is **one
+7. After writing `scores.json`, read it back and confirm it is **one
    complete JSON object** matching the schema (opening `{{`, closing `}}`,
    all fields inside). Fix it if needed, then call `done`.
 
@@ -167,3 +188,76 @@ same object. Valid JSON in this schema:
 - You have limited iterations: be efficient. List files once, read what
   matters, write scores.json, verify, done.
 """
+
+
+# ---------------------------------------------------------------------------
+# PR8 — generated test suite (control-plane generation call)
+# ---------------------------------------------------------------------------
+
+#: System prompt for the suite generator — the ONLY rules are about output
+#: shape and determinism; the user message carries the actual context.
+TESTGEN_SYSTEM_PROMPT = (
+    "You write pytest test suites that grade a Python submission for a "
+    "coding-agent benchmark. Output ONLY Python test code — no prose, no "
+    "explanation, no markdown fences.\n\n"
+    "Output contract:\n"
+    "- Emit one or more files; start EVERY file with a marker line of the "
+    "form '### FILE: test_<name>.py'.\n"
+    "- Every file must define at least one 'def test_*' function (plain "
+    "pytest — tmp_path/monkeypatch fixtures are fine, nothing else).\n\n"
+    "Test rules:\n"
+    "- Import the submission's modules by the paths shown (the submission "
+    "root is on sys.path — 'from app import x', never 'src.app' unless the "
+    "listing shows a package).\n"
+    "- Test externally observable behavior implied by the task summary and "
+    "criteria, not implementation details.\n"
+    "- Be deterministic: no sleeps, no network, no unseeded randomness, no "
+    "writes outside tmp_path.\n"
+    "- Tests must be INDEPENDENT of any tests the submission already has."
+)
+
+
+def build_testgen_prompt(
+    rubric: dict[str, Any] | None,
+    sources: list[tuple[str, str]],
+) -> str:
+    """User message for the generation call — rubric context + source listing.
+
+    ``sources`` is ``[(workspace-relative path, text)]`` from
+    ``evaluator.testgen._gather_sources`` (already budget-capped). The rubric
+    supplies the task summary + acceptance criteria — the closest thing to a
+    spec the generator can test against.
+    """
+    rubric = rubric or {}
+    parts: list[str] = []
+    summary = str(rubric.get("summary") or "").strip()
+    if summary:
+        parts += ["# Task summary", summary, ""]
+    criteria = [
+        c
+        for c in (rubric.get("criteria") or [])
+        if isinstance(c, dict) and str(c.get("text") or "").strip()
+    ]
+    if criteria:
+        parts.append("# Acceptance criteria")
+        for c in criteria:
+            dim = str(c.get("dimension") or "").strip()
+            line = f"- {str(c['text']).strip()}"
+            parts.append(f"{line} [{dim}]" if dim else line)
+        parts.append("")
+    parts.append("# Submission source files")
+    parts.append("")
+    for rel, text in sources:
+        parts += [f"### FILE: {rel}", "```python", text.rstrip(), "```", ""]
+    parts += [
+        "# Instructions",
+        (
+            "Write a pytest suite that checks whether this submission "
+            "satisfies the task summary and acceptance criteria above. Cover "
+            "the happy-path requirements first, then edge cases the criteria "
+            "imply. Remember: '### FILE: test_<name>.py' marker before every "
+            "file, test code only."
+        ),
+    ]
+    return "\n".join(parts) + "\n"
+

@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     # Repo-built image ExecRunner spawns for exec scoring (never pulled):
     #   docker build -f sandbox/images/exec.Dockerfile -t heg-exec:latest .
     EXEC_IMAGE: str = "heg-exec:latest"
+    # PR8 generated-test signal kill switch — when false the evaluator skips
+    # LLM test-suite generation entirely (no gateway call, no exec). Same
+    # env-first resolution as SCORING_EXEC.
+    SCORING_TESTGEN: bool = True
 
     # --- Artifact preview (F12) ---
     # Static-preview container image (`python -m http.server`); shares the

@@ -401,6 +401,119 @@ async def test_analysis_failure_does_not_block_eval(
     assert analysis_ev[0].payload["status"] == "unavailable"
 
 
+async def test_generated_tests_signal_flows_to_judge(
+    seeded, session_factory, monkeypatch
+) -> None:
+    """PR8 wiring: the generated_tests signal merges into analysis.json +
+    ANALYSIS.md, the suite is staged into the eval workspace, and a
+    test_execution event carries the pass rate to the timeline."""
+    import evaluator.evaluate as ev
+    from scoring.models import SignalReport
+
+    async def fake_gen(**kwargs):
+        # mimic the real helper: write the suite into <artifact>/generated_tests/
+        gen_dir = Path(kwargs["gen_dir"])
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        (gen_dir / "test_calc.py").write_text("def test_x():\n    assert True\n")
+        (gen_dir / "_manifest.json").write_text("{}")
+        return SignalReport(
+            name="generated_tests",
+            status="ok",
+            metrics={
+                "model": "judge-model",
+                "files_written": 1,
+                "tests_detected": True,
+                "tests_collected": 4,
+                "tests_passed": 3,
+                "tests_failed": 1,
+                "tests_errors": 0,
+                "tests_skipped": 0,
+                "pass_rate": 0.75,
+                "image": "heg-exec:latest",
+                "timed_out": False,
+            },
+        )
+
+    monkeypatch.setattr(ev, "generate_tests_signal", fake_gen)
+    fake = FakeRuntime()
+    rows = await _eval(seeded, session_factory, fake)
+    assert len(rows) == 3
+
+    eval_ws = Path(fake.specs[0].workspace_host_path)
+    # analysis staged for the judge incl. the new signal + dedicated section
+    report = json.loads((eval_ws / "analysis.json").read_text())
+    names = [s["name"] for s in report["signals"]]
+    assert "generated_tests" in names
+    gen = next(s for s in report["signals"] if s["name"] == "generated_tests")
+    assert gen["metrics"]["pass_rate"] == 0.75
+    assert "Generated test suite" in (eval_ws / "ANALYSIS.md").read_text()
+    # suite files staged (evaluator-authored copy)
+    assert (eval_ws / "generated_tests" / "test_calc.py").is_file()
+    # artifact persists the real report too
+    persisted = json.loads((seeded["artifact_dir"] / "analysis.json").read_text())
+    assert any(s["name"] == "generated_tests" for s in persisted["signals"])
+
+    events = _events_in_db(session_factory)
+    # eval_analysis checkpoint carries the generated_tests summary
+    analysis_ev = next(e for e in events if e.payload.get("phase") == "eval_analysis")
+    assert analysis_ev.payload["generated_tests"]["tests_passed"] == 3
+    # test_execution event with the eval_testgen phase + pass rate
+    tex = [
+        e for e in events
+        if e.type == "test_execution" and e.payload.get("phase") == "eval_testgen"
+    ]
+    assert len(tex) == 1
+    assert tex[0].payload["tests_passed"] == 3
+    assert tex[0].payload["pass_rate"] == 0.75
+
+
+async def test_candidate_generated_tests_dir_is_not_staged(
+    seeded, session_factory, monkeypatch
+) -> None:
+    """A candidate-authored generated_tests/ dir must never reach the judge
+    as 'LLM-generated' evidence — the name is reserved; when this attempt
+    wrote no suite, the staged workspace has no generated_tests/ at all."""
+    import evaluator.evaluate as ev
+    from scoring.models import SignalReport
+
+    ws = seeded["workspace"]
+    fake_dir = ws / "generated_tests"
+    fake_dir.mkdir()
+    (fake_dir / "test_fake.py").write_text("def test_fake():\n    assert False\n")
+
+    async def fake_gen(**kwargs):
+        return SignalReport(
+            name="generated_tests",
+            status="skipped",
+            warnings=["disabled"],
+        )
+
+    monkeypatch.setattr(ev, "generate_tests_signal", fake_gen)
+    fake = FakeRuntime()
+    rows = await _eval(seeded, session_factory, fake)
+    assert len(rows) == 3
+    eval_ws = Path(fake.specs[0].workspace_host_path)
+    assert not (eval_ws / "generated_tests").exists()
+
+
+async def test_testgen_failure_does_not_block_eval(
+    seeded, session_factory, monkeypatch
+) -> None:
+    """A raising generator degrades to no signal — eval proceeds normally."""
+    import evaluator.evaluate as ev
+
+    async def boom(**kwargs):
+        raise RuntimeError("generator exploded")
+
+    monkeypatch.setattr(ev, "generate_tests_signal", boom)
+    fake = FakeRuntime()
+    rows = await _eval(seeded, session_factory, fake)
+    assert len(rows) == 3
+    eval_ws = Path(fake.specs[0].workspace_host_path)
+    report = json.loads((eval_ws / "analysis.json").read_text())
+    assert "generated_tests" not in [s["name"] for s in report["signals"]]
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX only")
 async def test_candidate_special_files_are_not_staged(
     seeded, session_factory

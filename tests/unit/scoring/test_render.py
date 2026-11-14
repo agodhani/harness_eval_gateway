@@ -139,6 +139,59 @@ def test_render_exec_failed_tests(tmp_path: Path) -> None:
     assert "Coverage: not measured" in md
 
 
+def test_render_generated_tests_section(tmp_path: Path) -> None:
+    """PR8: the generated_tests signal renders its own block — suite size,
+    pass rate, failing names, submission-code coverage."""
+    report = AnalysisReport(
+        signals=[
+            SignalReport(
+                name="generated_tests",
+                metrics={
+                    "model": "eval-model",
+                    "files_written": 2,
+                    "files_rejected": 1,
+                    "tests_detected": True,
+                    "tests_collected": 10,
+                    "tests_passed": 7,
+                    "tests_failed": 2,
+                    "tests_errors": 1,
+                    "pass_rate": 0.7,
+                    "failed_tests": ["test_app::test_sub", "test_app::test_err"],
+                    "coverage_percent": 66.0,
+                    "coverage_statements": 10,
+                    "coverage_covered": 6,
+                    "timed_out": False,
+                },
+            )
+        ]
+    )
+    md = render_analysis_markdown(report)
+    assert "Generated test suite" in md
+    assert "evaluator-authored" in md
+    assert "eval-model" in md
+    assert "2 file(s)" in md
+    assert "1 chunk(s) rejected" in md
+    assert "7 passed" in md and "2 failed" in md and "1 errors" in md
+    assert "70%" in md
+    assert "`test_app::test_sub`" in md
+    assert "Coverage of submission code: **66.0%**" in md
+    # ok generated_tests also flips the intro off 'no code was executed'
+    assert "no code was executed" not in md
+
+
+def test_render_generated_tests_not_collected(tmp_path: Path) -> None:
+    report = AnalysisReport(
+        signals=[
+            SignalReport(
+                name="generated_tests",
+                metrics={"model": "m", "files_written": 1, "tests_detected": False},
+            )
+        ]
+    )
+    md = render_analysis_markdown(report)
+    assert "none collected" in md
+
+
 def test_render_empty_report() -> None:
     md = render_analysis_markdown(AnalysisReport())
     assert md.startswith("# Objective workspace analysis")

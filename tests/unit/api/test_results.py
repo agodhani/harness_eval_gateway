@@ -321,6 +321,84 @@ def test_run_results_exec_summary_skipped(
     assert "SCORING_EXEC" in (sb1["exec"]["detail"] or "")
 
 
+def test_run_results_generated_tests_summary(
+    client: TestClient, scored_run, session_factory, artifact_root
+) -> None:
+    """PR8: the flat `generated_tests` field is derived from the signal."""
+    payload = json.loads(json.dumps(ANALYSIS_JSON))
+    payload["signals"].append(
+        {
+            "name": "generated_tests",
+            "status": "ok",
+            "metrics": {
+                "model": "eval-model",
+                "files_written": 2,
+                "files_rejected": 1,
+                "tests_detected": True,
+                "tests_collected": 10,
+                "tests_passed": 7,
+                "tests_failed": 2,
+                "tests_errors": 1,
+                "pass_rate": 0.7,
+                "coverage_percent": 66.0,
+                "timed_out": False,
+            },
+            "warnings": [],
+            "error": None,
+        }
+    )
+    art_dir = artifact_root / "x" / "y"
+    art_dir.mkdir(parents=True)
+    (art_dir / "analysis.json").write_text(json.dumps(payload))
+    _set_artifact_path(session_factory, scored_run["sb1"], str(art_dir))
+
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb1 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"])
+    )
+    gt = sb1["generated_tests"]
+    assert gt["status"] == "ok"
+    assert gt["model"] == "eval-model"
+    assert gt["files_written"] == 2
+    assert gt["tests_passed"] == 7
+    assert gt["tests_failed"] == 2
+    assert gt["pass_rate"] == 0.7
+    assert gt["coverage_percent"] == 66.0
+    sb2 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"])
+    )
+    assert sb2["generated_tests"] is None
+
+
+def test_run_results_generated_tests_skipped(
+    client: TestClient, scored_run, session_factory, artifact_root
+) -> None:
+    """A skipped generated_tests signal surfaces its status + reason."""
+    payload = json.loads(json.dumps(ANALYSIS_JSON))
+    payload["signals"].append(
+        {
+            "name": "generated_tests",
+            "status": "skipped",
+            "metrics": {},
+            "warnings": ["test-suite generation disabled (SCORING_TESTGEN=0)"],
+            "error": None,
+        }
+    )
+    art_dir = artifact_root / "x" / "y"
+    art_dir.mkdir(parents=True)
+    (art_dir / "analysis.json").write_text(json.dumps(payload))
+    _set_artifact_path(session_factory, scored_run["sb1"], str(art_dir))
+
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb1 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"])
+    )
+    assert sb1["generated_tests"]["status"] == "skipped"
+    assert "SCORING_TESTGEN" in (sb1["generated_tests"]["detail"] or "")
+
+
 def test_run_results_invalid_analysis_is_null(
     client: TestClient, scored_run, session_factory, artifact_root
 ) -> None:
