@@ -1,4 +1,8 @@
-"""Upstream provider selection (ollama | openrouter) — config + client wiring.
+"""Upstream provider selection + routing — config, deps, and client wiring.
+
+Covers the four providers (ollama | openrouter | openai | anthropic),
+PROVIDER_ROUTES model-glob resolution, the ``x-heg-provider`` request-header
+override, and protocol-header forwarding to the anthropic upstream.
 
 Hermetic: settings are constructed directly (env file reads disabled), the
 upstream is an httpx.MockTransport injected via dependency override, and
@@ -12,6 +16,7 @@ from typing import Any, Self
 
 import httpx
 import pytest
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
@@ -37,6 +42,20 @@ _UPSTREAM_OK = {
 def _settings(**kwargs) -> GatewaySettings:
     kwargs.setdefault("_env_file", None)
     return GatewaySettings(**kwargs)
+
+
+def _request(headers: dict[str, str] | None = None) -> Request:
+    """Minimal starlette Request carrying the given headers."""
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "headers": [
+                (k.lower().encode(), v.encode())
+                for k, v in (headers or {}).items()
+            ],
+        }
+    )
 
 
 class TestSettings:
@@ -174,10 +193,58 @@ class TestProviderRoutes:
         assert s.provider_routes() is s.provider_routes()
 
 
+class TestGetProvider:
+    """``deps.get_provider`` — one resolution shared by the upstream client,
+    body rewriting, and event attribution: ``x-heg-provider`` header →
+    PROVIDER_ROUTES model globs → UPSTREAM_PROVIDER."""
+
+    def test_model_routes_through_provider_routes(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            deps,
+            "get_settings",
+            lambda: _settings(
+                PROVIDER_ROUTES='{"claude-*": "anthropic"}',
+                ANTHROPIC_API_KEY="a",
+            ),
+        )
+        assert (
+            deps.get_provider(_request(), {"model": "claude-sonnet-4-5"})
+            == "anthropic"
+        )
+        # Unmatched model + absent body fall back to the default.
+        assert deps.get_provider(_request(), {"model": "qwen3:8b"}) == "ollama"
+        assert deps.get_provider(_request()) == "ollama"
+
+    def test_header_overrides_routes_and_default(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            deps,
+            "get_settings",
+            lambda: _settings(
+                PROVIDER_ROUTES='{"claude-*": "anthropic"}',
+                ANTHROPIC_API_KEY="a",
+            ),
+        )
+        req = _request({"x-heg-provider": "openai"})
+        assert (
+            deps.get_provider(req, {"model": "claude-sonnet-4-5"}) == "openai"
+        )
+
+    def test_header_value_is_case_and_space_tolerant(self) -> None:
+        req = _request({"x-heg-provider": " OpenRouter "})
+        assert deps.get_provider(req) == "openrouter"
+
+    def test_unknown_header_value_400s(self) -> None:
+        req = _request({"x-heg-provider": "bogus"})
+        with pytest.raises(HTTPException) as excinfo:
+            deps.get_provider(req, {"model": "m"})
+        assert excinfo.value.status_code == 400
+        assert "bogus" in str(excinfo.value.detail)
+
+
 class TestUpstreamClient:
     async def test_ollama_client_has_no_auth(self, monkeypatch) -> None:
         monkeypatch.setattr(deps, "get_settings", lambda: _settings())
-        agen = deps.get_upstream_client()
+        agen = deps.get_upstream_client(provider="ollama")
         client = await agen.__anext__()
         try:
             assert str(client.base_url) == "http://host.docker.internal:11434"
@@ -193,7 +260,7 @@ class TestUpstreamClient:
                 UPSTREAM_PROVIDER="openrouter", OPENROUTER_API_KEY="sk-or-k"
             ),
         )
-        agen = deps.get_upstream_client()
+        agen = deps.get_upstream_client(provider="openrouter")
         client = await agen.__anext__()
         try:
             assert client.headers["authorization"] == "Bearer sk-or-k"
@@ -211,7 +278,7 @@ class TestUpstreamClient:
             "get_settings",
             lambda: _settings(UPSTREAM_PROVIDER="openai", OPENAI_API_KEY="sk-oai"),
         )
-        agen = deps.get_upstream_client()
+        agen = deps.get_upstream_client(provider="openai")
         client = await agen.__anext__()
         try:
             assert client.headers["authorization"] == "Bearer sk-oai"
@@ -230,7 +297,7 @@ class TestUpstreamClient:
                 UPSTREAM_PROVIDER="anthropic", ANTHROPIC_API_KEY="sk-ant"
             ),
         )
-        agen = deps.get_upstream_client()
+        agen = deps.get_upstream_client(provider="anthropic")
         client = await agen.__anext__()
         try:
             assert client.headers["x-api-key"] == "sk-ant"
@@ -242,7 +309,7 @@ class TestUpstreamClient:
             await agen.aclose()
 
     async def test_routed_client_uses_route_provider(self, monkeypatch) -> None:
-        """The request body's model picks the provider per PROVIDER_ROUTES."""
+        """A provider resolved via PROVIDER_ROUTES wires the routed client."""
         monkeypatch.setattr(
             deps,
             "get_settings",
@@ -251,37 +318,32 @@ class TestUpstreamClient:
                 ANTHROPIC_API_KEY="sk-ant",
             ),
         )
-        agen = deps.get_upstream_client({"model": "claude-sonnet-4-5"})
+        provider = deps.get_provider(_request(), {"model": "claude-sonnet-4-5"})
+        agen = deps.get_upstream_client(provider=provider)
         client = await agen.__anext__()
         try:
             assert str(client.base_url) == "https://api.anthropic.com/"
             assert client.headers["x-api-key"] == "sk-ant"
         finally:
             await agen.aclose()
-        # Unmatched model + absent body fall back to the default (ollama).
-        agen = deps.get_upstream_client({"model": "qwen3:8b"})
-        client = await agen.__anext__()
-        try:
-            assert str(client.base_url) == "http://host.docker.internal:11434"
-        finally:
-            await agen.aclose()
 
 
 class TestRealDepRouting:
-    """A POST through the REAL ``get_upstream_client`` — no dependency
-    override, no hand-invoked agen.
+    """A POST through the REAL dep chain — no dependency override, no
+    hand-invoked agen.
 
-    Guards the param-name coupling flagged in ``deps.get_upstream_client``:
-    the dep's ``body`` only populates because every endpoint also names its
+    Guards the param-name coupling flagged in ``deps.get_provider``: the
+    dep's ``body`` only populates because every endpoint also names its
     own body param ``body`` (FastAPI dedupes same-named body params across
     endpoint + dependencies). Renaming either side silently breaks routing
     — the dep would see ``body=None`` and fall back to the default provider
     (or the request 422s). Asserting the ROUTED provider's client proves
     the dep received the body."""
 
-    def test_post_routes_through_real_dep(
-        self, gw_client: TestClient, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    @staticmethod
+    def _fake_client(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        """Swap httpx.AsyncClient (inside the REAL dep) for a capturing
+        stand-in so nothing touches the network."""
         seen: dict[str, Any] = {}
 
         class _Client:
@@ -296,10 +358,31 @@ class TestRealDepRouting:
             async def __aexit__(self, *exc: object) -> None:
                 return None
 
-            async def post(self, path: str, json: Any = None) -> httpx.Response:
-                seen["path"], seen["json"] = path, json
+            async def post(
+                self, path: str, json: Any = None, headers: Any = None
+            ) -> httpx.Response:
+                seen["path"], seen["json"], seen["req_headers"] = (
+                    path,
+                    json,
+                    headers,
+                )
                 return httpx.Response(200, json=_UPSTREAM_OK)
 
+        monkeypatch.setattr(
+            deps.httpx, "AsyncClient", lambda **kw: _Client(**kw)
+        )
+        return seen
+
+    @staticmethod
+    def _no_ingest(monkeypatch: pytest.MonkeyPatch) -> None:
+        async def fake_post(events: list[dict[str, Any]]) -> tuple[int, Any]:
+            return 200, {"inserted": len(events)}
+
+        monkeypatch.setattr(metering, "post_ingest_events", fake_post)
+
+    def test_post_routes_through_real_dep(
+        self, gw_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         settings = _settings(
             PROVIDER_ROUTES='{"claude-*": "anthropic"}',
             ANTHROPIC_API_KEY="sk-ant",
@@ -307,16 +390,8 @@ class TestRealDepRouting:
         # deps and main each bind get_settings at import time — patch both.
         monkeypatch.setattr(deps, "get_settings", lambda: settings)
         monkeypatch.setattr(main, "get_settings", lambda: settings)
-        # The REAL dep constructs httpx.AsyncClient itself — swap the class
-        # so nothing touches the network (monkeypatch restores on teardown).
-        monkeypatch.setattr(
-            deps.httpx, "AsyncClient", lambda **kw: _Client(**kw)
-        )
-
-        async def fake_post(events: list[dict[str, Any]]) -> tuple[int, Any]:
-            return 200, {"inserted": len(events)}
-
-        monkeypatch.setattr(metering, "post_ingest_events", fake_post)
+        seen = self._fake_client(monkeypatch)
+        self._no_ingest(monkeypatch)
 
         resp = gw_client.post(
             "/v1/chat/completions",
@@ -340,6 +415,57 @@ class TestRealDepRouting:
         assert seen["json"]["stream"] is False
         # routed provider is not ollama → no ollama-only defaults injected
         assert "num_ctx" not in seen["json"]
+
+    def test_header_override_routes_through_real_dep(
+        self, gw_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``x-heg-provider`` forces the provider for the upstream client and
+        body rewriting — a model that would otherwise route elsewhere (here:
+        default ollama) still lands on the overridden provider."""
+        settings = _settings(OPENAI_API_KEY="sk-oai")
+        monkeypatch.setattr(deps, "get_settings", lambda: settings)
+        monkeypatch.setattr(main, "get_settings", lambda: settings)
+        seen = self._fake_client(monkeypatch)
+        self._no_ingest(monkeypatch)
+
+        resp = gw_client.post(
+            "/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {DEV_CRED_TOKEN}",
+                "x-heg-provider": "openai",
+            },
+            json={
+                "model": "qwen3:8b",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 200
+
+        # Override beat the model's default routing (qwen3 would be ollama).
+        assert seen["init"]["base_url"] == "https://api.openai.com/"
+        assert seen["init"]["headers"] == {"Authorization": "Bearer sk-oai"}
+        # ...and the same resolution drove body rewriting: no ollama
+        # defaults injected for a non-ollama provider.
+        assert "num_ctx" not in seen["json"]
+
+    def test_unknown_header_override_400s(
+        self, gw_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bogus ``x-heg-provider`` must never silently fall back to
+        model/default routing — the request 400s."""
+        self._no_ingest(monkeypatch)
+        resp = gw_client.post(
+            "/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {DEV_CRED_TOKEN}",
+                "x-heg-provider": "bogus",
+            },
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 400
 
 
 class TestOllamaDefaultInjection:
@@ -384,7 +510,7 @@ class TestOllamaDefaultInjection:
     def test_ollama_injects_num_ctx_and_keep_alive(
         self, gw_client: TestClient, forwarded: dict[str, Any], monkeypatch
     ) -> None:
-        monkeypatch.setattr(main, "get_settings", lambda: _settings())
+        monkeypatch.setattr(deps, "get_settings", lambda: _settings())
         self._post(gw_client)
         assert forwarded["json"]["num_ctx"] == 32_768
         assert forwarded["json"]["keep_alive"] == "30m"
@@ -394,7 +520,7 @@ class TestOllamaDefaultInjection:
         self, gw_client: TestClient, forwarded: dict[str, Any], monkeypatch
     ) -> None:
         monkeypatch.setattr(
-            main,
+            deps,
             "get_settings",
             lambda: _settings(
                 UPSTREAM_PROVIDER="openrouter", OPENROUTER_API_KEY="k"
@@ -421,7 +547,7 @@ class TestOllamaDefaultInjection:
         self, gw_client: TestClient, forwarded: dict[str, Any], monkeypatch
     ) -> None:
         monkeypatch.setattr(
-            main,
+            deps,
             "get_settings",
             lambda: _settings(
                 UPSTREAM_PROVIDER="openrouter", OPENROUTER_API_KEY="k"
@@ -448,7 +574,7 @@ class TestOllamaDefaultInjection:
         """The /v1/messages pass-through strips for hosted providers too —
         a stray ollama param must not reach api.anthropic.com."""
         monkeypatch.setattr(
-            main,
+            deps,
             "get_settings",
             lambda: _settings(
                 UPSTREAM_PROVIDER="anthropic", ANTHROPIC_API_KEY="k"
@@ -523,7 +649,7 @@ class TestProviderAttribution:
         self, gw_client: TestClient, posts: list, _upstream, monkeypatch
     ) -> None:
         monkeypatch.setattr(
-            main,
+            deps,
             "get_settings",
             lambda: _settings(
                 PROVIDER_ROUTES='{"m": "openai"}',
@@ -537,3 +663,82 @@ class TestProviderAttribution:
         )
         assert self._payloads(posts, "llm_request")[0]["provider"] == "openai"
         assert self._payloads(posts, "llm_response")[0]["provider"] == "openai"
+
+
+class TestAnthropicHeaderForwarding:
+    """Caller ``anthropic-beta``/``anthropic-version`` headers must reach the
+    anthropic upstream — Claude Code gates beta features (interleaved
+    thinking, fine-grained tool streaming, 1M context) on them. Forwarded
+    only when the resolved provider is ``anthropic``."""
+
+    @pytest.fixture()
+    def forwarded(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        """Capture the request the proxy sends upstream."""
+        seen: dict[str, Any] = {}
+
+        def dispatch(request: httpx.Request) -> httpx.Response:
+            seen["headers"] = request.headers
+            seen["json"] = json.loads(request.content)
+            return httpx.Response(200, json=_UPSTREAM_OK)
+
+        async def _dep():
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(dispatch),
+                base_url="http://upstream.test",
+            ) as client:
+                yield client
+
+        main.app.dependency_overrides[get_upstream_client] = _dep
+        yield seen
+        main.app.dependency_overrides.pop(get_upstream_client, None)
+
+    @pytest.fixture(autouse=True)
+    def _no_ingest(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def fake_post(events: list[dict[str, Any]]) -> tuple[int, Any]:
+            return 200, {"inserted": len(events)}
+
+        monkeypatch.setattr(metering, "post_ingest_events", fake_post)
+
+    def test_protocol_headers_forwarded_to_anthropic(
+        self, gw_client: TestClient, forwarded: dict[str, Any]
+    ) -> None:
+        resp = gw_client.post(
+            "/v1/messages",
+            headers={
+                "Authorization": f"Bearer {DEV_CRED_TOKEN}",
+                "x-heg-provider": "anthropic",
+                "anthropic-beta": "context-1m-2025-08-07,interleaved-thinking-2025-05-14",
+                "anthropic-version": "2024-06-01",
+            },
+            json={
+                "model": "claude-x",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 200
+        assert (
+            forwarded["headers"]["anthropic-beta"]
+            == "context-1m-2025-08-07,interleaved-thinking-2025-05-14"
+        )
+        assert forwarded["headers"]["anthropic-version"] == "2024-06-01"
+        # The routing-override header is gateway-internal — never forwarded.
+        assert "x-heg-provider" not in forwarded["headers"]
+
+    def test_protocol_headers_not_forwarded_to_ollama(
+        self, gw_client: TestClient, forwarded: dict[str, Any]
+    ) -> None:
+        resp = gw_client.post(
+            "/v1/messages",
+            headers={
+                "Authorization": f"Bearer {DEV_CRED_TOKEN}",
+                "anthropic-beta": "context-1m-2025-08-07",
+            },
+            json={
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 200
+        assert "anthropic-beta" not in forwarded["headers"]

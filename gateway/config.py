@@ -54,6 +54,20 @@ def _parse_provider_routes(raw: str) -> dict[str, ProviderName]:
     return cast(dict[str, ProviderName], parsed)
 
 
+def require_provider(value: str) -> ProviderName:
+    """``value`` as a ``ProviderName`` (case/space-tolerant).
+
+    ``x-heg-provider`` override values get the same validation as
+    ``PROVIDER_ROUTES`` targets; unknown names raise ``ValueError``.
+    """
+    name = value.strip().lower()
+    if name in _PROVIDER_NAMES:
+        return cast(ProviderName, name)
+    raise ValueError(
+        f"unknown provider {value!r} (one of {sorted(_PROVIDER_NAMES)})"
+    )
+
+
 class GatewaySettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",

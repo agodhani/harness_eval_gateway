@@ -435,7 +435,9 @@ or tests change.
   ernie-5.5) 400 on miniloop's `reasoning_effort:"none"` — pick tolerant free
   ids (particle-1, ling-3.2-flash, dots-3 verified). Anthropic auth is
   `x-api-key` + `anthropic-version` (`ANTHROPIC_VERSION`, default
-  2023-06-01; caller `anthropic-beta` headers are not forwarded). Emitted
+  2023-06-01; caller `anthropic-beta`/`anthropic-version` headers are
+  forwarded when the resolved provider is anthropic). An `x-heg-provider`
+  request header forces the provider outright (unknown values 400). Emitted
   `llm_request`/`llm_response`/`error` events record the resolved provider.
   Tests pin `UPSTREAM_PROVIDER=ollama` in `tests/conftest.py`.
 - `GET /api/skillpacks` (F11) lists vendored + imported packs (the submit

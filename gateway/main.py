@@ -4,9 +4,9 @@ Endpoints
 ---------
 ``GET  /health``                  — liveness.
 ``POST /v1/chat/completions``     — Bearer ``heg.*`` cred → budget gate →
-                                    forward to Ollama upstream; ``stream:
-                                    true`` callers get a metered SSE
-                                    pass-through, others a non-streamed
+                                    forward to the resolved upstream;
+                                    ``stream: true`` callers get a metered
+                                    SSE pass-through, others a non-streamed
                                     buffered response → emit ``llm_request``/
                                     ``llm_response``/``error`` events →
                                     return upstream body+status verbatim.
@@ -29,7 +29,10 @@ Endpoints
 Upstream providers: ``UPSTREAM_PROVIDER`` (``ollama`` default, ``openrouter``,
 ``openai``, ``anthropic``) is the process-wide default; ``PROVIDER_ROUTES``
 maps model globs → provider for per-request overrides resolved from the
-request body's ``model``. Endpoint coverage differs per provider — a path the
+request body's ``model``; an ``x-heg-provider`` request header forces a
+provider outright (unknown values 400). Caller ``anthropic-beta``/
+``anthropic-version`` headers are forwarded when the resolved provider is
+``anthropic``. Endpoint coverage differs per provider — a path the
 resolved upstream doesn't implement returns its native 404 verbatim (e.g.
 ``/v1/messages`` on ``openai``, ``/v1/chat/completions`` on ``anthropic``).
 
@@ -47,6 +50,7 @@ import asyncio
 import secrets
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -58,9 +62,13 @@ from pydantic import BaseModel, Field
 
 from api.schemas import EventSource, EventType
 from gateway import metering
-from gateway.config import get_settings
+from gateway.config import ProviderName, get_settings
 from gateway.creds import CredClaims, CredError, verify_cred
-from gateway.deps import get_session_factory, get_upstream_client
+from gateway.deps import (
+    get_provider,
+    get_session_factory,
+    get_upstream_client,
+)
 
 router = APIRouter()
 
@@ -195,28 +203,44 @@ _OLLAMA_ONLY_KEYS = ("num_ctx", "keep_alive", "think", "options")
 
 
 def _strip_ollama_only(
-    body: dict[str, Any], provider: str | None = None
+    body: dict[str, Any], provider: ProviderName
 ) -> dict[str, Any]:
-    """Drop Ollama-only body params unless the resolved provider is ollama.
-
-    ``provider`` is the request's routed upstream — under PROVIDER_ROUTES it
-    can differ from the process-wide ``UPSTREAM_PROVIDER``; ``None`` resolves
-    it from ``body["model"]``.
-    """
-    if provider is None:
-        provider = get_settings().provider_for_model(body.get("model"))
+    """Drop Ollama-only body params unless the resolved provider is ollama."""
     if provider == "ollama":
         return body
     return {k: v for k, v in body.items() if k not in _OLLAMA_ONLY_KEYS}
 
 
+# Anthropic protocol headers a caller may send that must reach the anthropic
+# upstream — `anthropic-beta` gates beta features (interleaved thinking,
+# fine-grained tool streaming, 1M context); `anthropic-version` names the
+# protocol revision the client speaks. Per-request headers override the
+# client's configured ANTHROPIC_VERSION default.
+_ANTHROPIC_FORWARD_HEADERS = ("anthropic-beta", "anthropic-version")
+
+
+def _forward_protocol_headers(
+    request_headers: Mapping[str, str], provider: ProviderName
+) -> dict[str, str] | None:
+    """Caller protocol headers to forward for ``provider`` — anthropic only."""
+    if provider != "anthropic":
+        return None
+    fwd = {
+        name: request_headers[name]
+        for name in _ANTHROPIC_FORWARD_HEADERS
+        if name in request_headers
+    }
+    return fwd or None
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(
+    request: Request,
     body: Annotated[dict[str, Any], Body()],
     claims: Annotated[CredClaims, Depends(get_cred)],
     upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
+    provider: Annotated[ProviderName, Depends(get_provider)],
 ) -> Response:
-    provider = get_settings().provider_for_model(body.get("model"))
     # --- streaming callers (pi and other OpenAI-compatible CLIs always set
     # stream:true and parse SSE — a forced non-streamed JSON body reads as an
     # empty stream to them): pass through with a metering tee. The shared
@@ -239,10 +263,11 @@ async def chat_completions(
             claims=claims,
             upstream=upstream,
             provider=provider,
+            request_headers=request.headers,
         )
 
     # --- budget gate (before any upstream traffic) ---
-    gated = await _budget_gate(claims, body)
+    gated = await _budget_gate(claims, body, provider)
     if gated is not None:
         return gated
 
@@ -257,7 +282,11 @@ async def chat_completions(
 
     started = time.monotonic()
     try:
-        upstream_resp = await upstream.post("/v1/chat/completions", json=out)
+        upstream_resp = await upstream.post(
+            "/v1/chat/completions",
+            json=out,
+            headers=_forward_protocol_headers(request.headers, provider),
+        )
     except httpx.HTTPError as exc:
         latency_ms = int((time.monotonic() - started) * 1000)
         await metering.emit_error(
@@ -318,7 +347,9 @@ async def chat_completions(
 # ---------------------------------------------------------------------------
 
 
-async def _budget_gate(claims: CredClaims, body: dict[str, Any]) -> JSONResponse | None:
+async def _budget_gate(
+    claims: CredClaims, body: dict[str, Any], provider: ProviderName
+) -> JSONResponse | None:
     """Shared run-token-budget gate; returns a 429 response or None (pass)."""
     settings = get_settings()
     run_uuid = metering.uuid_or_none(claims.run_id)
@@ -340,7 +371,7 @@ async def _budget_gate(claims: CredClaims, body: dict[str, Any]) -> JSONResponse
         http_status=status.HTTP_429_TOO_MANY_REQUESTS,
         used_tokens=used,
         budget=limit,
-        provider=settings.provider_for_model(body.get("model")),
+        provider=provider,
     )
     return JSONResponse(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -365,7 +396,8 @@ async def _passthrough(
     body: dict[str, Any],
     claims: CredClaims,
     upstream: httpx.AsyncClient,
-    provider: str | None = None,
+    provider: ProviderName,
+    request_headers: Mapping[str, str] | None = None,
     meter: bool = True,
 ) -> Response:
     """Forward ``body`` to ``upstream`` ``path`` verbatim; meter the outcome.
@@ -378,20 +410,25 @@ async def _passthrough(
     ``llm_response`` event once the stream ends.
 
     ``provider`` is the request's resolved upstream provider (recorded on the
-    emitted events); ``None`` resolves it from ``body["model"]``.
+    emitted events); ``request_headers`` are the inbound headers — protocol
+    headers the resolved provider honors (``anthropic-beta``/
+    ``anthropic-version`` for ``anthropic``) are forwarded.
     """
-    if provider is None:
-        provider = get_settings().provider_for_model(body.get("model"))
     body = _strip_ollama_only(body, provider)
     if meter:
-        gated = await _budget_gate(claims, body)
+        gated = await _budget_gate(claims, body, provider)
         if gated is not None:
             return gated
         await metering.emit_llm_request(claims, body, provider=provider)
 
     started = time.monotonic()
     try:
-        req = upstream.build_request("POST", path, json=body)
+        req = upstream.build_request(
+            "POST",
+            path,
+            json=body,
+            headers=_forward_protocol_headers(request_headers or {}, provider),
+        )
         upstream_resp = await upstream.send(req, stream=True)
     except httpx.HTTPError as exc:
         latency_ms = int((time.monotonic() - started) * 1000)
@@ -459,25 +496,31 @@ async def _passthrough(
 
 @router.post("/v1/messages")
 async def anthropic_messages(
+    request: Request,
     body: Annotated[dict[str, Any], Body()],
     claims: Annotated[CredClaims, Depends(get_cred)],
     upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
+    provider: Annotated[ProviderName, Depends(get_provider)],
 ) -> Response:
-    """Anthropic Messages API → Ollama's native /v1/messages (Claude, dsh)."""
+    """Anthropic Messages API → the resolved upstream's /v1/messages."""
     return await _passthrough(
         path="/v1/messages",
         api="anthropic",
         body=body,
         claims=claims,
         upstream=upstream,
+        provider=provider,
+        request_headers=request.headers,
     )
 
 
 @router.post("/v1/messages/count_tokens")
 async def anthropic_count_tokens(
+    request: Request,
     body: Annotated[dict[str, Any], Body()],
     claims: Annotated[CredClaims, Depends(get_cred)],
     upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
+    provider: Annotated[ProviderName, Depends(get_provider)],
 ) -> Response:
     """Token-count preflight — forwarded un-metered (not a generation call)."""
     return await _passthrough(
@@ -486,34 +529,45 @@ async def anthropic_count_tokens(
         body=body,
         claims=claims,
         upstream=upstream,
+        provider=provider,
+        request_headers=request.headers,
         meter=False,
     )
 
 
 @router.post("/v1/responses")
 async def openai_responses(
+    request: Request,
     body: Annotated[dict[str, Any], Body()],
     claims: Annotated[CredClaims, Depends(get_cred)],
     upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
+    provider: Annotated[ProviderName, Depends(get_provider)],
 ) -> Response:
-    """OpenAI Responses API → Ollama's native /v1/responses (Codex CLI)."""
+    """OpenAI Responses API → the resolved upstream's /v1/responses."""
     return await _passthrough(
         path="/v1/responses",
         api="responses",
         body=body,
         claims=claims,
         upstream=upstream,
+        provider=provider,
+        request_headers=request.headers,
     )
 
 
 @router.get("/v1/models")
 async def list_models(
+    request: Request,
     claims: Annotated[CredClaims, Depends(get_cred)],
     upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
+    provider: Annotated[ProviderName, Depends(get_provider)],
 ) -> Response:
     """Model list — harness CLIs probe it; not metered."""
     try:
-        upstream_resp = await upstream.get("/v1/models")
+        upstream_resp = await upstream.get(
+            "/v1/models",
+            headers=_forward_protocol_headers(request.headers, provider),
+        )
     except httpx.HTTPError as exc:
         return JSONResponse(
             status_code=status.HTTP_502_BAD_GATEWAY,

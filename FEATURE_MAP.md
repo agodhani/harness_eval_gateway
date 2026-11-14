@@ -110,18 +110,22 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Upstreams:** `UPSTREAM_PROVIDER` picks the default provider —
   `ollama` (default), `openrouter`, `openai`, `anthropic` — and
   `PROVIDER_ROUTES` (JSON `{"model-glob": provider}`) overrides it per
-  request model (first match wins, case-insensitive). Each provider gets its
-  own key/base-URL/headers (Anthropic sends `x-api-key` +
-  `anthropic-version`); endpoints a provider doesn't implement return its
-  native 404; Ollama-only body params are stripped for hosted providers.
+  request model (first match wins, case-insensitive); an `x-heg-provider`
+  request header forces the provider outright (unknown values 400). Each
+  provider gets its own key/base-URL/headers (Anthropic sends `x-api-key` +
+  `anthropic-version`; caller `anthropic-beta`/`anthropic-version` headers
+  forward to the anthropic provider); endpoints a provider doesn't
+  implement return its native 404; Ollama-only body params are stripped
+  for hosted providers.
 - **Where:** `gateway/` (`main.py`, `creds.py`, `metering.py`, `deps.py`,
   `config.py`, `mint_cred.py` CLI), compose service `gateway` (:8081→8080)
 - **Verify:**
   - Unit: `tests/unit/gateway/` (creds, metering, proxy — hermetic; protocol
     pass-throughs + SSE usage normalization covered),
     `test_upstream_provider.py` (provider selection, key validation,
-    PROVIDER_ROUTES resolution, per-provider client base/headers,
-    ollama-param stripping, provider attribution on emitted events)
+    PROVIDER_ROUTES resolution, `x-heg-provider` override, per-provider
+    client base/headers, ollama-param stripping, anthropic protocol-header
+    forwarding, provider attribution on emitted events)
   - Manual: mint cred (`uv run python -m gateway.mint_cred`) →
     `curl localhost:8081/v1/chat/completions` → completion + event rows
   - M2 e2e proven: sandbox→gateway→Ollama→events (see run
