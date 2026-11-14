@@ -324,13 +324,15 @@ def get_run_results(
     score_stmt = (
         select(Score)
         .where(Score.sandbox_id.in_(sandbox_ids))
-        # Merge order is last-wins per dimension. created_at ties are broken
-        # by rubric_version (sqlite's CURRENT_TIMESTAMP is second-precision,
-        # so two eval passes can land in the same second — the higher
-        # version is the later judgment). A re-score pinned to an older
-        # version still wins via its strictly-newer timestamp.
+        # Merge order is last-wins per dimension. created_at is only
+        # second-precision on sqlite, so ties break on seq — the durable
+        # insertion order stamped per eval pass (a re-score pinned to an
+        # OLDER rubric version still wins via its higher seq). NULL seq =
+        # unstamped rows, sorted first; rubric_version is the final
+        # semantic tiebreak for them.
         .order_by(
             Score.created_at.asc(),
+            Score.seq.asc().nulls_first(),
             Score.rubric_version.asc().nulls_first(),
             Score.id,
         )
@@ -475,7 +477,11 @@ def get_sandbox_scores(sandbox_id: UUID, session: DbSession) -> list[ScoreOut]:
         session.execute(
             select(Score)
             .where(Score.sandbox_id == sandbox_id)
-            .order_by(Score.created_at.asc(), Score.id)
+            .order_by(
+                Score.created_at.asc(),
+                Score.seq.asc().nulls_first(),
+                Score.id,
+            )
         )
         .scalars()
         .all()

@@ -17,6 +17,7 @@ import json
 import time
 import uuid
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -777,3 +778,51 @@ def test_sandbox_scores_expose_rubric_version(
 ) -> None:
     rows = client.get(f"/api/sandboxes/{scored_run['sb1']}/scores").json()
     assert all(r["rubric_version"] == 1 for r in rows)
+
+
+def test_results_same_second_passes_newest_inserted_wins(
+    client: TestClient, scored_run, session_factory
+) -> None:
+    """created_at ties (sqlite timestamps are second-precision): the
+    LAST-INSERTED pass wins per dimension via seq — even when the newer
+    pass re-judged against an OLDER rubric version. A version-based
+    tiebreak would show the stale v2 score here."""
+    ts = datetime(2099, 1, 1, tzinfo=UTC)  # identical instant, both passes
+    s = session_factory()
+    try:
+        v2 = Rubric(
+            run_id=scored_run["run_id"], version=2, status="approved",
+            parent_id=scored_run["rubric_id"],
+            content={"dimensions": [{"name": "functional_requirements"}]},
+        )
+        s.add(v2)
+        s.flush()
+        s.add_all([
+            # Earlier pass, judged under v2.
+            Score(
+                sandbox_id=scored_run["sb1"], rubric_id=v2.id,
+                rubric_version=2, seq=10, created_at=ts,
+                dimension="functional_requirements", score=9.5,
+                rationale="v2 pass",
+            ),
+            # Later pass, re-pinned to v1 — must win despite lower version.
+            Score(
+                sandbox_id=scored_run["sb1"], rubric_id=scored_run["rubric_id"],
+                rubric_version=1, seq=20, created_at=ts,
+                dimension="functional_requirements", score=3.0,
+                rationale="v1 rescore pass",
+            ),
+        ])
+        s.commit()
+    finally:
+        s.close()
+
+    body = client.get(f"/api/runs/{scored_run['run_id']}/results").json()
+    sb1 = next(
+        x for x in body["sandboxes"]
+        if x["sandbox_id"] == str(scored_run["sb1"])
+    )
+    assert sb1["dimensions"]["functional_requirements"] == {
+        "score": 3.0, "rationale": "v1 rescore pass"
+    }
+    assert sb1["rubric_version"] == 1

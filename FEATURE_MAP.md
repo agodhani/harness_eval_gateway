@@ -546,7 +546,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     denormalized `rubric_version` (stamped at write time, survives rubric
     lookups). `GET /api/runs/{id}/results?rubric_version=N` filters the
     matrix to one version's scores; the default view is per-sandbox
-    newest-wins (created_at, version tiebreak). `GET /api/runs/{id}/rubrics`
+    newest-wins (created_at, seq insertion-order tiebreak). `GET
+    /api/runs/{id}/rubrics`
     lists versions + score counts; `GET /api/rubrics/{id}` returns one
     version incl. content (prefills the editor).
   - **Events stay append-only:** `rescore_requested` /

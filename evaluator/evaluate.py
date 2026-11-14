@@ -59,7 +59,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from db.models import Event, Rubric, Score
@@ -617,6 +617,13 @@ async def evaluate_sandbox(
         )
 
     with session_factory() as s:
+        # Durable insertion order: created_at is only second-precision on
+        # sqlite, so the results merge breaks ties on seq — stamp this
+        # pass strictly after everything committed so far.
+        next_seq = (s.scalar(select(func.max(Score.seq))) or 0) + 1
+        for row in rows:
+            row.seq = next_seq
+            next_seq += 1
         s.add_all(rows)
         s.add(
             Event(

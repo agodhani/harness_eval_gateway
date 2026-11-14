@@ -165,6 +165,11 @@ class Score(Base):
     # Denormalized copy of rubrics.version at insert time (PR5) — keeps old
     # vs new re-score rows distinguishable without a join.
     rubric_version: Mapped[int | None] = mapped_column(Integer)
+    # Durable insertion order (PR5) — the evaluator stamps max(seq)+1 per
+    # pass so the newest-wins merge can break created_at ties (sqlite
+    # stores seconds) without guessing from rubric_version. NULL = legacy
+    # or unstamped rows; sorted first.
+    seq: Mapped[int | None] = mapped_column(BigInteger)
     dimension: Mapped[str] = mapped_column(String(128))
     score: Mapped[float] = mapped_column(Float)
     rationale: Mapped[str] = mapped_column(Text, default="")
