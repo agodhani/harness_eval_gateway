@@ -93,6 +93,9 @@ class Settings(BaseSettings):
     PREVIEW_REAP_SECONDS: float = 30.0
     # Published-port bind address — localhost only; previews are not LAN-visible.
     PREVIEW_BIND_HOST: str = "127.0.0.1"
+    # Results-GET preview probe cache TTL — the per-sandbox workspace scan is
+    # reused this long (the workspace only changes on re-snapshot; 0 disables).
+    PREVIEW_SCAN_TTL_SECONDS: float = 30.0
     # --- Desktop previews (executes candidate code — pygame via noVNC) ---
     # Runner image: repo-built, TigerVNC + noVNC/websockify + pygame-ce.
     PREVIEW_DESKTOP_IMAGE: str = "heg-preview-desktop:latest"

@@ -150,6 +150,22 @@ export const CANONICAL_DIMENSIONS: readonly string[] = [
   "cyclomatic_complexity",
 ];
 
+/** Order dimension rows: canonical rubric dimensions first, then alpha. */
+export function dimensionOrder(keys: string[]): string[] {
+  const canon = CANONICAL_DIMENSIONS.filter((d) => keys.includes(d));
+  const rest = keys.filter((d) => !CANONICAL_DIMENSIONS.includes(d)).sort();
+  return [...canon, ...rest];
+}
+
+/** `adapter · pack1, pack2` — mirrors analytics._sandbox_label. */
+export function harnessConfigLabel(
+  hc: Record<string, unknown> | undefined,
+): string {
+  const adapter = String(hc?.adapter ?? hc?.harness ?? "?");
+  const packs = Array.isArray(hc?.skill_packs) ? (hc.skill_packs as unknown[]) : [];
+  return packs.length ? `${adapter} · ${packs.join(", ")}` : adapter;
+}
+
 export interface HarnessConfig {
   adapter: string;
   skill_packs: string[];
@@ -270,6 +286,48 @@ export interface DimensionScore {
   rationale: string;
 }
 
+/** PR6 — objective scoring signals (scoring/ AnalysisReport).
+ * Measured on the workspace before judging; analysis.json is re-validated
+ * server-side and embedded on SandboxResult.analysis. Collector-agnostic:
+ * PR7's exec/coverage collector adds another SignalReport to `signals`. */
+export interface FunctionMetric {
+  name: string;
+  file: string;
+  line: number;
+  cyclomatic_complexity: number;
+  nloc: number;
+  params: number;
+  max_nesting_depth: number;
+}
+
+export interface FileMetric {
+  path: string;
+  language: string;
+  lines: number;
+  nloc: number;
+  function_count: number;
+  avg_cyclomatic_complexity: number;
+  max_cyclomatic_complexity: number;
+  max_nesting_depth: number;
+}
+
+export interface SignalReport {
+  name: string; // e.g. "static_analysis"; PR7 adds exec-derived signals
+  status: "ok" | "error" | "skipped" | string;
+  metrics: Record<string, unknown>;
+  files: FileMetric[];
+  functions: FunctionMetric[];
+  warnings: string[];
+  error: string | null;
+}
+
+export interface AnalysisReport {
+  schema_version: number;
+  generated_at: string; // ISO-8601
+  workspace: string;
+  signals: SignalReport[];
+}
+
 export interface SandboxResult {
   sandbox_id: string;
   harness_config: Record<string, unknown>;
@@ -279,6 +337,8 @@ export interface SandboxResult {
   rubric_id: string | null;
   dimensions: Record<string, DimensionScore>;
   overall: DimensionScore | null;
+  /** PR6: measured signals (analysis.json); null when not collected. */
+  analysis?: AnalysisReport | null;
   /** Optional artifact ids if/when the results API exposes them. */
   artifact_ids?: string[];
   artifacts?: { id: string; kind?: string; path?: string }[];
@@ -287,7 +347,7 @@ export interface SandboxResult {
   preview_type?: string | null;
   /**
    * F12: every detected runnable entry, default-first — the UI renders a
-   * dropdown and POSTs {entry}. Empty + previewable=false = unsupported.
+   * dropdown and POSTs {entry, type}. Empty + previewable=false = unsupported.
    */
   preview_candidates?: PreviewCandidate[];
 }
@@ -531,6 +591,7 @@ export interface SkillCallStats {
 export interface EvaluatorActivity {
   llm_turns: number;
   tokens: { input: number; output: number; total: number };
+  errors: number;
   estimated_cost_usd: number;
 }
 
@@ -578,6 +639,54 @@ export function estimateCostUsd(
     (tokens.input * price.input_per_mtok_usd +
       tokens.output * price.output_per_mtok_usd) /
     1_000_000
+  );
+}
+
+// ---------------------------------------------------------------------------
+// cross-run trends (F13 — GET /api/analytics/runs)
+// ---------------------------------------------------------------------------
+
+/** One run's aggregate for the cross-run trend chart. */
+export interface RunTrendPoint {
+  run_id: string;
+  status: string;
+  task_prompt: string; // truncated to 120 chars server-side
+  model_name: string;
+  evaluator_model: string | null;
+  created_at: string | null;
+  finished_at: string | null;
+  sandbox_count: number;
+  /** Participant-phase totals across all of the run's sandboxes. */
+  llm_turns: number;
+  tokens: TokenUsage;
+  errors: number;
+  /** Judge-phase totals (evaluator creds share the participant sandbox_id). */
+  evaluator_llm_turns: number;
+  evaluator_tokens: TokenUsage;
+  evaluator_errors: number;
+  /** Price-table key `estimated_cost_usd` was computed at. */
+  price_model: string;
+  estimated_cost_usd: number;
+  /** Judge tokens priced at the evaluator model's rate when listed. */
+  evaluator_cost_usd: number;
+  /** Mean of the run's `overall` score rows; null when unscored. */
+  mean_overall_score: number | null;
+}
+
+export interface RunTrends {
+  /** The explicit `?price_model=` basis, or null for per-run auto pricing. */
+  price_model: string | null;
+  price_table: Record<string, ModelPrice>;
+  /** Newest-first points (server ordering). */
+  points: RunTrendPoint[];
+}
+
+export function getRunTrends(opts: {
+  limit?: number;
+  priceModel?: string;
+} = {}): Promise<RunTrends> {
+  return request<RunTrends>(
+    `/api/analytics/runs${qs({ limit: opts.limit ?? 20, price_model: opts.priceModel })}`,
   );
 }
 
@@ -744,19 +853,25 @@ export function getPreview(runId: string, sandboxId: string): Promise<PreviewOut
 }
 
 /**
- * Idempotent per sandbox: returns the live preview if one already runs.
+ * Idempotent per sandbox: returns the live preview if one already runs and
+ * the requested plan matches (an explicit different entry/type replaces it).
  * `entry` (workspace-relative) picks an explicit entry point — for
  * ambiguous scans or artifacts detection missed; `.html` → static,
- * `.py` → desktop.
+ * `.py` → desktop. `type` overrides the pick: alone it selects the first
+ * candidate of that type; with `entry` it forces the plan type —
+ * `{entry: "x.py", type: "static"}` serves the file instead of executing
+ * it ("view source"), while `desktop` requires a `.py` entry.
  */
 export function startPreview(
   runId: string,
   sandboxId: string,
-  entry?: string,
+  opts?: { entry?: string; type?: string },
 ): Promise<PreviewOut> {
+  const body =
+    opts && (opts.entry || opts.type) ? JSON.stringify(opts) : undefined;
   return request<PreviewOut>(previewPath(runId, sandboxId), {
     method: "POST",
-    ...(entry ? { body: JSON.stringify({ entry }) } : {}),
+    ...(body ? { body } : {}),
   });
 }
 

@@ -15,6 +15,11 @@ append-mostly; rebase on main before merge.
   claude_code, pi, deepseek), evaluator w/ judge retries, results UI,
   analytics (F9), skillpack import (F11), artifact preview static+desktop
   (F12).
+- **PR2 preview fixes**: `type=` POST-body override on the artifact preview
+  (`plan_for_type` picks the first candidate of a type; `entry`+`type` forces
+  the plan — `static` serves any jailed file, `desktop` requires `.py`) and a
+  `ScanCache`'d results-GET probe (`PREVIEW_SCAN_TTL_SECONDS`, default 30s).
+  Details: `FEATURE_MAP.md` F12.
 - **OpenRouter provider** (commit 8014338): `UPSTREAM_PROVIDER=ollama|openrouter`
   in `gateway/config.py`; client base normalizes to `/api/` (httpx
   concatenates base+request paths); Ollama-only body params
@@ -25,6 +30,9 @@ append-mostly; rebase on main before merge.
   ids: `particle-ai/particle-1:free`, `inclusionai/ling-3.2-flash:free`,
   `dots-studio/dots-3-note-preview:free`. Mandatory-reasoning models (ernie,
   lfm) 400 on miniloop's `reasoning_effort:"none"`.
+- **PR6 — static-analysis signals** (`scoring/` package, see below).
+- **PR11 — Graphical analysis + cross-run dashboards** (F13): recharts,
+  `GET /api/analytics/runs`, results-matrix totals row.
 - **OpenAI + Anthropic providers + per-model routing** (PR12):
   `UPSTREAM_PROVIDER` gains `openai` (chat/completions + responses + models;
   no /v1/messages) and `anthropic` (/v1/messages + count_tokens + models;
@@ -44,8 +52,7 @@ Soft edge (╌▶) = works better after / benefits from.
 PR1  Submit UX ────────▶ PR14 Model-vs-model ◀╌╌╌╌ PR12 Providers ──▶ PR18 Cache/replay
    │                                                         │
    ├╌ labels ╌▶ PR9  Timeline-analytics ──▶ PR10 Split-view   ├╌╌╌▶ PR13 Aider ╌╌╌▶ PR17 Hooks
-   ├╌ labels ╌▶ PR10
-   └╌ labels ╌▶ PR11 Graphical analysis
+   └╌ labels ╌▶ PR10
 
 PR2  Preview fixes ────▶ PR3  Preview types ──▶ PR4  Thumbnails
 
@@ -59,14 +66,15 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR2, PR5, PR6, PR9, PR11, PR12,
-  PR15, PR19 — plus PR13/PR17 if soft-only deps are acceptable.
-- **Depth 1:** PR3 (←2), PR7 (←6, +5 soft), PR10 (←9), PR14 (←1, +12 soft),
-  PR16 (←15), PR18 (←12).
-- **Depth 2:** PR4 (←3), PR8 (←7).
+- **Depth 0 (start immediately):** PR1, PR3, PR5, PR9,
+  PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
+  PR13/PR17 if soft-only deps are acceptable.
+- **Depth 1:** PR4 (←3), PR8 (←7), PR10 (←9), PR14 (←1), PR16 (←15),
+  PR18 (←12).
 - **Floating:** PR20 (soft ←15).
 
-Critical path depth = 3 (`6→7→8` / `2→3→4`). Max safe concurrency ≈ 9 lanes.
+Critical path depth = 1 remaining (`7→8`, `3→4`; was 3 via `6→7→8` before
+PR2 and PR6 landed). Max safe concurrency ≈ 9 lanes.
 
 ## Shared-file hotspots (merge-conflict risk)
 
@@ -97,15 +105,9 @@ Critical path depth = 3 (`6→7→8` / `2→3→4`). Max safe concurrency ≈ 9 
 - **Verify:** unit tests for schema + migration; UI shows live model list
   + names in filters.
 
-### PR2 — Preview fixes
-- **Scope:** `?type=` override (entry= picks file but type should be
-  overridable — a workspace matching both detectors currently always gets
-  static); cache `previewable`/`preview_type` probe on results GET (runs a
-  per-sandbox FS probe on every call today).
-- **Touch:** `sandbox/preview.py`, `api/routers/preview.py`,
-  `api/routers/results.py`, `PreviewControls.tsx`.
-- **Verify:** existing `tests/unit/sandbox/test_preview.py`,
-  `tests/unit/api/test_preview.py` extended for type override + cache.
+### PR2 — Preview fixes ✅ landed
+`type=` POST-body override + `ScanCache`'d results-GET probe — see "Already
+landed" and `FEATURE_MAP.md` F12.
 
 ### PR3 — Preview types
 - **Scope:** `python-server` preview type (run candidate code like desktop —
@@ -135,12 +137,11 @@ Critical path depth = 3 (`6→7→8` / `2→3→4`). Max safe concurrency ≈ 9 
 - **Verify:** `tests/unit/evaluator/`, orchestrator unit tests; re-score on a
   stored run end-to-end.
 
-### PR6 — Objective scoring I: static analysis
-- **Scope:** real cyclomatic complexity + static metrics as rubric signals
-  (today LLM-assessed). No code execution — parse/analyze only.
-- **Touch:** new module (e.g. `evaluator/analysis/` or `scoring/`),
-  `evaluator/evaluate.py` wiring, `api/schemas.py` score payloads.
-- **Verify:** unit tests on sample workspaces with known complexity.
+### PR6 — Objective scoring I: static analysis — ✅ landed
+Landed as the `scoring/` collector registry (lizard, parse-only): the
+evaluator stages `ANALYSIS.md`/`analysis.json` judge evidence, persists
+`<artifact>/analysis.json`, emits an `eval_analysis` checkpoint, and the
+results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 
 ### PR7 — Objective scoring II: exec + coverage
 - **Scope:** execute candidate code in a locked sandbox — build success,
@@ -173,12 +174,12 @@ Critical path depth = 3 (`6→7→8` / `2→3→4`). Max safe concurrency ≈ 9 
   `web/lib/api.ts` if new query params needed.
 - **Depends on:** PR9 (same page — land it first).
 
-### PR11 — Graphical analysis page + cross-run dashboards
+### PR11 — Graphical analysis page + cross-run dashboards — ✅ landed
 - **Scope:** charts over F9 analytics + scores: per-dimension score
   comparison across sandboxes, token/cost/latency per sandbox, tool-call
   mix, eval-vs-participant spend split, cross-run trends; **also a totals
   row / aggregate column on the results score matrix** (per-sandbox winner
-  at a glance). Decision needed: charting lib.
+  at a glance). Charting lib: recharts.
 - **Touch:** new page (e.g. `web/app/runs/[id]/analysis/`), results matrix
   component, `api/routers/analytics.py` if new aggregates needed.
 - **Verify:** renders on real run data; totals match matrix sums.
