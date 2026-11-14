@@ -33,6 +33,10 @@ append-mostly; rebase on main before merge.
 - **PR6 — static-analysis signals** (`scoring/` package, see below).
 - **PR11 — Graphical analysis + cross-run dashboards** (F13): recharts,
   `GET /api/analytics/runs`, results-matrix totals row.
+- **PR5 — Eval iteration** (F14): re-score on stored artifacts
+  (`POST /api/runs/{id}/rescore` → `lifecycle.rescore_run`), versioned
+  post-run rubric edits (`parent_id` chain, `Score.rubric_version`/`seq`
+  provenance, `?rubric_version=` results filter). See FEATURE_MAP.md F14.
 
 ## Dependency DAG
 
@@ -48,8 +52,6 @@ PR1  Submit UX ────────▶ PR14 Model-vs-model ◀╌╌╌╌ P
 PR2  Preview fixes ────▶ PR3  Preview types ──▶ PR4  Thumbnails
 
 PR6  Static analysis ──▶ PR7  Exec+coverage ──▶ PR8  Test-suite-gen
-                            ▲
-PR5  Re-score/rub-edits ╌╌╌╌┘
 
 PR15 Queue/mem-aware ──▶ PR16 Add-next-prompt ╌╌▶ PR20 K8s
 PR19 Auth/templates/share — independent
@@ -57,9 +59,8 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR3, PR5, PR9, PR12,
-  PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
-  PR13/PR17 if soft-only deps are acceptable.
+- **Depth 0 (start immediately):** PR1, PR3, PR7, PR9, PR12,
+  PR15, PR19 — plus PR13/PR17 if soft-only deps are acceptable.
 - **Depth 1:** PR4 (←3), PR8 (←7), PR10 (←9), PR14 (←1, +12 soft),
   PR16 (←15), PR18 (←12).
 - **Floating:** PR20 (soft ←15).
@@ -71,9 +72,9 @@ PR2 and PR6 landed). Max safe concurrency ≈ 9 lanes.
 
 - `api/schemas.py`, `web/lib/api.ts` — most PRs append here.
 - `AGENTS.md`, `FEATURE_MAP.md` — every PR updates docs; rebase.
-- `db/migrations/` — PR1 + PR5 add migrations; renumber revisions at merge.
-- `orchestrator/` — PR5 (re-score trigger) vs PR15/PR16 (state machine);
-  stagger C and I lanes or coordinate.
+- `db/migrations/` — PR1 adds a migration; renumber revisions at merge.
+- `orchestrator/` — PR15 vs PR16 both touch the state machine;
+  coordinate.
 - `sandbox/preview.py` + `api/routers/preview.py` + `PreviewControls.tsx` —
   all of lane B; strictly sequential.
 
@@ -117,16 +118,14 @@ landed" and `FEATURE_MAP.md` F12.
 - **Touch:** `sandbox/preview.py` or new `sandbox/thumbnails.py`, artifact
   store layout (`data/artifacts/<run>/<sandbox>/`), results API + UI.
 
-### PR5 — Eval iteration: re-score + rubric edits
-- **Scope:** re-score runs (re-run evaluator on stored artifacts — trigger
-  endpoint + orchestrator hook); post-run rubric edits (versioned rubrics —
-  `rubrics` get a version/parent, scores keep `rubric_version` provenance so
-  old vs new scores stay distinguishable).
-- **Touch:** `orchestrator/` (eval trigger — likely `runner.py`/`lifecycle.py`),
-  `api/routers/results.py`, `evaluator/`, db `rubrics`/`scores` (migration),
-  results UI (re-score button + version selector).
-- **Verify:** `tests/unit/evaluator/`, orchestrator unit tests; re-score on a
-  stored run end-to-end.
+### PR5 — Eval iteration: re-score + rubric edits — ✅ landed
+Landed as F14: `POST /api/runs/{id}/rubrics` appends immutable rubric
+versions (`parent_id` chain, previous approved → `superseded`,
+`uq_rubrics_run_version`), `POST /api/runs/{id}/rescore` re-runs the
+evaluator on stored artifacts via `orchestrator.lifecycle.rescore_run`
+(terminal runs only, `rescore` task-kind dedup), and Score rows carry
+`rubric_version`/`seq` provenance for the newest-wins matrix merge.
+Paths + tests: FEATURE_MAP F14.
 
 ### PR6 — Objective scoring I: static analysis — ✅ landed
 Landed as the `scoring/` collector registry (lizard, parse-only): the
@@ -140,7 +139,7 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
   patterns (egress lockdown, resource bounds).
 - **Touch:** `evaluator/` (exec staging), `sandbox/runtime.py` or a new
   exec sandbox spec, `api/routers/results.py`.
-- **Depends on:** PR6 (signal plumbing), PR5 soft (evaluator wiring settles).
+- **Depends on:** PR6 (signal plumbing), PR5 (evaluator wiring) — both landed.
 - **Verify:** integration test executing a trivial artifact.
 
 ### PR8 — Automated test-suite generation

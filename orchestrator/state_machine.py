@@ -5,6 +5,10 @@ Allowed transitions mirror the lifecycle in AGENTS.md / docs/orchestrator-plan.m
     run:     submitted → rubric_review → provisioning → running → evaluating → done | failed
     sandbox: provisioning → running → terminating → done | failed
 
+PR5 adds the re-score loop: a terminal run may re-enter ``evaluating``
+(done|failed → evaluating) so the evaluator can re-run on stored artifacts;
+it then closes back to ``done`` or ``failed`` by the usual score-count rule.
+
 ``transition()`` is the ONLY sanctioned way to change ``status`` — it validates
 against the table, mutates the row, and emits an orchestrator ``checkpoint``
 event (callers commit the session). Illegal transitions raise
@@ -25,8 +29,9 @@ RUN_TRANSITIONS: dict[str, frozenset[str]] = {
     "provisioning": frozenset({"running", "failed"}),
     "running": frozenset({"evaluating", "failed"}),
     "evaluating": frozenset({"done", "failed"}),
-    "done": frozenset(),
-    "failed": frozenset(),
+    # PR5 re-score: terminal runs may re-enter evaluating.
+    "done": frozenset({"evaluating"}),
+    "failed": frozenset({"evaluating"}),
 }
 
 SANDBOX_TRANSITIONS: dict[str, frozenset[str]] = {

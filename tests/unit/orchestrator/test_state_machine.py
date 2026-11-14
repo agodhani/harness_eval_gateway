@@ -169,3 +169,27 @@ def test_can_transition_helper(session_factory) -> None:
         r = s.get(type(run), run.id)
         assert state_machine.can_transition(r, "rubric_review")
         assert not state_machine.can_transition(r, "running")
+
+
+def test_run_terminal_can_reenter_evaluating(session_factory) -> None:
+    """PR5 re-score loop: done|failed → evaluating → terminal again; a
+    terminal run can never go back to ``running``."""
+    for terminal in ("done", "failed"):
+        run = make_run(session_factory, status=terminal)
+        with session_factory() as s:
+            r = s.get(type(run), run.id)
+            transition(s, r, "evaluating")
+            s.commit()
+        with session_factory() as s:
+            r2 = s.get(type(run), run.id)
+            assert r2.status == "evaluating"
+            transition(s, r2, terminal)
+            s.commit()
+        with session_factory() as s:
+            r3 = s.get(type(run), run.id)
+            assert r3.status == terminal
+            with pytest.raises(InvalidTransition):
+                transition(s, r3, "running")
+            with pytest.raises(InvalidTransition):
+                transition(s, r3, "provisioning")
+            s.rollback()

@@ -237,6 +237,7 @@ or tests change.
 | F11 | Skillpack import from GitHub (discover → select → import) |
 | F12 | Artifact preview (static html + desktop/pygame via noVNC) |
 | F13 | Graphical analysis page + cross-run trends (recharts) |
+| F14 | Eval iteration: re-score runs + versioned rubric edits |
 
 ## Post-MVP roadmap
 
@@ -276,9 +277,6 @@ or tests change.
   for at-a-glance review before spawning a full live preview sandbox
 - Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.
   (executes candidate code → needs hardened isolation; approved direction)
-- Re-score runs — re-run the evaluator on stored artifacts
-- Post-run rubric edits — modify the frozen rubric after a run and re-score
-  with the updated rubric (keep score provenance per rubric version)
 - "Add next prompt" — continue a finished sandbox with a follow-up prompt
   on the same workspace (multi-turn runs: new phase in the event stream +
   artifact re-snapshotted; resume-in-place vs respawn-from-snapshot TBD)
@@ -402,6 +400,20 @@ or tests change.
   cross-run trends endpoint (`GET /api/analytics/runs`) prices each point at
   its own run's resolved price unless `?price_model=` forces uniform
   repricing — same "estimate, not billing" framing as F9.
+- **Rubric versions are immutable** (F14): post-run edits INSERT a new
+  `rubrics` row (`parent_id` → edited version, `version = max+1`,
+  previous approved → `superseded`); the frozen row is never mutated.
+  `Score.rubric_id` + denormalized `Score.rubric_version` keep per-pass
+  provenance so old/new score sets stay distinguishable — re-score only
+  ever adds Score rows, never rewrites them.
+- **Re-score is a dedicated path, not a lifecycle replay**: terminal runs
+  (`done|failed`) transition to `evaluating` and back via
+  `orchestrator.lifecycle.rescore_run` over stored artifact snapshots —
+  participant sandboxes are never respawned. Registered as the `rescore`
+  task kind so a concurrent trigger 409s; the startup sweep rescues an
+  interrupted re-score (marked by a `rescore_requested`/`rescore_started`
+  checkpoint) to `done` when ≥1 Score row exists — a first-pass eval with
+  no marker still fails.
 
 ## Working conventions
 

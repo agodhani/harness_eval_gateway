@@ -323,6 +323,63 @@ async def test_evaluate_requires_params(seeded, session_factory) -> None:
         await _eval(seeded, session_factory, FakeRuntime(), session_factory=None)
 
 
+async def test_evaluate_stamps_rubric_version(seeded, session_factory) -> None:
+    """PR5: Score rows carry rubric provenance — resolved from rubric_id
+    when no explicit version is passed."""
+    rows = await _eval(seeded, session_factory, FakeRuntime())
+    assert rows
+    assert all(r.rubric_version == 1 for r in rows)  # seeded rubric is v1
+    assert all(r.rubric_version == 1 for r in _scores_in_db(session_factory))
+
+    events = _events_in_db(session_factory)
+    started = [e for e in events if e.payload.get("phase") == "eval_started"]
+    scored = [e for e in events if e.payload.get("phase") == "eval_scored"]
+    assert started[0].payload["rubric_id"] == str(seeded["rubric_id"])
+    assert started[0].payload["rubric_version"] == 1
+    assert scored[0].payload["rubric_version"] == 1
+
+
+async def test_evaluate_rubric_version_kwarg_wins(seeded, session_factory) -> None:
+    """An explicit rubric_version (orchestrator-resolved) stamps rows as-is."""
+    rows = await _eval(seeded, session_factory, FakeRuntime(), rubric_version=7)
+    assert rows
+    assert all(r.rubric_version == 7 for r in rows)
+
+
+async def test_evaluate_rescore_provenance_distinct(seeded, session_factory) -> None:
+    """Two passes over the same artifact under different versions keep
+    separate Score rows — the re-score use case."""
+    s = session_factory()
+    try:
+        s.add(
+            Rubric(
+                run_id=seeded["run_id"], version=2, status="approved",
+                parent_id=seeded["rubric_id"], content=RUBRIC,
+            )
+        )
+        s.commit()
+        v2_id = s.execute(
+            select(Rubric.id).where(
+                Rubric.run_id == seeded["run_id"], Rubric.version == 2
+            )
+        ).scalar_one()
+    finally:
+        s.close()
+
+    await _eval(seeded, session_factory, FakeRuntime())  # v1 pass
+    await _eval(
+        seeded, session_factory, FakeRuntime(), rubric_id=v2_id, rubric_version=2
+    )  # re-score under v2
+
+    rows = _scores_in_db(session_factory)
+    v1_rows = [r for r in rows if r.rubric_version == 1]
+    v2_rows = [r for r in rows if r.rubric_version == 2]
+    assert len(v1_rows) == 3
+    assert len(v2_rows) == 3
+    assert all(r.rubric_id == seeded["rubric_id"] for r in v1_rows)
+    assert all(r.rubric_id == v2_id for r in v2_rows)
+
+
 async def test_candidate_scores_json_is_not_salvaged(
     seeded, session_factory
 ) -> None:

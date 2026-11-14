@@ -389,7 +389,11 @@ def get_run_trends(
         session.execute(
             select(Score)
             .where(Score.sandbox_id.in_(sandbox_ids))
-            .order_by(Score.created_at.asc(), Score.id)
+            .order_by(
+                Score.created_at.asc(),
+                Score.seq.asc().nulls_first(),
+                Score.id,
+            )
         )
         .scalars()
         .all()

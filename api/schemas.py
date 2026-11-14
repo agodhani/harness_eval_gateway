@@ -168,6 +168,8 @@ class RubricOut(BaseModel):
     id: uuid.UUID
     run_id: uuid.UUID
     version: int
+    # PR5: version chain — the rubric row this version was edited from.
+    parent_id: uuid.UUID | None = None
     status: str
     content: dict[str, Any]
     created_at: datetime
