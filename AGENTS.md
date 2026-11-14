@@ -240,6 +240,7 @@ or tests change.
 | F12 | Artifact preview (static html + desktop GUI via noVNC + python-server web apps) |
 | F13 | Graphical analysis page + cross-run trends (recharts) |
 | F14 | Eval iteration: re-score runs + versioned rubric edits |
+| F15 | Artifact thumbnails (headless screenshots via the preview stack) |
 
 ## Post-MVP roadmap
 
@@ -277,8 +278,10 @@ or tests change.
 - Split-view trace comparison — side-by-side, time-aligned event streams for
   two sandboxes on the traces/timeline page (today it's one merged stream
   with a single-sandbox filter dropdown); scrolling/diff-alignment UX TBD
-- Lightweight artifact thumbnails — capture screenshots of produced artifacts
-  for at-a-glance review before spawning a full live preview sandbox
+- ~~Lightweight artifact thumbnails~~ — **landed as PR4/F15**: results-page
+  `📷 snapshot` POSTs a bounded headless-chromium capture through the
+  artifact's own preview stack; `<artifact>/thumbnail.png` heads the
+  preview cell and clicks through to the full live preview.
 - ~~Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.~~
   — landed (F12; extended to pyglet/arcade/tkinter + python-server in PR3)
 - "Add next prompt" — continue a finished sandbox with a follow-up prompt
@@ -421,6 +424,19 @@ or tests change.
   `EVAL_PROMPT.md` carries targeted counter-hints (paging, no inner `"`).
 - One live preview per sandbox (POST is idempotent — re-clicking returns the
   existing preview); dead containers are cleared on respawn.
+- **Artifact thumbnails (F15) reuse the preview stack, not a parallel one** —
+  capture spawns the artifact's own `PreviewManager` topology with
+  `heg.preview_purpose=thumb` (interactive endpoints filter on `preview`, so
+  a mid-flight capture never surfaces as the live preview; the reaper/stop
+  see both), then a one-shot `heg-preview-thumb` container (debian chromium
+  on `python:3.12-slim`, nobody/read-only/tmpfs) joins `heg-preview` and
+  screenshots the in-network URL — `<runner>:8000` for static,
+  `<runner>-proxy:{8000|6080}` for the executed types (Xvnc is
+  loopback-only, so noVNC is desktop's only window → bigger settle +
+  virtual-time budget). Trigger is explicit-only (`POST .../thumbnail`,
+  bounded ~45s; results GET never spawns — it only jailed-probes
+  `thumbnail.png` + the `thumbnail.json` meta sidecar). Failures → 502 and
+  "no thumbnail", never a broken results read.
 - **Charts: recharts** (F13) — picked over visx/chart.js: smallest fit for
   grouped/stacked bars + a composed bar-line trend under React 19 / Next 16;
   themed via hexes mirroring globals.css tokens (no CSS-var reads). The

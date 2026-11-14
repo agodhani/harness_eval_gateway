@@ -57,7 +57,10 @@ Design notes:
   restart of the api loses nothing: ``list()`` rebuilds state from
   ``docker inspect`` and the reaper still enforces expiry written on the
   container itself. Runner and proxy share ``heg.preview_id``; the
-  ``heg.preview_role`` label distinguishes them.
+  ``heg.preview_role`` label distinguishes them, and
+  ``heg.preview_purpose`` separates interactive sessions (``"preview"``)
+  from thumbnail-capture stacks (``"thumb"``, PR4 — see
+  ``sandbox/thumbnails.py``).
 - Sync like :class:`sandbox.runtime.SandboxRuntime` (docker CLI is sync);
   the api wraps calls in ``asyncio.to_thread``.
 """
@@ -127,6 +130,16 @@ LABEL_EXPIRES_AT = "heg.preview_expires_at"  # epoch seconds
 LABEL_ROLE = "heg.preview_role"
 ROLE_RUNNER = "runner"
 ROLE_PROXY = "proxy"
+# WHY the stack exists: "preview" = interactive user session (the endpoints'
+# idempotency + GET semantics apply); "thumb" = a PR4 thumbnail capture's
+# ephemeral serving stack — same isolation/topology, but hidden from the
+# interactive endpoints so a mid-flight capture is never returned as "the
+# preview" and never satisfies start_preview's live-reuse check. The reaper
+# and stop() see both (leaks stay TTL-bounded). Containers without the
+# label (pre-purpose previews) count as interactive previews.
+LABEL_PURPOSE = "heg.preview_purpose"
+PURPOSE_PREVIEW = "preview"
+PURPOSE_THUMB = "thumb"
 
 #: Container statuses where the preview is (or will shortly be) serving.
 LIVE_STATUSES = frozenset({"created", "running", "restarting", "paused"})
@@ -246,6 +259,10 @@ class Preview:
     url: str | None
     created_at: datetime | None
     expires_at: datetime | None
+    # "preview" (interactive) | "thumb" (PR4 capture stack). Interactive
+    # endpoints filter on this; unlabeled legacy containers read as
+    # "preview".
+    purpose: str = PURPOSE_PREVIEW
 
     @property
     def live(self) -> bool:
@@ -264,6 +281,47 @@ def _within(child: Path, root: Path) -> bool:
     except OSError:
         return False
     return resolved == root or root in resolved.parents
+
+
+def resolve_artifact_dir(
+    *,
+    jail: Path,
+    run_id: str,
+    sandbox_id: str,
+    artifact_path: str | None,
+    must_exist: bool = True,
+) -> Path | None:
+    """Return the sandbox's artifact dir, jailed under ARTIFACT_ROOT.
+
+    ``Sandbox.artifact_path`` is tried first (it's where the snapshot actually
+    landed), then the conventional ``<jail>/<run_id>/<sandbox_id>`` layout —
+    both must resolve inside ``jail``. The artifact dir holds ``workspace/``
+    plus sidecar files (``analysis.json``, ``thumbnail.png`` — PR4) that are
+    jailed reads/writes for the api, never bind-mounted themselves.
+
+    ``must_exist`` (default) requires the dir to exist on disk; pass False
+    when the caller only needs the would-be location.
+    """
+    try:
+        jail = jail.resolve()
+    except OSError:
+        return None
+    candidates: list[Path] = []
+    if artifact_path:
+        candidates.append(Path(artifact_path))
+    candidates.append(jail / str(run_id) / str(sandbox_id))
+
+    for cand in candidates:
+        try:
+            resolved = cand.resolve()
+        except OSError:
+            continue
+        if not _within(resolved, jail):
+            continue
+        if must_exist and not resolved.is_dir():
+            continue
+        return resolved
+    return None
 
 
 def resolve_workspace_dir(
@@ -740,6 +798,23 @@ class ScanCache:
         self._entries.clear()
 
 
+def _entry_url_path(entry: str | None) -> str:
+    """Docroot-relative URL path for a static ``entry`` — ``/``-prefixed.
+
+    ``index.html``/``index.htm`` collapse to their parent dir (``/`` or
+    ``/dist/``) since the server resolves them anyway; any other file keeps
+    its path. Shared by ``_preview_url`` (browser) and the thumbnail capture
+    URL (in-network).
+    """
+    if not entry:
+        return "/"
+    base = entry.rsplit("/", 1)[-1]
+    if base.lower() in _INDEX_NAMES:
+        parent = entry[: -len(base)].lstrip("/")
+        return f"/{parent}"
+    return f"/{entry}"
+
+
 def _preview_url(
     port: int | None, entry: str | None, preview_type: str = "static"
 ) -> str | None:
@@ -753,13 +828,7 @@ def _preview_url(
         # The relay/sidecar forwards to whatever the app serves — root is
         # the entry contract (the app owns its routes).
         return f"http://localhost:{port}/"
-    if not entry:
-        return f"http://localhost:{port}/"
-    base = entry.rsplit("/", 1)[-1]
-    if base.lower() in _INDEX_NAMES:
-        parent = entry[: -len(base)].lstrip("/")
-        return f"http://localhost:{port}/{parent}"
-    return f"http://localhost:{port}/{entry}"
+    return f"http://localhost:{port}{_entry_url_path(entry)}"
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -916,6 +985,7 @@ class PreviewManager:
         serve_dir: Path,
         plan: PreviewPlan,
         ttl_seconds: float | None = None,
+        purpose: str = PURPOSE_PREVIEW,
     ) -> Preview:
         """Spawn the container(s) for ``plan``; returns the live Preview.
 
@@ -926,7 +996,12 @@ class PreviewManager:
           relay), plus a socat proxy sidecar straddling ``heg-desktop`` +
           ``heg-preview`` that publishes a localhost port.
 
-        Unknown types raise ``ValueError`` — the router maps it to 422.
+        ``purpose`` rides the ``heg.preview_purpose`` label:
+        ``PURPOSE_PREVIEW`` (default) is an interactive session;
+        ``PURPOSE_THUMB`` is a thumbnail capture's ephemeral stack (PR4) —
+        identical topology/isolation, hidden from the interactive
+        endpoints. Unknown types raise ``ValueError`` — the router maps it
+        to 422.
         """
         self.ensure_network()
 
@@ -946,6 +1021,7 @@ class PreviewManager:
             sandbox_id=sandbox_id,
             plan=plan,
             expires_epoch=expires_epoch,
+            purpose=purpose,
         )
 
         if plan.type == "static":
@@ -985,6 +1061,7 @@ class PreviewManager:
             url=None,
             created_at=datetime.now(UTC),
             expires_at=datetime.fromtimestamp(expires_epoch, UTC),
+            purpose=purpose,
         )
 
     def _labels(
@@ -996,6 +1073,7 @@ class PreviewManager:
         plan: PreviewPlan,
         expires_epoch: float,
         role: str = ROLE_RUNNER,
+        purpose: str = PURPOSE_PREVIEW,
     ) -> list[str]:
         """Flat ``[--label, k=v, ...]`` args — the restart-safe registry."""
         pairs = [
@@ -1007,6 +1085,7 @@ class PreviewManager:
             (LABEL_ENTRY, plan.entry or ""),
             (LABEL_EXPIRES_AT, f"{expires_epoch:.0f}"),
             (LABEL_ROLE, role),
+            (LABEL_PURPOSE, purpose),
         ]
         args: list[str] = []
         for k, v in pairs:
@@ -1280,6 +1359,8 @@ class PreviewManager:
             url=_preview_url(port, entry, preview_type),
             created_at=created,
             expires_at=expires,
+            # Unlabeled legacy containers are interactive previews.
+            purpose=labels.get(LABEL_PURPOSE) or PURPOSE_PREVIEW,
         )
 
     def _proxy_port(self, preview_id: str, container_port: int) -> int | None:
@@ -1354,9 +1435,18 @@ class PreviewManager:
         previews = self._inspect_ids(ids)
         return previews[0] if previews else None
 
-    def get_for_sandbox(self, sandbox_id: str) -> Preview | None:
-        """Newest preview for a sandbox (any status), or None."""
+    def get_for_sandbox(
+        self, sandbox_id: str, *, purpose: str | None = PURPOSE_PREVIEW
+    ) -> Preview | None:
+        """Newest preview for a sandbox (any status), or None.
+
+        ``purpose`` filters on ``heg.preview_purpose`` — the default
+        ``PURPOSE_PREVIEW`` keeps thumbnail-capture stacks (PR4) invisible
+        to the interactive endpoints; pass ``None`` for every purpose.
+        """
         previews = self.list(sandbox_id=sandbox_id)
+        if purpose is not None:
+            previews = [p for p in previews if p.purpose == purpose]
         return previews[0] if previews else None
 
     # -- stop / reap ---------------------------------------------------------

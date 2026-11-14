@@ -32,6 +32,7 @@ from sandbox.preview import (
     detect_preview,
     plan_for_entry,
     plan_for_type,
+    resolve_artifact_dir,
     resolve_workspace_dir,
     scan_preview,
 )
@@ -1537,3 +1538,151 @@ def test_spawn_server_missing_image(tmp_path: Path) -> None:
             plan=PreviewPlan(type="python-server", entry="app.py"),
         )
     assert not [c for c in fake.calls if c[0] == "run"]
+
+
+# ---------------------------------------------------------------------------
+# resolve_artifact_dir — artifact-dir jail resolution (PR4 thumbnails)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_artifact_dir_conventional(tmp_path: Path) -> None:
+    d = tmp_path / "r1" / "s1"
+    (d / "workspace").mkdir(parents=True)
+    got = resolve_artifact_dir(
+        jail=tmp_path, run_id="r1", sandbox_id="s1", artifact_path=None
+    )
+    assert got == d.resolve()
+
+
+def test_resolve_artifact_dir_via_artifact_path(tmp_path: Path) -> None:
+    d = tmp_path / "r1" / "s1"
+    d.mkdir(parents=True)
+    got = resolve_artifact_dir(
+        jail=tmp_path,
+        run_id="other",
+        sandbox_id="s1",
+        artifact_path=str(d),
+    )
+    assert got == d.resolve()
+
+
+def test_resolve_artifact_dir_outside_jail(tmp_path: Path) -> None:
+    assert (
+        resolve_artifact_dir(
+            jail=tmp_path, run_id="r1", sandbox_id="s1", artifact_path="/etc"
+        )
+        is None
+    )
+
+
+def test_resolve_artifact_dir_must_exist(tmp_path: Path) -> None:
+    """Missing dir → None by default; must_exist=False returns the path."""
+    assert (
+        resolve_artifact_dir(
+            jail=tmp_path, run_id="r1", sandbox_id="s1", artifact_path=None
+        )
+        is None
+    )
+    got = resolve_artifact_dir(
+        jail=tmp_path,
+        run_id="r1",
+        sandbox_id="s1",
+        artifact_path=None,
+        must_exist=False,
+    )
+    assert got == (tmp_path / "r1" / "s1").resolve()
+
+
+def test_resolve_artifact_dir_artifact_path_fallback(tmp_path: Path) -> None:
+    """A nonexistent artifact_path falls through to the conventional layout."""
+    d = tmp_path / "r1" / "s1"
+    d.mkdir(parents=True)
+    got = resolve_artifact_dir(
+        jail=tmp_path,
+        run_id="r1",
+        sandbox_id="s1",
+        artifact_path=str(tmp_path / "missing"),
+    )
+    assert got == d.resolve()
+
+
+# ---------------------------------------------------------------------------
+# purpose labels — interactive previews vs thumbnail capture stacks (PR4)
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_marks_default_purpose(tmp_path: Path) -> None:
+    """spawn() labels purpose=preview by default — captured via run args."""
+    fake = FakeRuntime(inspect_rows=[_inspect_row(labels=_labels())])
+    fake.ps_ids = ["cid123"]
+    _manager(fake).spawn(
+        run_id="r1",
+        sandbox_id="s1",
+        serve_dir=tmp_path,
+        plan=PreviewPlan(type="static", entry="index.html"),
+    )
+    run = next(c for c in fake.calls if c[0] == "run")
+    label_args = [run[i + 1] for i, v in enumerate(run) if v == "--label"]
+    assert "heg.preview_purpose=preview" in label_args
+
+
+def test_spawn_thumb_purpose_label(tmp_path: Path) -> None:
+    """spawn(purpose="thumb") writes the thumb label — the interactive
+    endpoints then ignore the stack."""
+    fake = FakeRuntime(
+        inspect_rows=[
+            _inspect_row(labels=_labels(**{"heg.preview_purpose": "thumb"}))
+        ]
+    )
+    fake.ps_ids = ["cid123"]
+    preview = _manager(fake).spawn(
+        run_id="r1",
+        sandbox_id="s1",
+        serve_dir=tmp_path,
+        plan=PreviewPlan(type="static", entry="index.html"),
+        purpose="thumb",
+    )
+    run = next(c for c in fake.calls if c[0] == "run")
+    label_args = [run[i + 1] for i, v in enumerate(run) if v == "--label"]
+    assert "heg.preview_purpose=thumb" in label_args
+    assert preview.purpose == "thumb"
+
+
+def test_row_to_preview_purpose_defaults() -> None:
+    """Unlabeled (legacy) containers parse as interactive previews."""
+    fake = FakeRuntime(
+        inspect_rows=[_inspect_row(labels=_labels())]
+    )
+    fake.ps_ids = ["cid123"]
+    preview = _manager(fake).list()[0]
+    assert preview.purpose == "preview"
+
+
+def test_get_for_sandbox_filters_purpose() -> None:
+    """purpose="preview" (default) skips thumb stacks; purpose=None sees all."""
+    older = _inspect_row(
+        container_id="a",
+        name="/heg-prev-a",
+        created="2026-01-01T00:00:00.000000000Z",
+        labels=_labels(
+            **{"heg.preview_purpose": "thumb", "heg.preview_id": PID_A}
+        ),
+    )
+    newer = _inspect_row(
+        container_id="b",
+        name="/heg-prev-b",
+        created="2026-01-02T00:00:00.000000000Z",
+        labels=_labels(**{"heg.preview_id": PID_B}),
+    )
+    fake = FakeRuntime()
+    fake.rows_by_id = {"a": older, "b": newer}
+    fake.ps_ids = ["a", "b"]
+    mgr = _manager(fake)
+    got = mgr.get_for_sandbox("s1")
+    assert got is not None and got.preview_id == PID_B  # the real preview
+    thumb = mgr.get_for_sandbox("s1", purpose="thumb")
+    assert thumb is not None and thumb.preview_id == PID_A
+    anyp = mgr.get_for_sandbox("s1", purpose=None)
+    assert anyp is not None and anyp.preview_id == PID_B  # newest first
+    # list() itself is unfiltered — the reaper/stop see every purpose.
+    assert {p.preview_id for p in mgr.list()} == {PID_A, PID_B}
