@@ -909,7 +909,9 @@ export interface ModelInfo {
 
 export interface ModelsOut {
   models: ModelInfo[];
-  /** Gateway UPSTREAM_PROVIDER — e.g. "ollama" | "openrouter". */
+  /** Gateway provider name — "ollama" | "openrouter" | "openai" |
+   * "anthropic" (PR12 adds these + PROVIDER_ROUTES per-model providers;
+   * pull stays ollama-only). */
   provider: string | null;
   /** True when the upstream can install models (ollama pull). */
   pull_supported: boolean;
@@ -932,7 +934,8 @@ export interface ModelPullEvent {
 /**
  * POST /api/models/pull — streams the gateway's NDJSON progress lines;
  * `onProgress` fires per line. Resolves with the last event; throws ApiError
- * on non-2xx or when the stream itself reports `{"error": ...}`.
+ * on non-2xx or when ANY stream line reports `{"error": ...}` — mid-stream
+ * errors surface too, not just a terminal one (the first error wins).
  */
 export async function pullModel(
   name: string,
@@ -961,6 +964,7 @@ export async function pullModel(
   const decoder = new TextDecoder();
   let buf = "";
   let last: ModelPullEvent | null = null;
+  let firstError: ModelPullEvent | null = null;
 
   const take = (line: string): ModelPullEvent | null => {
     const s = line.trim();
@@ -982,6 +986,7 @@ export async function pullModel(
       buf = buf.slice(nl + 1);
       if (ev) {
         last = ev;
+        if (ev.error && !firstError) firstError = ev;
         onProgress?.(ev);
       }
     }
@@ -990,11 +995,12 @@ export async function pullModel(
   const tailEv = take(buf);
   if (tailEv) {
     last = tailEv;
+    if (tailEv.error && !firstError) firstError = tailEv;
     onProgress?.(tailEv);
   }
 
-  if (last?.error) {
-    throw new ApiError(502, String(last.error), last);
+  if (firstError) {
+    throw new ApiError(502, String(firstError.error), firstError);
   }
   return last;
 }
