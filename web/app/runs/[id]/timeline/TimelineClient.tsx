@@ -214,6 +214,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
 
   const loading = loadInfo?.forId !== runId;
   const fatalError = loadInfo?.forId === runId ? loadInfo.error : null;
+  const scopedAnalytics = analytics?.run_id === runId ? analytics : null;
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
@@ -349,11 +350,11 @@ export default function TimelineClient({ runId }: { runId: string }) {
 
   const sandboxIds = useMemo(() => {
     const set = new Set<string>();
-    for (const sb of analytics?.sandboxes ?? []) set.add(sb.sandbox_id);
+    for (const sb of scopedAnalytics?.sandboxes ?? []) set.add(sb.sandbox_id);
     for (const e of events) if (e.sandbox_id) set.add(e.sandbox_id);
     if (filterSandbox && filterSandbox !== "__none__") set.add(filterSandbox);
     return [...set].sort();
-  }, [events, analytics, filterSandbox]);
+  }, [events, scopedAnalytics, filterSandbox]);
 
   const typeOptions = useMemo(() => {
     const set = new Set(events.map((e) => e.type));
@@ -375,14 +376,15 @@ export default function TimelineClient({ runId }: { runId: string }) {
 
   // PR9 metrics strip data + adapter labels for the sandbox filter dropdown.
   const strips = useMemo(
-    () => (analytics ? sandboxStrips(analytics) : []),
-    [analytics],
+    () => (scopedAnalytics ? sandboxStrips(scopedAnalytics) : []),
+    [scopedAnalytics],
   );
   const sandboxLabels = useMemo(() => {
     const m = new Map<string, string>();
-    for (const sb of analytics?.sandboxes ?? []) m.set(sb.sandbox_id, sb.label);
+    for (const sb of scopedAnalytics?.sandboxes ?? [])
+      m.set(sb.sandbox_id, sb.label);
     return m;
-  }, [analytics]);
+  }, [scopedAnalytics]);
 
   // ---- scroll behaviour --------------------------------------------------
 
