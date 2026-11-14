@@ -401,7 +401,13 @@ or tests change.
   provider abstraction (Ollama today, OpenRouter next) behind the gateway;
   the gateway stamps `X-HEG-Provider` so the UI only offers install when the
   upstream can `ollama pull` (`POST /v1/models/pull` → `/api/pull`, 501
-  otherwise). Pull progress streams end-to-end as NDJSON — never buffered.
+  otherwise). Pull is **control-plane only**: creds carrying a `sandbox_id`
+  (every participant/evaluator cred, and `heg-dev`) get 403 — only
+  run-scoped service creds (`sandbox_id=None`) may pull; the body is
+  allowlisted to `name`/`model` (+ forced `stream`, `insecure` dropped) and
+  the upstream client is pinned to Ollama (`get_ollama_client`) so pull can
+  never follow per-model routing. Pull progress streams end-to-end as
+  NDJSON — never buffered.
 - **Sandbox names are persisted, not derived (F14)** — `HarnessConfigIn.name`
   (≤64, whitespace-normalized) lands on `sandboxes.name`; `spawn_one` fills
   blanks with `<adapter>-<shortid>` once the UUID exists. All UI surfaces
