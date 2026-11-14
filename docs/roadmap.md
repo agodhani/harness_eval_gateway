@@ -25,6 +25,15 @@ append-mostly; rebase on main before merge.
   ids: `particle-ai/particle-1:free`, `inclusionai/ling-3.2-flash:free`,
   `dots-studio/dots-3-note-preview:free`. Mandatory-reasoning models (ernie,
   lfm) 400 on miniloop's `reasoning_effort:"none"`.
+- **OpenAI + Anthropic providers + per-model routing** (PR12):
+  `UPSTREAM_PROVIDER` gains `openai` (chat/completions + responses + models;
+  no /v1/messages) and `anthropic` (/v1/messages + count_tokens + models;
+  no chat-completions) — Anthropic auth is `x-api-key` + `anthropic-version`.
+  `PROVIDER_ROUTES` (JSON `{model-glob: provider}`, first match wins)
+  overrides the process-wide provider per request model, so one gateway can
+  e.g. route `claude-*` to Anthropic while the rest stays on Ollama. Every
+  provider a request may resolve to must have its key (boot-time check).
+  Emitted `llm_*`/`error` events record the resolved provider.
 
 ## Dependency DAG
 
@@ -174,10 +183,13 @@ Critical path depth = 3 (`6→7→8` / `2→3→4`). Max safe concurrency ≈ 9 
   component, `api/routers/analytics.py` if new aggregates needed.
 - **Verify:** renders on real run data; totals match matrix sums.
 
-### PR12 — Providers (remainder)
+### PR12 — Providers (remainder) ✅ landed
 - **Scope:** remaining upstreams — direct Anthropic + OpenAI adapters
   (OpenRouter already landed); per-request/per-model provider routing if
   wanted (today's switch is process-wide).
+- **Landed:** `openai` + `anthropic` providers; `PROVIDER_ROUTES` JSON
+  model-glob → provider overrides resolved per request `model`; provider
+  recorded on emitted `llm_*`/`error` events.
 - **Touch:** `gateway/config.py`, `gateway/deps.py`,
   `gateway/main.py` (body transforms if APIs differ), `api/config.py`
   (key plumbing), `.env.example`.

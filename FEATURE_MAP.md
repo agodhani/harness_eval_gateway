@@ -94,8 +94,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 ### F3 — AI gateway ✅
 
-- **What:** OpenAI-compatible `/v1/chat/completions` endpoint → Ollama
-  upstream — non-streaming by default, metered SSE pass-through when the
+- **What:** OpenAI-compatible `/v1/chat/completions` endpoint → configurable
+  upstream (Ollama default) — non-streaming by default, metered SSE pass-through when the
   caller sets `stream: true` (pi and other OpenAI-compatible CLIs stream
   unconditionally); Anthropic Messages `/v1/messages` +
   `/v1/messages/count_tokens` (Claude Code, dsh) and OpenAI Responses
@@ -103,13 +103,24 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   tee; `GET /v1/models` for CLI probes; per-run/sandbox HMAC credentials
   (`heg.<b64>.<sig>`); records tokens in/out, latency, failures; token
   budgets (429 + `error` event); emits `llm_request`/`llm_response`/`error`
-  events. `/internal/events` (harness-event proxy, cred or ingest-token
-  auth) + `/internal/done` (done_signal) for sandbox egress.
+  events carrying the resolved upstream provider. `/internal/events`
+  (harness-event proxy, cred or ingest-token auth) + `/internal/done`
+  (done_signal) for sandbox egress.
+- **Upstreams:** `UPSTREAM_PROVIDER` picks the default provider —
+  `ollama` (default), `openrouter`, `openai`, `anthropic` — and
+  `PROVIDER_ROUTES` (JSON `{"model-glob": provider}`) overrides it per
+  request model (first match wins, case-insensitive). Each provider gets its
+  own key/base-URL/headers (Anthropic sends `x-api-key` +
+  `anthropic-version`); endpoints a provider doesn't implement return its
+  native 404; Ollama-only body params are stripped for hosted providers.
 - **Where:** `gateway/` (`main.py`, `creds.py`, `metering.py`, `deps.py`,
   `config.py`, `mint_cred.py` CLI), compose service `gateway` (:8081→8080)
 - **Verify:**
   - Unit: `tests/unit/gateway/` (creds, metering, proxy — hermetic; protocol
-    pass-throughs + SSE usage normalization covered)
+    pass-throughs + SSE usage normalization covered),
+    `test_upstream_provider.py` (provider selection, key validation,
+    PROVIDER_ROUTES resolution, per-provider client base/headers,
+    ollama-param stripping, provider attribution on emitted events)
   - Manual: mint cred (`uv run python -m gateway.mint_cred`) →
     `curl localhost:8081/v1/chat/completions` → completion + event rows
   - M2 e2e proven: sandbox→gateway→Ollama→events (see run

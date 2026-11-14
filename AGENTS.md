@@ -164,8 +164,8 @@ CLI, Codex CLI, Aider (note: these need paid accounts/API keys — not free).
 **Default skill packs** (named presets, vendored under `skillpacks/`):
 `superpowers`, `mattpocock-skills`, `spec-kit`.
 
-**Providers:** Ollama default (local, free); OpenRouter / direct
-Anthropic/OpenAI post-MVP.
+**Providers:** Ollama default (local, free); OpenRouter + direct
+Anthropic/OpenAI landed (env-switched, `PROVIDER_ROUTES` per-model).
 
 ## Rubric
 
@@ -229,7 +229,6 @@ or tests change.
 ## Post-MVP roadmap
 
 - Additional harness adapters: Claude Code CLI, Codex CLI, Aider
-- Additional providers: OpenRouter, direct Anthropic/OpenAI
 - Anthropic-compatible gateway endpoint (`/v1/messages`)
 - Model-vs-model comparisons (multi-model matrices)
 - Objective scoring: build/test execution, coverage, static analysis
@@ -393,18 +392,28 @@ or tests change.
   e2e `cd web && E2E_PORT=3100 npm run test:e2e`.
 - `GET /api/runs/{id}/analytics?price_model=` (F9) serves per-sandbox metrics
   + estimated cost; price table lives in `api/pricing.py` (`PRICE_TABLE`).
-- `UPSTREAM_PROVIDER=openrouter` + `OPENROUTER_API_KEY` (gitignored `.env`;
-  compose `${VAR}` passthrough) switches the gateway upstream to OpenRouter
-  for free-model testing without local Ollama. Only `/v1/chat/completions` +
-  `/v1/models` are supported there — `/v1/messages`/`/v1/responses` will 404,
-  so claude_code/codex adapters still need `ollama`. Client base is the API
-  root (`/api/`): httpx concatenates base+request paths and request paths
-  carry `/v1/…`. Callers' Ollama-only body params (`think`, `num_ctx`,
-  `keep_alive`, `options`) are stripped for non-ollama providers; note
-  mandatory-reasoning models (e.g. ernie-5.5) 400 on miniloop's
-  `reasoning_effort:"none"` — pick tolerant free ids (particle-1,
-  ling-3.2-flash, dots-3 verified). Tests pin `UPSTREAM_PROVIDER=ollama`
-  in `tests/conftest.py`.
+- `UPSTREAM_PROVIDER=ollama|openrouter|openai|anthropic` (gitignored `.env`
+  keys `OPENROUTER_API_KEY`/`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`; compose
+  `${VAR}` passthrough) picks the gateway's default upstream — every provider
+  a request may resolve to needs its key or the gateway refuses to boot.
+  `PROVIDER_ROUTES` (JSON `{"glob": "provider"}`, first match wins,
+  case-insensitive) overrides per request model — e.g.
+  `{"claude-*": "anthropic"}` serves claude_code from Anthropic while the
+  rest stays on Ollama. Coverage differs: `openrouter` has chat/completions +
+  models only; `openai` adds `/v1/responses` but no `/v1/messages`
+  (claude_code/dsh can't use it); `anthropic` has `/v1/messages`
+  (+count_tokens) + models but no chat/completions/responses (miniloop,
+  rubric drafting, codex can't use it) — unsupported paths return the
+  upstream's native 404. Client bases normalize to the API root: httpx
+  concatenates base+request paths and request paths carry `/v1/…`. Callers'
+  Ollama-only body params (`think`, `num_ctx`, `keep_alive`, `options`) are
+  stripped for non-ollama providers; note mandatory-reasoning models (e.g.
+  ernie-5.5) 400 on miniloop's `reasoning_effort:"none"` — pick tolerant free
+  ids (particle-1, ling-3.2-flash, dots-3 verified). Anthropic auth is
+  `x-api-key` + `anthropic-version` (`ANTHROPIC_VERSION`, default
+  2023-06-01; caller `anthropic-beta` headers are not forwarded). Emitted
+  `llm_request`/`llm_response`/`error` events record the resolved provider.
+  Tests pin `UPSTREAM_PROVIDER=ollama` in `tests/conftest.py`.
 - `GET /api/skillpacks` (F11) lists vendored + imported packs (the submit
   form's source of truth); `POST /api/skillpacks/discover` (GitHub URL →
   skills), `POST /api/skillpacks/import` (selection → `data/skillpacks/`;

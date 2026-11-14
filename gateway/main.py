@@ -26,6 +26,13 @@ Endpoints
                                     ``done_signal`` event for the cred's
                                     run/sandbox.
 
+Upstream providers: ``UPSTREAM_PROVIDER`` (``ollama`` default, ``openrouter``,
+``openai``, ``anthropic``) is the process-wide default; ``PROVIDER_ROUTES``
+maps model globs → provider for per-request overrides resolved from the
+request body's ``model``. Endpoint coverage differs per provider — a path the
+resolved upstream doesn't implement returns its native 404 verbatim (e.g.
+``/v1/messages`` on ``openai``, ``/v1/chat/completions`` on ``anthropic``).
+
 Auth: ``Authorization: Bearer <cred>`` (or Anthropic-style ``x-api-key``)
 where cred is ``heg-dev`` (static dev credential) or
 ``heg.<b64url-payload>.<b64url-hmac>`` (see gateway/creds.py).
@@ -187,8 +194,18 @@ def _tokens_used(run_uuid: uuid.UUID) -> int:
 _OLLAMA_ONLY_KEYS = ("num_ctx", "keep_alive", "think", "options")
 
 
-def _strip_ollama_only(body: dict[str, Any]) -> dict[str, Any]:
-    if get_settings().inject_ollama_defaults:
+def _strip_ollama_only(
+    body: dict[str, Any], provider: str | None = None
+) -> dict[str, Any]:
+    """Drop Ollama-only body params unless the resolved provider is ollama.
+
+    ``provider`` is the request's routed upstream — under PROVIDER_ROUTES it
+    can differ from the process-wide ``UPSTREAM_PROVIDER``; ``None`` resolves
+    it from ``body["model"]``.
+    """
+    if provider is None:
+        provider = get_settings().provider_for_model(body.get("model"))
+    if provider == "ollama":
         return body
     return {k: v for k, v in body.items() if k not in _OLLAMA_ONLY_KEYS}
 
@@ -199,19 +216,20 @@ async def chat_completions(
     claims: Annotated[CredClaims, Depends(get_cred)],
     upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
 ) -> Response:
+    provider = get_settings().provider_for_model(body.get("model"))
     # --- streaming callers (pi and other OpenAI-compatible CLIs always set
     # stream:true and parse SSE — a forced non-streamed JSON body reads as an
     # empty stream to them): pass through with a metering tee. The shared
     # passthrough applies the budget gate + llm_request emit, so this branch
     # must run before the non-streamed gate below.
     if body.get("stream"):
-        out = _strip_ollama_only(dict(body))
+        out = _strip_ollama_only(dict(body), provider)
         # Ask the upstream for a terminal usage chunk so streamed calls stay
         # metered (no-op for upstreams that ignore it).
         stream_options = dict(out.get("stream_options") or {})
         stream_options.setdefault("include_usage", True)
         out["stream_options"] = stream_options
-        if get_settings().inject_ollama_defaults:
+        if provider == "ollama":
             out.setdefault("num_ctx", 32_768)
             out.setdefault("keep_alive", "30m")
         return await _passthrough(
@@ -220,6 +238,7 @@ async def chat_completions(
             body=out,
             claims=claims,
             upstream=upstream,
+            provider=provider,
         )
 
     # --- budget gate (before any upstream traffic) ---
@@ -228,13 +247,13 @@ async def chat_completions(
         return gated
 
     # --- prepare upstream request: force non-streaming, inject defaults ---
-    out = _strip_ollama_only(dict(body))
+    out = _strip_ollama_only(dict(body), provider)
     out["stream"] = False
-    if get_settings().inject_ollama_defaults:
+    if provider == "ollama":
         out.setdefault("num_ctx", 32_768)
         out.setdefault("keep_alive", "30m")
 
-    await metering.emit_llm_request(claims, out)
+    await metering.emit_llm_request(claims, out, provider=provider)
 
     started = time.monotonic()
     try:
@@ -246,6 +265,7 @@ async def chat_completions(
             stage="upstream",
             message=f"{type(exc).__name__}: {exc}",
             latency_ms=latency_ms,
+            provider=provider,
         )
         return JSONResponse(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -270,6 +290,7 @@ async def chat_completions(
         usage=usage,
         latency_ms=latency_ms,
         http_status=upstream_resp.status_code,
+        provider=provider,
     )
     if not 200 <= upstream_resp.status_code < 300:
         await metering.emit_error(
@@ -278,6 +299,7 @@ async def chat_completions(
             message=upstream_resp.text[:500],
             http_status=upstream_resp.status_code,
             latency_ms=latency_ms,
+            provider=provider,
         )
 
     return Response(
@@ -318,6 +340,7 @@ async def _budget_gate(claims: CredClaims, body: dict[str, Any]) -> JSONResponse
         http_status=status.HTTP_429_TOO_MANY_REQUESTS,
         used_tokens=used,
         budget=limit,
+        provider=settings.provider_for_model(body.get("model")),
     )
     return JSONResponse(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -342,6 +365,7 @@ async def _passthrough(
     body: dict[str, Any],
     claims: CredClaims,
     upstream: httpx.AsyncClient,
+    provider: str | None = None,
     meter: bool = True,
 ) -> Response:
     """Forward ``body`` to ``upstream`` ``path`` verbatim; meter the outcome.
@@ -352,12 +376,18 @@ async def _passthrough(
     their SDK parsers. Streamed bodies are tee'd: chunks pass through as they
     arrive and the captured bytes yield the final usage for the
     ``llm_response`` event once the stream ends.
+
+    ``provider`` is the request's resolved upstream provider (recorded on the
+    emitted events); ``None`` resolves it from ``body["model"]``.
     """
+    if provider is None:
+        provider = get_settings().provider_for_model(body.get("model"))
+    body = _strip_ollama_only(body, provider)
     if meter:
         gated = await _budget_gate(claims, body)
         if gated is not None:
             return gated
-        await metering.emit_llm_request(claims, body)
+        await metering.emit_llm_request(claims, body, provider=provider)
 
     started = time.monotonic()
     try:
@@ -371,6 +401,7 @@ async def _passthrough(
                 stage="upstream",
                 message=f"{type(exc).__name__}: {exc}",
                 latency_ms=latency_ms,
+                provider=provider,
             )
         return JSONResponse(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -401,6 +432,7 @@ async def _passthrough(
                         usage=usage,
                         latency_ms=latency_ms,
                         http_status=upstream_resp.status_code,
+                        provider=provider,
                     )
                     if not 200 <= upstream_resp.status_code < 300:
                         await metering.emit_error(
@@ -409,6 +441,7 @@ async def _passthrough(
                             message=captured.decode("utf-8", errors="replace")[:500],
                             http_status=upstream_resp.status_code,
                             latency_ms=latency_ms,
+                            provider=provider,
                         )
             finally:
                 await upstream_resp.aclose()
