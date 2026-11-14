@@ -321,14 +321,14 @@ or tests change.
   returned a bare JSON body its SSE reader dropped as an empty response).
 - **CLI image pattern**: node:slim base + `python3` for the shim + pinned
   npm CLI + `adapters/` under `/opt/harness` + `done` at `/usr/local/bin`.
+  npm install happens before COPY so dependency layers cache. DeepSeek's
+  `dsh` needs node >=24.9 → `node:24-slim` (others stay on 22).
 - **PR15 pacing is DB-driven, not in-memory**: `queued` is a run status, so
   the submission queue survives api restarts (startup sweep re-promotes).
   Queue order = `started_at` (approval time). Spawn admission is a bounded
   wait *inside* `spawn_one` (per-sandbox failure on timeout) rather than a
   scheduler loop — sequential provisioning already makes spawns the unit of
   queuing. `run.status` stays `String` — no migration needed for `queued`.
-  npm install happens before COPY so dependency layers cache. DeepSeek's
-  `dsh` needs node >=24.9 → `node:24-slim` (others stay on 22).
 - **`done` invocation**: bare `done` is a shell keyword in sh/bash — prompts
   instruct harnesses to run `/usr/local/bin/done` (or `command done`).
 - **Imported skill packs (F11) live under `data/skillpacks/`**, not the
