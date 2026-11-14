@@ -39,7 +39,9 @@ _FILE_TOOLS = {
 _TEXT_LIMIT = MAX_SNIPPET
 
 
-def _truncate(value: Any, limit: int = _TEXT_LIMIT) -> str:
+def _truncate(value: Any, limit: int = _TEXT_LIMIT) -> str | None:
+    if value is None:
+        return None
     text = value if isinstance(value, str) else str(value)
     return text if len(text) <= limit else text[:limit] + "…[truncated]"
 
@@ -190,7 +192,7 @@ def translate_events(lines: Any) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 #: Dict ``tool_response`` keys probed for an exit-code-ish field, in order.
-_RESPONSE_EXIT_KEYS = ("returnCode", "exitCode", "exit_code", "code")
+_RESPONSE_EXIT_KEYS = ("returnCode", "exitCode", "exit_code")
 #: Dict ``tool_response`` keys probed for an error flag, in order.
 _RESPONSE_ERROR_KEYS = ("is_error", "isError")
 

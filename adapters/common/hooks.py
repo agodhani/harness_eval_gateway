@@ -13,13 +13,13 @@ the hook command so every mechanism lands on the same normalized-event sink:
   (NOT stdin — the docs get this backwards constantly).
 - ``pi`` — a generated extension (``extensions/heg-events.ts``) forwards
   ``tool_execution_end`` → ``tool_result`` via ``execFileSync`` with the
-  payload on argv.
+  payload on stdin (a large tool result can exceed a single argv token).
 
 How events flow:
 
 1. The CLI invokes ``python3 -m adapters.common.hooks <adapter> [payload]``.
-2. :func:`parse_payload` reads the JSON from argv (codex/pi) or stdin
-   (claude) — argv wins when both could exist.
+2. :func:`parse_payload` reads the JSON from argv (codex) or stdin
+   (claude/pi) — argv wins when both could exist.
 3. The adapter's ``translate_hook`` (sibling of ``translate_obj`` in each
    ``adapters/<name>/translate.py``) maps the native payload to normalized
    event dicts — the same shape ``translate_events`` produces, so the event
@@ -80,19 +80,19 @@ def _read_stdin(stdin: TextIO) -> str:
     """Bounded stdin read with a deadline — empty when nothing is piped in.
 
     ``select`` gates each ``os.read`` so a caller that never writes stdin
-    (codex notify, pi forwarder) doesn't hang, and looping covers payloads
+    (codex notify) doesn't hang, and looping covers payloads
     larger than the pipe buffer without blocking for EOF like
     ``stdin.read()`` would.
     """
     try:
         fileno = stdin.fileno()
-    except (OSError, AttributeError):
+    except (OSError, ValueError, AttributeError):
         fileno = None
     if fileno is None:
         # Non-fd streams (StringIO in tests): read what is buffered.
         try:
             return stdin.read(_STDIN_READ_CAP) or ""
-        except OSError:
+        except (OSError, ValueError):
             return ""
     chunks: list[bytes] = []
     total = 0
@@ -121,7 +121,7 @@ def _read_stdin(stdin: TextIO) -> str:
 def parse_payload(
     argv_tail: Sequence[str], stdin_text: str | None = None, *, stdin: TextIO | None = None
 ) -> dict[str, Any] | None:
-    """Hook JSON from argv (codex notify / pi forwarder) or stdin (claude).
+    """Hook JSON from argv (codex notify) or stdin (claude / pi forwarder).
 
     ``argv_tail`` is scanned right-to-left for the first dict-JSON token —
     callers like codex append the payload after any configured argv.
@@ -179,7 +179,11 @@ def run_hook(
     except Exception as exc:  # noqa: BLE001 — a bad payload must not kill the run
         events = _error_events(adapter, exc)
 
+    if not isinstance(events, list):
+        events = []
     for ev in events:
+        if not isinstance(ev, dict):
+            continue
         etype = ev.get("type")
         if not isinstance(etype, str) or not etype:
             continue

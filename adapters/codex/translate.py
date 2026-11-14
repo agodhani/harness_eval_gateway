@@ -25,7 +25,9 @@ from adapters.common.runner import MAX_SNIPPET
 _MAX_CHANGES = 40
 
 
-def _truncate(value: Any, limit: int = MAX_SNIPPET) -> str:
+def _truncate(value: Any, limit: int = MAX_SNIPPET) -> str | None:
+    if value is None:
+        return None
     text = value if isinstance(value, str) else str(value)
     return text if len(text) <= limit else text[:limit] + "…[truncated]"
 

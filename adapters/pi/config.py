@@ -37,7 +37,7 @@ def models_json(cfg: ShimConfig) -> dict[str, Any]:
 
 #: Generated pi extension (PR17) — pi auto-discovers ``extensions/*.ts``
 #: under the agent dir. The forwarder is observer-only: it spawns the shared
-#: hook receiver per forwarded event (argv JSON, env carries the ingest URL +
+#: hook receiver per forwarded event (stdin JSON, env carries the ingest URL +
 #: cred) and swallows every error so telemetry can never block or break the
 #: agent loop. Only ``tool_execution_end`` is forwarded — its result payload
 #: becomes a ``tool_result`` event; starts/turns/messages are already covered
@@ -58,14 +58,11 @@ const HOOK_TIMEOUT_MS = 10_000;
 function forward(hookEventName: string): (event: unknown) => void {
   return (event: unknown) => {
     try {
-      execFileSync(
-        "python3",
-        [
-          ...RECEIVER_ARGS,
-          JSON.stringify({ hook_event_name: hookEventName, event }),
-        ],
-        { stdio: "ignore", timeout: HOOK_TIMEOUT_MS },
-      );
+      execFileSync("python3", RECEIVER_ARGS, {
+        input: JSON.stringify({ hook_event_name: hookEventName, event }),
+        stdio: ["pipe", "ignore", "ignore"],
+        timeout: HOOK_TIMEOUT_MS,
+      });
     } catch {
       // Telemetry must never propagate.
     }

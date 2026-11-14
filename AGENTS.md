@@ -149,8 +149,8 @@ stream-json`, Aider logs) or harness hooks where available.
 
 **Hook events (PR17):** harnesses with a native hook/plugin surface register
 the shared receiver `python3 -m adapters.common.hooks <adapter>` — payload
-JSON arrives on stdin (Claude Code `settings.json` hooks) or argv (Codex
-`notify`, pi's generated `heg-events.ts` extension), the adapter's
+JSON arrives on stdin (Claude Code `settings.json` hooks, pi's generated
+`heg-events.ts` extension) or argv (Codex `notify`), the adapter's
 `translate_hook` normalizes it, and events POST to `/internal/events` with
 `via: "hook"` stamped into the payload. The receiver always exits 0 and
 mirrors JSONL to stderr only (Claude injects SessionStart/UserPromptSubmit
@@ -343,7 +343,7 @@ or tests change.
 - **PR17 — hook/plugin telemetry lane**: `adapters/common/hooks.py` is the
   shared receiver (`python3 -m adapters.common.hooks <adapter> [json]`) for
   native hooks — claude_code `settings.json` hooks (stdin), codex `notify`
-  (argv), pi's generated extension forwarder (argv). Normalization stays in
+  (argv), pi's generated extension forwarder (stdin). Normalization stays in
   Python via each adapter's `translate_hook` (contract-tested); events carry
   `via: "hook"`. New `tool_result` EventType reports tool *outcomes* — the
   detail translated streams drop to avoid double-counting tool calls. Hook

@@ -249,8 +249,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Hook/plugin telemetry (PR17):** harnesses with a documented native hook
   surface report higher-fidelity events through the shared receiver
   `adapters/common/hooks.py` (`python3 -m adapters.common.hooks <adapter>
-  [json]` — stdin payload for Claude Code hooks, argv for Codex `notify` and
-  pi's extension forwarder). Each hooked adapter ships `translate_hook`
+  [json]` — stdin payload for Claude Code hooks and pi's extension
+  forwarder, argv for Codex `notify`). Each hooked adapter ships `translate_hook`
   beside `translate_obj` in `translate.py` + a `MANIFEST["hooks"]` line;
   emitted payloads are stamped `via: "hook"`. Coverage: `claude_code`
   settings.json hooks (`PostToolUse` → `tool_result` — outcome detail the
