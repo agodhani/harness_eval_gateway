@@ -20,6 +20,11 @@ append-mostly; rebase on main before merge.
   the plan — `static` serves any jailed file, `desktop` requires `.py`) and a
   `ScanCache`'d results-GET probe (`PREVIEW_SCAN_TTL_SECONDS`, default 30s).
   Details: `FEATURE_MAP.md` F12.
+- **PR3 preview types**: `python-server` (web apps via `heg-preview-server`
+  + listen-socket relay runner) and desktop GUI stacks beyond pygame
+  (pyglet/arcade/tkinter — baked deps, zero-egress preview nets). Shared
+  `_spawn_isolated` runner+sidecar topology; `_PROXIED_PORTS` per-type port
+  resolution. Details: `FEATURE_MAP.md` F12.
 - **OpenRouter provider** (commit 8014338): `UPSTREAM_PROVIDER=ollama|openrouter`
   in `gateway/config.py`; client base normalizes to `/api/` (httpx
   concatenates base+request paths); Ollama-only body params
@@ -99,15 +104,21 @@ PR2 and PR6 landed). Max safe concurrency ≈ 9 lanes.
 `type=` POST-body override + `ScanCache`'d results-GET probe — see "Already
 landed" and `FEATURE_MAP.md` F12.
 
-### PR3 — Preview types
+### PR3 — Preview types — ✅ landed
 - **Scope:** `python-server` preview type (run candidate code like desktop —
   needs the runner+socat-proxy topology, zero-egress internal net);
   more desktop types: pyglet/arcade/tkinter (baked deps or wheelhouse mount —
   no egress in preview nets).
-- **Touch:** `sandbox/preview.py` (`scan_preview` candidates, `_spawn_*`),
-  `api/routers/preview.py`, `sandbox/images/*-preview.Dockerfile`,
-  `PreviewControls.tsx`, `api/config.py` `PREVIEW_*`.
-- **Verify:** `tests/integration/test_preview.py` (@pytest.mark.docker).
+- **Landed:** `python-server` spawns `heg-preview-server` (baked flask/
+  fastapi/django/aiohttp/bottle/tornado/gunicorn) + `server-preview-runner.py`
+  which detects the app's first LISTEN socket via `/proc/net/tcp{,6}` and
+  relays `:8000` → actual port (direct when the app already binds non-loopback
+  `:8000`; `manage.py` → `runserver 0.0.0.0:8000 --noreload`). Desktop image
+  gained pyglet/arcade/tkinter (multi-stage wheels build — pymunk has no
+  aarch64 wheel; system `tk` + mesa GL libs). `_spawn_desktop`/`_spawn_server`
+  share `_spawn_isolated`; `_PROXIED_PORTS` resolves sidecar ports per type.
+  `PREVIEW_TYPES` = {static, desktop, python-server}; `templates/` skipped in
+  scans (flask render dir). Details: `FEATURE_MAP.md` F12.
 
 ### PR4 — Artifact thumbnails
 - **Scope:** lightweight screenshots of produced artifacts for at-a-glance

@@ -795,3 +795,110 @@ def test_results_preview_probe_cached(
     assert sb1["preview_candidates"] == [
         {"entry": "main.py", "type": "desktop"}
     ]
+
+
+# ---------------------------------------------------------------------------
+# PR3 — python-server type + new GUI stacks
+# ---------------------------------------------------------------------------
+
+
+def test_start_preview_python_server(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """Flask evidence → python-server plan, app root URL (not noVNC)."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {"app.py": "from flask import Flask\napp = Flask(__name__)\n"},
+    )
+    resp = client.post(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["type"] == "python-server"
+    assert body["entry"] == "app.py"
+    assert body["url"] == "http://localhost:49321/"
+    kw = fake_manager.spawn_calls[0]
+    assert kw["plan"].type == "python-server"
+
+
+def test_start_preview_type_python_server_on_both_match(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """static+server workspace defaults to static — {"type":
+    "python-server"} reaches the app."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {"index.html": "x", "app.py": "from flask import Flask\n"},
+    )
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"type": "python-server"},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["type"] == "python-server"
+    assert fake_manager.spawn_calls[0]["plan"].entry == "app.py"
+
+
+def test_start_preview_entry_manage_py(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """Bare manage.py pick → python-server (django runserver contract)."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {"manage.py": "from django.core.management import execute_from_command_line\n"},
+    )
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"entry": "manage.py"},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["type"] == "python-server"
+
+
+def test_start_preview_entry_type_python_server(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """{entry: x.py, type: python-server} forces the server plan."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {"app.py": "print('ambiguous')\n"},
+    )
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"entry": "app.py", "type": "python-server"},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["type"] == "python-server"
+    assert fake_manager.spawn_calls[0]["plan"].type == "python-server"
+
+
+def test_results_preview_candidates_server_and_gui(
+    client: TestClient, run, artifact_root
+) -> None:
+    """GUI + web apps surface as typed candidates in the results payload."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {
+            "game.py": "import pyglet\n",
+            "app.py": "from flask import Flask\n",
+        },
+    )
+    resp = client.get(f"/api/runs/{run['run_id']}/results")
+    sandboxes = {s["sandbox_id"]: s for s in resp.json()["sandboxes"]}
+    sb1 = sandboxes[str(run["sb1"])]
+    assert sb1["previewable"] is True
+    assert sb1["preview_type"] == "desktop"  # executed candidates, GUI first
+    # scan order: static → desktop → python-server
+    assert sb1["preview_candidates"] == [
+        {"entry": "game.py", "type": "desktop"},
+        {"entry": "app.py", "type": "python-server"},
+    ]

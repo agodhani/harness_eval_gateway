@@ -85,14 +85,20 @@ class Settings(BaseSettings):
     # Results-GET preview probe cache TTL — the per-sandbox workspace scan is
     # reused this long (the workspace only changes on re-snapshot; 0 disables).
     PREVIEW_SCAN_TTL_SECONDS: float = 30.0
-    # --- Desktop previews (executes candidate code — pygame via noVNC) ---
-    # Runner image: repo-built, TigerVNC + noVNC/websockify + pygame-ce.
+    # --- Desktop previews (executes candidate code — GUI via noVNC) ---
+    # Runner image: repo-built, TigerVNC + noVNC/websockify + baked GUI
+    # stacks (pygame-ce, pyglet, arcade, tkinter).
     PREVIEW_DESKTOP_IMAGE: str = "heg-preview-desktop:latest"
-    # Sidecar that publishes the runner's noVNC port (dumb TCP pipe).
+    # --- python-server previews (executes candidate code — web app) ---
+    # Runner image: repo-built, common web frameworks baked in (flask,
+    # fastapi/uvicorn, django, aiohttp, bottle, tornado, gunicorn).
+    PREVIEW_SERVER_IMAGE: str = "heg-preview-server:latest"
+    # Sidecar that publishes the runner's port (dumb TCP pipe).
     PREVIEW_PROXY_IMAGE: str = "alpine/socat:1.8.1.3"
-    # Internal net for desktop runners — zero egress; only peer = own proxy.
+    # Internal net for executed-code runners — zero egress; peers = own proxy
+    # + other ephemeral preview runners, none of which can egress.
     PREVIEW_DESKTOP_NETWORK: str = "heg-desktop"
-    # Resource bounds on executed candidate code.
+    # Resource bounds on executed candidate code (desktop + python-server).
     PREVIEW_DESKTOP_CPUS: str = "1"
     PREVIEW_DESKTOP_MEMORY: str = "512m"
     PREVIEW_DESKTOP_PIDS: int = 256

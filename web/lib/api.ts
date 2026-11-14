@@ -759,7 +759,7 @@ export function artifactDownloadUrl(artifactId: string): string {
 export interface PreviewCandidate {
   /** Workspace-relative entry path, e.g. "index.html" or "game/main.py". */
   entry: string;
-  /** Preview type — "static" | "desktop" (pygame via noVNC). */
+  /** Preview type — "static" | "desktop" (GUI via noVNC) | "python-server" (web app). */
   type: string;
 }
 
@@ -767,7 +767,7 @@ export interface PreviewOut {
   preview_id: string;
   run_id: string;
   sandbox_id: string;
-  /** Preview type — "static" | "desktop" (pygame via noVNC); python-server planned. */
+  /** Preview type — "static" | "desktop" (GUI via noVNC) | "python-server" (web app). */
   type: string;
   /** Docker container status: created | running | exited | ... */
   status: string;
@@ -792,10 +792,11 @@ export function getPreview(runId: string, sandboxId: string): Promise<PreviewOut
  * the requested plan matches (an explicit different entry/type replaces it).
  * `entry` (workspace-relative) picks an explicit entry point — for
  * ambiguous scans or artifacts detection missed; `.html` → static,
- * `.py` → desktop. `type` overrides the pick: alone it selects the first
- * candidate of that type; with `entry` it forces the plan type —
- * `{entry: "x.py", type: "static"}` serves the file instead of executing
- * it ("view source"), while `desktop` requires a `.py` entry.
+ * `.py` → desktop, `manage.py` → python-server. `type` overrides the
+ * pick: alone it selects the first candidate of that type; with `entry`
+ * it forces the plan type — `{entry: "x.py", type: "static"}` serves the
+ * file instead of executing it ("view source"), while `desktop` and
+ * `python-server` require a `.py` entry.
  */
 export function startPreview(
   runId: string,
