@@ -157,13 +157,36 @@ export function dimensionOrder(keys: string[]): string[] {
   return [...canon, ...rest];
 }
 
-/** `adapter · pack1, pack2` — mirrors analytics._sandbox_label. */
+/** `adapter · model · pack1, pack2` — mirrors analytics._sandbox_label.
+ * The model segment only appears on multi-model matrix cells (PR14 — the
+ * ``model`` key is injected by matrix expansion); single-model runs keep
+ * the ``adapter · packs`` label. */
 export function harnessConfigLabel(
   hc: Record<string, unknown> | undefined,
 ): string {
   const adapter = String(hc?.adapter ?? hc?.harness ?? "?");
+  const parts = [adapter];
+  const model = String(hc?.model ?? "").trim();
+  if (model) parts.push(model);
   const packs = Array.isArray(hc?.skill_packs) ? (hc.skill_packs as unknown[]) : [];
-  return packs.length ? `${adapter} · ${packs.join(", ")}` : adapter;
+  if (packs.length) parts.push(packs.join(", "));
+  return parts.join(" · ");
+}
+
+/** Effective participant-model set for a run — [model_name] + config extras
+ * (PR14). Falls back to [modelName] for runs that predate config.models. */
+export function runModels(
+  modelName: string,
+  configModels: unknown,
+): string[] {
+  const list = Array.isArray(configModels)
+    ? (configModels as unknown[]).map(String).filter(Boolean)
+    : [];
+  const out = [modelName];
+  for (const m of list) {
+    if (m && !out.includes(m)) out.push(m);
+  }
+  return out;
 }
 
 export interface HarnessConfig {
@@ -189,6 +212,9 @@ export const DEFAULT_BUDGETS: Budgets = {
 export interface RunCreate {
   task_prompt: string;
   model_name: string;
+  /** PR14: ADDITIONAL participant models — matrix expands to
+   * harness_configs × ([model_name] + models). Omit for single-model. */
+  models?: string[] | null;
   harness_configs: HarnessConfig[];
   evaluator_model?: string | null;
   budgets?: Budgets;
@@ -196,6 +222,8 @@ export interface RunCreate {
 
 export interface RunConfig {
   harness_configs?: HarnessConfig[];
+  /** PR14: effective participant-model set persisted at submit. */
+  models?: string[];
   evaluator_model?: string | null;
   budgets?: Budgets;
   same_model_eval?: boolean;
@@ -269,6 +297,8 @@ export interface RunSummary {
   status: string;
   task_prompt: string; // truncated to 200 chars server-side
   model_name: string;
+  /** PR14: full participant-model set (model_name + extras). */
+  models?: string[];
   created_at: string;
   finished_at: string | null;
   sandbox_count: number;
@@ -337,6 +367,9 @@ export interface SandboxResult {
   harness_config: Record<string, unknown>;
   /** Config label from the sandbox row (PR1 named harness configs). */
   name?: string | null;
+  /** PR14: participant model this sandbox ran (config ``model`` cell else
+   * the run's model_name). */
+  model?: string;
   status: string;
   terminal_reason: string | null;
   artifact_path: string | null;
@@ -362,6 +395,8 @@ export interface RunResults {
   run_id: string;
   status: string;
   model_name: string;
+  /** PR14: effective participant-model set ([model_name] + extras). */
+  models?: string[];
   evaluator_model: string | null;
   same_model_eval: boolean | null;
   sandboxes: SandboxResult[];
@@ -607,8 +642,31 @@ export interface SandboxAnalytics {
   name?: string | null;
   label: string;
   harness_config: Record<string, unknown>;
+  /** PR14: participant model this sandbox ran + the price-table key its
+   * estimated_cost_usd was computed at. */
+  model: string;
+  price_model: string;
   status: string;
   terminal_reason: string | null;
+  llm_turns: number;
+  tokens: TokenUsage;
+  latency_ms: LatencyStats;
+  tool_calls: ToolCallStats;
+  skill_calls: SkillCallStats;
+  shell_commands: number;
+  file_ops: number;
+  test_executions: number;
+  errors: number;
+  wall_clock_seconds: number;
+  estimated_cost_usd: number;
+  evaluator: EvaluatorActivity | null;
+}
+
+/** PR14 — per-model rollup across a run's sandboxes (compare-by-model). */
+export interface ModelAnalytics {
+  model: string;
+  price_model: string;
+  sandbox_count: number;
   llm_turns: number;
   tokens: TokenUsage;
   latency_ms: LatencyStats;
@@ -626,10 +684,12 @@ export interface SandboxAnalytics {
 export interface RunAnalytics {
   run_id: string;
   model_name: string;
-  /** Which price_table entry `estimated_cost_usd` was computed at. */
-  price_model: string;
+  /** Explicit ?price_model= basis, or null for auto per-model pricing. */
+  price_model: string | null;
   price_table: Record<string, ModelPrice>;
   sandboxes: SandboxAnalytics[];
+  /** PR14: participant-model rollups (one per model in the run's matrix). */
+  models: ModelAnalytics[];
 }
 
 export function getRunAnalytics(runId: string, priceModel?: string): Promise<RunAnalytics> {

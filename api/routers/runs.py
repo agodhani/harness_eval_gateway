@@ -32,6 +32,7 @@ from db.models import Rubric, Run, Sandbox
 from orchestrator import adapters as orch_adapters
 from orchestrator import events as orch_events
 from orchestrator import provision, runner, state_machine
+from orchestrator.matrix import participant_models
 from orchestrator.rubric import RubricContent
 from skillpack_import.store import imported_root
 
@@ -73,9 +74,11 @@ def _run_sandboxes(session: Session, run_id: uuid.UUID) -> list[Sandbox]:
 
 
 def _same_model_eval(run: Run) -> bool:
+    """True when the judge model equals ANY participant model — non-independent
+    judging for that cell (PR14: participants are a set, not just model_name)."""
     cfg = run.config or {}
     evaluator = cfg.get("evaluator_model") or run.model_name
-    return evaluator == run.model_name
+    return evaluator in set(participant_models(run.model_name, cfg.get("models")))
 
 
 def _run_out(session: Session, run: Run) -> RunOut:
@@ -148,11 +151,16 @@ async def create_run(body: RunCreate, session: DbSession) -> RunOut:
     _validate_harness_configs(body)
 
     evaluator_model = body.evaluator_model or body.model_name
+    # PR14: persist the effective participant-model set ([model_name] +
+    # deduped extras) so lifecycle/results/analytics can expand the matrix
+    # without re-parsing the raw request.
+    models = participant_models(body.model_name, body.models)
     config = {
         "harness_configs": [hc.model_dump() for hc in body.harness_configs],
+        "models": models,
         "evaluator_model": evaluator_model,
         "budgets": body.budgets.model_dump(),
-        "same_model_eval": evaluator_model == body.model_name,
+        "same_model_eval": evaluator_model in set(models),
     }
     run = Run(
         status="submitted",
@@ -197,6 +205,7 @@ async def list_runs(
             status=r.status,
             task_prompt=r.task_prompt[:200],
             model_name=r.model_name,
+            models=participant_models(r.model_name, (r.config or {}).get("models")),
             created_at=r.created_at,
             finished_at=r.finished_at,
             sandbox_count=counts.get(r.id, 0),

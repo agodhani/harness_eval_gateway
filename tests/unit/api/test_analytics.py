@@ -173,8 +173,9 @@ def test_analytics_shape_and_defaults(client: TestClient, analytics_run) -> None
     body = _get(client, analytics_run["run_id"])
     assert body["run_id"] == str(analytics_run["run_id"])
     assert body["model_name"] == "qwen3:8b"
-    # run's model IS in the table → it's the default price model
-    assert body["price_model"] == "qwen3:8b"
+    # PR14: no ?price_model= → auto mode (None); each sandbox carries its
+    # own resolved rate in SandboxAnalytics.price_model.
+    assert body["price_model"] is None
     assert body["price_table"]["qwen3:8b"]["local"] is True
     assert set(body["price_table"]) == set(PRICE_TABLE)
     assert len(body["sandboxes"]) == 2
@@ -265,12 +266,22 @@ def test_default_price_model_falls_back_to_first_entry(
     try:
         run = Run(task_prompt="x", model_name="mystery-model", config={}, status="running")
         s.add(run)
+        s.flush()
+        sb = Sandbox(
+            run_id=run.id, harness_config={"adapter": "miniloop"}, status="running"
+        )
+        s.add(sb)
         s.commit()
         run_id = run.id
     finally:
         s.close()
     body = _get(client, run_id)
-    assert body["price_model"] == next(iter(PRICE_TABLE))
+    # PR14 auto mode: response price_model is None; the per-sandbox rate
+    # falls back to the first table entry for unlisted models.
+    assert body["price_model"] is None
+    (row,) = body["sandboxes"]
+    assert row["price_model"] == next(iter(PRICE_TABLE))
+    assert row["model"] == "mystery-model"
 
 
 def test_unknown_price_model_422(client: TestClient, analytics_run) -> None:
@@ -303,9 +314,11 @@ def test_zero_event_run_returns_zeros(
         s.close()
 
     body = _get(client, run_id)
-    assert body["price_model"] == "gpt-4o-mini"  # run model in table
+    assert body["price_model"] is None  # PR14 auto mode
     (sb,) = body["sandboxes"]
     assert sb["sandbox_id"] == str(sb_id)
+    assert sb["price_model"] == "gpt-4o-mini"  # run's model, in the table
+    assert sb["model"] == "gpt-4o-mini"
     assert sb["llm_turns"] == 0
     assert sb["tokens"] == {"input": 0, "output": 0, "cache_read": 0, "total": 0}
     assert sb["latency_ms"] == {"avg": None, "p95": None, "max": None}
@@ -318,6 +331,173 @@ def test_zero_event_run_returns_zeros(
     assert sb["wall_clock_seconds"] == 0.0
     assert sb["estimated_cost_usd"] == 0.0
     assert sb["evaluator"] is None
+
+
+# ---------------------------------------------------------------------------
+# PR14 — multi-model matrix: per-sandbox model + compare-by-model rollup
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def multimodel_run(session_factory: sessionmaker[Session]):
+    """Run on qwen3:8b + gpt-4o (config.models), 2 configs × 2 models = 4
+    sandboxes — each cell's harness_config carries its ``model``."""
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="compare models",
+            model_name="qwen3:8b",
+            config={
+                "models": ["qwen3:8b", "gpt-4o"],
+                "evaluator_model": "gpt-4o-mini",
+            },
+            status="done",
+        )
+        s.add(run)
+        s.flush()
+        sbs = []
+        for model in ("qwen3:8b", "gpt-4o"):
+            for adapter, packs in (("miniloop", []), ("codex", ["superpowers"])):
+                sbs.append(
+                    Sandbox(
+                        run_id=run.id,
+                        name=f"{adapter}-{model}",
+                        harness_config={
+                            "adapter": adapter,
+                            "skill_packs": packs,
+                            "model": model,
+                        },
+                        status="done",
+                        terminal_reason="agent_done",
+                    )
+                )
+        s.add_all(sbs)
+        s.flush()
+        # one llm_response per sandbox: qwen cells 100/50, gpt-4o cells 200/100
+        for sb in sbs:
+            model = sb.harness_config["model"]
+            pin, pout = (100, 50) if model == "qwen3:8b" else (200, 100)
+            s.add(
+                _ev(
+                    run.id,
+                    sandbox_id=sb.id,
+                    type_="llm_response",
+                    ts=T0,
+                    payload={
+                        "model": model,
+                        "usage": {
+                            "prompt_tokens": pin,
+                            "completion_tokens": pout,
+                            "total_tokens": pin + pout,
+                        },
+                        "latency_ms": 100,
+                    },
+                )
+            )
+        s.commit()
+        return {"run_id": run.id, "sandboxes": {sb.id: sb for sb in sbs}}
+    finally:
+        s.close()
+
+
+def _model_rollup(body: dict, model: str) -> dict:
+    return next(m for m in body["models"] if m["model"] == model)
+
+
+def test_multimodel_sandbox_fields(client: TestClient, multimodel_run) -> None:
+    body = _get(client, multimodel_run["run_id"])
+    assert body["price_model"] is None  # auto per-model pricing
+    by_model = {}
+    for sb in body["sandboxes"]:
+        by_model.setdefault(sb["model"], []).append(sb)
+        # label carries the model on multi-model cells
+        assert sb["model"] in sb["label"]
+        # per-sandbox price key = its own model when listed
+        assert sb["price_model"] == sb["model"]
+    assert set(by_model) == {"qwen3:8b", "gpt-4o"}
+    assert len(by_model["qwen3:8b"]) == 2
+    assert len(by_model["gpt-4o"]) == 2
+
+
+def test_multimodel_rollup_aggregation(client: TestClient, multimodel_run) -> None:
+    body = _get(client, multimodel_run["run_id"])
+    assert [m["model"] for m in body["models"]] == ["qwen3:8b", "gpt-4o"]
+
+    qwen = _model_rollup(body, "qwen3:8b")
+    assert qwen["sandbox_count"] == 2
+    assert qwen["llm_turns"] == 2
+    assert qwen["tokens"]["input"] == 200  # 2 cells × 100
+    assert qwen["tokens"]["output"] == 100
+    # qwen3:8b is local → $0 even in auto mode
+    assert qwen["price_model"] == "qwen3:8b"
+    assert qwen["estimated_cost_usd"] == 0.0
+
+    gpt = _model_rollup(body, "gpt-4o")
+    assert gpt["sandbox_count"] == 2
+    assert gpt["tokens"]["input"] == 400  # 2 cells × 200
+    # gpt-4o rate: (400*2.5 + 200*10)/1e6 = 0.003
+    assert gpt["estimated_cost_usd"] == pytest.approx(0.003)
+    assert gpt["price_model"] == "gpt-4o"
+
+
+def test_multimodel_uniform_repricing(client: TestClient, multimodel_run) -> None:
+    """?price_model= reprices every cell AND the rollup uniformly."""
+    body = _get(client, multimodel_run["run_id"], price_model="claude-opus-4.1")
+    assert body["price_model"] == "claude-opus-4.1"
+    for sb in body["sandboxes"]:
+        assert sb["price_model"] == "claude-opus-4.1"
+    for m in body["models"]:
+        assert m["price_model"] == "claude-opus-4.1"
+    # qwen rollup repriced at opus rates: (200*15 + 100*75)/1e6 = 0.0105
+    qwen = _model_rollup(body, "qwen3:8b")
+    assert qwen["estimated_cost_usd"] == pytest.approx(0.0105)
+
+
+def test_multimodel_unlisted_model_falls_back(
+    client: TestClient, session_factory: sessionmaker[Session]
+) -> None:
+    """A participant model absent from PRICE_TABLE costs at the run's
+    resolved fallback rate (first entry) in auto mode."""
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="x",
+            model_name="mystery-a",
+            config={"models": ["mystery-a", "mystery-b"]},
+            status="done",
+        )
+        s.add(run)
+        s.flush()
+        sb = Sandbox(
+            run_id=run.id,
+            harness_config={"adapter": "miniloop", "model": "mystery-b"},
+            status="done",
+        )
+        s.add(sb)
+        s.flush()
+        s.add(
+            _ev(
+                run.id,
+                sandbox_id=sb.id,
+                type_="llm_response",
+                ts=T0,
+                payload={
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50,
+                              "total_tokens": 150},
+                    "latency_ms": 10,
+                },
+            )
+        )
+        s.commit()
+        run_id = run.id
+    finally:
+        s.close()
+    body = _get(client, run_id)
+    fallback = next(iter(PRICE_TABLE))
+    (row,) = [x for x in body["sandboxes"] if x["model"] == "mystery-b"]
+    assert row["price_model"] == fallback
+    # rollup only contains models that have sandboxes
+    assert [m["model"] for m in body["models"]] == ["mystery-b"]
 
 
 # ---------------------------------------------------------------------------

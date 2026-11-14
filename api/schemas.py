@@ -150,15 +150,49 @@ class BudgetsIn(BaseModel):
     wall_clock_seconds: int = Field(default=3600, ge=60, le=86_400)
 
 
+#: PR14 — sanity cap on the expanded comparison matrix (configs × models);
+#: each cell is a real sandbox container.
+MAX_MATRIX_CELLS = 32
+
+
 class RunCreate(BaseModel):
     """POST /api/runs body — one evaluation submission."""
 
     task_prompt: str = Field(min_length=1, max_length=100_000)
     model_name: str = Field(min_length=1, max_length=255)
+    # PR14 model-vs-model: ADDITIONAL participant models — the matrix expands
+    # to harness_configs × ([model_name] + models). Omitted/empty → the run
+    # is single-model on model_name (pre-PR14 shape).
+    models: list[str] | None = Field(default=None, max_length=8)
     harness_configs: list[HarnessConfigIn] = Field(min_length=1, max_length=8)
     # Defaults to model_name at submit (same-model eval is flagged, not banned).
     evaluator_model: str | None = Field(default=None, max_length=255)
     budgets: BudgetsIn = Field(default_factory=BudgetsIn)
+
+    @model_validator(mode="after")
+    def _normalize_models(self) -> RunCreate:
+        """Dedupe/blank-strip ``models`` (model_name always wins), then cap
+        the expanded matrix — 8 configs × 8 models would spawn 64 sandboxes."""
+        if self.models is not None:
+            seen = {self.model_name}
+            cleaned: list[str] = []
+            for raw in self.models:
+                m = raw.strip() if isinstance(raw, str) else ""
+                if m and m not in seen and len(m) <= 255:
+                    seen.add(m)
+                    cleaned.append(m)
+            self.models = cleaned or None
+        cells = len(self.harness_configs) * (
+            1 + len(self.models or [])
+        )
+        if cells > MAX_MATRIX_CELLS:
+            raise ValueError(
+                f"run matrix would spawn {cells} sandboxes "
+                f"({len(self.harness_configs)} configs × "
+                f"{1 + len(self.models or [])} models); "
+                f"max is {MAX_MATRIX_CELLS}"
+            )
+        return self
 
 
 class SandboxOut(BaseModel):
@@ -217,6 +251,9 @@ class RunSummary(BaseModel):
     status: str
     task_prompt: str  # truncated to 200 chars
     model_name: str
+    # PR14: full participant-model set ([model_name] + config extras) so the
+    # list can flag multi-model runs without parsing ``config``.
+    models: list[str] = Field(default_factory=list)
     created_at: datetime
     finished_at: datetime | None
     sandbox_count: int
@@ -382,11 +419,45 @@ class SandboxAnalytics(BaseModel):
     sandbox_id: uuid.UUID
     # Config label from the sandbox row (PR1 named harness configs).
     name: str | None = None
-    # Human label mirroring the results-matrix header (adapter · packs).
+    # Human label mirroring the results-matrix header (adapter · packs;
+    # includes the model on multi-model runs — PR14).
     label: str = ""
     harness_config: dict[str, Any] = Field(default_factory=dict)
+    # PR14: the participant model this sandbox ran (config ``model`` cell,
+    # else the run's ``model_name``) + the price-table key its
+    # ``estimated_cost_usd`` was computed at.
+    model: str = ""
+    price_model: str = ""
     status: str
     terminal_reason: str | None = None
+    llm_turns: int = 0
+    tokens: TokenUsage = Field(default_factory=TokenUsage)
+    latency_ms: LatencyStats = Field(default_factory=LatencyStats)
+    tool_calls: ToolCallStats = Field(default_factory=ToolCallStats)
+    skill_calls: SkillCallStats = Field(default_factory=SkillCallStats)
+    shell_commands: int = 0
+    file_ops: int = 0
+    test_executions: int = 0
+    errors: int = 0
+    wall_clock_seconds: float = 0.0
+    estimated_cost_usd: float = 0.0
+    evaluator: EvaluatorActivity | None = None
+
+
+class ModelAnalytics(BaseModel):
+    """PR14 — per-model rollup of a run's sandboxes (compare-by-model).
+
+    Same metric fields as ``SandboxAnalytics`` aggregated across every
+    sandbox that ran ``model`` — sums for counts/tokens/cost, pooled
+    latencies for honest p95, event-span wall clock. ``sandbox_count``
+    reports how many cells the model covers.
+    """
+
+    model: str
+    # Price-table key this model's ``estimated_cost_usd`` was computed at
+    # (its own rate in auto mode, the uniform ``?price_model=`` otherwise).
+    price_model: str = ""
+    sandbox_count: int = 0
     llm_turns: int = 0
     tokens: TokenUsage = Field(default_factory=TokenUsage)
     latency_ms: LatencyStats = Field(default_factory=LatencyStats)
@@ -406,10 +477,16 @@ class RunAnalytics(BaseModel):
 
     run_id: uuid.UUID
     model_name: str
-    # Which price_table entry ``estimated_cost_usd`` was computed at.
-    price_model: str
+    # The explicit ``?price_model=`` repricing basis, or None for auto mode —
+    # each sandbox (and model rollup) costed at its OWN model's listed rate,
+    # falling back to the run's resolved rate for unlisted models. Mirrors
+    # ``RunTrends.price_model``.
+    price_model: str | None = None
     price_table: dict[str, ModelPrice] = Field(default_factory=dict)
     sandboxes: list[SandboxAnalytics] = Field(default_factory=list)
+    # PR14: participant-model rollups (one entry per model in the run's
+    # matrix; a single entry for single-model runs).
+    models: list[ModelAnalytics] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

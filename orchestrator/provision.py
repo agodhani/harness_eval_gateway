@@ -32,6 +32,7 @@ from skillpack_import.store import imported_root
 from . import state_machine
 from .adapters import adapter_image, get_adapter
 from .events import emit
+from .matrix import sandbox_model
 
 log = logging.getLogger(__name__)
 
@@ -175,7 +176,8 @@ def build_spec(
     adapter = get_adapter(str(harness_config.get("adapter") or "miniloop"))
     task = {
         "task_prompt": run.task_prompt,
-        "model": run.model_name,
+        # PR14: per-cell model — same model the env/gateway wiring uses.
+        "model": sandbox_model(harness_config, run.model_name),
         "gateway_url": GATEWAY_INTERNAL_URL,
         "cred": env.get("GATEWAY_CRED", ""),
         "events_ingest_url": GATEWAY_INGEST_URL,
@@ -210,12 +212,25 @@ def _sandbox_name(hc: dict[str, Any], sid: uuid.UUID) -> str:
     The submit form's optional config label wins; blank gets
     ``<adapter>-<sandbox short id>`` so same-adapter siblings stay
     distinguishable in the timeline filter, results matrix, and analytics.
+    PR14: on multi-model runs the cell's ``model`` is appended
+    (``<label> · <model>``) so same-config siblings on different models stay
+    distinguishable everywhere the name is shown.
     """
     label = str(hc.get("name") or "").strip()
-    if label:
-        return label
-    adapter = str(hc.get("adapter") or hc.get("harness") or "miniloop")
-    return f"{adapter}-{str(sid)[:8]}"
+    if not label:
+        adapter = str(hc.get("adapter") or hc.get("harness") or "miniloop")
+        label = f"{adapter}-{str(sid)[:8]}"
+    model = str(hc.get("model") or "").strip()
+    if not model:
+        return label[:255]
+    # sandboxes.name is String(255): keep the model tail intact, truncate
+    # the label side if the pair overflows.
+    suffix = f" · {model}"
+    if len(suffix) >= 255:
+        return suffix[-255:]
+    if len(label) + len(suffix) > 255:
+        label = label[: 255 - len(suffix)]
+    return label + suffix
 
 
 def _insert_sandbox_row(
@@ -330,11 +345,14 @@ async def spawn_one(
             secret=settings.GATEWAY_CRED_SECRET,
             budgets=budgets,
         )
+        # PR14: the cell's model overrides run.model_name — the harness env
+        # (MODEL_NAME / adapter config) AND the launch task agree on it.
+        model = sandbox_model(harness_config, run.model_name)
         env = build_env(
             adapter,
             cred=cred,
             task_prompt=run.task_prompt,
-            model_name=run.model_name,
+            model_name=model,
             max_iters=budgets["max_iters"],
             system_prompt_extra=harness_config.get("system_prompt_extra"),
         )

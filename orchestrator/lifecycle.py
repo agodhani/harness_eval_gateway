@@ -2,7 +2,8 @@
 
 ``run_lifecycle(run_id)`` sequences the whole post-approval flow:
 
-1. Provision one sandbox per ``harness_configs`` entry (sequential — cheap,
+1. Provision one sandbox per expanded matrix cell —
+   ``harness_configs × participant models`` (PR14; sequential — cheap,
    simpler DB handling; spawn failures are per-sandbox).
 2. ``running`` → one monitor task per spawned sandbox (``asyncio.gather``).
 3. All terminal → ``evaluating`` → per-sandbox evaluator calls (contract in
@@ -34,6 +35,7 @@ from sandbox.runtime import SandboxRuntime
 
 from . import monitor, provision, state_machine
 from .events import emit
+from .matrix import expanded_configs
 
 log = logging.getLogger(__name__)
 
@@ -61,8 +63,20 @@ def _load_run(session_factory: sessionmaker[Session], run_id: uuid.UUID) -> Run 
         return session.get(Run, run_id)
 
 
-def _harness_configs(run: Run) -> list[dict[str, Any]]:
-    return list((run.config or {}).get("harness_configs") or [])
+def _sandbox_configs(run: Run) -> list[dict[str, Any]]:
+    """Expanded run matrix — one config dict per sandbox.
+
+    PR14: ``harness_configs × participant models``. ``run.config.models``
+    holds the effective participant set ([model_name] + extras); each cell
+    gets its model injected under ``model`` so spawn/results/analytics can
+    attribute it. Single-model runs return the raw harness_configs verbatim.
+    """
+    cfg = run.config or {}
+    return expanded_configs(
+        cfg.get("harness_configs") or [],
+        cfg.get("models"),
+        run.model_name,
+    )
 
 
 def _running_sandbox_ids(
@@ -360,8 +374,8 @@ async def _run_lifecycle(
         log.warning("run_lifecycle: run %s not found", run_id)
         return
 
-    # 1) Provision one sandbox per harness config (sequential awaits).
-    configs = _harness_configs(run)
+    # 1) Provision one sandbox per expanded matrix cell (sequential awaits).
+    configs = _sandbox_configs(run)
     for hc in configs:
         await provision.spawn_one(
             session_factory=session_factory,
