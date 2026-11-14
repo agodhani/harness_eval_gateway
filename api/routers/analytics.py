@@ -18,11 +18,18 @@ judge events land on the participant timeline), so judge traffic would pollute
 participant metrics. The first ``source="evaluator"`` event for a sandbox (the
 ``eval_started`` checkpoint, emitted before the judge spawns) marks the
 boundary; everything at/after it is reported under ``evaluator`` instead.
+
+F13 cross-run trends: ``GET /api/analytics/runs`` rolls the same participant/
+evaluator split up to per-run points (tokens, turns, errors, mean overall
+score, cost) for the most recent runs — powers the analysis page's trend
+chart. ``?price_model=`` reprices every point uniformly; omitted, each point
+is costed at its own run's resolved price model.
 """
 
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -36,12 +43,15 @@ from api.schemas import (
     EvaluatorActivity,
     LatencyStats,
     RunAnalytics,
+    RunTrendPoint,
+    RunTrends,
     SandboxAnalytics,
     SkillCallStats,
     TokenUsage,
     ToolCallStats,
 )
-from db.models import Event, Run, Sandbox
+from db.models import Event, Run, Sandbox, Score
+from evaluator.scores import OVERALL_DIMENSION
 
 router = APIRouter(tags=["analytics"])
 
@@ -159,6 +169,30 @@ class _Agg:
         return max(0.0, (self.last_ts - self.first_ts).total_seconds())
 
 
+def _eval_boundaries(events: list[Event]) -> dict[UUID, datetime]:
+    """First evaluator-sourced event ts per sandbox — the judge boundary.
+
+    The ``eval_started`` checkpoint precedes the judge container spawn, so any
+    event at/after it (incl. cred-stamped gateway/harness rows) is judge
+    activity, not participant activity.
+    """
+    boundary: dict[UUID, datetime] = {}
+    for ev in events:
+        if ev.sandbox_id is None or ev.source != "evaluator":
+            continue
+        prev = boundary.get(ev.sandbox_id)
+        if ev.ts is not None and (prev is None or ev.ts < prev):
+            boundary[ev.sandbox_id] = ev.ts
+    return boundary
+
+
+def _is_eval_event(ev: Event, boundary: datetime | None) -> bool:
+    """True when the event belongs to the judge phase, not the participant."""
+    return ev.source == "evaluator" or (
+        boundary is not None and ev.ts is not None and ev.ts >= boundary
+    )
+
+
 @router.get("/api/runs/{run_id}/analytics", response_model=RunAnalytics)
 def get_run_analytics(
     run_id: UUID,
@@ -197,28 +231,15 @@ def get_run_analytics(
         .all()
     )
 
-    # Eval boundary per sandbox: first evaluator-sourced event (the
-    # ``eval_started`` checkpoint precedes the judge container spawn, so any
-    # event at/after it — incl. cred-stamped gateway/harness rows — is judge
-    # activity, not participant activity).
-    eval_start: dict[UUID, object] = {}
-    for ev in events:
-        if ev.sandbox_id is None or ev.source != "evaluator":
-            continue
-        prev = eval_start.get(ev.sandbox_id)
-        if ev.ts is not None and (prev is None or ev.ts < prev):
-            eval_start[ev.sandbox_id] = ev.ts
+    # Eval boundary per sandbox (see _eval_boundaries).
+    eval_start = _eval_boundaries(events)
 
     participant: dict[UUID, _Agg] = {sb.id: _Agg() for sb in sandboxes}
     evaluator: dict[UUID, _Agg] = {}
     for ev in events:
         if ev.sandbox_id is None or ev.sandbox_id not in participant:
             continue  # run-level rows / non-sandbox traffic
-        boundary = eval_start.get(ev.sandbox_id)
-        is_eval = ev.source == "evaluator" or (
-            boundary is not None and ev.ts is not None and ev.ts >= boundary
-        )
-        if is_eval:
+        if _is_eval_event(ev, eval_start.get(ev.sandbox_id)):
             evaluator.setdefault(ev.sandbox_id, _Agg()).add(ev)
         else:
             participant[ev.sandbox_id].add(ev)
@@ -245,6 +266,7 @@ def get_run_analytics(
             eval_activity = EvaluatorActivity(
                 llm_turns=eval_agg.llm_turns,
                 tokens=eval_agg.tokens,
+                errors=eval_agg.errors,
                 estimated_cost_usd=round(
                     estimate_cost_usd(
                         eval_price,
@@ -291,4 +313,159 @@ def get_run_analytics(
         price_model=selected,
         price_table=PRICE_TABLE,
         sandboxes=out,
+    )
+
+
+@router.get("/api/analytics/runs", response_model=RunTrends)
+def get_run_trends(
+    session: DbSession,
+    price_model: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> RunTrends:
+    """Cross-run trend points for the analysis page (F13).
+
+    Newest-first: the ``limit`` most recent runs, each rolled up to
+    participant + evaluator token/turn/error totals, the mean of its
+    sandboxes' ``overall`` score rows, and cost. With ``price_model`` every
+    point is repriced uniformly; without it each point is costed at its own
+    run's resolved price (run's model when listed, else the table fallback).
+    """
+    if price_model is not None and price_model not in PRICE_TABLE:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"unknown price_model {price_model!r}; "
+                f"known: {sorted(PRICE_TABLE)}"
+            ),
+        )
+
+    runs = (
+        session.execute(
+            select(Run).order_by(Run.created_at.desc(), Run.id).limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+    run_ids = [r.id for r in runs]
+    sandboxes = (
+        session.execute(select(Sandbox).where(Sandbox.run_id.in_(run_ids)))
+        .scalars()
+        .all()
+        if run_ids
+        else []
+    )
+    events = (
+        session.execute(
+            select(Event).where(Event.run_id.in_(run_ids)).order_by(Event.id)
+        )
+        .scalars()
+        .all()
+        if run_ids
+        else []
+    )
+
+    sb_run: dict[UUID, UUID] = {sb.id: sb.run_id for sb in sandboxes}
+    sb_count: dict[UUID, int] = {}
+    for sb in sandboxes:
+        sb_count[sb.run_id] = sb_count.get(sb.run_id, 0) + 1
+    eval_start = _eval_boundaries(events)
+    participant: dict[UUID, _Agg] = {r.id: _Agg() for r in runs}
+    evaluator: dict[UUID, _Agg] = {}
+    for ev in events:
+        if ev.sandbox_id is None:
+            continue
+        rid = sb_run.get(ev.sandbox_id)
+        if rid is None:
+            continue  # run-level rows / non-sandbox traffic
+        if _is_eval_event(ev, eval_start.get(ev.sandbox_id)):
+            evaluator.setdefault(rid, _Agg()).add(ev)
+        else:
+            participant[rid].add(ev)
+
+    # Latest overall score per sandbox → mean per run (mirrors the results
+    # endpoint's "rows ordered asc → newest wins" rule before averaging).
+    sandbox_ids = list(sb_run)
+    scores = (
+        session.execute(
+            select(Score)
+            .where(Score.sandbox_id.in_(sandbox_ids))
+            .order_by(Score.created_at.asc(), Score.id)
+        )
+        .scalars()
+        .all()
+        if sandbox_ids
+        else []
+    )
+    latest_overall: dict[UUID, float] = {}
+    for sc in scores:
+        if sc.dimension == OVERALL_DIMENSION:
+            latest_overall[sc.sandbox_id] = sc.score
+    overall_by_run: dict[UUID, list[float]] = {}
+    for sb_id, score_val in latest_overall.items():
+        overall_by_run.setdefault(sb_run[sb_id], []).append(score_val)
+
+    points: list[RunTrendPoint] = []
+    for run in runs:
+        cfg = run.config or {}
+        evaluator_model = cfg.get("evaluator_model") or run.model_name
+        # Explicit param reprices every run uniformly; else the run's own
+        # resolved price (never None for a None param — falls back to the
+        # first table entry).
+        selected = (
+            price_model
+            if price_model is not None
+            else resolve_price_model(None, run.model_name)
+        )
+        assert selected is not None  # resolve_price_model only Nones on bad param
+        price = PRICE_TABLE[selected]
+        eval_price = PRICE_TABLE.get(evaluator_model, price)
+
+        agg = participant[run.id]
+        eval_agg = evaluator.get(run.id)
+        overalls = overall_by_run.get(run.id, [])
+        points.append(
+            RunTrendPoint(
+                run_id=run.id,
+                status=run.status,
+                task_prompt=run.task_prompt[:120],
+                model_name=run.model_name,
+                evaluator_model=evaluator_model,
+                created_at=run.created_at,
+                finished_at=run.finished_at,
+                sandbox_count=sb_count.get(run.id, 0),
+                llm_turns=agg.llm_turns,
+                tokens=agg.tokens,
+                errors=agg.errors,
+                evaluator_llm_turns=eval_agg.llm_turns if eval_agg else 0,
+                evaluator_tokens=(
+                    eval_agg.tokens if eval_agg is not None else TokenUsage()
+                ),
+                evaluator_errors=eval_agg.errors if eval_agg else 0,
+                price_model=selected,
+                estimated_cost_usd=round(
+                    estimate_cost_usd(
+                        price,
+                        input_tokens=agg.tokens.input,
+                        output_tokens=agg.tokens.output,
+                    ),
+                    6,
+                ),
+                evaluator_cost_usd=round(
+                    estimate_cost_usd(
+                        eval_price,
+                        input_tokens=eval_agg.tokens.input if eval_agg else 0,
+                        output_tokens=eval_agg.tokens.output if eval_agg else 0,
+                    ),
+                    6,
+                ),
+                mean_overall_score=(
+                    round(sum(overalls) / len(overalls), 2) if overalls else None
+                ),
+            )
+        )
+
+    return RunTrends(
+        price_model=price_model,
+        price_table=PRICE_TABLE,
+        points=points,
     )

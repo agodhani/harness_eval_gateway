@@ -17,12 +17,22 @@ What it does:
    (i.e. ``data/eval``), a sibling of the artifact store so it lives on the
    same host-visible mount. Contents: a copy of the artifact ``workspace/``
    (the candidate repo) plus ``rubric.json`` (frozen rubric),
-   ``EVAL_PROMPT.md`` (judge brief), and ``EVAL_TRANSCRIPT.log`` when a
-   transcript exists.
+   ``EVAL_PROMPT.md`` (judge brief), ``ANALYSIS.md``/``analysis.json``
+   (measured signals, PR6), and ``EVAL_TRANSCRIPT.log`` when a transcript
+   exists.
 2. Spawns a miniloop sandbox (``heg-sandbox:latest`` on the egress-locked
    ``heg-sandbox`` network) with the run-scoped gateway cred, the evaluator
    model, and a judge TASK_PROMPT. The agent reads the rubric + files and
    writes ``scores.json`` to the workspace root (= the staged dir on host).
+
+   PR6: before staging, the candidate workspace is measured by the
+   ``scoring`` signal collectors (parse-only static analysis — real
+   cyclomatic complexity, size, language mix). The report is staged as
+   ``ANALYSIS.md``/``analysis.json`` (judge evidence, mostly for the
+   ``cyclomatic_complexity`` dimension), persisted as
+   ``<artifact>/analysis.json`` for the results API, and summarized in an
+   ``eval_analysis`` checkpoint event. Analysis never blocks evaluation —
+   failures degrade to a missing report.
 3. Waits for container exit (or ``timeout_seconds`` → docker stop), removes
    the container, parses ``scores.json``, validates it, and inserts
    ``Score`` rows (one per rubric dimension + an ``overall`` pseudo-row when
@@ -68,6 +78,12 @@ from evaluator.scores import (
     load_scores_file,
 )
 from sandbox.runtime import DEFAULT_IMAGE, SandboxRuntime
+from scoring import AnalysisReport, collect_signals
+from scoring.render import (
+    ANALYSIS_JSON_FILENAME,
+    ANALYSIS_MD_FILENAME,
+    render_analysis_markdown,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +157,62 @@ def _emit_event(
         )
 
 
+def _collect_analysis(workspace: Path) -> AnalysisReport | None:
+    """Run the scoring signal collectors; never raises.
+
+    A catastrophic failure (shouldn't happen — ``collect_signals`` isolates
+    per-collector errors) degrades to ``None``: evaluation continues with no
+    staged analysis, and the ``eval_analysis`` event records it.
+    """
+    try:
+        return collect_signals(workspace)
+    except Exception:
+        logger.warning("evaluator: signal collection failed for %s", workspace, exc_info=True)
+        return None
+
+
+def _analysis_event_payload(report: AnalysisReport | None) -> dict[str, Any]:
+    """Compact summary for the ``eval_analysis`` checkpoint event."""
+    if report is None:
+        return {"phase": "eval_analysis", "status": "unavailable"}
+    static = report.signal("static_analysis")
+    payload: dict[str, Any] = {
+        "phase": "eval_analysis",
+        "status": "ok",
+        "signals": [
+            {"name": s.name, "status": s.status, **({"error": s.error} if s.error else {})}
+            for s in report.signals
+        ],
+    }
+    if static is not None and static.status == "ok":
+        cc = static.metrics.get("cyclomatic_complexity") or {}
+        payload["summary"] = {
+            "files_analyzed": static.metrics.get("files_analyzed", 0),
+            "total_nloc": static.metrics.get("total_nloc", 0),
+            "function_count": static.metrics.get("function_count", 0),
+            "cc_mean": cc.get("mean"),
+            "cc_max": cc.get("max"),
+        }
+    return payload
+
+
+def _persist_analysis(artifact_dir: Path, report: AnalysisReport | None) -> Path | None:
+    """Write ``<artifact>/analysis.json`` for the results API + downloads.
+
+    Best-effort — persistence failure is logged, never raised (the eval
+    workspace copy still gives the judge the data).
+    """
+    if report is None:
+        return None
+    path = Path(artifact_dir) / ANALYSIS_JSON_FILENAME
+    try:
+        path.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        logger.warning("evaluator: could not write %s", path, exc_info=True)
+        return None
+    return path
+
+
 def _staging_ignore(dirpath: str, names: list[str]) -> set[str]:
     """copytree ``ignore`` filter for the candidate workspace.
 
@@ -169,6 +241,7 @@ def _stage_eval_workspace(
     transcript_path: Path | None,
     rubric: dict[str, Any],
     terminal_reason: str | None,
+    analysis: AnalysisReport | None = None,
 ) -> Path:
     """Build ``<eval_root>/<run>/<sandbox>/eval_workspace/`` and return it.
 
@@ -179,6 +252,8 @@ def _stage_eval_workspace(
           rubric.json             # frozen rubric (overwrites any candidate file)
           EVAL_PROMPT.md          # judge brief
           EVAL_TRANSCRIPT.log     # candidate transcript, when available
+          ANALYSIS.md             # measured signals summary (PR6), when collected
+          analysis.json           # machine-readable signals report (PR6)
           scores.json             # <- written later by the judge agent
     """
     stage_dir = eval_root / str(run_uuid) / str(sandbox_uuid)
@@ -199,14 +274,22 @@ def _stage_eval_workspace(
     # Candidate-authored files under reserved names must not survive staging:
     # scores.json would be mistaken for judge output, and the copy preserved
     # symlinks — a symlinked rubric.json/EVAL_*.md would redirect the writes
-    # below through the link to an arbitrary host path.
+    # below through the link to an arbitrary host path. ANALYSIS.md /
+    # analysis.json are evaluator-generated (PR6): a candidate-authored file
+    # under those names could inject fake "measured" evidence into the brief.
     for reserved in (
         SCORES_FILENAME,
         "rubric.json",
         "EVAL_PROMPT.md",
         "EVAL_TRANSCRIPT.log",
+        ANALYSIS_MD_FILENAME,
+        ANALYSIS_JSON_FILENAME,
     ):
-        (eval_ws / reserved).unlink(missing_ok=True)
+        p = eval_ws / reserved
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p)
+        else:
+            p.unlink(missing_ok=True)
 
     (eval_ws / "rubric.json").write_text(
         json.dumps(rubric, indent=2, ensure_ascii=False, default=str) + "\n",
@@ -218,6 +301,13 @@ def _stage_eval_workspace(
     )
     if transcript_path is not None and Path(transcript_path).is_file():
         shutil.copy2(transcript_path, eval_ws / "EVAL_TRANSCRIPT.log")
+    if analysis is not None:
+        (eval_ws / ANALYSIS_MD_FILENAME).write_text(
+            render_analysis_markdown(analysis), encoding="utf-8"
+        )
+        (eval_ws / ANALYSIS_JSON_FILENAME).write_text(
+            analysis.model_dump_json(indent=2) + "\n", encoding="utf-8"
+        )
     return eval_ws
 
 
@@ -344,6 +434,30 @@ async def evaluate_sandbox(
     eval_sid = eval_sandbox_id(sandbox_uuid)
     deadline = time.monotonic() + float(timeout_seconds)
 
+    # ---- objective signals (PR6) --------------------------------------------
+    # Parse-only measurement of the candidate workspace — runs BEFORE staging
+    # so ANALYSIS.md/analysis.json land in the eval workspace as judge
+    # evidence. Also persisted to the artifact dir for the results API.
+    analysis_report = await asyncio.to_thread(_collect_analysis, ws_path)
+    analysis_path = await asyncio.to_thread(
+        _persist_analysis, art_path, analysis_report
+    )
+    _emit_event(
+        session_factory,
+        run_id=run_uuid,
+        sandbox_id=sandbox_uuid,
+        event_type="checkpoint",
+        payload={
+            **_analysis_event_payload(analysis_report),
+            "eval_sandbox_id": eval_sid,
+            **(
+                {"analysis_path": str(analysis_path)}
+                if analysis_path is not None
+                else {}
+            ),
+        },
+    )
+
     # ---- stage + spawn ------------------------------------------------------
     eval_ws = await asyncio.to_thread(
         _stage_eval_workspace,
@@ -354,6 +468,7 @@ async def evaluate_sandbox(
         transcript_path=transcript,
         rubric=rubric,
         terminal_reason=terminal_reason,
+        analysis=analysis_report,
     )
 
     _emit_event(

@@ -36,6 +36,19 @@ export function truncate(text: string, max = 80): string {
   return clean.length <= max ? clean : `${clean.slice(0, max - 1)}…`;
 }
 
+/** Deterministic thousands separator (no toLocaleString — hydration-safe). */
+export function formatNum(n: number): string {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+/** $-formatting for small estimate values: 4dp under a cent, else 2dp. */
+export function formatUsd(cost: number): string {
+  if (!Number.isFinite(cost)) return "—";
+  if (cost === 0) return "$0.00";
+  if (cost < 0.01) return `$${cost.toFixed(4)}`;
+  return `$${cost.toFixed(2)}`;
+}
+
 export function formatBytes(n: unknown): string {
   if (typeof n !== "number" || !Number.isFinite(n)) return "";
   if (n < 1024) return `${n} B`;

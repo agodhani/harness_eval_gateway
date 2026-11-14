@@ -1685,6 +1685,113 @@ a.chip:hover {
 }
 
 /* ==========================================================================
+   Analysis page (F13) — chart grid, tooltip, legend chips, matrix totals
+   ========================================================================== */
+
+.analysis-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+.analysis-grid > * {
+  min-width: 0; /* let ResponsiveContainer shrink inside grid cells */
+}
+.analysis-grid .card--span2 {
+  grid-column: 1 / -1;
+}
+@media (max-width: 900px) {
+  .analysis-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.chart {
+  width: 100%;
+  padding: 0.4rem 0.5rem 0.2rem;
+}
+.chart .recharts-wrapper {
+  font-family: var(--mono);
+}
+
+.chart-tip {
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  padding: 0.45rem 0.6rem;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  max-width: 300px;
+}
+.chart-tip__label {
+  color: var(--text-faint);
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  margin-bottom: 0.3rem;
+}
+.chart-tip__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  white-space: nowrap;
+}
+.chart-tip__sw {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 0.4rem;
+}
+.chart-tip__val {
+  color: var(--text);
+}
+.chart-tip__foot {
+  margin-top: 0.35rem;
+  padding-top: 0.3rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 0.66rem;
+  line-height: 1.6;
+}
+.chart-tip__prompt {
+  color: var(--text-dim);
+  margin-bottom: 0.15rem;
+  white-space: normal;
+}
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  padding: 0.4rem 0.7rem 0.6rem;
+  font-family: var(--mono);
+  font-size: 0.64rem;
+  color: var(--text-faint);
+  letter-spacing: 0.04em;
+}
+.chart-legend__sw {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 0.35rem;
+}
+
+/* results score-matrix totals row (F13) */
+.matrix tr.row-total td {
+  background: var(--surface-2);
+  border-top: 2px solid var(--border-strong);
+}
+.matrix tr.row-total .dim-name {
+  color: var(--text);
+}
+.score-cell--leader .score-value {
+  color: var(--accent);
+}
+.dim-desc--leader {
+  color: var(--accent);
+}
+
+/* ==========================================================================
    Small screens — keep last so these win over base rules
    ========================================================================== */
 

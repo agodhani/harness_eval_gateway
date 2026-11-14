@@ -236,7 +236,9 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
               <tr>
                 <td>
                   <div className="dim-name">evaluator</div>
-                  <div className="dim-desc">judge turns · tokens · est. cost</div>
+                  <div className="dim-desc">
+                    judge turns · tokens · est. cost · err
+                  </div>
                 </td>
                 {current.sandboxes.map((sb) => (
                   <td key={sb.sandbox_id} className="num">
@@ -244,7 +246,8 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
                       <span className="faint" style={{ fontSize: "0.8rem" }}>
                         {formatInt(sb.evaluator.llm_turns)} ·{" "}
                         {formatInt(sb.evaluator.tokens.total)} ·{" "}
-                        {formatUsd(sb.evaluator.estimated_cost_usd)}
+                        {formatUsd(sb.evaluator.estimated_cost_usd)} ·{" "}
+                        {formatInt(sb.evaluator.errors)} err
                       </span>
                     ) : (
                       <span className="score-na">—</span>

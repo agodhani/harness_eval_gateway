@@ -10,6 +10,7 @@ hermetically; the real spawn path is covered by tests/integration/test_preview.p
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -1018,3 +1019,232 @@ def test_desktop_url_shape() -> None:
         _preview_url(9999, "main.py", "desktop")
         == "http://localhost:9999/vnc.html?autoconnect=true&resize=scale"
     )
+
+
+# ---------------------------------------------------------------------------
+# plan_for_entry — type= override
+# ---------------------------------------------------------------------------
+
+
+def test_plan_for_entry_type_static_serves_py(tmp_path: Path) -> None:
+    """type=static serves a .py as a file — view source, not execute."""
+    from sandbox.preview import plan_for_entry
+
+    (tmp_path / "main.py").write_text("import pygame\n")
+    plan = plan_for_entry(tmp_path, "main.py", "static")
+    assert plan == PreviewPlan(type="static", entry="main.py")
+
+
+def test_plan_for_entry_type_static_any_file(tmp_path: Path) -> None:
+    """static serving has no suffix whitelist — any jailed file is servable
+    (http.server serves the whole dir; the entry is only the URL opened)."""
+    from sandbox.preview import plan_for_entry
+
+    (tmp_path / "notes.txt").write_text("hi")
+    assert plan_for_entry(tmp_path, "notes.txt", "static") == PreviewPlan(
+        type="static", entry="notes.txt"
+    )
+
+
+def test_plan_for_entry_type_desktop_on_html_rejected(tmp_path: Path) -> None:
+    from sandbox.preview import plan_for_entry
+
+    (tmp_path / "index.html").write_text("x")
+    with pytest.raises(ValueError, match="execute a .py entry"):
+        plan_for_entry(tmp_path, "index.html", "desktop")
+
+
+def test_plan_for_entry_type_desktop_on_py(tmp_path: Path) -> None:
+    """.py + type=desktop — same plan the suffix derives."""
+    from sandbox.preview import plan_for_entry
+
+    (tmp_path / "x.py").write_text("print(1)")
+    assert plan_for_entry(tmp_path, "x.py", "desktop") == PreviewPlan(
+        type="desktop", entry="x.py"
+    )
+
+
+def test_plan_for_entry_unknown_type(tmp_path: Path) -> None:
+    from sandbox.preview import plan_for_entry
+
+    (tmp_path / "index.html").write_text("x")
+    with pytest.raises(ValueError, match="unsupported preview type"):
+        plan_for_entry(tmp_path, "index.html", "weird")
+
+
+# ---------------------------------------------------------------------------
+# plan_for_type — type-filtered default
+# ---------------------------------------------------------------------------
+
+
+def test_plan_for_type_picks_first_of_type(tmp_path: Path) -> None:
+    """Both-matching workspace: type=desktop reaches the game the static
+    default would have hidden."""
+    from sandbox.preview import plan_for_type
+
+    (tmp_path / "index.html").write_text("x")
+    (tmp_path / "main.py").write_text("import pygame\n")
+    assert plan_for_type(tmp_path, "desktop") == PreviewPlan(
+        type="desktop", entry="main.py"
+    )
+    assert plan_for_type(tmp_path, "static") == PreviewPlan(
+        type="static", entry="index.html"
+    )
+
+
+def test_plan_for_type_no_candidate(tmp_path: Path) -> None:
+    """Missing type → ValueError listing what WAS detected."""
+    from sandbox.preview import plan_for_type
+
+    (tmp_path / "index.html").write_text("x")
+    with pytest.raises(
+        ValueError,
+        match=r"no 'desktop' preview candidate.*index\.html \(static\)",
+    ):
+        plan_for_type(tmp_path, "desktop")
+
+
+def test_plan_for_type_none_detected(tmp_path: Path) -> None:
+    from sandbox.preview import plan_for_type
+
+    with pytest.raises(ValueError, match="no 'desktop' preview candidate"):
+        plan_for_type(tmp_path, "desktop")
+
+
+def test_plan_for_type_unknown(tmp_path: Path) -> None:
+    from sandbox.preview import plan_for_type
+
+    with pytest.raises(ValueError, match="unsupported preview type"):
+        plan_for_type(tmp_path, "weird")
+
+
+# ---------------------------------------------------------------------------
+# ScanCache — results-GET probe memoization
+# ---------------------------------------------------------------------------
+
+
+def _scan_ws(tmp_path: Path, ws_files: dict[str, str]) -> Path:
+    """<tmp>/r1/s1/workspace populated with ws_files."""
+    ws = tmp_path / "r1" / "s1" / "workspace"
+    ws.mkdir(parents=True)
+    for rel, content in ws_files.items():
+        p = ws / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+    return ws
+
+
+def test_scan_cache_reuses_probe(tmp_path: Path) -> None:
+    """Second call serves the cached scan — no FS re-probe within the TTL."""
+    from sandbox.preview import ScanCache
+
+    ws = _scan_ws(tmp_path, {"index.html": "x"})
+    cache = ScanCache()
+    kw = {"jail": tmp_path, "run_id": "r1", "sandbox_id": "s1", "artifact_path": None}
+    first = cache.scan(**kw)
+    assert first is not None and first.plan == PreviewPlan(
+        type="static", entry="index.html"
+    )
+    shutil.rmtree(ws)  # a re-probe would now find nothing
+    assert cache.scan(**kw) is first  # cached
+
+
+def test_scan_cache_ttl_zero_bypasses(tmp_path: Path) -> None:
+    """ttl_seconds=0 disables caching — every call re-probes."""
+    from sandbox.preview import ScanCache
+
+    ws = _scan_ws(tmp_path, {"index.html": "x"})
+    cache = ScanCache()
+    kw = {
+        "jail": tmp_path,
+        "run_id": "r1",
+        "sandbox_id": "s1",
+        "artifact_path": None,
+        "ttl_seconds": 0,
+    }
+    scan = cache.scan(**kw)
+    assert scan is not None and scan.plan is not None
+    assert scan.plan.type == "static"
+    (ws / "index.html").unlink()
+    (ws / "main.py").write_text("import pygame\n")
+    scan = cache.scan(**kw)
+    assert scan is not None
+    assert scan.plan == PreviewPlan(type="desktop", entry="main.py")
+
+
+def test_scan_cache_expires(tmp_path: Path) -> None:
+    """Past the TTL the probe re-runs and sees FS changes."""
+    from sandbox.preview import ScanCache
+
+    ws = _scan_ws(tmp_path, {"index.html": "x"})
+    now = [0.0]
+    cache = ScanCache(ttl_seconds=30.0, clock=lambda: now[0])
+    kw = {"jail": tmp_path, "run_id": "r1", "sandbox_id": "s1", "artifact_path": None}
+    scan = cache.scan(**kw)
+    assert scan is not None and scan.plan is not None
+    assert scan.plan.type == "static"
+    (ws / "index.html").unlink()
+    now[0] = 10.0
+    scan = cache.scan(**kw)
+    assert scan is not None and scan.plan is not None  # within TTL — hit
+    now[0] = 31.0
+    scan = cache.scan(**kw)  # expired → re-probe sees the change
+    assert scan is not None and scan.plan is None
+
+
+def test_scan_cache_keyed_on_artifact_path(tmp_path: Path) -> None:
+    """artifact_path is part of the key — a re-snapshot elsewhere re-probes."""
+    from sandbox.preview import ScanCache
+
+    a = tmp_path / "a" / "workspace"
+    a.mkdir(parents=True)
+    (a / "index.html").write_text("x")
+    b = tmp_path / "b" / "workspace"
+    b.mkdir(parents=True)
+    (b / "main.py").write_text("import pygame\n")
+    cache = ScanCache()
+    kw = {"jail": tmp_path, "run_id": "r1", "sandbox_id": "s1"}
+    scan = cache.scan(artifact_path=str(tmp_path / "a"), **kw)
+    assert scan is not None and scan.plan is not None
+    assert scan.plan.type == "static"
+    scan = cache.scan(artifact_path=str(tmp_path / "b"), **kw)
+    assert scan is not None
+    assert scan.plan == PreviewPlan(type="desktop", entry="main.py")
+
+
+def test_scan_cache_none_result_cached(tmp_path: Path) -> None:
+    """A missing workspace caches None too — that's the common case; a
+    workspace appearing mid-TTL stays invisible until expiry."""
+    from sandbox.preview import ScanCache
+
+    cache = ScanCache()
+    kw = {"jail": tmp_path, "run_id": "r1", "sandbox_id": "s1", "artifact_path": None}
+    assert cache.scan(**kw) is None
+    _scan_ws(tmp_path, {"index.html": "x"})
+    assert cache.scan(**kw) is None
+
+
+def test_scan_cache_evicts_oldest(tmp_path: Path) -> None:
+    """LRU bound: >max_entries keys drop the least-recently-used."""
+    from sandbox.preview import ScanCache
+
+    cache = ScanCache(max_entries=2)
+    for sid in ("s1", "s2", "s3"):
+        cache.scan(jail=tmp_path, run_id="r1", sandbox_id=sid, artifact_path=None)
+    assert len(cache._entries) == 2
+    assert [k[2] for k in cache._entries] == ["s2", "s3"]
+
+
+def test_scan_cache_clear(tmp_path: Path) -> None:
+    from sandbox.preview import ScanCache
+
+    ws = _scan_ws(tmp_path, {"index.html": "x"})
+    cache = ScanCache()
+    kw = {"jail": tmp_path, "run_id": "r1", "sandbox_id": "s1", "artifact_path": None}
+    cache.scan(**kw)
+    (ws / "index.html").unlink()
+    scan = cache.scan(**kw)
+    assert scan is not None and scan.plan is not None  # cached
+    cache.clear()
+    scan = cache.scan(**kw)  # re-probed — sees the removal
+    assert scan is not None and scan.plan is None
