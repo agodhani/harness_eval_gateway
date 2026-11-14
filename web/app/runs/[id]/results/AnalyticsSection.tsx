@@ -13,7 +13,7 @@ import {
   ApiError,
   estimateCostUsd,
   getRunAnalytics,
-  type ModelPrice,
+  type ModelAnalytics,
   type RunAnalytics,
   type SandboxAnalytics,
 } from "@/lib/api";
@@ -39,10 +39,21 @@ function errMsg(err: unknown): string {
   return "analytics endpoint unavailable";
 }
 
+/** A table column — one sandbox, or one participant-model rollup (PR14). */
+type Column = SandboxAnalytics | ModelAnalytics;
+
+function isModelCol(c: Column): c is ModelAnalytics {
+  return "sandbox_count" in c;
+}
+
+function colKey(c: Column): string {
+  return isModelCol(c) ? `model:${c.model}` : c.sandbox_id;
+}
+
 interface Row {
   label: string;
   hint?: string;
-  cell: (sb: SandboxAnalytics) => React.ReactNode;
+  cell: (col: Column) => React.ReactNode;
 }
 
 function breakdown(by: Record<string, number>): React.ReactNode {
@@ -63,7 +74,12 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
   const [analytics, setAnalytics] = useState<RunAnalytics | null>(null);
   const [loadedFor, setLoadedFor] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // null = auto: each column costed at its own model's rate (server
+  // resolved); a price-table key reprices every column uniformly (what-if).
   const [priceModel, setPriceModel] = useState<string | null>(null);
+  // PR14: "sandbox" = per-cell metrics; "model" = per-model rollup. Only
+  // offered when the run actually spans >1 participant model.
+  const [view, setView] = useState<"sandbox" | "model">("sandbox");
 
   useEffect(() => {
     let cancelled = false;
@@ -88,9 +104,11 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
   }, [runId]);
 
   const current = loadedFor === runId ? analytics : null;
-  // Effective price model: user override > server-selected default.
-  const selected = priceModel ?? current?.price_model ?? "";
-  const price: ModelPrice | undefined = current?.price_table?.[selected];
+  const multiModel = (current?.models?.length ?? 0) > 1;
+  const byModel = view === "model" && multiModel;
+  const columns: Column[] = byModel
+    ? (current?.models ?? [])
+    : (current?.sandboxes ?? []);
 
   if (current === null) {
     if (loadedFor !== runId) return null; // still loading — page shows spinners
@@ -103,15 +121,6 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
   if (current.sandboxes.length === 0) return null;
 
   const rows: Row[] = [
-    {
-      label: "terminal state",
-      cell: (sb) =>
-        sb.terminal_reason ? (
-          <Badge tone={statusTone(sb.terminal_reason)}>{sb.terminal_reason}</Badge>
-        ) : (
-          <span className="score-na">—</span>
-        ),
-    },
     {
       label: "wall clock",
       cell: (sb) => formatDuration(sb.wall_clock_seconds * 1000) || "—",
@@ -175,42 +184,77 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
     },
     {
       label: "estimated cost",
-      hint: selected ? `at ${selected}` : undefined,
-      cell: (sb) => {
-        if (!price) return <span className="score-na">—</span>;
-        if (price.local) return <span className="mono">local — $0</span>;
+      hint: priceModel ? `at ${priceModel}` : "auto — per-model rates",
+      cell: (col) => {
+        // Explicit pick reprices every column uniformly (what-if); auto
+        // uses each column's own resolved rate (PR14 per-model pricing).
+        const rateKey = priceModel ?? col.price_model;
+        const p = current.price_table[rateKey];
+        if (!p) return <span className="score-na">—</span>;
+        if (p.local) return <span className="mono">local — $0</span>;
         return (
-          <span className="mono">{formatUsd(estimateCostUsd(price, sb.tokens))}</span>
+          <span className="mono">{formatUsd(estimateCostUsd(p, col.tokens))}</span>
         );
       },
     },
   ];
 
-  const anyEval = current.sandboxes.some((sb) => sb.evaluator != null);
+  const anyEval = columns.some((c) => c.evaluator != null);
 
   return (
     <Card
       title="Analytics"
       className="card--flush"
       actions={
-        <label className="row" style={{ gap: "0.4rem", fontSize: "0.8rem" }}>
-          <span className="faint">Estimated cost at:</span>
-          <select
-            className="select"
-            style={{ width: "auto", padding: "0.3rem 0.5rem", fontSize: "0.8rem" }}
-            value={selected}
-            onChange={(e) => setPriceModel(e.target.value)}
-            aria-label="Estimated cost at"
-          >
-            {Object.entries(current.price_table).map(([name, p]) => (
-              <option key={name} value={name}>
-                {p.local
-                  ? `${name} (local — $0)`
-                  : `${name} — $${p.input_per_mtok_usd}/$${p.output_per_mtok_usd} per Mtok`}
+        <div className="row" style={{ gap: "0.6rem", flexWrap: "wrap" }}>
+          {multiModel ? (
+            <div
+              className="seg"
+              role="tablist"
+              aria-label="Analytics view"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={!byModel}
+                className={`seg__btn${byModel ? "" : " seg__btn--active"}`}
+                onClick={() => setView("sandbox")}
+              >
+                per sandbox
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={byModel}
+                className={`seg__btn${byModel ? " seg__btn--active" : ""}`}
+                onClick={() => setView("model")}
+              >
+                by model
+              </button>
+            </div>
+          ) : null}
+          <label className="row" style={{ gap: "0.4rem", fontSize: "0.8rem" }}>
+            <span className="faint">Estimated cost at:</span>
+            <select
+              className="select"
+              style={{ width: "auto", padding: "0.3rem 0.5rem", fontSize: "0.8rem" }}
+              value={priceModel ?? ""}
+              onChange={(e) => setPriceModel(e.target.value || null)}
+              aria-label="Estimated cost at"
+            >
+              <option value="">
+                auto — per-model rates
               </option>
-            ))}
-          </select>
-        </label>
+              {Object.entries(current.price_table).map(([name, p]) => (
+                <option key={name} value={name}>
+                  {p.local
+                    ? `${name} (local — $0)`
+                    : `${name} — $${p.input_per_mtok_usd}/$${p.output_per_mtok_usd} per Mtok`}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
       }
     >
       <div className="matrix-wrap">
@@ -218,34 +262,75 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
           <thead>
             <tr>
               <th style={{ minWidth: "150px" }}>Metric</th>
-              {current.sandboxes.map((sb) => (
-                <th key={sb.sandbox_id}>
-                  <div className="row" style={{ gap: "0.4rem" }}>
-                    <span className="mono" title={sb.sandbox_id}>
-                      {shortId(sb.sandbox_id)}
-                    </span>
-                    <Badge tone={statusTone(sb.status)}>{sb.status}</Badge>
-                  </div>
-                  {sb.name ? (
-                    <div className="dim-name" title={sb.name}>
-                      {sb.name}
+              {columns.map((col) =>
+                isModelCol(col) ? (
+                  <th key={colKey(col)}>
+                    <div className="row" style={{ gap: "0.4rem" }}>
+                      <span className="mono">{col.model}</span>
+                      <Badge tone="outline">
+                        {col.sandbox_count} sandbox{col.sandbox_count === 1 ? "" : "es"}
+                      </Badge>
                     </div>
-                  ) : null}
-                  <div className="dim-desc">{sb.label}</div>
-                </th>
-              ))}
+                  </th>
+                ) : (
+                  <th key={colKey(col)}>
+                    <div className="row" style={{ gap: "0.4rem" }}>
+                      <span className="mono" title={col.sandbox_id}>
+                        {shortId(col.sandbox_id)}
+                      </span>
+                      <Badge tone={statusTone(col.status)}>{col.status}</Badge>
+                    </div>
+                    {col.name ? (
+                      <div className="dim-name" title={col.name}>
+                        {col.name}
+                      </div>
+                    ) : null}
+                    <div className="dim-desc">{col.label}</div>
+                  </th>
+                ),
+              )}
             </tr>
           </thead>
           <tbody>
+            {byModel ? (
+              <tr>
+                <td>
+                  <div className="dim-name">sandboxes</div>
+                  <div className="dim-desc">matrix cells on this model</div>
+                </td>
+                {columns.map((col) => (
+                  <td key={colKey(col)} className="num">
+                    {isModelCol(col) ? col.sandbox_count : "—"}
+                  </td>
+                ))}
+              </tr>
+            ) : (
+              <tr>
+                <td>
+                  <div className="dim-name">terminal state</div>
+                </td>
+                {columns.map((col) => (
+                  <td key={colKey(col)} className="num">
+                    {!isModelCol(col) && col.terminal_reason ? (
+                      <Badge tone={statusTone(col.terminal_reason)}>
+                        {col.terminal_reason}
+                      </Badge>
+                    ) : (
+                      <span className="score-na">—</span>
+                    )}
+                  </td>
+                ))}
+              </tr>
+            )}
             {rows.map((r) => (
               <tr key={r.label}>
                 <td>
                   <div className="dim-name">{r.label}</div>
                   {r.hint ? <div className="dim-desc">{r.hint}</div> : null}
                 </td>
-                {current.sandboxes.map((sb) => (
-                  <td key={sb.sandbox_id} className="num">
-                    {r.cell(sb)}
+                {columns.map((col) => (
+                  <td key={colKey(col)} className="num">
+                    {r.cell(col)}
                   </td>
                 ))}
               </tr>
@@ -258,14 +343,14 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
                     judge turns · tokens · est. cost · err
                   </div>
                 </td>
-                {current.sandboxes.map((sb) => (
-                  <td key={sb.sandbox_id} className="num">
-                    {sb.evaluator ? (
+                {columns.map((col) => (
+                  <td key={colKey(col)} className="num">
+                    {col.evaluator ? (
                       <span className="faint" style={{ fontSize: "0.8rem" }}>
-                        {num(sb.evaluator.llm_turns)} ·{" "}
-                        {num(sb.evaluator.tokens.total)} ·{" "}
-                        {formatUsd(sb.evaluator.estimated_cost_usd)} ·{" "}
-                        {num(sb.evaluator.errors)} err
+                        {num(col.evaluator.llm_turns)} ·{" "}
+                        {num(col.evaluator.tokens.total)} ·{" "}
+                        {formatUsd(col.evaluator.estimated_cost_usd)} ·{" "}
+                        {num(col.evaluator.errors)} err
                       </span>
                     ) : (
                       <span className="score-na">—</span>

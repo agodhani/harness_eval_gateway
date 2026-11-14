@@ -19,6 +19,7 @@ import {
   getRunResults,
   getSandboxScores,
   harnessConfigLabel,
+  runModels,
   TERMINAL_RUN_STATUSES,
   type DimensionScore,
   type RunOut,
@@ -71,6 +72,9 @@ async function fetchResultsViaScores(run: RunOut): Promise<RunResults> {
     sandboxes.push({
       sandbox_id: sb.id,
       harness_config: sb.harness_config ?? {},
+      name: sb.name ?? null,
+      model:
+        String(sb.harness_config?.model ?? "").trim() || run.model_name,
       status: sb.status,
       terminal_reason: sb.terminal_reason,
       artifact_path: sb.artifact_path,
@@ -83,6 +87,7 @@ async function fetchResultsViaScores(run: RunOut): Promise<RunResults> {
     run_id: run.id,
     status: run.status,
     model_name: run.model_name,
+    models: runModels(run.model_name, run.config?.models),
     evaluator_model: run.config?.evaluator_model ?? null,
     same_model_eval: run.same_model_eval ?? null,
     sandboxes,
@@ -219,6 +224,38 @@ export default function ResultsClient({ runId }: { runId: string }) {
     [dimTotals],
   );
 
+  /** PR14 — group sandboxes by participant model for the compare-by-model
+   * card: sandbox count, mean judge `overall`, mean Σ-dimensions total. */
+  const modelGroups = useMemo(() => {
+    const map = new Map<string, SandboxResult[]>();
+    for (const sb of sandboxes) {
+      const m = sb.model || run?.model_name || "?";
+      const list = map.get(m);
+      if (list) list.push(sb);
+      else map.set(m, [sb]);
+    }
+    return [...map.entries()].map(([model, sbs]) => {
+      const overalls = sbs
+        .map((s) => s.overall?.score)
+        .filter((v): v is number => typeof v === "number");
+      const totals = sbs
+        .map((s) => dimTotals.get(s.sandbox_id))
+        .filter((t): t is { sum: number; count: number } => !!t && t.count > 0);
+      return {
+        model,
+        count: sbs.length,
+        meanOverall:
+          overalls.length > 0
+            ? overalls.reduce((a, b) => a + b, 0) / overalls.length
+            : null,
+        meanTotal:
+          totals.length > 0
+            ? totals.reduce((a, t) => a + t.sum, 0) / totals.length
+            : null,
+      };
+    });
+  }, [sandboxes, dimTotals, run]);
+
   function toggleCell(sbId: string, dim: string) {
     const key = `${sbId}::${dim}`;
     setExpanded((prev) => {
@@ -288,6 +325,10 @@ export default function ResultsClient({ runId }: { runId: string }) {
   const modelName = currentResults?.model_name ?? run?.model_name ?? "?";
   const evaluatorModel = currentResults?.evaluator_model ?? run?.config?.evaluator_model ?? null;
   const sameModel = currentResults?.same_model_eval ?? run?.same_model_eval ?? null;
+  // PR14: full participant-model set for the header note.
+  const participantModels =
+    currentResults?.models ??
+    runModels(modelName, run?.config?.models);
 
   return (
     <main className="container">
@@ -315,14 +356,15 @@ export default function ResultsClient({ runId }: { runId: string }) {
       <div className="stack">
         {sameModel === true ? (
           <WarnNote>
-            <strong>Same-model evaluation:</strong> the evaluator model equals the
-            participant model (<code>{modelName}</code>). Scores are produced by the
-            same weights being judged — treat rankings as indicative, not independent.
+            <strong>Same-model evaluation:</strong> the evaluator model equals a
+            participant model (<code>{evaluatorModel ?? modelName}</code>). Scores
+            are produced by the same weights being judged — treat rankings as
+            indicative, not independent.
           </WarnNote>
         ) : evaluatorModel ? (
           <InfoNote>
             Evaluator: <code>{evaluatorModel}</code> · participants:{" "}
-            <code>{modelName}</code>
+            <code>{participantModels.join(", ") || modelName}</code>
           </InfoNote>
         ) : null}
 
@@ -438,6 +480,53 @@ export default function ResultsClient({ runId }: { runId: string }) {
                 </table>
               </div>
             </Card>
+
+            {modelGroups.length > 1 ? (
+              <Card title="By model" className="card--flush">
+                <div className="table-wrap">
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th>Model</th>
+                        <th>Sandboxes</th>
+                        <th>Mean overall</th>
+                        <th>Mean total (Σ dims)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {modelGroups.map((g) => (
+                        <tr key={g.model}>
+                          <td className="mono" style={{ fontSize: "0.82rem" }}>
+                            {g.model}
+                          </td>
+                          <td className="num">{g.count}</td>
+                          <td className="num">
+                            {g.meanOverall !== null ? (
+                              <span
+                                className={`score-value score-value--${scoreTone(g.meanOverall)}`}
+                              >
+                                {Math.round(g.meanOverall * 10) / 10}
+                              </span>
+                            ) : (
+                              <span className="score-na">—</span>
+                            )}
+                          </td>
+                          <td className="num">
+                            {g.meanTotal !== null ? (
+                              <span className="score-value">
+                                {Math.round(g.meanTotal * 10) / 10}
+                              </span>
+                            ) : (
+                              <span className="score-na">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+            ) : null}
 
             <AnalyticsSection runId={runId} />
 

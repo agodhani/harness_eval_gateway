@@ -271,6 +271,63 @@ async def test_spawn_one_unknown_adapter_fails_sandbox(
         assert row.status == "failed"
 
 
+async def test_spawn_one_model_override_reaches_env_and_name(
+    session_factory, settings, fake_runtime
+) -> None:
+    """PR14: a harness_config ``model`` cell overrides run.model_name —
+    env MODEL_NAME, persisted harness_config, and the display name."""
+    run = make_run(
+        session_factory,
+        status="provisioning",
+        model_name="primary-model",
+        config=run_config(),
+    )
+    hc = {
+        "adapter": "miniloop",
+        "name": "baseline",
+        "model": "alt-model",
+        "skill_packs": [],
+    }
+    sid = await spawn_one(
+        session_factory=session_factory,
+        runtime=fake_runtime,
+        run_id=run.id,
+        harness_config=hc,
+        settings=settings,
+    )
+    assert sid is not None
+    spec = fake_runtime.spawned[0]
+    assert spec.env["MODEL_NAME"] == "alt-model"  # not run.model_name
+    sb = _db_sandbox(session_factory, sid)
+    assert sb.harness_config["model"] == "alt-model"  # cell persisted verbatim
+    assert sb.name == "baseline · alt-model"
+
+
+async def test_spawn_one_no_model_uses_run_default(
+    session_factory, settings, fake_runtime
+) -> None:
+    """PR14 regression: no ``model`` key → run.model_name everywhere,
+    name unchanged (single-model shape)."""
+    run = make_run(
+        session_factory,
+        status="provisioning",
+        model_name="primary-model",
+        config=run_config(),
+    )
+    sid = await spawn_one(
+        session_factory=session_factory,
+        runtime=fake_runtime,
+        run_id=run.id,
+        harness_config={"adapter": "miniloop", "name": "baseline"},
+        settings=settings,
+    )
+    assert sid is not None
+    assert fake_runtime.spawned[0].env["MODEL_NAME"] == "primary-model"
+    sb = _db_sandbox(session_factory, sid)
+    assert sb.name == "baseline"  # no model suffix
+    assert "model" not in sb.harness_config
+
+
 async def test_spawn_one_persists_custom_name(
     session_factory, settings, fake_runtime
 ) -> None:

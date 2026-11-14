@@ -14,6 +14,7 @@ import {
   approveRun,
   getRun,
   getRunResults,
+  runModels,
   TERMINAL_RUN_STATUSES,
   updateRubric,
   type HarnessConfig,
@@ -106,6 +107,9 @@ function RubricView({
   const scored = results?.sandboxes ?? [];
   const hasScores = scored.length > 0;
   const anyOverall = scored.some((s) => s.overall);
+  // PR14: show the model under each column only on multi-model runs —
+  // single-model runs already carry it in the page subtitle.
+  const multiModel = new Set(scored.map((s) => s.model || "")).size > 1;
 
   function scoreCell(sb: RunResults["sandboxes"][number], dim: string) {
     const entry = sb.dimensions?.[dim];
@@ -146,6 +150,7 @@ function RubricView({
                       {shortId(sb.sandbox_id)}
                     </Link>
                     <div className="faint" style={{ fontSize: "0.66rem", fontWeight: 400 }}>
+                      {multiModel && sb.model ? `${sb.model} · ` : ""}
                       {sb.name ? `${sb.name} · ` : ""}
                       {String(sb.harness_config?.adapter ?? sb.harness_config?.harness ?? "?")}
                     </div>
@@ -422,6 +427,8 @@ export default function RunDetailClient({ runId }: { runId: string }) {
   const configs: HarnessConfig[] = run.config?.harness_configs ?? [];
   const budgets = run.config?.budgets;
   const evaluatorModel = run.config?.evaluator_model ?? null;
+  // PR14: effective participant-model set ([model_name] + config extras).
+  const participantModels = runModels(run.model_name, run.config?.models);
 
   return (
     <main className="container">
@@ -440,7 +447,14 @@ export default function RunDetailClient({ runId }: { runId: string }) {
             ) : null}
           </div>
           <p className="subtitle">
-            <span className="mono">{run.model_name}</span>
+            <span className="mono">
+              {participantModels.length > 1
+                ? participantModels.join(", ")
+                : run.model_name}
+            </span>
+            {participantModels.length > 1 ? (
+              <span className="faint"> ({participantModels.length} models)</span>
+            ) : null}
             {evaluatorModel ? (
               <>
                 {" "}· evaluator <span className="mono">{evaluatorModel}</span>
@@ -485,6 +499,18 @@ export default function RunDetailClient({ runId }: { runId: string }) {
         <div className="split">
           <Card title="Harness configs">
             <ConfigSummary configs={configs} />
+            {participantModels.length > 1 ? (
+              <div className="chip-row" style={{ marginTop: "0.6rem" }}>
+                <span className="faint" style={{ fontSize: "0.78rem" }}>
+                  models:
+                </span>
+                {participantModels.map((m) => (
+                  <span key={m} className="chip">
+                    {m}
+                  </span>
+                ))}
+              </div>
+            ) : null}
             {budgets ? (
               <dl className="kv" style={{ marginTop: "0.9rem" }}>
                 <dt>Budgets</dt>
@@ -534,6 +560,11 @@ export default function RunDetailClient({ runId }: { runId: string }) {
                           <td>
                             <div className="row" style={{ gap: "0.35rem" }}>
                               <Badge tone="outline">{adapter}</Badge>
+                              {typeof hc.model === "string" && hc.model ? (
+                                <Badge tone="teal" title="participant model">
+                                  {hc.model}
+                                </Badge>
+                              ) : null}
                               {packs.map((p) => (
                                 <span key={p} className="chip">
                                   {p}

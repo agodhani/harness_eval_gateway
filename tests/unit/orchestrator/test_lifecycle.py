@@ -135,6 +135,100 @@ async def test_lifecycle_happy_path_two_sandboxes(
         assert s.execute(select(Score).where(Score.rubric_id == rubric.id)).scalars().all()
 
 
+async def test_lifecycle_multi_model_matrix_expansion(
+    session_factory, settings, artifact_root
+) -> None:
+    """PR14: harness_configs × models → one sandbox per cell; each carries
+    its model in harness_config, env MODEL_NAME, and the display name."""
+    cfg = run_config(
+        harness_configs=[
+            {"adapter": "miniloop", "skill_packs": [], "name": "baseline"},
+            {"adapter": "miniloop", "skill_packs": ["pack-a"], "name": "packed"},
+        ]
+    )
+    # effective participant set — model_name leads (dedupe keeps order)
+    cfg["models"] = ["test-model", "other-model"]
+    run = make_run(
+        session_factory, status="provisioning", config=cfg, model_name="test-model"
+    )
+    _approved_rubric(session_factory, run.id)
+
+    fake = FakeRuntime(artifact_root=artifact_root, default_logs=RESULT_DONE)
+    calls: list = []
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+
+    with session_factory() as s:
+        sbs = list(
+            s.execute(select(Sandbox).where(Sandbox.run_id == run.id))
+            .scalars()
+            .all()
+        )
+        # 2 configs × 2 models = 4 sandboxes, all completed
+        assert len(sbs) == 4
+        assert all(sb.status == "done" for sb in sbs)
+        # every cell self-describes its model
+        assert sorted(sb.harness_config.get("model") for sb in sbs) == [
+            "other-model", "other-model", "test-model", "test-model",
+        ]
+        # names disambiguate same-config siblings across models
+        assert sorted(sb.name for sb in sbs) == [
+            "baseline · other-model",
+            "baseline · test-model",
+            "packed · other-model",
+            "packed · test-model",
+        ]
+        assert s.get(type(run), run.id).status == "done"
+        # evaluator ran once per cell
+        assert len(calls) == 4
+
+    # env MODEL_NAME reached each spawned spec with the cell's model
+    env_models = sorted(sp.env["MODEL_NAME"] for sp in fake.spawned)
+    assert env_models == ["other-model", "other-model", "test-model", "test-model"]
+
+
+async def test_lifecycle_single_model_keeps_unexpanded_configs(
+    session_factory, settings, artifact_root
+) -> None:
+    """PR14 regression: a run without config.models spawns exactly one
+    sandbox per harness_config with NO model key injected (pre-PR14 shape)."""
+    cfg = run_config(
+        harness_configs=[
+            {"adapter": "miniloop", "skill_packs": []},
+            {"adapter": "miniloop", "skill_packs": ["pack-a"]},
+        ]
+    )
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+
+    fake = FakeRuntime(artifact_root=artifact_root, default_logs=RESULT_DONE)
+    calls: list = []
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+
+    with session_factory() as s:
+        sbs = list(
+            s.execute(select(Sandbox).where(Sandbox.run_id == run.id))
+            .scalars()
+            .all()
+        )
+        assert len(sbs) == 2
+        assert all("model" not in (sb.harness_config or {}) for sb in sbs)
+        # names have no model suffix on single-model runs
+        assert all("·" not in (sb.name or "") for sb in sbs)
+    assert {sp.env["MODEL_NAME"] for sp in fake.spawned} == {"test-model"}
+
+
 async def test_lifecycle_partial_spawn_failure_still_done(
     session_factory, settings, artifact_root
 ) -> None:

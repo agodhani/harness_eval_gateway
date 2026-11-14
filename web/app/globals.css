@@ -468,6 +468,40 @@ h3 {
   border-color: transparent;
 }
 
+/* Segmented view toggle (PR14 analytics per-sandbox / by-model). */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+}
+.seg__btn {
+  padding: 0.3rem 0.7rem;
+  border: none;
+  border-right: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 0.64rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.seg__btn:last-child {
+  border-right: none;
+}
+.seg__btn:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+.seg__btn--active {
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+.seg__btn--active:hover {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
 /* ==========================================================================
    Forms
    ========================================================================== */
@@ -625,6 +659,12 @@ select.select option {
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem 1.1rem;
+}
+/* Scrollable variant for long catalogs (PR14 model multi-select). */
+.check-list--scroll {
+  max-height: 9.5rem;
+  overflow-y: auto;
+  padding-right: 0.35rem;
 }
 .check-item {
   display: inline-flex;

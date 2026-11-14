@@ -34,6 +34,7 @@ from api.deps import get_db
 from api.schemas import AnalysisReport
 from db.models import Artifact, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
+from orchestrator.matrix import participant_models, sandbox_model
 from sandbox.preview import ScanCache
 from scoring.render import ANALYSIS_JSON_FILENAME
 
@@ -85,6 +86,9 @@ class SandboxResult(BaseModel):
     # Config label from the sandbox row (PR1 named harness configs); NULL
     # on sandboxes that predate the column.
     name: str | None = None
+    # PR14: the participant model this sandbox ran — the harness_config
+    # ``model`` cell on multi-model runs, else the run's ``model_name``.
+    model: str = ""
     status: str
     terminal_reason: str | None = None
     artifact_path: str | None = None
@@ -110,6 +114,9 @@ class RunResults(BaseModel):
     run_id: UUID
     status: str
     model_name: str
+    # PR14: the run's full participant-model set — [model_name] + extras —
+    # so the UI can render multi-model runs without re-deriving the matrix.
+    models: list[str] = Field(default_factory=list)
     evaluator_model: str | None = None
     same_model_eval: bool | None = None
     sandboxes: list[SandboxResult] = Field(default_factory=list)
@@ -236,6 +243,7 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
                 sandbox_id=sb.id,
                 harness_config=sb.harness_config or {},
                 name=sb.name,
+                model=sandbox_model(sb.harness_config or {}, run.model_name),
                 status=sb.status,
                 terminal_reason=sb.terminal_reason,
                 artifact_path=sb.artifact_path,
@@ -265,6 +273,7 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
         run_id=run.id,
         status=run.status,
         model_name=run.model_name,
+        models=participant_models(run.model_name, cfg.get("models")),
         evaluator_model=cfg.get("evaluator_model"),
         same_model_eval=cfg.get("same_model_eval"),
         sandboxes=results,

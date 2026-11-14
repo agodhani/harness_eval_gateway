@@ -33,6 +33,8 @@ import { ImportSkillPackDialog } from "./ImportSkillPackDialog";
 // GET /api/models (gateway → upstream) when the backend is reachable.
 const MODEL_SUGGESTIONS = ["qwen3:8b", "qwen2.5-coder:3b", "qwen2.5-coder:7b"];
 const MAX_CONFIGS = 8;
+// Mirrors api/schemas.py MAX_MATRIX_CELLS — configs × models sandbox cap.
+const MAX_MATRIX_CELLS = 32;
 
 interface ConfigRow {
   key: number;
@@ -58,6 +60,9 @@ export default function SubmitPage() {
 
   const [taskPrompt, setTaskPrompt] = useState("");
   const [modelName, setModelName] = useState("qwen3:8b");
+  // PR14: ADDITIONAL participant models — the run matrix expands to
+  // harness_configs × ([modelName] + extraModels). Empty = single-model.
+  const [extraModels, setExtraModels] = useState<string[]>([]);
   const [evaluatorModel, setEvaluatorModel] = useState("");
   const [configs, setConfigs] = useState<ConfigRow[]>(() => [blankConfig()]);
   const [budgets, setBudgets] = useState<Budgets>({ ...DEFAULT_BUDGETS });
@@ -77,7 +82,42 @@ export default function SubmitPage() {
   const [pullMsg, setPullMsg] = useState<string | null>(null);
   const [pullFailed, setPullFailed] = useState(false);
 
-  const modelSuggestions = models.length > 0 ? models : [...MODEL_SUGGESTIONS];
+  const modelSuggestions = useMemo(
+    () => (models.length > 0 ? models : [...MODEL_SUGGESTIONS]),
+    [models],
+  );
+
+  // Effective participant-model set: primary first, extras deduped against
+  // it and each other (mirrors orchestrator.matrix.participant_models).
+  const participantModels = useMemo(() => {
+    const out: string[] = [];
+    for (const raw of [modelName, ...extraModels]) {
+      const m = raw.trim();
+      if (m && !out.includes(m)) out.push(m);
+    }
+    return out;
+  }, [modelName, extraModels]);
+  const modelCount = participantModels.length;
+  const sandboxCount = configs.length * Math.max(modelCount, 1);
+  // Catalog models eligible as extras — the primary is already a participant.
+  const extraModelOptions = useMemo(
+    () => modelSuggestions.filter((m) => m !== modelName.trim()),
+    [modelSuggestions, modelName],
+  );
+
+  function setPrimaryModel(v: string) {
+    setModelName(v);
+    // A model promoted to primary leaves the extras set (dedupe anyway,
+    // but keeping state clean avoids a stale checked box reappearing).
+    const p = v.trim();
+    if (p) setExtraModels((prev) => prev.filter((m) => m !== p));
+  }
+
+  function toggleExtraModel(m: string) {
+    setExtraModels((prev) =>
+      prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m],
+    );
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -192,7 +232,10 @@ export default function SubmitPage() {
   }
 
   const effectiveEvaluator = evaluatorModel.trim() || modelName.trim();
-  const sameModelEval = effectiveEvaluator !== "" && effectiveEvaluator === modelName.trim();
+  // PR14: flagged when the judge equals ANY participant model —
+  // non-independent judging for that matrix cell.
+  const sameModelEval =
+    effectiveEvaluator !== "" && participantModels.includes(effectiveEvaluator);
 
   const canAddConfig = configs.length < MAX_CONFIGS;
 
@@ -215,8 +258,12 @@ export default function SubmitPage() {
       errs.token_budget = "token_budget must be ≥ 1000 (per-run).";
     if (budgets.wall_clock_seconds < 60 || budgets.wall_clock_seconds > 86400)
       errs.wall_clock_seconds = "wall_clock_seconds must be 60–86400.";
+    if (sandboxCount > MAX_MATRIX_CELLS)
+      errs.models =
+        `Matrix too large: ${configs.length} configs × ${modelCount} models ` +
+        `= ${sandboxCount} sandboxes (max ${MAX_MATRIX_CELLS}).`;
     return errs;
-  }, [taskPrompt, modelName, configs, budgets, adapterNames, packNames]);
+  }, [taskPrompt, modelName, configs, budgets, adapterNames, packNames, sandboxCount, modelCount]);
 
   const isValid = Object.keys(validation).length === 0;
 
@@ -293,6 +340,8 @@ export default function SubmitPage() {
       const run = await createRun({
         task_prompt: taskPrompt.trim(),
         model_name: modelName.trim(),
+        // PR14: extra participant models — empty list → single-model run.
+        models: extraModels.length ? extraModels : null,
         harness_configs,
         evaluator_model: evaluatorModel.trim() || null,
         budgets,
@@ -317,7 +366,7 @@ export default function SubmitPage() {
           <span className="kicker"><b>01</b> — experiment spec</span>
           <h1>Submit a run</h1>
           <p className="subtitle">
-            One task, one model, N harness configurations — evaluated side by side.
+            One task, N harness configurations × M models — evaluated side by side.
           </p>
         </div>
       </div>
@@ -356,7 +405,7 @@ export default function SubmitPage() {
               <ComboInput
                 id="model_name"
                 value={modelName}
-                onChange={setModelName}
+                onChange={setPrimaryModel}
                 suggestions={modelSuggestions}
                 placeholder="qwen3:8b"
                 disabled={submitting}
@@ -367,8 +416,8 @@ export default function SubmitPage() {
               ) : (
                 <span className="field__hint">
                   {models.length > 0
-                    ? `${models.length} models from the gateway upstream — same model runs in every sandbox.`
-                    : "Same model runs in every sandbox — we compare harnesses, not models."}
+                    ? `${models.length} models from the gateway upstream — the primary model every config runs on.`
+                    : "Primary participant model — runs in every sandbox unless extended below."}
                 </span>
               )}
             </div>
@@ -392,9 +441,51 @@ export default function SubmitPage() {
                   scores may not be fully independent. This is allowed; the results page flags it.
                 </InfoNote>
               ) : (
-                <span className="field__hint">Leave empty to reuse the participant model.</span>
+                <span className="field__hint">
+                  Leave empty to reuse the primary participant model.
+                </span>
               )}
             </div>
+          </div>
+          <div className="field" style={{ marginTop: "0.9rem" }}>
+            <label className="field__label" htmlFor="extra_models">
+              Additional models{" "}
+              <span className="faint">(optional — model-vs-model)</span>
+            </label>
+            <div
+              id="extra_models"
+              className="check-list check-list--scroll"
+              role="group"
+              aria-label="Additional participant models"
+            >
+              {extraModelOptions.map((m) => (
+                <label key={m} className="check-item">
+                  <input
+                    type="checkbox"
+                    checked={extraModels.includes(m)}
+                    onChange={() => toggleExtraModel(m)}
+                    disabled={submitting}
+                  />
+                  <code>{m}</code>
+                </label>
+              ))}
+            </div>
+            <span className="field__hint">
+              {modelCount > 1 ? (
+                <>
+                  <strong>
+                    {modelCount} models × {configs.length} configs = {sandboxCount}{" "}
+                    sandboxes
+                  </strong>{" "}
+                  — every config runs once per model.
+                </>
+              ) : (
+                "Check extra models to compare harness AND model in one run — each config runs once per model."
+              )}
+            </span>
+            {fieldErrors.models ? (
+              <span className="field__error">{fieldErrors.models}</span>
+            ) : null}
           </div>
           {pullSupported ? (
             <div className="field" style={{ marginTop: "0.9rem" }}>
