@@ -19,7 +19,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F4 | Sandbox runtime (spawn, egress, snapshot, done) | ✅ | `sandbox/`, `data/artifacts/` | `tests/integration/test_sandbox.py` |
 | F5 | Miniloop harness + adapter + skill packs | ✅ | `adapters/miniloop/`, `skillpacks/` | `tests/unit/adapters/miniloop/` |
 | F6 | Event store + live timeline | ✅ | `api/routers/events.py`, `web/app/runs/[id]/timeline/` | `tests/unit/api/test_events.py` |
-| F7 | Evaluator sandbox (rubric scoring) | ✅ | `evaluator/` | `tests/unit/evaluator/` |
+| F7 | Evaluator sandbox (rubric scoring + objective signals) | ✅ | `evaluator/`, `scoring/` | `tests/unit/evaluator/`, `tests/unit/scoring/` |
 | F8 | Results UI (matrix, scores, artifacts) | ✅ | `web/app/runs/`, `api/routers/results.py` | `tests/unit/api/test_results.py` |
 | F9 | Run analytics (per-sandbox metrics + cost) | ✅ | `api/routers/analytics.py`, `api/pricing.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx` | `tests/unit/api/test_analytics.py` |
 | F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
@@ -182,13 +182,38 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   rows is re-spawned up to `EVAL_SCORE_RETRIES` times (default 1) with a fresh
   cred, emitting an `eval_retry` checkpoint — covers small-model flake modes
   (malformed JSON, stuck-loop wander); infra exceptions are not retried.
+  **Objective signals (PR6):** before staging, the candidate workspace is
+  measured by the `scoring` package's signal collectors — `static_analysis`
+  runs lizard (multi-language, parse-only, no code execution) for real
+  cyclomatic complexity, nloc, function counts, nesting depth, and language
+  mix. The report is staged into the eval workspace as `ANALYSIS.md`
+  (judge-facing brief; judge is told to score `cyclomatic_complexity` from
+  measured values) + `analysis.json`, persisted at
+  `<artifact>/analysis.json`, summarized in an `eval_analysis` checkpoint
+  event, and re-validated + embedded as `analysis` on
+  `GET /api/runs/{id}/results` sandboxes. Candidate-authored
+  `ANALYSIS.md`/`analysis.json` files are dropped at staging (reserved
+  names — fake measured evidence can't reach the judge). Collection never
+  blocks evaluation: collector failures degrade to `status="error"` signal
+  entries / `status="unavailable"` event. Collector registry
+  (`scoring/collectors.py::COLLECTORS`) is the extension point for PR7's
+  exec/coverage signals.
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
-  `prompts.py`), db `scores`, `api/routers/results.py`
+  `prompts.py`), `scoring/` (`models.py` — analysis.json/API pydantic
+  contract, `collectors.py` — SignalCollector protocol + registry,
+  `static.py` — lizard collector, `render.py` — ANALYSIS.md), db `scores`,
+  `api/routers/results.py` (`SandboxResult.analysis`),
+  `api/schemas.py` (AnalysisReport re-export)
 - **Verify:**
   - Unit: `tests/unit/evaluator/` (`test_evaluate.py`, `test_scores.py`,
     `test_prompts.py`) — mocked runtime; staging, timeout salvage, malformed
-    scores covered
-  - Manual: scores + rationale visible on results page
+    scores covered; `tests/unit/scoring/` (`test_static.py`,
+    `test_collectors.py`, `test_render.py`) — workspaces with known CC
+    values, skip/cap/symlink rules, collector isolation, markdown render
+  - Results API: `tests/unit/api/test_results.py` — analysis embedded when
+    `<artifact>/analysis.json` exists+valid, null otherwise
+  - Manual: scores + rationale visible on results page; rationale for
+    cyclomatic_complexity cites measured CC values
 - **Depends on:** F2, F4, artifacts from a completed run
 
 ### F8 — Results UI ✅
