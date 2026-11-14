@@ -134,7 +134,7 @@ async def list_models(client: GatewayClient) -> ModelsOut:
     raw = data.get("data") if isinstance(data, dict) else None
     models = [
         ModelInfo.model_validate(m)
-        for m in raw or []
+        for m in (raw if isinstance(raw, list) else [])
         if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]
     ]
     provider = resp.headers.get("x-heg-provider")

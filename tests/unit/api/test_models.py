@@ -151,6 +151,13 @@ def test_list_models_non_json_body(client: TestClient, gw: Any) -> None:
     assert resp.json()["models"] == []
 
 
+def test_list_models_non_list_data_body(client: TestClient, gw: Any) -> None:
+    gw["handler"] = lambda _r: httpx.Response(200, json={"data": 5})
+    resp = client.get("/api/models")
+    assert resp.status_code == 200
+    assert resp.json()["models"] == []
+
+
 # ---------------------------------------------------------------------------
 # POST /api/models/pull
 # ---------------------------------------------------------------------------
