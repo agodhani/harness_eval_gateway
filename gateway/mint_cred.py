@@ -7,7 +7,10 @@ Prints the credential to stdout — use it as ``Authorization: Bearer <cred>``
 against ``/v1/chat/completions`` and the ``/internal/*`` endpoints.
 
 ``--run-id``/``--sandbox-id`` must be UUIDs (they key into the events table).
-The secret defaults to ``GATEWAY_CRED_SECRET`` (env or .env).
+Omit ``--sandbox-id`` to mint a SERVICE cred — run-scoped only, the shape
+the control plane uses; it may use the ``x-heg-provider`` override that
+sandbox-scoped creds are denied. The secret defaults to
+``GATEWAY_CRED_SECRET`` (env or .env).
 """
 
 from __future__ import annotations
@@ -33,7 +36,12 @@ def main(argv: list[str] | None = None) -> int:
         description="Mint an heg.* run/sandbox credential for the AI gateway.",
     )
     parser.add_argument("--run-id", required=True, type=_uuid_arg)
-    parser.add_argument("--sandbox-id", required=True, type=_uuid_arg)
+    parser.add_argument(
+        "--sandbox-id",
+        type=_uuid_arg,
+        default=None,
+        help="sandbox scope; omit for a run-level service cred",
+    )
     parser.add_argument(
         "--ttl-seconds",
         type=int,
