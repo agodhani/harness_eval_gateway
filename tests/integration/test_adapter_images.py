@@ -40,6 +40,7 @@ ADAPTERS = {
     "claude_code": ("heg-sandbox-claude:latest", "claude"),
     "pi": ("heg-sandbox-pi:latest", "pi"),
     "deepseek": ("heg-sandbox-deepseek:latest", "dsh"),
+    "aider": ("heg-sandbox-aider:latest", "aider"),
 }
 
 

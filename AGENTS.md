@@ -158,8 +158,10 @@ Each adapter provides:
 - `completion_signal()` — how `done` / loop-completion is detected
 
 **MVP adapter:** `miniloop` — our custom minimal coding agent (tool-call
-loop: shell exec, file read/write, `done`). Post-MVP adapters: Claude Code
-CLI, Codex CLI, Aider (note: these need paid accounts/API keys — not free).
+loop: shell exec, file read/write, `done`). Shipped CLI adapters (F10 +
+PR13): Claude Code, Codex, Pi, DeepSeek `dsh`, Aider — each runs against
+the same model via the gateway (paid accounts only needed if pointing at
+hosted providers; Ollama keeps everything free).
 
 **Default skill packs** (named presets, vendored under `skillpacks/`):
 `superpowers`, `mattpocock-skills`, `spec-kit`.
@@ -228,7 +230,8 @@ or tests change.
 
 ## Post-MVP roadmap
 
-- Additional harness adapters: Claude Code CLI, Codex CLI, Aider
+- Additional harness adapters beyond the shipped six (miniloop, codex,
+  claude_code, pi, deepseek, aider)
 - Additional providers: OpenRouter, direct Anthropic/OpenAI
 - Anthropic-compatible gateway endpoint (`/v1/messages`)
 - Model-vs-model comparisons (multi-model matrices)
@@ -309,7 +312,9 @@ or tests change.
   (stdlib-only) writes each CLI's native config, launches it in JSONL mode,
   translates records → normalized events, prints `HEG_RESULT`. Registry in
   `orchestrator/adapters.py` covers miniloop, codex, claude_code, pi,
-  deepseek; `GET /api/harnesses` serves manifests to the submit form.
+  deepseek, aider; `GET /api/harnesses` serves manifests to the submit
+  form. Aider has no JSONL mode — the shim's `translate_text` hook
+  (PR13) maps its plain-text status lines heuristically instead.
 - **Gateway protocol fan-out**: `/v1/messages` (+`count_tokens`) for
   Anthropic-SDK CLIs, `/v1/responses` for Codex, `/v1/models` for probes —
   pass-throughs that preserve `stream` with a metering tee
@@ -319,7 +324,8 @@ or tests change.
 - **CLI image pattern**: node:slim base + `python3` for the shim + pinned
   npm CLI + `adapters/` under `/opt/harness` + `done` at `/usr/local/bin`.
   npm install happens before COPY so dependency layers cache. DeepSeek's
-  `dsh` needs node >=24.9 → `node:24-slim` (others stay on 22).
+  `dsh` needs node >=24.9 → `node:24-slim` (others stay on 22). Aider is a
+  Python CLI → `python:3.12-slim` + `pip install aider-chat` (PR13).
 - **`done` invocation**: bare `done` is a shell keyword in sh/bash — prompts
   instruct harnesses to run `/usr/local/bin/done` (or `command done`).
 - **Imported skill packs (F11) live under `data/skillpacks/`**, not the

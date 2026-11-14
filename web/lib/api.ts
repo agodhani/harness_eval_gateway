@@ -118,6 +118,7 @@ export const SKILL_PACKS: readonly string[] = [
  * offline fallback when the API is unreachable. */
 export const ADAPTERS: readonly string[] = [
   "miniloop",
+  "aider",
   "claude_code",
   "codex",
   "deepseek",

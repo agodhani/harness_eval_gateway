@@ -6,9 +6,9 @@ implementing the AGENTS.md contract (``image_spec``, ``env``, ``launch``,
 ``parse_terminal_state``).
 
 Phase 2.5 adds real harness CLIs beside miniloop — ``claude_code``, ``codex``,
-``pi``, ``deepseek`` — each a shim'd sandbox image plus a module-level
-``MANIFEST`` dict powering ``GET /api/harnesses`` and the submit form's
-adapter dropdown.
+``pi``, ``deepseek``, and PR13's ``aider`` — each a shim'd sandbox image plus a
+module-level ``MANIFEST`` dict powering ``GET /api/harnesses`` and the submit
+form's adapter dropdown.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from __future__ import annotations
 from types import ModuleType
 from typing import Any
 
+from adapters.aider import adapter as aider_adapter
 from adapters.claude_code import adapter as claude_code_adapter
 from adapters.codex import adapter as codex_adapter
 from adapters.deepseek import adapter as deepseek_adapter
@@ -28,6 +29,7 @@ ADAPTERS: dict[str, ModuleType] = {
     "codex": codex_adapter,
     "pi": pi_adapter,
     "deepseek": deepseek_adapter,
+    "aider": aider_adapter,
 }
 
 

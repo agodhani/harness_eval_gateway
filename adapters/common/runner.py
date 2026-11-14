@@ -15,7 +15,11 @@ One ``run_shim`` loop serves every CLI adapter:
    JSON-parsed; ``translate(obj)`` maps native records to normalized event
    dicts which are printed as harness JSONL **and** POSTed to
    ``EVENTS_INGEST_URL`` (the gateway's ``/internal/events``, cred auth —
-   run/sandbox ids are stamped server-side).
+   run/sandbox ids are stamped server-side). Lines that are not JSON
+   objects go through the optional ``translate_text`` hook — plain-text
+   CLIs like aider have no JSONL mode, so their status lines
+   (``Applied edit to``, ``Tokens:``, ``Commit``…) are mapped
+   heuristically instead.
 5. On process exit the shim emits ``terminal_state`` and prints
    ``HEG_RESULT {json}`` — the marker ``parse_terminal_state`` scans for in
    captured logs.
@@ -51,6 +55,10 @@ SOURCE = "harness"
 
 #: Normalized-event producer: native parsed record -> normalized event dicts.
 TranslateFn = Callable[[dict[str, Any]], list[dict[str, Any]]]
+
+#: Plain-text-line translator for CLIs with no machine-readable mode
+#: (aider) — one stdout line -> normalized event dicts.
+TranslateTextFn = Callable[[str], list[dict[str, Any]]]
 
 #: Adapter-provided config writer, run before the CLI is spawned.
 SetupFn = Callable[["ShimConfig"], None]
@@ -243,6 +251,7 @@ def run_shim(
     cfg: ShimConfig,
     argv: list[str],
     translate: TranslateFn,
+    translate_text: TranslateTextFn | None = None,
     sink: EventSink | None = None,
     setup: SetupFn | None = None,
     env: Mapping[str, str] | None = None,
@@ -254,6 +263,11 @@ def run_shim(
     Returns the shim's exit code (0 normally, 2 on shim/setup failures). The
     CLI's raw stdout is echoed to ``stderr`` so ``docker logs`` keeps both
     channels; normalized events go to ``stdout`` as JSONL.
+
+    ``translate`` handles JSON-object lines; when a line is not a JSON
+    object the optional ``translate_text`` handles it (plain-text harnesses
+    like aider — pass both so ``adapters.<name>.translate_events`` and the
+    live loop share the same folding).
     """
     out = stdout if stdout is not None else sys.stdout
     err = stderr if stderr is not None else sys.stderr
@@ -322,37 +336,53 @@ def run_shim(
 
     signal.signal(signal.SIGTERM, _sigterm)
 
+    def _emit_events(events: Iterable[dict[str, Any]]) -> None:
+        nonlocal result_state
+        for ev in events:
+            etype = ev.get("type")
+            if not isinstance(etype, str) or not etype:
+                continue
+            payload = ev.get("payload")
+            sink.emit(
+                etype,
+                payload if isinstance(payload, dict) else {"value": payload},
+            )
+            if etype == "terminal_state" and isinstance(payload, dict):
+                s = payload.get("terminal_state")
+                if isinstance(s, str) and s:
+                    result_state = s
+
+    def _translate_error(exc: Exception) -> list[dict[str, Any]]:
+        # A bad record must not kill the run — surface it as an error event.
+        return [
+            {
+                "type": "error",
+                "payload": {
+                    "stage": "translate",
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            }
+        ]
+
     assert proc.stdout is not None
     try:
         for line in proc.stdout:
             # Raw transcript channel — stderr so stdout stays machine-clean.
             print(line.rstrip("\n"), file=err, flush=True)
-            for obj in _iter_json_objects([line]):
+            objs = list(_iter_json_objects([line]))
+            if objs:
+                for obj in objs:
+                    try:
+                        events = translate(obj)
+                    except Exception as exc:  # noqa: BLE001
+                        events = _translate_error(exc)
+                    _emit_events(events)
+            elif translate_text is not None:
                 try:
-                    events = translate(obj)
-                except Exception as exc:  # noqa: BLE001 — a bad record must not kill the run
-                    events = [
-                        {
-                            "type": "error",
-                            "payload": {
-                                "stage": "translate",
-                                "message": f"{type(exc).__name__}: {exc}",
-                            },
-                        }
-                    ]
-                for ev in events:
-                    etype = ev.get("type")
-                    if not isinstance(etype, str) or not etype:
-                        continue
-                    payload = ev.get("payload")
-                    sink.emit(
-                        etype,
-                        payload if isinstance(payload, dict) else {"value": payload},
-                    )
-                    if etype == "terminal_state" and isinstance(payload, dict):
-                        s = payload.get("terminal_state")
-                        if isinstance(s, str) and s:
-                            result_state = s
+                    events = translate_text(line.rstrip("\n"))
+                except Exception as exc:  # noqa: BLE001
+                    events = _translate_error(exc)
+                _emit_events(events)
     finally:
         try:
             proc.stdout.close()

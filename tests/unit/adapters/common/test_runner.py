@@ -265,6 +265,77 @@ def test_run_shim_setup_failure(tmp_path: Path) -> None:
     assert rc == 2
 
 
+def test_run_shim_translate_text(tmp_path: Path) -> None:
+    """Plain-text CLIs (aider): non-JSON stdout lines hit translate_text."""
+    argv = _write_stub_cli(
+        tmp_path,
+        "import json\n"
+        "print('Applied edit to a.py')\n"
+        "print('plain noise')\n"
+        "print(json.dumps({'type':'finish','state':'harness_complete'}))\n",
+    )
+
+    def _text(line: str) -> list[dict[str, Any]]:
+        if line.startswith("Applied edit to"):
+            return [
+                {
+                    "type": "file_op",
+                    "payload": {"op": "edit", "path": line.rsplit(" ", 1)[-1]},
+                }
+            ]
+        return []
+
+    out, err = io.StringIO(), io.StringIO()
+    cfg = runner.ShimConfig(
+        gateway_url="g", cred="c", model="m", task_prompt="t", workspace=str(tmp_path)
+    )
+    rc = runner.run_shim(
+        harness="fake",
+        cfg=cfg,
+        argv=argv,
+        translate=_translate,
+        translate_text=_text,
+        stdout=out,
+        stderr=err,
+    )
+    assert rc == 0
+    raw_lines = out.getvalue().strip().splitlines()
+    types = [
+        json.loads(x)["type"] for x in raw_lines if x.startswith("{")
+    ]
+    # "plain noise" produced nothing; "Applied edit" mapped via text hook.
+    assert types == ["run_started", "file_op", "terminal_state", "terminal_state"]
+
+
+def test_run_shim_translate_text_error(tmp_path: Path) -> None:
+    """A raising translate_text degrades to an error event, never a crash."""
+    argv = _write_stub_cli(tmp_path, "print('anything')\n")
+
+    def _boom(line: str) -> list[dict[str, Any]]:
+        raise ValueError("bad line")
+
+    out, err = io.StringIO(), io.StringIO()
+    cfg = runner.ShimConfig(
+        gateway_url="g", cred="c", model="m", task_prompt="t", workspace=str(tmp_path)
+    )
+    rc = runner.run_shim(
+        harness="fake",
+        cfg=cfg,
+        argv=argv,
+        translate=_translate,
+        translate_text=_boom,
+        stdout=out,
+        stderr=err,
+    )
+    assert rc == 0
+    events = [
+        json.loads(x) for x in out.getvalue().strip().splitlines() if x.startswith("{")
+    ]
+    assert events[1]["type"] == "error"
+    assert events[1]["payload"]["stage"] == "translate"
+    assert "bad line" in events[1]["payload"]["message"]
+
+
 def test_run_shim_emits_run_started_first(tmp_path: Path) -> None:
     argv = _write_stub_cli(tmp_path, "pass\n")
     out = io.StringIO()

@@ -106,8 +106,9 @@ class HarnessConfigIn(BaseModel):
     """One sandbox configuration in a run's comparison matrix.
 
     ``adapter`` picks the harness adapter — ``miniloop`` plus the Phase 2.5
-    CLI harnesses (``codex``, ``claude_code``, ``pi``, ``deepseek``; see
-    ``orchestrator/adapters.py`` and ``GET /api/harnesses``). ``skill_packs``
+    CLI harnesses (``codex``, ``claude_code``, ``pi``, ``deepseek``,
+    ``aider``; see ``orchestrator/adapters.py`` and ``GET /api/harnesses``).
+    ``skill_packs``
     selects which vendored packs under ``./skillpacks`` are staged into the
     sandbox, and ``system_prompt_extra`` appends run-specific instructions
     (native ``--append-system-prompt`` where the harness has one, otherwise
