@@ -242,6 +242,94 @@ async def test_startup_sweep_promotes_queued_after_failing_stale(
     assert _status(session_factory, parked.id) == "done"
 
 
+async def test_promote_retries_transient_claim_failure(
+    session_factory, settings, fake_runtime, monkeypatch
+) -> None:
+    """A claim that raises once must not strand the queue — promotion
+    retries and still launches the oldest queued run."""
+    calls: list[uuid.UUID] = []
+    monkeypatch.setattr(
+        lifecycle_mod, "run_lifecycle", _done_marking_lifecycle(calls)
+    )
+    real_claim = pacing.claim_next_queued
+    attempts = {"n": 0}
+
+    def flaky_claim(sf):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("transient db failure")
+        return real_claim(sf)
+
+    monkeypatch.setattr(pacing, "claim_next_queued", flaky_claim)
+    monkeypatch.setattr(runner, "_CLAIM_RETRY_DELAY_SECONDS", 0.01)
+
+    queued = make_run(session_factory, status="queued")
+    _set_status(session_factory, queued.id, "queued", started_at=datetime.now(UTC))
+
+    await runner.promote_next_queued(
+        session_factory=session_factory, settings=settings, runtime=fake_runtime
+    )
+    await _wait_calls(calls, 1)
+
+    # >= 2: the first attempt raised, a retry claimed the run (the promoted
+    # run's own lifecycle exit may add another no-op claim attempt).
+    assert attempts["n"] >= 2
+    assert calls == [queued.id]
+    assert _status(session_factory, queued.id) == "done"
+
+
+async def test_promote_gives_up_after_bounded_claim_retries(
+    session_factory, settings, fake_runtime, monkeypatch
+) -> None:
+    """A persistent claim failure returns after the bounded retries — the
+    queued run stays parked rather than crashing the promote path."""
+    calls: list[uuid.UUID] = []
+    monkeypatch.setattr(
+        lifecycle_mod, "run_lifecycle", _done_marking_lifecycle(calls)
+    )
+    attempts = {"n": 0}
+
+    def always_fail(sf):
+        attempts["n"] += 1
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(pacing, "claim_next_queued", always_fail)
+    monkeypatch.setattr(runner, "_CLAIM_RETRY_DELAY_SECONDS", 0.01)
+
+    queued = make_run(session_factory, status="queued")
+    await runner.promote_next_queued(
+        session_factory=session_factory, settings=settings, runtime=fake_runtime
+    )
+    await asyncio.sleep(0.05)
+
+    assert attempts["n"] == runner._CLAIM_ATTEMPTS
+    assert calls == []
+    assert _status(session_factory, queued.id) == "queued"
+
+
+async def test_startup_sweep_rearms_accepting_after_shutdown(
+    session_factory, settings, fake_runtime, monkeypatch
+) -> None:
+    """A same-process shutdown() -> startup_sweep() cycle (e.g. a lifespan
+    re-entry) must leave queue promotion live, not stuck off."""
+    calls: list[uuid.UUID] = []
+    monkeypatch.setattr(
+        lifecycle_mod, "run_lifecycle", _done_marking_lifecycle(calls)
+    )
+
+    await runner.shutdown()  # real shutdown flips the module flag
+    try:
+        queued = make_run(session_factory, status="queued")
+        await runner.startup_sweep(
+            session_factory=session_factory, settings=settings, runtime=fake_runtime
+        )
+        await _wait_calls(calls, 1)
+        assert calls == [queued.id]
+        assert _status(session_factory, queued.id) == "done"
+    finally:
+        runner._accepting = True  # don't leak the shutdown state
+
+
 # ---------------------------------------------------------------------------
 # wait_for_headroom — the memory gate
 # ---------------------------------------------------------------------------
