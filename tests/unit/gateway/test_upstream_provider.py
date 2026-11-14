@@ -8,7 +8,7 @@ ingest emission is monkeypatched — no live upstream/api.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Self
 
 import httpx
 import pytest
@@ -165,6 +165,14 @@ class TestProviderRoutes:
         with pytest.raises(ValidationError, match="unknown provider"):
             _settings(PROVIDER_ROUTES='{"x-*": "bogus"}')
 
+    def test_routes_parsed_once_cached(self) -> None:
+        """provider_for_model resolves per request — the JSON parse must be
+        cached, not re-run per call (identical dict object returned)."""
+        s = _settings(
+            PROVIDER_ROUTES='{"claude-*": "anthropic"}', ANTHROPIC_API_KEY="a"
+        )
+        assert s.provider_routes() is s.provider_routes()
+
 
 class TestUpstreamClient:
     async def test_ollama_client_has_no_auth(self, monkeypatch) -> None:
@@ -257,6 +265,81 @@ class TestUpstreamClient:
             assert str(client.base_url) == "http://host.docker.internal:11434"
         finally:
             await agen.aclose()
+
+
+class TestRealDepRouting:
+    """A POST through the REAL ``get_upstream_client`` — no dependency
+    override, no hand-invoked agen.
+
+    Guards the param-name coupling flagged in ``deps.get_upstream_client``:
+    the dep's ``body`` only populates because every endpoint also names its
+    own body param ``body`` (FastAPI dedupes same-named body params across
+    endpoint + dependencies). Renaming either side silently breaks routing
+    — the dep would see ``body=None`` and fall back to the default provider
+    (or the request 422s). Asserting the ROUTED provider's client proves
+    the dep received the body."""
+
+    def test_post_routes_through_real_dep(
+        self, gw_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: dict[str, Any] = {}
+
+        class _Client:
+            """Stand-in for httpx.AsyncClient — captures ctor kwargs + posts."""
+
+            def __init__(self, **kwargs: Any) -> None:
+                seen["init"] = kwargs
+
+            async def __aenter__(self) -> Self:
+                return self
+
+            async def __aexit__(self, *exc: object) -> None:
+                return None
+
+            async def post(self, path: str, json: Any = None) -> httpx.Response:
+                seen["path"], seen["json"] = path, json
+                return httpx.Response(200, json=_UPSTREAM_OK)
+
+        settings = _settings(
+            PROVIDER_ROUTES='{"claude-*": "anthropic"}',
+            ANTHROPIC_API_KEY="sk-ant",
+        )
+        # deps and main each bind get_settings at import time — patch both.
+        monkeypatch.setattr(deps, "get_settings", lambda: settings)
+        monkeypatch.setattr(main, "get_settings", lambda: settings)
+        # The REAL dep constructs httpx.AsyncClient itself — swap the class
+        # so nothing touches the network (monkeypatch restores on teardown).
+        monkeypatch.setattr(
+            deps.httpx, "AsyncClient", lambda **kw: _Client(**kw)
+        )
+
+        async def fake_post(events: list[dict[str, Any]]) -> tuple[int, Any]:
+            return 200, {"inserted": len(events)}
+
+        monkeypatch.setattr(metering, "post_ingest_events", fake_post)
+
+        resp = gw_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {DEV_CRED_TOKEN}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 200
+
+        # The REAL dep saw body["model"] and built the routed anthropic
+        # client — body=None would have resolved the default (ollama).
+        assert seen["init"]["base_url"] == "https://api.anthropic.com/"
+        assert seen["init"]["headers"] == {
+            "x-api-key": "sk-ant",
+            "anthropic-version": "2023-06-01",
+        }
+        assert seen["path"] == "/v1/chat/completions"
+        assert seen["json"]["model"] == "claude-sonnet-4-5"
+        assert seen["json"]["stream"] is False
+        # routed provider is not ollama → no ollama-only defaults injected
+        assert "num_ctx" not in seen["json"]
 
 
 class TestOllamaDefaultInjection:

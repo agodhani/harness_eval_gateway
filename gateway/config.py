@@ -24,6 +24,36 @@ _PROVIDER_KEY_FIELDS: dict[str, str] = {
 }
 
 
+@lru_cache(maxsize=8)
+def _parse_provider_routes(raw: str) -> dict[str, ProviderName]:
+    """Parse + validate a ``PROVIDER_ROUTES`` JSON string.
+
+    ``provider_for_model`` resolves per request, so the parse is cached on
+    the raw string (key validation still fails fast at boot via
+    ``model_post_init``). Small cache — the value is process config, but
+    bound it anyway; callers must not mutate the returned dict.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"PROVIDER_ROUTES is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict) or not all(
+        isinstance(k, str) for k in parsed
+    ):
+        raise ValueError(
+            "PROVIDER_ROUTES must be a JSON object of model-glob → provider"
+        )
+    for glob, provider in parsed.items():
+        if provider not in _PROVIDER_NAMES:
+            raise ValueError(
+                f"PROVIDER_ROUTES[{glob!r}] routes to unknown provider "
+                f"{provider!r} (one of {sorted(_PROVIDER_NAMES)})"
+            )
+    return cast(dict[str, ProviderName], parsed)
+
+
 class GatewaySettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -97,28 +127,10 @@ class GatewaySettings(BaseSettings):
         """Parsed ``PROVIDER_ROUTES``: ``{model_glob: provider}``.
 
         Declaration order is preserved — the first matching glob wins.
-        ``{}`` when unset/blank.
+        ``{}`` when unset/blank. Cached (see ``_parse_provider_routes``) —
+        do not mutate the returned dict.
         """
-        raw = self.PROVIDER_ROUTES.strip()
-        if not raw:
-            return {}
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"PROVIDER_ROUTES is not valid JSON: {exc}") from exc
-        if not isinstance(parsed, dict) or not all(
-            isinstance(k, str) for k in parsed
-        ):
-            raise ValueError(
-                "PROVIDER_ROUTES must be a JSON object of model-glob → provider"
-            )
-        for glob, provider in parsed.items():
-            if provider not in _PROVIDER_NAMES:
-                raise ValueError(
-                    f"PROVIDER_ROUTES[{glob!r}] routes to unknown provider "
-                    f"{provider!r} (one of {sorted(_PROVIDER_NAMES)})"
-                )
-        return cast(dict[str, ProviderName], parsed)
+        return _parse_provider_routes(self.PROVIDER_ROUTES.strip())
 
     def provider_for_model(self, model: str | None) -> ProviderName:
         """Resolve the upstream provider serving ``model``.

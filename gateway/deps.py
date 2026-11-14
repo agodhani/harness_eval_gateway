@@ -48,6 +48,14 @@ async def get_upstream_client(
     ``body`` carries the caller's ``model`` for PROVIDER_ROUTES per-model
     routing; ``None`` (GETs like ``/v1/models``, or direct calls) resolves
     the process-wide ``UPSTREAM_PROVIDER``.
+
+    WARNING — param-name coupling: FastAPI dedupes request-body params by
+    NAME across the endpoint and its dependencies, so this ``body`` is only
+    populated because every endpoint also names its own body param ``body``.
+    Renaming either side silently breaks the merge (all proxied POSTs would
+    422 — or the dep sees ``body=None`` and routes to the default provider).
+    ``TestRealDepRouting.test_post_routes_through_real_dep`` exercises the
+    REAL dep end-to-end to guard this.
     """
     settings = get_settings()
     provider = settings.provider_for_model((body or {}).get("model"))
