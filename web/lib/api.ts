@@ -286,6 +286,48 @@ export interface DimensionScore {
   rationale: string;
 }
 
+/** PR6 — objective scoring signals (scoring/ AnalysisReport).
+ * Measured on the workspace before judging; analysis.json is re-validated
+ * server-side and embedded on SandboxResult.analysis. Collector-agnostic:
+ * PR7's exec/coverage collector adds another SignalReport to `signals`. */
+export interface FunctionMetric {
+  name: string;
+  file: string;
+  line: number;
+  cyclomatic_complexity: number;
+  nloc: number;
+  params: number;
+  max_nesting_depth: number;
+}
+
+export interface FileMetric {
+  path: string;
+  language: string;
+  lines: number;
+  nloc: number;
+  function_count: number;
+  avg_cyclomatic_complexity: number;
+  max_cyclomatic_complexity: number;
+  max_nesting_depth: number;
+}
+
+export interface SignalReport {
+  name: string; // e.g. "static_analysis"; PR7 adds exec-derived signals
+  status: "ok" | "error" | "skipped" | string;
+  metrics: Record<string, unknown>;
+  files: FileMetric[];
+  functions: FunctionMetric[];
+  warnings: string[];
+  error: string | null;
+}
+
+export interface AnalysisReport {
+  schema_version: number;
+  generated_at: string; // ISO-8601
+  workspace: string;
+  signals: SignalReport[];
+}
+
 export interface SandboxResult {
   sandbox_id: string;
   harness_config: Record<string, unknown>;
@@ -295,6 +337,8 @@ export interface SandboxResult {
   rubric_id: string | null;
   dimensions: Record<string, DimensionScore>;
   overall: DimensionScore | null;
+  /** PR6: measured signals (analysis.json); null when not collected. */
+  analysis?: AnalysisReport | null;
   /** Optional artifact ids if/when the results API exposes them. */
   artifact_ids?: string[];
   artifacts?: { id: string; kind?: string; path?: string }[];
@@ -303,7 +347,7 @@ export interface SandboxResult {
   preview_type?: string | null;
   /**
    * F12: every detected runnable entry, default-first — the UI renders a
-   * dropdown and POSTs {entry}. Empty + previewable=false = unsupported.
+   * dropdown and POSTs {entry, type}. Empty + previewable=false = unsupported.
    */
   preview_candidates?: PreviewCandidate[];
 }
@@ -809,19 +853,25 @@ export function getPreview(runId: string, sandboxId: string): Promise<PreviewOut
 }
 
 /**
- * Idempotent per sandbox: returns the live preview if one already runs.
+ * Idempotent per sandbox: returns the live preview if one already runs and
+ * the requested plan matches (an explicit different entry/type replaces it).
  * `entry` (workspace-relative) picks an explicit entry point — for
  * ambiguous scans or artifacts detection missed; `.html` → static,
- * `.py` → desktop.
+ * `.py` → desktop. `type` overrides the pick: alone it selects the first
+ * candidate of that type; with `entry` it forces the plan type —
+ * `{entry: "x.py", type: "static"}` serves the file instead of executing
+ * it ("view source"), while `desktop` requires a `.py` entry.
  */
 export function startPreview(
   runId: string,
   sandboxId: string,
-  entry?: string,
+  opts?: { entry?: string; type?: string },
 ): Promise<PreviewOut> {
+  const body =
+    opts && (opts.entry || opts.type) ? JSON.stringify(opts) : undefined;
   return request<PreviewOut>(previewPath(runId, sandboxId), {
     method: "POST",
-    ...(entry ? { body: JSON.stringify({ entry }) } : {}),
+    ...(body ? { body } : {}),
   });
 }
 

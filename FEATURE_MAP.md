@@ -19,7 +19,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F4 | Sandbox runtime (spawn, egress, snapshot, done) | ✅ | `sandbox/`, `data/artifacts/` | `tests/integration/test_sandbox.py` |
 | F5 | Miniloop harness + adapter + skill packs | ✅ | `adapters/miniloop/`, `skillpacks/` | `tests/unit/adapters/miniloop/` |
 | F6 | Event store + live timeline | ✅ | `api/routers/events.py`, `web/app/runs/[id]/timeline/` | `tests/unit/api/test_events.py` |
-| F7 | Evaluator sandbox (rubric scoring) | ✅ | `evaluator/` | `tests/unit/evaluator/` |
+| F7 | Evaluator sandbox (rubric scoring + objective signals) | ✅ | `evaluator/`, `scoring/` | `tests/unit/evaluator/`, `tests/unit/scoring/` |
 | F8 | Results UI (matrix, scores, artifacts) | ✅ | `web/app/runs/`, `api/routers/results.py` | `tests/unit/api/test_results.py` |
 | F9 | Run analytics (per-sandbox metrics + cost) | ✅ | `api/routers/analytics.py`, `api/pricing.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx` | `tests/unit/api/test_analytics.py` |
 | F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
@@ -183,13 +183,38 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   rows is re-spawned up to `EVAL_SCORE_RETRIES` times (default 1) with a fresh
   cred, emitting an `eval_retry` checkpoint — covers small-model flake modes
   (malformed JSON, stuck-loop wander); infra exceptions are not retried.
+  **Objective signals (PR6):** before staging, the candidate workspace is
+  measured by the `scoring` package's signal collectors — `static_analysis`
+  runs lizard (multi-language, parse-only, no code execution) for real
+  cyclomatic complexity, nloc, function counts, nesting depth, and language
+  mix. The report is staged into the eval workspace as `ANALYSIS.md`
+  (judge-facing brief; judge is told to score `cyclomatic_complexity` from
+  measured values) + `analysis.json`, persisted at
+  `<artifact>/analysis.json`, summarized in an `eval_analysis` checkpoint
+  event, and re-validated + embedded as `analysis` on
+  `GET /api/runs/{id}/results` sandboxes. Candidate-authored
+  `ANALYSIS.md`/`analysis.json` files are dropped at staging (reserved
+  names — fake measured evidence can't reach the judge). Collection never
+  blocks evaluation: collector failures degrade to `status="error"` signal
+  entries / `status="unavailable"` event. Collector registry
+  (`scoring/collectors.py::COLLECTORS`) is the extension point for PR7's
+  exec/coverage signals.
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
-  `prompts.py`), db `scores`, `api/routers/results.py`
+  `prompts.py`), `scoring/` (`models.py` — analysis.json/API pydantic
+  contract, `collectors.py` — SignalCollector protocol + registry,
+  `static.py` — lizard collector, `render.py` — ANALYSIS.md), db `scores`,
+  `api/routers/results.py` (`SandboxResult.analysis`),
+  `api/schemas.py` (AnalysisReport re-export)
 - **Verify:**
   - Unit: `tests/unit/evaluator/` (`test_evaluate.py`, `test_scores.py`,
     `test_prompts.py`) — mocked runtime; staging, timeout salvage, malformed
-    scores covered
-  - Manual: scores + rationale visible on results page
+    scores covered; `tests/unit/scoring/` (`test_static.py`,
+    `test_collectors.py`, `test_render.py`) — workspaces with known CC
+    values, skip/cap/symlink rules, collector isolation, markdown render
+  - Results API: `tests/unit/api/test_results.py` — analysis embedded when
+    `<artifact>/analysis.json` exists+valid, null otherwise
+  - Manual: scores + rationale visible on results page; rationale for
+    cyclomatic_complexity cites measured CC values
 - **Depends on:** F2, F4, artifacts from a completed run
 
 ### F8 — Results UI ✅
@@ -343,13 +368,20 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     `preview_type` (cheap FS probe of the jailed workspace).
   - `POST /api/runs/{run}/sandboxes/{sandbox}/preview` → `201
     {preview_id, url, type, status, entry, expires_at}`; idempotent (a live
-    preview is returned as-is); `404` run/sandbox/workspace missing, `422`
-    zero candidates / bad `entry` / unsupported type, `502` docker
-    failure. Optional body `{"entry": "rel/path"}` picks an entry —
-    jailed to the workspace, must exist and be non-symlinked;
-    `.html`/`.htm` → static, `.py` → desktop (explicit `.py` bypasses
-    pygame evidence — the pick IS the disambiguation). No body → the
-    scan's default (`candidates[0]`).
+    preview is returned as-is — unless an explicit `entry`/`type` requests
+    a different plan, which stops it and respawns); `404`
+    run/sandbox/workspace missing, `422` zero candidates / bad `entry` /
+    unsupported type, `502` docker failure. Optional body `{"entry":
+    "rel/path"}` picks an entry — jailed to the workspace, must exist and
+    be non-symlinked; `.html`/`.htm` → static, `.py` → desktop (explicit
+    `.py` bypasses pygame evidence — the pick IS the disambiguation).
+    `{"type": "static"|"desktop"}` overrides the pick: alone it selects the
+    first detected candidate of that type (a both-matching workspace
+    defaults to static — `{"type": "desktop"}` reaches the game); with
+    `entry` it forces the plan — `static` serves any jailed file (view a
+    `.py`'s source — the entry is only the URL opened), `desktop` still
+    requires a `.py` entry. No body → the scan's default
+    (`candidates[0]`).
   - `GET .../preview` → current state (any status) or `404`; `DELETE
     .../preview` → `204` stop.
 - **Detection** (`sandbox/preview.py::scan_preview` → `PreviewScan{plan,
@@ -368,10 +400,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   yet still offers the desktop entry; helper .py files with real pygame
   imports are offered too.
 - **UI**: `preview_candidates` (typed `{entry,type}`) rides
-  `SandboxResult` → >1 option renders a dropdown (`index.html (site)` /
-  `game/main.py (desktop)`) + Preview button POSTing `{entry}`; one
-  option → plain button; zero → disabled button + "not supported"
-  (artifact still downloadable — preview is an add-on).
+  `SandboxResult` → the dropdown lists each candidate plus type-override
+  variants (`index.html (site)` / `game/main.py (desktop)` /
+  `game/main.py (view source)` — a `.py` can be served instead of
+  executed) + Preview button POSTing `{entry, type}`; one option → plain
+  button; zero → disabled button + "not supported" (artifact still
+  downloadable — preview is an add-on).
 - **Static posture** (`_spawn_static`): `python:3.12-slim` running
   `python -m http.server` over the workspace bind-mounted `:ro`; nobody
   user, `--read-only` rootfs, `--cap-drop ALL`, `no-new-privileges`.
@@ -401,8 +435,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Jail:** `resolve_workspace_dir` reuses the download-jail rule —
   `artifact_path` or `<ARTIFACT_ROOT>/<run>/<sandbox>` must resolve inside
   `ARTIFACT_ROOT`, and `workspace` must not be a symlink escaping it.
-- **Where:** `sandbox/preview.py`, `api/routers/preview.py` (+ reaper),
-  `api/config.py` (`PREVIEW_*`), `api/routers/results.py` (previewable flag),
+- **Where:** `sandbox/preview.py` (detection + `plan_for_entry`/
+  `plan_for_type` overrides, `ScanCache`, `PreviewManager`),
+  `api/routers/preview.py` (+ reaper),
+  `api/config.py` (`PREVIEW_*` incl. `PREVIEW_SCAN_TTL_SECONDS`),
+  `api/routers/results.py` (cached previewable probe via `_scan_cache`),
   `sandbox/images/desktop-preview.Dockerfile` +
   `desktop-preview-entrypoint.sh`,
   `web/lib/api.ts` (`getPreview`/`startPreview`/`stopPreview`, `PreviewOut`),
@@ -411,10 +448,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - Unit: `tests/unit/sandbox/test_preview.py` (static + desktop detection
     — nested depth bound, skip-dirs, candidate ordering/default-first,
     non-named `.py` evidence, comment-stripped requirements,
-    `plan_for_entry` jail/validation; manager via stubbed docker —
+    `plan_for_entry` jail/validation + `type=` override, `plan_for_type`,
+    `ScanCache` hit/expiry/LRU/clear; manager via stubbed docker —
     runner/proxy args, role labels, stop-all) +
-    `tests/unit/api/test_preview.py` (lifecycle, `entry=` override,
-    default-spawn semantics, typed `preview_candidates`)
+    `tests/unit/api/test_preview.py` (lifecycle, `entry=`/`type=`
+    overrides, live-preview replace-on-different-plan, default-spawn
+    semantics, typed `preview_candidates`, cached results probe)
   - Docker: `tests/integration/test_preview.py` (`@pytest.mark.docker` —
     static spawn → HTTP 200, localhost-only binding, reaper; desktop spawn
     builds `heg-preview-desktop` once per session → real pygame executes
@@ -424,9 +463,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     opens in new tab; "■ stop". Build image first:
     `docker build -f sandbox/images/desktop-preview.Dockerfile -t
     heg-preview-desktop:latest .`
-  - Note: `previewable`/`preview_type` probe runs per-sandbox on every
-    results GET — fine at MVP scale; could be cached later if results
-    pages grow large.
+  - Note: the `previewable`/`preview_type` results-GET probe rides
+    `sandbox.preview.ScanCache` — memoized per (jail, run, sandbox,
+    artifact_path) for `PREVIEW_SCAN_TTL_SECONDS` (default 30s; 0
+    disables); the workspace only changes on re-snapshot, so staleness is
+    bounded. `reset_scan_cache()` is the test hook.
 - **Depends on:** F4 (runtime plumbing/host-path translation), F8 (results
   page + artifact store layout)
 

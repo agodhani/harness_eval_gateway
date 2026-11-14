@@ -8,6 +8,7 @@ a tmp dir per test.
 from __future__ import annotations
 
 import io
+import json
 import uuid
 import zipfile
 from pathlib import Path
@@ -161,6 +162,105 @@ def test_run_results_404(client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PR6 — SandboxResult.analysis from <artifact>/analysis.json
+# ---------------------------------------------------------------------------
+
+
+ANALYSIS_JSON = {
+    "schema_version": 1,
+    "generated_at": "2026-11-13T00:00:00+00:00",
+    "workspace": "/x/y/workspace",
+    "signals": [
+        {
+            "name": "static_analysis",
+            "status": "ok",
+            "metrics": {
+                "files_analyzed": 2,
+                "function_count": 5,
+                "cyclomatic_complexity": {"mean": 3.4, "max": 9.0},
+            },
+            "files": [
+                {
+                    "path": "a.py",
+                    "language": "python",
+                    "lines": 40,
+                    "nloc": 30,
+                    "function_count": 3,
+                    "avg_cyclomatic_complexity": 4.0,
+                    "max_cyclomatic_complexity": 9.0,
+                    "max_nesting_depth": 2,
+                }
+            ],
+            "functions": [
+                {
+                    "name": "f_branchy",
+                    "file": "a.py",
+                    "line": 5,
+                    "cyclomatic_complexity": 9.0,
+                    "nloc": 12,
+                    "params": 2,
+                    "max_nesting_depth": 2,
+                }
+            ],
+            "warnings": ["1 source file(s) over 512 KiB skipped"],
+            "error": None,
+        }
+    ],
+}
+
+
+def _set_artifact_path(session_factory, sandbox_id, path: str) -> None:
+    s = session_factory()
+    try:
+        sb = s.get(Sandbox, sandbox_id)
+        sb.artifact_path = path
+        s.commit()
+    finally:
+        s.close()
+
+
+def test_run_results_includes_analysis(
+    client: TestClient, scored_run, session_factory, artifact_root
+) -> None:
+    """A valid <artifact>/analysis.json is re-validated + embedded."""
+    art_dir = artifact_root / "x" / "y"
+    art_dir.mkdir(parents=True)
+    (art_dir / "analysis.json").write_text(json.dumps(ANALYSIS_JSON))
+    _set_artifact_path(session_factory, scored_run["sb1"], str(art_dir))
+
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    body = resp.json()
+    sb1 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"]))
+    assert sb1["analysis"]["schema_version"] == 1
+    sig = sb1["analysis"]["signals"][0]
+    assert sig["name"] == "static_analysis"
+    assert sig["metrics"]["cyclomatic_complexity"]["max"] == 9.0
+    assert sig["functions"][0]["name"] == "f_branchy"
+    # sb2 has no artifact_path -> analysis absent
+    sb2 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"]))
+    assert sb2["analysis"] is None
+
+
+def test_run_results_invalid_analysis_is_null(
+    client: TestClient, scored_run, session_factory, artifact_root
+) -> None:
+    """Malformed/foreign analysis.json degrades to analysis=null — never a
+    500 or a pass-through of unvalidated candidate content."""
+    art_dir = artifact_root / "x" / "y"
+    art_dir.mkdir(parents=True)
+    (art_dir / "analysis.json").write_text('{"completely": "wrong shape"')
+    _set_artifact_path(session_factory, scored_run["sb1"], str(art_dir))
+
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb1 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"])
+    )
+    assert sb1["analysis"] is None
+
+
+# ---------------------------------------------------------------------------
 # GET /api/sandboxes/{sandbox_id}/scores
 # ---------------------------------------------------------------------------
 
@@ -197,8 +297,11 @@ def artifact_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         results_router,
         "get_settings",
-        lambda: SimpleNamespace(ARTIFACT_ROOT=tmp_path),
+        lambda: SimpleNamespace(
+            ARTIFACT_ROOT=tmp_path, PREVIEW_SCAN_TTL_SECONDS=0
+        ),
     )
+    results_router.reset_scan_cache()
     return tmp_path
 
 
