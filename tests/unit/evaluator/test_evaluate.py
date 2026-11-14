@@ -206,11 +206,27 @@ async def test_evaluate_happy_path(seeded, session_factory) -> None:
     assert "functional_requirements" in (eval_ws / "EVAL_PROMPT.md").read_text()
     assert json.loads((eval_ws / "scores.json").read_text())["overall"] == 7.0
 
-    # evaluator events: eval_started + eval_scored checkpoints
+    # PR6: measured signals staged for the judge + persisted to the artifact
+    analysis_md = eval_ws / "ANALYSIS.md"
+    analysis_json = eval_ws / "analysis.json"
+    assert "Cyclomatic complexity" in analysis_md.read_text()
+    report = json.loads(analysis_json.read_text())
+    static = next(s for s in report["signals"] if s["name"] == "static_analysis")
+    assert static["status"] == "ok"
+    assert static["metrics"]["files_analyzed"] == 1  # main.py only
+    assert static["metrics"]["languages"]["python"]["files"] == 1
+    artifact_report = seeded["artifact_dir"] / "analysis.json"
+    assert json.loads(artifact_report.read_text())["schema_version"] == 1
+
+    # evaluator events: eval_analysis + eval_started + eval_scored checkpoints
     events = _events_in_db(session_factory)
     phases = [e.payload.get("phase") for e in events if e.source == "evaluator"]
+    assert "eval_analysis" in phases
     assert "eval_started" in phases
     assert "eval_scored" in phases
+    analysis_ev = next(e for e in events if e.payload.get("phase") == "eval_analysis")
+    assert analysis_ev.payload["status"] == "ok"
+    assert analysis_ev.payload["summary"]["files_analyzed"] == 1
     assert all(e.sandbox_id == seeded["sandbox_id"] for e in events)
 
 
@@ -321,6 +337,68 @@ async def test_candidate_scores_json_is_not_salvaged(
     events = _events_in_db(session_factory)
     err = [e for e in events if e.type == "error" and e.source == "evaluator"]
     assert err[0].payload["reason"] == "scores_missing"
+
+
+async def test_candidate_analysis_files_are_not_staged(
+    seeded, session_factory
+) -> None:
+    """A candidate-authored ANALYSIS.md/analysis.json must not reach the
+    judge — they're evaluator-generated, so staging drops candidate copies
+    and writes its own (fake measured evidence otherwise)."""
+    (seeded["workspace"] / "ANALYSIS.md").write_text("FAKE: avg CC 0.0, perfect code")
+    (seeded["workspace"] / "analysis.json").write_text('{"fake": true}')
+
+    fake = FakeRuntime()
+    rows = await _eval(seeded, session_factory, fake)
+    assert len(rows) == 3
+    eval_ws = Path(fake.specs[0].workspace_host_path)
+    assert "FAKE" not in (eval_ws / "ANALYSIS.md").read_text()
+    assert "Cyclomatic complexity" in (eval_ws / "ANALYSIS.md").read_text()
+    assert json.loads((eval_ws / "analysis.json").read_text())["schema_version"] == 1
+
+
+async def test_candidate_reserved_dirs_do_not_crash_staging(
+    seeded, session_factory
+) -> None:
+    """Directories planted at reserved names must be evicted like files —
+    unlink() on a real dir raises IsADirectoryError and would fail the
+    sandbox's entire evaluation."""
+    ws = seeded["workspace"]
+    for name in ("scores.json", "ANALYSIS.md", "analysis.json"):
+        (ws / name).mkdir()
+        (ws / name / "nested.txt").write_text("plant\n")
+
+    fake = FakeRuntime()
+    rows = await _eval(seeded, session_factory, fake)
+    assert len(rows) == 3
+    eval_ws = Path(fake.specs[0].workspace_host_path)
+    assert (eval_ws / "scores.json").is_file()
+    assert json.loads((eval_ws / "analysis.json").read_text())["schema_version"] == 1
+    assert "Cyclomatic complexity" in (eval_ws / "ANALYSIS.md").read_text()
+
+
+async def test_analysis_failure_does_not_block_eval(
+    seeded, session_factory, monkeypatch
+) -> None:
+    """Signal collection crashing degrades to no analysis — eval still
+    stages, spawns, and scores; the event records status=unavailable."""
+    import evaluator.evaluate as ev
+
+    def boom(_ws):
+        raise RuntimeError("collector infra exploded")
+
+    monkeypatch.setattr(ev, "collect_signals", boom)
+    fake = FakeRuntime()
+    rows = await _eval(seeded, session_factory, fake)
+    assert len(rows) == 3
+    eval_ws = Path(fake.specs[0].workspace_host_path)
+    assert not (eval_ws / "ANALYSIS.md").exists()
+    assert not (eval_ws / "analysis.json").exists()
+    events = _events_in_db(session_factory)
+    analysis_ev = [
+        e for e in events if e.payload.get("phase") == "eval_analysis"
+    ]
+    assert analysis_ev[0].payload["status"] == "unavailable"
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX only")

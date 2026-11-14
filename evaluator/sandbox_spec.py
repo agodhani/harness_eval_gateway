@@ -3,8 +3,8 @@
 The evaluator reuses the miniloop harness as its judge agent: same image
 (``heg-sandbox:latest``), same env contract (``adapters.miniloop.adapter.env``),
 same tools (read_file / write_file / shell / done). What differs is the
-staged workspace (candidate repo + rubric.json + EVAL_PROMPT.md) and the task
-prompt.
+staged workspace (candidate repo + rubric.json + EVAL_PROMPT.md +
+ANALYSIS.md/analysis.json when collected) and the task prompt.
 """
 
 from __future__ import annotations
