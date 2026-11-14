@@ -94,9 +94,12 @@ adapters are added.
    event stream, artifact metadata, evaluator scores.
 6. **Evaluator** — runs in its own sandbox post-run; fetches artifact + rubric,
    scores via gateway, returns score + rationale per dimension. Objective
-   signals (PR6): the `scoring` collector registry measures the workspace
-   before judging (parse-only static analysis — real cyclomatic complexity,
-   size, language mix) and feeds the judge `ANALYSIS.md`/`analysis.json`.
+   signals (PR6+PR7): the `scoring` collector registry measures the
+   workspace before judging — parse-only static analysis (real cyclomatic
+   complexity, size, language mix) plus, when enabled, exec scoring:
+   build/tests/coverage run inside a locked `heg-exec` container (zero
+   egress, resource-capped, artifact read-only). Both feed the judge
+   `ANALYSIS.md`/`analysis.json`.
 7. **Artifact store** — `./data/artifacts/<run_id>/<sandbox_id>/` — repo
    tarballs, transcripts, event exports.
 
@@ -173,13 +176,17 @@ Anthropic/OpenAI post-MVP.
 ## Rubric
 
 MVP dimensions: functional requirements, acceptance criteria, code
-implementation quality, cyclomatic complexity. Since PR6 the judge scores
-from **measured** signals where available — the `scoring` package's
+implementation quality, cyclomatic complexity. Since PR6/PR7 the judge
+scores from **measured** signals where available — the `scoring` package's
 static-analysis collector (lizard, parse-only) computes real cyclomatic
-complexity/size/language mix before evaluation; the report is staged as
-`ANALYSIS.md`/`analysis.json` for the judge, persisted at
-`<artifact>/analysis.json`, and surfaced on the results API. Remaining
-objective signals (build/test exec, coverage) are post-MVP.
+complexity/size/language mix, and the `exec` collector runs the
+submission's build/tests/coverage inside a locked `heg-exec` container
+(`--network none`, nobody user, resource caps, read-only artifact mount);
+the report is staged as `ANALYSIS.md`/`analysis.json` for the judge,
+persisted at `<artifact>/analysis.json`, and surfaced on the results API
+(flat `exec` summary included). Disable exec via `SCORING_EXEC=0`;
+requires the `heg-exec:latest` image (`docker build -f
+sandbox/images/exec.Dockerfile -t heg-exec:latest .`).
 
 Flow: auto-generated from task spec → HITL review/edit in UI → frozen →
 applied identically to all sandboxes.
@@ -204,7 +211,7 @@ api/           # control-plane HTTP API (FastAPI app)
 adapters/      # harness adapters (miniloop first; cli adapters post-MVP)
 sandbox/       # image defs, workspace prep, done mechanism, event collector
 evaluator/     # rubric scoring agent
-scoring/       # objective signal collectors (static analysis; PR7 adds exec/coverage)
+scoring/       # objective signal collectors (static analysis + exec/coverage)
 skillpacks/    # vendored default packs: superpowers, mattpocock-skills, spec-kit
 skillpack_import/  # F11 GitHub import: codeload fetch, SKILL.md scan, pack store
 web/           # Next.js app
@@ -244,8 +251,9 @@ or tests change.
 - Additional providers: OpenRouter, direct Anthropic/OpenAI
 - Anthropic-compatible gateway endpoint (`/v1/messages`)
 - Model-vs-model comparisons (multi-model matrices)
-- Objective scoring: build/test execution, coverage as score dimensions
-  (PR7 — static analysis landed in PR6 via `scoring/` signal collectors)
+- ~~Objective scoring: build/test execution, coverage~~ — **landed PR6
+  (static analysis) + PR7 (exec+coverage)** via `scoring/` signal
+  collectors; generated-test-suite scoring remains (PR8)
 - Automated test-suite generation as eval target
 - Higher-fidelity instrumentation via harness hooks/plugins
 - Gateway response caching / deterministic replay
@@ -297,9 +305,10 @@ or tests change.
 - HITL rubric approval; frozen pre-launch; shared across sandboxes.
 - Evaluator in own sandbox; UI flags evaluator == participant model.
 - LLM-judge scoring, fed by measured signals: PR6 added parse-only static
-  analysis (real cyclomatic complexity + static metrics via lizard) as
-  judge evidence — exec-derived checks (build/test/coverage) remain
-  post-MVP (PR7).
+  analysis (real cyclomatic complexity + static metrics via lizard);
+  PR7 added exec-derived checks — build/test/coverage measured in a
+  locked, zero-egress `heg-exec` container (read-only artifact, nobody
+  user, resource-capped) — as judge evidence + a `test_execution` event.
 - Artifacts local; metadata in Postgres.
 - Evaluator model is user-selected at submission (independence is opt-in).
 - **Ollama is the default inference** for MVP — small local models; cost ≈ 0

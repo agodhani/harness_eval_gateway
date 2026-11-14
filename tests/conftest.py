@@ -23,6 +23,10 @@ os.environ.setdefault("GATEWAY_URL", "http://localhost:8081")
 os.environ.setdefault("UPSTREAM_PROVIDER", "ollama")
 os.environ.setdefault("ARTIFACT_ROOT", str(ROOT / "data" / "artifacts"))
 os.environ.setdefault("LOG_LEVEL", "WARNING")
+# PR7: the exec signal collector lives in the default COLLECTORS registry —
+# pin it off for the suite so a stray collect_signals() can't spawn docker
+# containers on a dev machine. Docker-marked tests enable it explicitly.
+os.environ.setdefault("SCORING_EXEC", "0")
 
 from fastapi.testclient import TestClient
 

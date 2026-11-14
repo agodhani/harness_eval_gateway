@@ -4,7 +4,8 @@
 :class:`~scoring.collectors.SignalCollector` over a candidate workspace and
 returns an :class:`AnalysisReport` (the ``analysis.json`` contract). The
 evaluator feeds the report to the judge as evidence and persists it for the
-results API; PR7 adds exec/coverage collectors behind the same envelope.
+results API; PR7's exec/coverage collector (``scoring.exec`` — locked
+``heg-exec`` container) rides the same envelope.
 
 ``scoring.models`` is import-light (pydantic only) — safe for
 ``api/schemas.py``. ``collect_signals`` is lazy so importing this package

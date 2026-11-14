@@ -62,6 +62,28 @@ class DimensionScore(BaseModel):
     rationale: str = ""
 
 
+class ExecSummary(BaseModel):
+    """Flat exec-signal headline (PR7) — the measured build/test/coverage
+    outcome, derived from ``analysis.json``'s ``exec`` signal so UI
+    consumers don't re-derive it from nested metrics. ``status`` mirrors
+    the SignalReport status: ``ok`` = measured (build/tests may still be
+    red), ``skipped``/``error`` = not measured."""
+
+    status: str = "ok"
+    build_ok: bool | None = None
+    tests_detected: bool = False
+    tests_ok: bool | None = None
+    tests_collected: int = 0
+    tests_passed: int = 0
+    tests_failed: int = 0
+    tests_errors: int = 0
+    tests_skipped: int = 0
+    coverage_percent: float | None = None
+    timed_out: bool = False
+    duration_seconds: float | None = None
+    detail: str | None = None  # skip reason / error message
+
+
 class ArtifactRef(BaseModel):
     """Artifact row exposed for the download endpoint."""
 
@@ -101,6 +123,9 @@ class SandboxResult(BaseModel):
     # (``<artifact>/analysis.json``). None when the evaluator ran without
     # signal collection or the report is unreadable.
     analysis: AnalysisReport | None = None
+    # PR7: flat view of the ``exec`` signal (build/test/coverage measured
+    # in the locked heg-exec container) — None when no analysis exists.
+    exec: ExecSummary | None = None
 
 
 class RunResults(BaseModel):
@@ -146,6 +171,36 @@ def _load_analysis(jail: Path, sandbox: Sandbox) -> AnalysisReport | None:
         )
     except Exception:  # noqa: BLE001 — unreadable/invalid report -> absent
         return None
+
+
+def _exec_summary(analysis: AnalysisReport | None) -> ExecSummary | None:
+    """Flatten ``analysis``'s exec signal into a :class:`ExecSummary`.
+
+    None when there's no analysis or no exec signal at all; skipped/error
+    signals surface their status + a short detail (skip reason or error).
+    """
+    if analysis is None:
+        return None
+    sig = analysis.signal("exec")
+    if sig is None:
+        return None
+    m = sig.metrics
+    summary = ExecSummary(
+        status=sig.status,
+        build_ok=m.get("build_ok"),
+        tests_detected=bool(m.get("tests_detected")),
+        tests_ok=m.get("tests_ok"),
+        tests_collected=int(m.get("tests_collected") or 0),
+        tests_passed=int(m.get("tests_passed") or 0),
+        tests_failed=int(m.get("tests_failed") or 0),
+        tests_errors=int(m.get("tests_errors") or 0),
+        tests_skipped=int(m.get("tests_skipped") or 0),
+        coverage_percent=m.get("coverage_percent"),
+        timed_out=bool(m.get("timed_out")),
+        duration_seconds=m.get("duration_seconds"),
+        detail=sig.error or (sig.warnings[0] if sig.warnings else None),
+    )
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +272,7 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
             ttl_seconds=scan_ttl,
         )
         plan = scan.plan if scan is not None else None
+        analysis = _load_analysis(jail, sb)
         dimensions: dict[str, DimensionScore] = {}
         overall: DimensionScore | None = None
         rubric_id: UUID | None = None
@@ -252,7 +308,8 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
                     if scan is not None
                     else []
                 ),
-                analysis=_load_analysis(jail, sb),
+                analysis=analysis,
+                exec=_exec_summary(analysis),
             )
         )
 
