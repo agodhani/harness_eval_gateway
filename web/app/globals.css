@@ -1435,7 +1435,8 @@ table.matrix {
   max-width: 320px;
   text-align: left;
 }
-.matrix tr.row-overall td {
+.matrix tr.row-overall td,
+.table tr.row-overall td {
   background: var(--accent-soft);
 }
 .matrix tr.row-overall .dim-name {

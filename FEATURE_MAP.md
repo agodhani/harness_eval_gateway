@@ -195,7 +195,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 - **What:** run list; per-run matrix (sandbox × rubric dimension); score +
   rationale view; link to timeline replay; artifact download; flag when
-  evaluator model == participant model.
+  evaluator model == participant model. The run-detail rubric table also
+  renders per-sandbox score columns + an `overall` row once results exist
+  (`RunDetailClient.tsx` `RubricView` + `getRunResults` poll while
+  `evaluating`).
 - **Where:** `web/app/runs/` (list, detail, `results/`), results components,
   `api/routers/results.py` (results + scores + artifact-download endpoints)
 - **Verify:**
