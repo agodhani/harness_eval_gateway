@@ -11,6 +11,10 @@ Docker sandboxes, rubric-scored by a sandboxed evaluator.
 
 ## Screenshots
 
+| Landing — hero | Landing — the method |
+|---|---|
+| ![Landing hero](docs/screenshots/app/landing-hero.png) | ![Landing method](docs/screenshots/app/landing-method.png) |
+
 | Submit a run | Runs list | Run detail |
 |---|---|---|
 | ![Submit](docs/screenshots/app/submit.png) | ![Runs](docs/screenshots/app/runs.png) | ![Run detail](docs/screenshots/app/run-detail.png) |
