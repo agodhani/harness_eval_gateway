@@ -184,9 +184,10 @@ def _proc_meminfo(path: Path = _PROC_MEMINFO) -> MemReading | None:
     except OSError:
         return None
     total = fields.get("MemTotal", 0)
-    if total <= 0:
+    available = fields.get("MemAvailable")
+    if total <= 0 or available is None:
         return None
-    return MemReading(fields.get("MemAvailable", 0), total, "proc_meminfo")
+    return MemReading(available, total, "proc_meminfo")
 
 
 def _sysconf() -> MemReading | None:
@@ -197,7 +198,7 @@ def _sysconf() -> MemReading | None:
         available = page_size * int(os.sysconf("SC_AVPHYS_PAGES"))
     except (ValueError, OSError, AttributeError):
         return None
-    if total <= 0:
+    if total <= 0 or available < 0:
         return None
     return MemReading(available, total, "sysconf")
 
