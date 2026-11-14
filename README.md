@@ -9,6 +9,22 @@ lives, how to verify).
 **MVP:** 1 model (local Ollama) × 2 miniloop harness configs → 2 concurrent
 Docker sandboxes, rubric-scored by a sandboxed evaluator.
 
+## Screenshots
+
+| Submit a run | Runs list | Run detail |
+|---|---|---|
+| ![Submit](docs/screenshots/app/submit.png) | ![Runs](docs/screenshots/app/runs.png) | ![Run detail](docs/screenshots/app/run-detail.png) |
+
+| Results — score matrix | Timeline — live event stream |
+|---|---|
+| ![Results](docs/screenshots/app/run-results.png) | ![Timeline](docs/screenshots/app/run-timeline.png) |
+
+**Live artifact previews** — produced artifacts run in throwaway, locked-down
+containers straight from the results page: static sites served on localhost,
+pygame/desktop apps streamed interactively via noVNC:
+
+![Live pygame preview over noVNC](docs/screenshots/p25-artifact-preview/live-desktop-novnc.png)
+
 ## Layout
 
 ```
