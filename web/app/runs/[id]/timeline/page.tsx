@@ -22,5 +22,8 @@ export default function Page({ params }: { params: Promise<{ id: string }> }) {
 
 async function TimelineLoader({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  return <TimelineClient runId={id} />;
+  // key={id} — the App Router reuses the client component instance navigating
+  // /runs/A/timeline → /runs/B/timeline; a fresh key remounts it so no events,
+  // cursor, filters, or split lanes leak across runs.
+  return <TimelineClient key={id} runId={id} />;
 }

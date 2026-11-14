@@ -25,6 +25,14 @@ append-mostly; rebase on main before merge.
   judge line; chips double as sandbox-filter selectors; `sandboxStrips`
   transform in `web/lib/timelineAnalytics.ts` + `node --test` unit tests).
   Leftover idea: on-event-hover cumulative stats.
+- **PR10 split-view trace comparison**: `merged | split` toggle on the
+  timeline page — two sandbox lanes on ONE merged `(ts,id)` ordering inside
+  a single scroll container (synchronized scroll + time alignment by
+  construction, no scroll mirroring); sticky lane pickers with
+  swap-on-collision, run-level/other-sandbox events as full-width shared
+  rows, metrics chips assign lanes in split mode; transform + tests in
+  `web/lib/splitTimeline.ts(.test.ts)`, shared row markup in
+  `timeline/EventRow.tsx`.
 - **OpenRouter provider** (commit 8014338): `UPSTREAM_PROVIDER=ollama|openrouter`
   in `gateway/config.py`; client base normalizes to `/api/` (httpx
   concatenates base+request paths); Ollama-only body params
@@ -164,13 +172,27 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 - **Landed:** metrics strip between toolbar and stream (`SandboxMetricsBar`
   + `sandboxStrips`); see "Already landed" + `FEATURE_MAP.md` F9.
 
-### PR10 — Split-view trace comparison
+### PR10 — Split-view trace comparison — ✅ landed
 - **Scope:** side-by-side, time-aligned event streams for two sandboxes on
   the timeline page (today: one merged stream + a single-sandbox filter
   dropdown); scrolling/diff-alignment UX TBD.
 - **Touch:** `web/app/runs/[id]/timeline/` (new split component),
   `web/lib/api.ts` if new query params needed.
 - **Depends on:** PR9 (same page — land it first).
+- **Landed:** `merged | split` toolbar toggle (`?view=split&left=&right=`
+  seeds lanes, auto-defaults to first two sandboxes until touched). Design
+  picked over scroll-mirroring: ONE scroll container renders a merged
+  `(ts,id)` ordering as two-column rows — each event fills only its lane's
+  cell, so sync scroll + time alignment are structural and a quiet lane
+  reads as gaps (diff-tool idiom). `buildSplitRows`/`pickLane`/`toggleLane`/
+  `laneEventCounts`/`defaultLanes` in `web/lib/splitTimeline.ts` (+
+  node:test); `SplitTimeline.tsx` sticky lane heads (picker swap on
+  collision, status badge, per-lane counts); `EventRow.tsx` extraction
+  shares row markup/summaries/colors across both views; run-level +
+  non-lane-sandbox events span both columns; PR9 metrics chips assign lanes
+  in split mode (`selectedIds` prop); sandbox filter dropdown is
+  merged-only. `ts` ordering uses `Date.parse` (mixed fractional-seconds
+  ISO strings don't sort lexicographically).
 
 ### PR11 — Graphical analysis page + cross-run dashboards — ✅ landed
 - **Scope:** charts over F9 analytics + scores: per-dimension score
