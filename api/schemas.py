@@ -350,6 +350,7 @@ class EvaluatorActivity(BaseModel):
 
     llm_turns: int = 0
     tokens: TokenUsage = Field(default_factory=TokenUsage)
+    errors: int = 0
     estimated_cost_usd: float = 0.0
 
 
@@ -416,6 +417,7 @@ class RunTrendPoint(BaseModel):
     # Judge-phase totals (evaluator creds share the participant sandbox_id).
     evaluator_llm_turns: int = 0
     evaluator_tokens: TokenUsage = Field(default_factory=TokenUsage)
+    evaluator_errors: int = 0
     # Which price_table entry ``estimated_cost_usd`` was computed at —
     # the explicit param, else this run's resolved model price.
     price_model: str

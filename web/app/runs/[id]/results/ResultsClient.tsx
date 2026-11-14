@@ -14,10 +14,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ApiError,
   artifactDownloadUrl,
-  CANONICAL_DIMENSIONS,
+  dimensionOrder,
   getRun,
   getRunResults,
   getSandboxScores,
+  harnessConfigLabel,
   TERMINAL_RUN_STATUSES,
   type DimensionScore,
   type RunOut,
@@ -51,13 +52,6 @@ function scoreTone(score: number): "good" | "mid" | "bad" {
   if (score >= 8) return "good";
   if (score >= 5) return "mid";
   return "bad";
-}
-
-/** Order dimension rows: canonical rubric dimensions first, then alpha. */
-function dimensionOrder(keys: string[]): string[] {
-  const canon = CANONICAL_DIMENSIONS.filter((d) => keys.includes(d));
-  const rest = keys.filter((d) => !CANONICAL_DIMENSIONS.includes(d)).sort();
-  return [...canon, ...rest];
 }
 
 /** Synthesize SandboxResult[] from per-sandbox ScoreOut rows. */
@@ -364,11 +358,7 @@ export default function ResultsClient({ runId }: { runId: string }) {
                             <Badge tone={statusTone(sb.status)}>{sb.status}</Badge>
                           </div>
                           <div className="dim-desc">
-                            {String(sb.harness_config?.adapter ?? sb.harness_config?.harness ?? "?")}
-                            {Array.isArray(sb.harness_config?.skill_packs) &&
-                            sb.harness_config.skill_packs.length > 0
-                              ? ` · ${(sb.harness_config.skill_packs as string[]).join(", ")}`
-                              : ""}
+                            {harnessConfigLabel(sb.harness_config)}
                           </div>
                           {sb.terminal_reason ? (
                             <div className="dim-desc">

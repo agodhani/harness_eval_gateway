@@ -266,6 +266,7 @@ def get_run_analytics(
             eval_activity = EvaluatorActivity(
                 llm_turns=eval_agg.llm_turns,
                 tokens=eval_agg.tokens,
+                errors=eval_agg.errors,
                 estimated_cost_usd=round(
                     estimate_cost_usd(
                         eval_price,
@@ -439,6 +440,7 @@ def get_run_trends(
                 evaluator_tokens=(
                     eval_agg.tokens if eval_agg is not None else TokenUsage()
                 ),
+                evaluator_errors=eval_agg.errors if eval_agg else 0,
                 price_model=selected,
                 estimated_cost_usd=round(
                     estimate_cost_usd(

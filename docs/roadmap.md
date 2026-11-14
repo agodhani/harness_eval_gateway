@@ -25,6 +25,8 @@ append-mostly; rebase on main before merge.
   ids: `particle-ai/particle-1:free`, `inclusionai/ling-3.2-flash:free`,
   `dots-studio/dots-3-note-preview:free`. Mandatory-reasoning models (ernie,
   lfm) 400 on miniloop's `reasoning_effort:"none"`.
+- **PR11 — Graphical analysis + cross-run dashboards** (F13): recharts,
+  `GET /api/analytics/runs`, results-matrix totals row.
 
 ## Dependency DAG
 
@@ -50,7 +52,7 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR2, PR5, PR6, PR9, PR11, PR12,
+- **Depth 0 (start immediately):** PR1, PR2, PR5, PR6, PR9, PR12,
   PR15, PR19 — plus PR13/PR17 if soft-only deps are acceptable.
 - **Depth 1:** PR3 (←2), PR7 (←6, +5 soft), PR10 (←9), PR14 (←1, +12 soft),
   PR16 (←15), PR18 (←12).
@@ -164,12 +166,12 @@ Critical path depth = 3 (`6→7→8` / `2→3→4`). Max safe concurrency ≈ 9 
   `web/lib/api.ts` if new query params needed.
 - **Depends on:** PR9 (same page — land it first).
 
-### PR11 — Graphical analysis page + cross-run dashboards
+### PR11 — Graphical analysis page + cross-run dashboards — ✅ landed
 - **Scope:** charts over F9 analytics + scores: per-dimension score
   comparison across sandboxes, token/cost/latency per sandbox, tool-call
   mix, eval-vs-participant spend split, cross-run trends; **also a totals
   row / aggregate column on the results score matrix** (per-sandbox winner
-  at a glance). Decision needed: charting lib.
+  at a glance). Charting lib: recharts.
 - **Touch:** new page (e.g. `web/app/runs/[id]/analysis/`), results matrix
   component, `api/routers/analytics.py` if new aggregates needed.
 - **Verify:** renders on real run data; totals match matrix sums.

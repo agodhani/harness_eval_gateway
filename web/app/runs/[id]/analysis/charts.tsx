@@ -323,6 +323,7 @@ function TrendMeta({ meta }: { meta: Row }) {
     sandbox_count?: number;
     llm_turns?: number;
     errors?: number;
+    evaluator_errors?: number;
     estimated_cost_usd?: number;
     price_model?: string;
     task_prompt?: string;
@@ -333,6 +334,7 @@ function TrendMeta({ meta }: { meta: Row }) {
       <div>
         {m.status} · {m.model_name} · {m.sandbox_count} sandbox
         {m.sandbox_count === 1 ? "" : "es"} · {m.llm_turns} turns · {m.errors} err
+        {m.evaluator_errors ? ` · ${m.evaluator_errors} judge err` : ""}
       </div>
       <div>
         est. ${(m.estimated_cost_usd ?? 0).toFixed(4)} at {m.price_model}

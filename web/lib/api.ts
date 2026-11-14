@@ -150,6 +150,22 @@ export const CANONICAL_DIMENSIONS: readonly string[] = [
   "cyclomatic_complexity",
 ];
 
+/** Order dimension rows: canonical rubric dimensions first, then alpha. */
+export function dimensionOrder(keys: string[]): string[] {
+  const canon = CANONICAL_DIMENSIONS.filter((d) => keys.includes(d));
+  const rest = keys.filter((d) => !CANONICAL_DIMENSIONS.includes(d)).sort();
+  return [...canon, ...rest];
+}
+
+/** `adapter · pack1, pack2` — mirrors analytics._sandbox_label. */
+export function harnessConfigLabel(
+  hc: Record<string, unknown> | undefined,
+): string {
+  const adapter = String(hc?.adapter ?? hc?.harness ?? "?");
+  const packs = Array.isArray(hc?.skill_packs) ? (hc.skill_packs as unknown[]) : [];
+  return packs.length ? `${adapter} · ${packs.join(", ")}` : adapter;
+}
+
 export interface HarnessConfig {
   adapter: string;
   skill_packs: string[];
@@ -531,6 +547,7 @@ export interface SkillCallStats {
 export interface EvaluatorActivity {
   llm_turns: number;
   tokens: { input: number; output: number; total: number };
+  errors: number;
   estimated_cost_usd: number;
 }
 
@@ -602,6 +619,7 @@ export interface RunTrendPoint {
   /** Judge-phase totals (evaluator creds share the participant sandbox_id). */
   evaluator_llm_turns: number;
   evaluator_tokens: TokenUsage;
+  evaluator_errors: number;
   /** Price-table key `estimated_cost_usd` was computed at. */
   price_model: string;
   estimated_cost_usd: number;

@@ -54,7 +54,8 @@ def analytics_run(session_factory: sessionmaker[Session]):
     sb1: 2 llm_responses (in 100+200, out 40+60, latency 500/1500),
     tool_calls shell×2 + write_file×1, 1 skill_invocation, 1 shell_command,
     1 file_op, 1 test_execution, 1 error, run_started/terminal_state markers —
-    then an eval boundary + judge-side llm_response that must NOT count.
+    then an eval boundary + judge-side llm_response + judge-side error that
+    must NOT count.
     sb2: 1 llm_response only.
     """
     s = session_factory()
@@ -138,6 +139,9 @@ def analytics_run(session_factory: sessionmaker[Session]):
                     payload={"phase": "eval_started"}),
                 resp(sb1, T0 + timedelta(minutes=21), 1000, 90, 800,
                      model="gpt-4o"),
+                _ev(run.id, sandbox_id=sb1.id, source="evaluator",
+                    type_="error", ts=T0 + timedelta(minutes=21, seconds=30),
+                    payload={"message": "judge timeout"}),
                 _ev(run.id, sandbox_id=sb1.id, source="evaluator",
                     type_="checkpoint", ts=T0 + timedelta(minutes=22),
                     payload={"phase": "eval_scored"}),
@@ -224,6 +228,7 @@ def test_evaluator_phase_split_out(client: TestClient, analytics_run) -> None:
     assert sb1["evaluator"]["llm_turns"] == 1
     assert sb1["evaluator"]["tokens"]["input"] == 1000
     assert sb1["evaluator"]["tokens"]["output"] == 90
+    assert sb1["evaluator"]["errors"] == 1
     # judge priced at evaluator_model gpt-4o: (1000*2.5 + 90*10)/1e6 = 0.0034
     assert sb1["evaluator"]["estimated_cost_usd"] == pytest.approx(0.0034)
     # participant metrics unaffected
@@ -327,8 +332,8 @@ def trend_runs(session_factory: sessionmaker[Session]):
     to 120 in the response).
     run_new (T0+1d): gpt-4o, judge claude-sonnet-4.5, 2 sandboxes —
     participant turns 3 (in 900 / out 300), 1 error, judge turn 1
-    (1000/200); overall scores 6 + 4 → mean 5 (a code_quality row must not
-    pollute the mean).
+    (1000/200) + 1 judge error; overall scores 6 + 4 → mean 5 (a
+    code_quality row must not pollute the mean).
     """
     s = session_factory()
     try:
@@ -389,6 +394,9 @@ def trend_runs(session_factory: sessionmaker[Session]):
                     type_="checkpoint", ts=t1 + timedelta(minutes=10),
                     payload={"phase": "eval_started"}),
                 resp(sb_new1, t1 + timedelta(minutes=11), 1000, 200),
+                _ev(new.id, sandbox_id=sb_new1.id, type_="error",
+                    ts=t1 + timedelta(minutes=12),
+                    payload={"message": "judge boom"}),
                 # sb_new2 participant ×1 + an error
                 resp(sb_new2, t1 + timedelta(minutes=1), 400, 150),
                 _ev(new.id, sandbox_id=sb_new2.id, type_="error",
@@ -449,6 +457,7 @@ def test_trends_point_aggregation(client: TestClient, trend_runs) -> None:
     # judge phase split out at eval_started
     assert pt["evaluator_llm_turns"] == 1
     assert pt["evaluator_tokens"]["total"] == 1200
+    assert pt["evaluator_errors"] == 1
     # auto pricing: run model gpt-4o is listed → its own rate
     assert pt["price_model"] == "gpt-4o"
     # (900*2.5 + 300*10)/1e6 = 0.00525

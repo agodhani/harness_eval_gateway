@@ -18,12 +18,13 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ApiError,
-  CANONICAL_DIMENSIONS,
+  dimensionOrder,
   estimateCostUsd,
   getRun,
   getRunAnalytics,
   getRunResults,
   getRunTrends,
+  harnessConfigLabel,
   TERMINAL_RUN_STATUSES,
   type ModelPrice,
   type RunAnalytics,
@@ -62,21 +63,6 @@ function errMsg(err: unknown, fallback: string): string {
   if (err instanceof ApiError) return err.detail;
   if (err instanceof Error) return err.message;
   return fallback;
-}
-
-/** Order dimension rows: canonical rubric dimensions first, then alpha.
- * (Mirrors ResultsClient's dimensionOrder — keep in sync.) */
-function dimensionOrder(keys: string[]): string[] {
-  const canon = CANONICAL_DIMENSIONS.filter((d) => keys.includes(d));
-  const rest = keys.filter((d) => !CANONICAL_DIMENSIONS.includes(d)).sort();
-  return [...canon, ...rest];
-}
-
-/** adapter · pack1, pack2 — mirrors analytics._sandbox_label. */
-function hcLabel(hc: Record<string, unknown> | undefined): string {
-  const adapter = String(hc?.adapter ?? hc?.harness ?? "?");
-  const packs = Array.isArray(hc?.skill_packs) ? (hc.skill_packs as unknown[]) : [];
-  return packs.length ? `${adapter} · ${packs.join(", ")}` : adapter;
 }
 
 /** "2026-11-14T03:…" → "11-14" (UTC slice, hydration-safe). */
@@ -181,7 +167,9 @@ export default function AnalysisClient({ runId }: { runId: string }) {
   const labelOf = useCallback(
     (id: string) =>
       sbs.find((s) => s.sandbox_id === id)?.label ??
-      hcLabel(resSandboxes.find((s) => s.sandbox_id === id)?.harness_config),
+      harnessConfigLabel(
+        resSandboxes.find((s) => s.sandbox_id === id)?.harness_config,
+      ),
     [sbs, resSandboxes],
   );
 
@@ -206,10 +194,10 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     });
   }, [resSandboxes]);
 
-  /** Computed dimension totals → the at-a-glance leader (matches the
-   * results-matrix totals row). */
-  const leader = useMemo(() => {
-    let best: { id: string; sum: number } | null = null;
+  /** Computed dimension totals → the at-a-glance leader(s) (matches the
+   * results-matrix totals row: every sandbox tied at the max leads). */
+  const leaders = useMemo(() => {
+    const sums: { id: string; sum: number }[] = [];
     for (const sb of resSandboxes) {
       let sum = 0;
       let count = 0;
@@ -220,9 +208,11 @@ export default function AnalysisClient({ runId }: { runId: string }) {
           count++;
         }
       }
-      if (count > 0 && (best === null || sum > best.sum)) best = { id: sb.sandbox_id, sum };
+      if (count > 0) sums.push({ id: sb.sandbox_id, sum });
     }
-    return best;
+    const max = Math.max(0, ...sums.map((s) => s.sum));
+    const ids = sums.filter((s) => s.sum === max).map((s) => s.id);
+    return ids.length ? { ids, sum: max } : null;
   }, [resSandboxes, scoreRows]);
 
   const tokenRows: Row[] = useMemo(
@@ -387,11 +377,12 @@ export default function AnalysisClient({ runId }: { runId: string }) {
                 fmt={(v) => v.toFixed(1)}
               />
               <SeriesChips items={sbChips} />
-              {leader ? (
+              {leaders ? (
                 <p className="chart-legend">
-                  Σ dimensions leader:{" "}
+                  Σ dimensions leader{leaders.ids.length > 1 ? "s (tie)" : ""}:{" "}
                   <strong style={{ color: "var(--accent)" }}>
-                    {shortId(leader.id)} ({Math.round(leader.sum * 10) / 10})
+                    {leaders.ids.map((id) => shortId(id)).join(", ")} (
+                    {Math.round(leaders.sum * 10) / 10})
                   </strong>
                 </p>
               ) : null}
