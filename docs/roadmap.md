@@ -36,6 +36,8 @@ append-mostly; rebase on main before merge.
   `dots-studio/dots-3-note-preview:free`. Mandatory-reasoning models (ernie,
   lfm) 400 on miniloop's `reasoning_effort:"none"`.
 - **PR6 — static-analysis signals** (`scoring/` package, see below).
+- **PR11 — Graphical analysis + cross-run dashboards** (F13): recharts,
+  `GET /api/analytics/runs`, results-matrix totals row.
 
 ## Dependency DAG
 
@@ -46,8 +48,7 @@ Soft edge (╌▶) = works better after / benefits from.
 PR1  Submit UX ────────▶ PR14 Model-vs-model ◀╌╌╌╌ PR12 Providers ──▶ PR18 Cache/replay
    │                                                         │
    ├╌ labels ╌▶ PR9  Timeline-analytics ──▶ PR10 Split-view   ├╌╌╌▶ PR13 Aider ╌╌╌▶ PR17 Hooks
-   ├╌ labels ╌▶ PR10
-   └╌ labels ╌▶ PR11 Graphical analysis
+   └╌ labels ╌▶ PR10
 
 PR2  Preview fixes ────▶ PR3  Preview types ──▶ PR4  Thumbnails
 
@@ -61,7 +62,7 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR3, PR5, PR9, PR11, PR12,
+- **Depth 0 (start immediately):** PR1, PR3, PR5, PR9, PR12,
   PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
   PR13/PR17 if soft-only deps are acceptable.
 - **Depth 1:** PR4 (←3), PR8 (←7), PR10 (←9), PR14 (←1, +12 soft),
@@ -175,12 +176,12 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
   `web/lib/api.ts` if new query params needed.
 - **Depends on:** PR9 (same page — land it first).
 
-### PR11 — Graphical analysis page + cross-run dashboards
+### PR11 — Graphical analysis page + cross-run dashboards — ✅ landed
 - **Scope:** charts over F9 analytics + scores: per-dimension score
   comparison across sandboxes, token/cost/latency per sandbox, tool-call
   mix, eval-vs-participant spend split, cross-run trends; **also a totals
   row / aggregate column on the results score matrix** (per-sandbox winner
-  at a glance). Decision needed: charting lib.
+  at a glance). Charting lib: recharts.
 - **Touch:** new page (e.g. `web/app/runs/[id]/analysis/`), results matrix
   component, `api/routers/analytics.py` if new aggregates needed.
 - **Verify:** renders on real run data; totals match matrix sums.
