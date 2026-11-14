@@ -26,13 +26,28 @@ append-mostly; rebase on main before merge.
   (`think`/`num_ctx`/`keep_alive`/`options`) stripped for hosted providers;
   tests pin `UPSTREAM_PROVIDER=ollama` in `tests/conftest.py`. OpenRouter
   only serves `/v1/chat/completions` + `/v1/models` — `/v1/messages` and
-  `/v1/responses` 404 there (claude_code/codex need ollama). Verified free
+  `/v1/responses` 404 there (claude_code/codex needed ollama until PR12
+  routing). Verified free
   ids: `particle-ai/particle-1:free`, `inclusionai/ling-3.2-flash:free`,
   `dots-studio/dots-3-note-preview:free`. Mandatory-reasoning models (ernie,
   lfm) 400 on miniloop's `reasoning_effort:"none"`.
 - **PR6 — static-analysis signals** (`scoring/` package, see below).
 - **PR11 — Graphical analysis + cross-run dashboards** (F13): recharts,
   `GET /api/analytics/runs`, results-matrix totals row.
+- **OpenAI + Anthropic providers + per-model routing** (PR12):
+  `UPSTREAM_PROVIDER` gains `openai` (chat/completions + responses + models;
+  no /v1/messages) and `anthropic` (/v1/messages + count_tokens + models;
+  no chat-completions) — Anthropic auth is `x-api-key` + `anthropic-version`.
+  `PROVIDER_ROUTES` (JSON `{model-glob: provider}`, first match wins)
+  overrides the process-wide provider per request model, so one gateway can
+  e.g. route `claude-*` to Anthropic while the rest stays on Ollama. Every
+  provider a request may resolve to must have its key (boot-time check).
+  An `x-heg-provider` request header forces the provider outright on
+  service creds (`sandbox_id=None`; unknown or unkeyed values 400) and is
+  silently ignored on sandbox-scoped creds — agent code can't retarget
+  onto paid upstreams; caller `anthropic-beta`/`anthropic-version` headers
+  forward to the anthropic upstream. Emitted `llm_*`/`error` events record
+  the resolved provider.
 
 ## Dependency DAG
 
@@ -57,11 +72,11 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR3, PR5, PR9, PR12,
+- **Depth 0 (start immediately):** PR1, PR3, PR5, PR9,
   PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
   PR13/PR17 if soft-only deps are acceptable.
-- **Depth 1:** PR4 (←3), PR8 (←7), PR10 (←9), PR14 (←1, +12 soft),
-  PR16 (←15), PR18 (←12).
+- **Depth 1:** PR4 (←3), PR8 (←7), PR10 (←9), PR14 (←1), PR16 (←15),
+  PR18 (←12).
 - **Floating:** PR20 (soft ←15).
 
 Critical path depth = 1 remaining (`7→8`, `3→4`; was 3 via `6→7→8` before
@@ -175,10 +190,15 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
   component, `api/routers/analytics.py` if new aggregates needed.
 - **Verify:** renders on real run data; totals match matrix sums.
 
-### PR12 — Providers (remainder)
+### PR12 — Providers (remainder) ✅ landed
 - **Scope:** remaining upstreams — direct Anthropic + OpenAI adapters
   (OpenRouter already landed); per-request/per-model provider routing if
   wanted (today's switch is process-wide).
+- **Landed:** `openai` + `anthropic` providers; `PROVIDER_ROUTES` JSON
+  model-glob → provider overrides resolved per request `model`;
+  `x-heg-provider` request header override (service creds only); caller
+  `anthropic-beta`/`anthropic-version` headers forward to the anthropic
+  upstream; provider recorded on emitted `llm_*`/`error` events.
 - **Touch:** `gateway/config.py`, `gateway/deps.py`,
   `gateway/main.py` (body transforms if APIs differ), `api/config.py`
   (key plumbing), `.env.example`.

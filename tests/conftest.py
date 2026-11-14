@@ -20,7 +20,9 @@ os.environ.setdefault("OLLAMA_BASE_URL", "http://localhost:11434")
 os.environ.setdefault("GATEWAY_URL", "http://localhost:8081")
 # Pin the gateway upstream to ollama so a developer's .env provider switch
 # (e.g. UPSTREAM_PROVIDER=openrouter for live testing) can't leak into tests.
+# Same for PROVIDER_ROUTES — model-glob overrides must not reroute tests.
 os.environ.setdefault("UPSTREAM_PROVIDER", "ollama")
+os.environ.setdefault("PROVIDER_ROUTES", "")
 os.environ.setdefault("ARTIFACT_ROOT", str(ROOT / "data" / "artifacts"))
 os.environ.setdefault("LOG_LEVEL", "WARNING")
 

@@ -242,6 +242,17 @@ def _cred_ids(claims: CredClaims) -> tuple[str | None, str | None]:
     return claims.run_id, claims.sandbox_id
 
 
+def _resolve_provider(model: Any) -> str:
+    """Provider serving ``model`` for event payloads (PROVIDER_ROUTES-aware).
+
+    Emit callers pass ``provider=`` when the request path already resolved
+    it; this is the fallback for callers that didn't.
+    """
+    return get_settings().provider_for_model(
+        model if isinstance(model, str) else None
+    )
+
+
 async def emit_event(
     claims: CredClaims,
     *,
@@ -281,7 +292,9 @@ async def emit_event(
         log.warning("event emission failed for %s", event_type, exc_info=True)
 
 
-async def emit_llm_request(claims: CredClaims, body: dict[str, Any]) -> None:
+async def emit_llm_request(
+    claims: CredClaims, body: dict[str, Any], *, provider: str | None = None
+) -> None:
     messages = body.get("messages")
     tools = body.get("tools")
     await emit_event(
@@ -290,6 +303,7 @@ async def emit_llm_request(claims: CredClaims, body: dict[str, Any]) -> None:
         event_type="llm_request",
         payload={
             "model": body.get("model"),
+            "provider": provider or _resolve_provider(body.get("model")),
             "message_count": len(messages) if isinstance(messages, list) else 0,
             "tool_count": len(tools) if isinstance(tools, list) else 0,
             "run_id": claims.run_id,
@@ -305,6 +319,7 @@ async def emit_llm_response(
     usage: dict[str, int],
     latency_ms: int,
     http_status: int,
+    provider: str | None = None,
 ) -> None:
     await emit_event(
         claims,
@@ -312,6 +327,7 @@ async def emit_llm_response(
         event_type="llm_response",
         payload={
             "model": model,
+            "provider": provider or _resolve_provider(model),
             "usage": usage,
             "latency_ms": latency_ms,
             "http_status": http_status,
