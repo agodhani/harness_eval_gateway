@@ -26,6 +26,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F11 | Skillpack import from GitHub | ✅ | `skillpack_import/`, `api/routers/skillpacks.py`, `web/app/submit/ImportSkillPackDialog.tsx` | `tests/unit/api/test_skillpacks.py`, `test_skillpack_import.py` |
 | F12 | Artifact preview (static html + desktop GUI via noVNC + python-server web apps, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `sandbox/images/server-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
 | F13 | Graphical analysis page + cross-run trends (recharts) | ✅ | `web/app/runs/[id]/analysis/`, `api/routers/analytics.py` (`GET /api/analytics/runs`), `web/app/runs/[id]/results/ResultsClient.tsx` (totals row) | `tests/unit/api/test_analytics.py` (trends section) |
+| F14 | Artifact thumbnails (headless screenshots via the preview stack) | ✅ | `sandbox/thumbnails.py`, `sandbox/images/thumbnail-capture.{Dockerfile,sh}`, `api/routers/preview.py` (`.../thumbnail`), `api/routers/results.py` (`SandboxResult.thumbnail`), `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_thumbnails.py`, `tests/unit/api/test_thumbnails.py`, `tests/integration/test_thumbnail.py` |
 
 ## Feature details
 
@@ -566,6 +567,88 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     scored run; cost dropdown reprices the cost + split charts client-side.
 - **Depends on:** F6 (events), F7 (scores), F8 (results page), F9
   (analytics aggregation)
+
+### F14 — Artifact thumbnails ✅
+
+- **What:** results-page `📷 snapshot` button → a synchronous, bounded
+  headless screenshot of the artifact, served exactly as an interactive
+  preview would serve it. The PNG lands at `<artifact>/thumbnail.png`
+  (+ `thumbnail.json` meta sidecar), rides the results payload as
+  `SandboxResult.thumbnail{url,captured_at,type,entry}`, and renders as a
+  small shot at the head of the preview cell. Clicking the shot opens the
+  FULL live preview (spawning one when none is running). `↻ recapture`
+  re-shoots; DELETE removes it.
+- **Trigger = explicit-only.** Generation is never lazy on `GET
+  .../results` — that endpoint is polled every few seconds and capture
+  costs a container spawn + browser run. The results GET only FS-probes
+  for an existing `thumbnail.png` (cheap, jailed, meta-decorated).
+- **API** (`api/routers/preview.py`):
+  - `POST .../thumbnail` → `201 {url, captured_at, type, entry}`;
+    optional `{entry,type}` body picks the captured candidate exactly like
+    `POST .../preview` (default = scan's default plan). `502` on capture
+    failure — "no thumbnail" is a fine outcome, never a broken results
+    read. `422` unpreviewable workspace.
+  - `GET .../thumbnail` → `200 image/png` (jailed like artifact downloads;
+    a planted symlink can't escape `ARTIFACT_ROOT`) or `404`.
+  - `DELETE .../thumbnail` → `204`, removes PNG + sidecar.
+- **Capture pipeline** (`sandbox/thumbnails.py::Thumbnailer.capture`):
+  1. `PreviewManager.spawn(purpose=PURPOSE_THUMB)` — the artifact's own
+     preview stack, same isolation/topology (static → hardened
+     http.server; desktop/python-server → runner+socat on the zero-egress
+     `heg-desktop` net), short TTL (`THUMB_PREVIEW_TTL_SECONDS`, 300s).
+  2. `_wait_ready` polls the published localhost port until ANY HTTP
+     response (≤ `THUMB_READY_SECONDS`, 30s); a dead runner fails fast.
+  3. Type-scaled settle (`THUMB_SETTLE_SECONDS` 0.5s;
+     `THUMB_DESKTOP_SETTLE_SECONDS` 8s — Xvnc is loopback-only inside the
+     runner, so the noVNC page is the only window onto the framebuffer).
+  4. One-shot `docker run --rm` of `heg-preview-thumb` (repo-built:
+     debian chromium on `python:3.12-slim` —
+     `sandbox/images/thumbnail-capture.Dockerfile` + `…-capture.sh`) on
+     the `heg-preview` bridge, loading the stack's in-network URL by
+     container name (`<runner>:8000` for static,
+     `<runner>-proxy:{8000|6080}` for the executed types). nobody +
+     read-only rootfs + cap-drop ALL + no-new-privileges + tmpfs /tmp;
+     `timeout` inside, subprocess timeout (`THUMB_CAPTURE_SECONDS`, 45s)
+     outside.
+  5. PNG-magic validation → atomic `os.replace` to `thumbnail.png` +
+     `thumbnail.json` (`{version,captured_at,type,entry,generator,
+     width,height,bytes}`). Scratch `.thumb-*` dir + stack always cleaned.
+- **Purpose separation:** capture stacks carry `heg.preview_purpose=thumb`
+  — the interactive endpoints filter on `preview`, so a mid-flight
+  capture is never returned as "the preview" and never satisfies
+  start_preview's reuse check; the reaper/`stop()` see both (leaks stay
+  TTL-bounded). Unlabeled legacy previews read as `preview`.
+- **Where:** `sandbox/thumbnails.py` (`Thumbnailer`, `ThumbResult`,
+  `ThumbnailError`), `sandbox/preview.py` (`LABEL_PURPOSE`/`PURPOSE_*`,
+  `Preview.purpose`, purpose-aware `get_for_sandbox`, `resolve_artifact_dir`,
+  `_entry_url_path`, `_PROXIED_PORTS`), `api/routers/preview.py`
+  (`capture_thumbnail`/`get_thumbnail`/`delete_thumbnail`,
+  `get_thumbnailer`, purpose filtering in `start_preview`),
+  `api/routers/results.py` (`ThumbnailRef`, `_load_thumbnail`),
+  `api/config.py` (`PREVIEW_THUMB_IMAGE`, `THUMB_*` bounds),
+  `sandbox/images/thumbnail-capture.Dockerfile` +
+  `thumbnail-capture.sh`, `web/lib/api.ts` (`ThumbRef`, `ThumbOut`,
+  `thumbnailUrl`, `captureThumbnail`, `deleteThumbnail`),
+  `web/app/runs/[id]/results/PreviewControls.tsx` (`.thumb-*` styles in
+  `globals.css`)
+- **Verify:**
+  - Unit: `tests/unit/sandbox/test_thumbnails.py` (capture flow via a
+    stubbed docker CLI + fake manager — spawn args/labels, ready-poll,
+    dead-runner fast fail, capture URL per type incl. entry-path quoting,
+    PNG validation, meta write, scratch/stack cleanup, timeout→`rm -f`) +
+    `tests/unit/api/test_thumbnails.py` (POST/GET/DELETE lifecycle, 502
+    mapping, jailed GET incl. symlink escape → 404, results payload
+    embeds `thumbnail`) + purpose-filtering cases in
+    `tests/unit/{sandbox,api}/test_preview.py`
+  - Docker: `tests/integration/test_thumbnail.py`
+    (`@pytest.mark.docker` — builds `heg-preview-thumb`, real static-site
+    capture end-to-end → PNG + meta, label-scoped cleanup only)
+  - Manual: build `docker build -f
+    sandbox/images/thumbnail-capture.Dockerfile -t
+    heg-preview-thumb:latest .`, results page → `📷 snapshot` → shot
+    appears → click → live preview opens.
+- **Depends on:** F12 (preview stack, purpose label plumbing, jailed
+  workspace resolution), F8 (results page)
 
 ## Implementation sequence
 

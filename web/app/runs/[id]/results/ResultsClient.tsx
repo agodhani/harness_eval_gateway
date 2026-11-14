@@ -488,6 +488,7 @@ export default function ResultsClient({ runId }: { runId: string }) {
                                 sandboxId={sb.sandbox_id}
                                 previewable={sb.previewable ?? false}
                                 candidates={sb.preview_candidates ?? []}
+                                thumbnail={sb.thumbnail ?? null}
                               />
                             ) : (
                               <span className="faint" style={{ fontSize: "0.8rem" }}>
