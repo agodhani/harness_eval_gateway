@@ -10,16 +10,17 @@ Design notes:
 - **Preview types.** ``scan_preview`` returns every runnable entry as
   typed :class:`PreviewPlan` candidates (default-first; ``detect_preview``
   returns just the default). ``"static"`` serves ``python -m http.server``;
-  ``"desktop"`` executes the artifact (pygame — see
-  ``_desktop_candidates`` for the evidence heuristic) on a virtual display
-  streamed via noVNC. The plan/label/API shape leaves room for
-  ``python-server`` etc. The POST body's ``type=`` overrides the pick:
+  ``"desktop"`` executes the artifact (GUI — pygame/pyglet/arcade/tkinter —
+  see ``_desktop_candidates``) on a virtual display streamed via noVNC;
+  ``"python-server"`` executes a web app (flask/fastapi/django/… — see
+  ``_server_candidates``) whose listener the runner bridges onto :8000.
+  The POST body's ``type=`` overrides the pick:
   ``plan_for_type`` yields the first candidate of that type (a
   both-matching workspace defaults to static), and
   ``plan_for_entry(..., preview_type=)`` forces the plan type for an
   explicit entry — ``"static"`` serves any jailed file (the entry is only
   the URL opened — view a ``.py``'s source instead of executing it) while
-  ``"desktop"`` still requires a ``.py`` entry.
+  ``"desktop"``/``"python-server"`` still require a ``.py`` entry.
 - **Probe caching.** The results GET runs ``resolve_workspace_dir`` +
   ``scan_preview`` per sandbox per request; :class:`ScanCache` memoizes
   that probe for ``PREVIEW_SCAN_TTL_SECONDS`` — workspaces only change on
@@ -35,15 +36,18 @@ Design notes:
   outbound NAT on Linux; inert on Docker Desktop). The hardening flags carry
   the weight: nobody user, read-only rootfs, cap-drop ALL, no-new-privileges,
   and a pinned image running ``http.server`` — no candidate code executes.
-- **Desktop isolation.** Desktop previews *execute* candidate code, so the
-  posture is stricter: the runner sits alone on a dedicated ``--internal``
-  network ``heg-desktop`` (zero egress, zero published ports, only peer =
-  its own proxy) with ``--cpus``/``--memory``/``--pids-limit`` bounds. A
+- **Executed-code isolation.** Desktop AND python-server previews
+  *execute* candidate code, so the posture is stricter than static: the
+  runner sits on a dedicated ``--internal`` network ``heg-desktop`` (zero
+  egress, zero published ports; peers = its own proxy plus other
+  ephemeral preview runners — none can egress) with
+  ``--cpus``/``--memory``/``--pids-limit`` bounds. A
   pinned ``alpine/socat`` sidecar — a dumb TCP pipe, nothing for the artifact
-  to exploit — straddles ``heg-desktop`` + ``heg-preview`` and publishes the
-  noVNC port on localhost. The api-side alternative was rejected: it would
-  require the api to join the runner's network (giving candidate code a path
-  to the control plane) and hand-roll websocket proxying.
+  to exploit — straddles ``heg-desktop`` + ``heg-preview`` and publishes
+  the runner's port on localhost (:6080 noVNC for desktop, :8000 for
+  python-server). The api-side alternative was rejected: it would
+  require the api to join the runner's network (giving candidate code a
+  path to the control plane) and hand-roll websocket proxying.
 - **Jail.** ``resolve_workspace_dir`` reuses the download-jail pattern from
   ``api/routers/results.py``: the served directory must resolve inside
   ``ARTIFACT_ROOT`` — ``..`` escapes and symlinked ``workspace`` dirs that
@@ -91,7 +95,7 @@ SERVE_ROOT = "/srv/artifact"
 # zero reachable peers except its own proxy sidecar (the only way in). The
 # proxy straddles heg-desktop + heg-preview (the bridge that can publish a
 # localhost port) and is a dumb TCP pipe — alpine/socat, no HTTP parsing.
-DESKTOP_NETWORK = "heg-desktop"
+DESKTOP_NETWORK = "heg-desktop"  # shared internal net for ALL executed-code previews
 DEFAULT_DESKTOP_IMAGE = "heg-preview-desktop:latest"
 DEFAULT_PROXY_IMAGE = "alpine/socat:1.8.1.3"
 DESKTOP_CONTAINER_PORT = 6080  # websockify (noVNC web + ws) inside the runner
@@ -99,6 +103,14 @@ DESKTOP_ARTIFACT_ROOT = "/srv/artifact-ro"  # :ro mount; entrypoint copies to /w
 DEFAULT_DESKTOP_CPUS = "1"
 DEFAULT_DESKTOP_MEMORY = "512m"
 DEFAULT_DESKTOP_PIDS = 256
+
+# --- python-server previews (PR3) — executed web apps, same topology -------
+# Same runner+sidecar topology as desktop previews (the app *executes*), but
+# the app serves plain HTTP — the runner's relay script makes it reachable
+# on :8000 whatever port the artifact actually binds (apps hardcode :5000,
+# :3000, ... — see server-preview-runner.py).
+DEFAULT_SERVER_IMAGE = "heg-preview-server:latest"
+SERVER_CONTAINER_PORT = 8000  # canonical app port inside the server runner
 
 # Labels — ``heg.preview`` marks manager ownership; the rest rebuild Preview
 # state after an api restart (and let the reaper enforce TTL out-of-process).
@@ -123,15 +135,28 @@ _HTML_SUFFIXES = frozenset({".html", ".htm"})
 _INDEX_NAMES = frozenset({"index.html", "index.htm"})
 
 #: Types with an implemented spawner — ``PreviewManager.spawn`` dispatches on
-#: these; ``python-server`` lands in PR3.
-PREVIEW_TYPES = frozenset({"static", "desktop"})
+#: these. ``static`` serves files; ``desktop`` (GUI apps) and
+#: ``python-server`` (web apps) execute the artifact on the internal net.
+PREVIEW_TYPES = frozenset({"static", "desktop", "python-server"})
 
-# Desktop detection: an unambiguous .py entry (root or nested ≤3 levels) AND
-# explicit pygame evidence — a non-comment requirements.txt line mentioning
-# pygame/pygame-ce, or `import pygame`/`from pygame` in the candidate file.
+#: Executed-code types whose published port lives on the proxy sidecar —
+#: ``_row_to_preview`` resolves these via ``_proxy_port`` instead of the
+#: runner's own bindings.
+_PROXIED_PORTS = {
+    "desktop": DESKTOP_CONTAINER_PORT,
+    "python-server": SERVER_CONTAINER_PORT,
+}
+
+# Desktop detection: every unambiguous .py entry (root or nested ≤3 levels)
+# with explicit GUI evidence — a line-anchored pygame/pyglet/arcade/tkinter
+# import in the file itself, or entry-shaped + a non-comment requirements.txt
+# line naming a GUI stack (see _py_candidates).
 _DESKTOP_ENTRY_NAMES = ("main.py", "app.py", "game.py", "run.py")
 _DESKTOP_MAX_DEPTH = 3
-# Dirs never worth scanning for an artifact entry point.
+# Dirs never worth scanning for an artifact entry point. ``templates`` is
+# flask/django's render dir — a ``templates/index.html`` is the server
+# app's fragment, not a static site entry; skipping it lets the workspace
+# default to the python-server candidate.
 _DESKTOP_SKIP_DIRS = frozenset(
     {
         "node_modules",
@@ -147,11 +172,46 @@ _DESKTOP_SKIP_DIRS = frozenset(
         "site-packages",
         "migrations",
         "fixtures",
+        "templates",
     }
 )
-_PYGAME_REQ_RE = re.compile(r"pygame(?:-ce)?", re.IGNORECASE)
-_PYGAME_IMPORT_RE = re.compile(r"^\s*(?:import|from)\s+pygame\b", re.MULTILINE)
+# pyglet/arcade install under their own names; tkinter is stdlib — a
+# requirements file can't name it (it's not pip-installed), so only import
+# evidence detects tk apps. `pip install tk` is a different (useless)
+# package — don't count bare `tk` requirements lines as evidence.
+_GUI_REQ_RE = re.compile(r"pygame(?:-ce)?|pyglet|arcade", re.IGNORECASE)
+_GUI_IMPORT_RE = re.compile(
+    r"^\s*(?:import|from)\s+(?:pygame|pyglet|arcade|tkinter)\b", re.MULTILINE
+)
 _READ_CAP = 512 * 1024  # only the head of a file is scanned for evidence
+
+# python-server detection: same shape as desktop (see _py_candidates) — a
+# line-anchored web-framework import in the file, or entry-shaped AND a
+# scanned requirements.txt names a server framework on a non-comment line.
+# `manage.py` (django) qualifies via its django import.
+# Kept in sync with the baked deps in server-preview.Dockerfile (plus
+# http.server — stdlib, runs in any python image; `from http.server` is the
+# import form, matched by the dotted pattern below).
+_SERVER_ENTRY_NAMES = (
+    "main.py",
+    "app.py",
+    "server.py",
+    "manage.py",
+    "wsgi.py",
+    "asgi.py",
+    "run.py",
+    "api.py",
+)
+_SERVER_REQ_RE = re.compile(
+    r"flask|fastapi|uvicorn|starlette|aiohttp|bottle|django|gunicorn|tornado|waitress|hypercorn",
+    re.IGNORECASE,
+)
+_SERVER_IMPORT_RE = re.compile(
+    r"^\s*(?:import|from)\s+"
+    r"(?:flask|fastapi|uvicorn|starlette|aiohttp|bottle|django|gunicorn|"
+    r"tornado|waitress|hypercorn|http\.server)\b",
+    re.MULTILINE,
+)
 
 
 @dataclass(frozen=True)
@@ -161,9 +221,10 @@ class PreviewPlan:
     ``type == "static"`` → serve the whole workspace dir over HTTP; ``entry``
     is the docroot-relative entry point (``"index.html"``, ``"game.html"``,
     ``"dist/index.html"``). ``type == "desktop"`` → execute ``entry`` (a
-    root-level ``.py``) on a virtual display streamed via noVNC. Future
-    types (``python-server``) extend this rather than the API shape —
-    ``PreviewOut`` already carries ``type``/``url``/``entry``.
+    ``.py``) on a virtual display streamed via noVNC. ``type ==
+    "python-server"`` → execute ``entry`` (a ``.py`` web app) and publish
+    whatever port it listens on. ``PreviewOut`` carries ``type``/``url``/
+    ``entry`` — new types extend this rather than the API shape.
     """
 
     type: str
@@ -259,14 +320,26 @@ def _html_files(dirpath: Path) -> list[Path]:
 
 
 def _nested_indexes(workspace: Path) -> list[Path]:
-    """``*/index.html`` files one level down (hidden/symlinked dirs skipped)."""
+    """``*/index.html`` files one level down (hidden/symlinked dirs skipped).
+
+    ``templates/`` is skipped too — that's the flask/django render dir, so
+    a ``templates/index.html`` is a server app's fragment, not a static
+    site entry (skipping it lets such workspaces default to the
+    python-server candidate). Note ``dist/`` IS allowed — a built static
+    site's entry point lives there; it's only skipped for ``*.py``.
+    """
     nested: list[Path] = []
     try:
         entries = sorted(workspace.iterdir(), key=lambda p: p.name)
     except OSError:
         return []
     for d in entries:
-        if d.name.startswith(".") or d.is_symlink() or not d.is_dir():
+        if (
+            d.name.startswith(".")
+            or d.name == "templates"
+            or d.is_symlink()
+            or not d.is_dir()
+        ):
             continue
         for cand in _html_files(d):
             if cand.name.lower() in _INDEX_NAMES:
@@ -309,15 +382,15 @@ def _read_head(path: Path, cap: int = _READ_CAP) -> str:
         return ""
 
 
-def _req_mentions_pygame(path: Path) -> bool:
-    """``requirements.txt`` names pygame on a REAL line — comments (first
-    non-whitespace char ``#``) and blanks are stripped before matching."""
+def _req_matches(path: Path, pattern: re.Pattern[str]) -> bool:
+    """``requirements.txt`` matches ``pattern`` on a REAL line — comments
+    (first non-whitespace char ``#``) and blanks are stripped first."""
     lines = [
         line
         for line in _read_head(path).splitlines()
         if not line.lstrip().startswith("#")
     ]
-    return _PYGAME_REQ_RE.search("\n".join(lines)) is not None
+    return pattern.search("\n".join(lines)) is not None
 
 
 def _scan_dirs(workspace: Path) -> list[Path]:
@@ -362,51 +435,95 @@ def _py_files(dirpath: Path) -> list[Path]:
     ]
 
 
-def _desktop_candidates(workspace: Path) -> list[PreviewPlan]:
-    """All runnable pygame entries — the dropdown's ``desktop`` options.
+def _py_candidates(
+    workspace: Path,
+    *,
+    import_re: re.Pattern[str],
+    req_re: re.Pattern[str],
+    entry_names: tuple[str, ...],
+    ptype: str,
+) -> list[PreviewPlan]:
+    """Shared executed-code ``*.py`` candidate walk for desktop/server.
 
-    Every ``*.py`` with pygame evidence is a candidate — no named-entry
-    shape required (the dropdown is the disambiguation mechanism):
+    Every ``*.py`` with evidence is a candidate — no named-entry shape
+    required (the dropdown is the disambiguation mechanism):
 
-    - the file **itself imports pygame** (line-anchored — comments can't
-      match), OR
-    - it is **entry-shaped** (named ``main.py``/``app.py``/``game.py``/
-      ``run.py``, or a dir containing exactly one ``*.py``) AND any
-      ``requirements.txt`` within the scanned dirs names pygame on a real
-      non-comment line.
+    - the file **itself imports** a matching package (``import_re`` is
+      line-anchored — comments can't match), OR
+    - it is **entry-shaped** (named in ``entry_names``, or a dir containing
+      exactly one ``*.py``) AND any ``requirements.txt`` within the scanned
+      dirs matches ``req_re`` on a real non-comment line.
 
     Scanned dirs = root + ≤3 levels (``_DESKTOP_SKIP_DIRS``/hidden/symlinked
     dirs skipped). Ordered for default-first presentation: shallower first,
-    named entries (in ``_DESKTOP_ENTRY_NAMES`` order) before others, then
-    path — so ``main.py`` beats ``lib/helpers.py``.
+    named entries (in ``entry_names`` order) before others, then path — so
+    ``main.py`` beats ``lib/helpers.py``.
     """
     scan_dirs = _scan_dirs(workspace)
     req_evidence = False
     for d in scan_dirs:
         req = d / "requirements.txt"
-        if req.is_file() and not req.is_symlink() and _req_mentions_pygame(req):
+        if req.is_file() and not req.is_symlink() and _req_matches(req, req_re):
             req_evidence = True
             break
 
     candidates: list[tuple[int, int, str]] = []  # (depth, named_rank, rel)
     for d in scan_dirs:
         py = _py_files(d)
-        entry_shaped = {d / name for name in _DESKTOP_ENTRY_NAMES if (d / name) in py}
+        entry_shaped = {d / name for name in entry_names if (d / name) in py}
         if len(py) == 1:
             entry_shaped.add(py[0])
         for cand in py:
             rel = str(cand.relative_to(workspace))
-            own_evidence = _PYGAME_IMPORT_RE.search(_read_head(cand)) is not None
+            own_evidence = import_re.search(_read_head(cand)) is not None
             if not (own_evidence or (req_evidence and cand in entry_shaped)):
                 continue
             try:
-                rank = _DESKTOP_ENTRY_NAMES.index(cand.name)
+                rank = entry_names.index(cand.name)
             except ValueError:
-                rank = len(_DESKTOP_ENTRY_NAMES)
+                rank = len(entry_names)
             candidates.append((len(Path(rel).parts) - 1, rank, rel))
 
     candidates.sort()
-    return [PreviewPlan(type="desktop", entry=rel) for _, _, rel in candidates]
+    return [PreviewPlan(type=ptype, entry=rel) for _, _, rel in candidates]
+
+
+def _desktop_candidates(workspace: Path) -> list[PreviewPlan]:
+    """Runnable GUI entries — the dropdown's ``desktop`` options.
+
+    Evidence: the file imports pygame/pyglet/arcade/tkinter, OR it's
+    entry-shaped (``main.py``/``app.py``/``game.py``/``run.py``, or a dir's
+    only ``*.py``) AND a scanned ``requirements.txt`` names
+    pygame(-ce)/pyglet/arcade (tkinter is stdlib — no pip evidence exists;
+    bare ``tk`` in requirements is the unrelated Tcl-binding package, not
+    evidence). All stacks are baked into ``heg-preview-desktop``.
+    """
+    return _py_candidates(
+        workspace,
+        import_re=_GUI_IMPORT_RE,
+        req_re=_GUI_REQ_RE,
+        entry_names=_DESKTOP_ENTRY_NAMES,
+        ptype="desktop",
+    )
+
+
+def _server_candidates(workspace: Path) -> list[PreviewPlan]:
+    """Runnable web-app entries — the dropdown's ``python-server`` options.
+
+    Evidence: the file imports a web framework (flask/fastapi/uvicorn/
+    django/aiohttp/bottle/tornado/…, or stdlib ``http.server``), OR it's
+    entry-shaped (``app.py``/``main.py``/``server.py``/``manage.py``/…, or a
+    dir's only ``*.py``) AND a scanned ``requirements.txt`` names a server
+    framework. ``manage.py`` qualifies via its ``from django…`` import and
+    gets the runserver contract inside the runner.
+    """
+    return _py_candidates(
+        workspace,
+        import_re=_SERVER_IMPORT_RE,
+        req_re=_SERVER_REQ_RE,
+        entry_names=_SERVER_ENTRY_NAMES,
+        ptype="python-server",
+    )
 
 
 @dataclass(frozen=True)
@@ -416,8 +533,9 @@ class PreviewScan:
     ``plan`` — the default pick (``candidates[0]``, ``None`` when nothing is
     previewable). ``candidates`` — every detected runnable entry as typed
     :class:`PreviewPlan` records, ordered default-first: static entries
-    (root index → root html → nested index), then desktop ``.py`` entries
-    (shallower → named → path). The UI renders this as the dropdown's
+    (root index → root html → nested index), then desktop ``.py`` entries,
+    then python-server ``.py`` entries (each group: shallower → named →
+    path). The UI renders this as the dropdown's
     options; the user picks, never types paths.
     """
 
@@ -426,13 +544,17 @@ class PreviewScan:
 
 
 def scan_preview(workspace: Path) -> PreviewScan:
-    """Static candidates first, then desktop — ``candidates[0]`` is the
-    default pick, so a workspace matching both defaults to static while the
-    dropdown still offers the desktop entry."""
+    """Static candidates first, then desktop, then python-server —
+    ``candidates[0]`` is the default pick, so a workspace matching both
+    defaults to static while the dropdown still offers the executed-code
+    entries. A file matching BOTH executed detectors (say, imports flask
+    AND pygame) appears once per type — the dropdown disambiguates."""
     if not workspace.is_dir():
         return PreviewScan(None, ())
     candidates = (
-        *_static_candidates(workspace), *_desktop_candidates(workspace)
+        *_static_candidates(workspace),
+        *_desktop_candidates(workspace),
+        *_server_candidates(workspace),
     )
     return PreviewScan(candidates[0] if candidates else None, candidates)
 
@@ -454,18 +576,23 @@ def plan_for_entry(
     The entry is jailed to ``workspace``: must be a relative path (no ``..``,
     not absolute), resolve inside it, exist as a regular non-symlinked file,
     and — without ``preview_type`` — have a recognized suffix:
-    ``.html``/``.htm`` → ``static``, ``.py`` → ``desktop``. Anything else
+    ``.html``/``.htm`` → ``static``, ``manage.py`` → ``python-server``
+    (unambiguous django — only the server runner publishes the app port),
+    other ``.py`` → ``desktop``. Anything else
     raises ``ValueError`` (router maps to 422).
 
     ``preview_type`` overrides the suffix-derived type: ``"static"`` serves
     ANY jailed file — ``http.server`` already serves the whole workspace, so
     the entry is only the URL the browser opens (view a ``.py``'s source
-    instead of executing it); ``"desktop"`` still requires a ``.py`` entry
-    (the runner executes it). Unknown types raise ``ValueError``.
+    instead of executing it); ``"desktop"`` and ``"python-server"`` still
+    require a ``.py`` entry (the runner executes it). Unknown types raise
+    ``ValueError``.
 
-    Note: an explicit ``.py`` entry bypasses pygame evidence — the user's
+    Note: an explicit ``.py`` entry bypasses framework evidence — the user's
     pick IS the disambiguation; the executed artifact runs under the same
-    isolation regardless.
+    isolation regardless. Suffix alone can't tell a GUI app from a web
+    server — a bare ``.py`` defaults to ``desktop``; pass
+    ``"python-server"`` explicitly to run it as a web app.
     """
     raw = raw_entry.strip()
     rel_path = Path(raw)
@@ -496,17 +623,22 @@ def plan_for_entry(
                 f"unsupported preview type {preview_type!r} — want one of "
                 f"{', '.join(sorted(PREVIEW_TYPES))}"
             )
-        if preview_type == "desktop":
+        if preview_type in ("desktop", "python-server"):
             if suffix != ".py":
                 raise ValueError(
-                    f"desktop previews execute a .py entry — {rel!r} is "
+                    f"{preview_type} previews execute a .py entry — {rel!r} is "
                     f"{suffix or 'extensionless'}"
                 )
-            return PreviewPlan(type="desktop", entry=rel)
+            return PreviewPlan(type=preview_type, entry=rel)
         return PreviewPlan(type="static", entry=rel)
     if suffix in _HTML_SUFFIXES:
         return PreviewPlan(type="static", entry=rel)
     if suffix == ".py":
+        # manage.py is unambiguously django — a bare pick means "run the
+        # project", which only the server runner can reach (its app port is
+        # published; the desktop runner's 6080 is noVNC, not the app).
+        if cand.name == "manage.py":
+            return PreviewPlan(type="python-server", entry=rel)
         return PreviewPlan(type="desktop", entry=rel)
     raise ValueError(
         f"unsupported entry type {cand.suffix!r} — want .html/.htm or .py"
@@ -611,11 +743,16 @@ class ScanCache:
 def _preview_url(
     port: int | None, entry: str | None, preview_type: str = "static"
 ) -> str | None:
-    """Browser URL for a preview — entry dir/file for static, noVNC for desktop."""
+    """Browser URL for a preview — entry dir/file for static, noVNC for
+    desktop, the app's root for python-server."""
     if port is None:
         return None
     if preview_type == "desktop":
         return f"http://localhost:{port}/vnc.html?autoconnect=true&resize=scale"
+    if preview_type == "python-server":
+        # The relay/sidecar forwards to whatever the app serves — root is
+        # the entry contract (the app owns its routes).
+        return f"http://localhost:{port}/"
     if not entry:
         return f"http://localhost:{port}/"
     base = entry.rsplit("/", 1)[-1]
@@ -663,6 +800,7 @@ class PreviewManager:
         desktop_cpus: str = DEFAULT_DESKTOP_CPUS,
         desktop_memory: str = DEFAULT_DESKTOP_MEMORY,
         desktop_pids: int = DEFAULT_DESKTOP_PIDS,
+        server_image: str | None = None,
     ) -> None:
         self._rt = runtime or SandboxRuntime()
         self.image = (
@@ -674,9 +812,11 @@ class PreviewManager:
         self.desktop_image = desktop_image or DEFAULT_DESKTOP_IMAGE
         self.proxy_image = proxy_image or DEFAULT_PROXY_IMAGE
         self.desktop_network = desktop_network
+        # Executed-code resource bounds — shared by desktop + server runners.
         self.desktop_cpus = desktop_cpus
         self.desktop_memory = desktop_memory
         self.desktop_pids = desktop_pids
+        self.server_image = server_image or DEFAULT_SERVER_IMAGE
 
     # -- docker plumbing (delegates to the composed runtime) -----------------
 
@@ -727,14 +867,17 @@ class PreviewManager:
                 self.network,
             )
 
-    def _ensure_desktop_network(self) -> None:
-        """Create the INTERNAL desktop-runner network if missing (idempotent).
+    def _ensure_internal_network(self) -> None:
+        """Create the INTERNAL runner network if missing (idempotent).
 
-        ``heg-desktop`` is the isolation boundary for executed artifacts:
-        ``--internal`` means no outbound route and no published ports — the
-        runner can reach only its own socat proxy sidecar. An existing
-        network that is NOT internal is a security misconfiguration (the
-        runner would have egress) — logged loudly.
+        ``heg-desktop`` is the isolation boundary for ALL executed
+        artifacts (desktop + python-server runners share it): ``--internal``
+        means no outbound route and no published ports — a runner can reach
+        only the other executed-code containers on this net (its own socat
+        proxy plus any concurrently-running preview runners; all are
+        ephemeral candidate code, and none can egress). An existing network
+        that is NOT internal is a security misconfiguration (the runners
+        would have egress) — logged loudly.
         """
         proc = self._docker(
             ["network", "inspect", self.desktop_network], check=False
@@ -777,9 +920,11 @@ class PreviewManager:
         """Spawn the container(s) for ``plan``; returns the live Preview.
 
         - ``static``: one hardened ``python -m http.server`` container.
-        - ``desktop``: a runner on the internal ``heg-desktop`` net executing
-          the artifact under Xvnc/noVNC, plus a socat proxy sidecar straddling
-          ``heg-desktop`` + ``heg-preview`` that publishes a localhost port.
+        - ``desktop`` / ``python-server``: a runner on the internal
+          ``heg-desktop`` net *executing* the artifact (GUI under
+          Xvnc/noVNC, or a web app made reachable on :8000 by the runner's
+          relay), plus a socat proxy sidecar straddling ``heg-desktop`` +
+          ``heg-preview`` that publishes a localhost port.
 
         Unknown types raise ``ValueError`` — the router maps it to 422.
         """
@@ -809,6 +954,13 @@ class PreviewManager:
             )
         elif plan.type == "desktop":
             self._spawn_desktop(
+                name=name,
+                serve_dir=serve_dir,
+                plan=plan,
+                labels=labels,
+            )
+        elif plan.type == "python-server":
+            self._spawn_server(
                 name=name,
                 serve_dir=serve_dir,
                 plan=plan,
@@ -911,27 +1063,78 @@ class PreviewManager:
         plan: PreviewPlan,
         labels: list[str],
     ) -> None:
+        """GUI runner (Xvnc + noVNC :6080) — pygame/pyglet/arcade/tkinter."""
+        self._spawn_isolated(
+            name=name,
+            serve_dir=serve_dir,
+            plan=plan,
+            labels=labels,
+            runner_image=self.desktop_image,
+            image_dockerfile="sandbox/images/desktop-preview.Dockerfile",
+            container_port=DESKTOP_CONTAINER_PORT,
+            env={"APP_ENTRY": plan.entry},
+        )
+
+    def _spawn_server(
+        self,
+        *,
+        name: str,
+        serve_dir: Path,
+        plan: PreviewPlan,
+        labels: list[str],
+    ) -> None:
+        """Web-app runner (heg-preview-server) — the app is made reachable
+        on :8000 by the baked-in relay, whatever it actually binds."""
+        self._spawn_isolated(
+            name=name,
+            serve_dir=serve_dir,
+            plan=plan,
+            labels=labels,
+            runner_image=self.server_image,
+            image_dockerfile="sandbox/images/server-preview.Dockerfile",
+            container_port=SERVER_CONTAINER_PORT,
+            env={
+                "APP_ENTRY": plan.entry,
+                "PORT": str(SERVER_CONTAINER_PORT),
+                "HOST": "0.0.0.0",
+            },
+        )
+
+    def _spawn_isolated(
+        self,
+        *,
+        name: str,
+        serve_dir: Path,
+        plan: PreviewPlan,
+        labels: list[str],
+        runner_image: str,
+        image_dockerfile: str,
+        container_port: int,
+        env: dict[str, str],
+    ) -> None:
         """Runner on the INTERNAL net + socat proxy sidecar publishing the port.
 
-        The runner *executes* candidate code, so unlike a static preview it
-        gets zero egress: ``--internal`` ``heg-desktop`` with its only peer
-        being its own proxy. ``socat`` is a dumb TCP pipe — no HTTP parsing,
-        nothing for the artifact to exploit — and is the only container with
-        a published port (bound to localhost on ``heg-preview``). CPU/memory/
-        pids limits bound what the candidate code can burn.
+        Shared topology for ALL executed-code previews (desktop, server —
+        and future runner types). The runner *executes* candidate code, so
+        unlike a static preview it gets zero egress: ``--internal``
+        ``heg-desktop`` — peers are only other ephemeral preview containers
+        (its own proxy plus concurrent runners; none can egress). ``socat``
+        is a dumb TCP pipe — no HTTP parsing, nothing for the artifact to
+        exploit — and is the only container with a published port (bound to
+        localhost on ``heg-preview``). CPU/memory/pids limits bound what
+        the candidate code can burn.
         """
-        self._ensure_desktop_network()
+        self._ensure_internal_network()
         if (
             self._docker(
-                ["image", "inspect", self.desktop_image], check=False
+                ["image", "inspect", runner_image], check=False
             ).returncode
             != 0
         ):
             raise RuntimeError(
-                f"desktop preview image {self.desktop_image!r} not found — "
-                f"build it: docker build -f "
-                f"sandbox/images/desktop-preview.Dockerfile "
-                f"-t {self.desktop_image} ."
+                f"{plan.type} preview image {runner_image!r} not found — "
+                f"build it: docker build -f {image_dockerfile} "
+                f"-t {runner_image} ."
             )
 
         runner_args = [
@@ -955,14 +1158,13 @@ class PreviewManager:
             self.desktop_memory,
             "--pids-limit",
             str(self.desktop_pids),
-            "-e",
-            f"APP_ENTRY={plan.entry}",
+            *(a for k, v in env.items() for a in ("-e", f"{k}={v}")),
             "-e",
             "HOME=/tmp",
             "-v",
             f"{self._rt.to_host_path(serve_dir)}:{DESKTOP_ARTIFACT_ROOT}:ro",
             *labels,
-            self.desktop_image,
+            runner_image,
         ]
         proxy_name = f"{name}-proxy"
         # The proxy's FIRST network must be the publishable bridge — docker
@@ -984,11 +1186,11 @@ class PreviewManager:
             "--user",
             "65534:65534",
             "-p",
-            f"{self.bind_host}::{DESKTOP_CONTAINER_PORT}",
+            f"{self.bind_host}::{container_port}",
             *self._labels_as_args(labels, role=ROLE_PROXY),
             self.proxy_image,
-            "TCP-LISTEN:" + str(DESKTOP_CONTAINER_PORT) + ",fork,reuseaddr",
-            f"TCP:{name}:{DESKTOP_CONTAINER_PORT}",
+            "TCP-LISTEN:" + str(container_port) + ",fork,reuseaddr",
+            f"TCP:{name}:{container_port}",
         ]
         try:
             self._docker(runner_args, timeout=180)
@@ -1037,9 +1239,10 @@ class PreviewManager:
 
         preview_type = labels.get(LABEL_TYPE) or "static"
         port: int | None = None
-        if preview_type == "desktop":
+        proxied = _PROXIED_PORTS.get(preview_type)
+        if proxied is not None:
             # The published port lives on the proxy sidecar, not the runner.
-            port = self._proxy_port(preview_id)
+            port = self._proxy_port(preview_id, proxied)
         else:
             bindings = (
                 (row.get("NetworkSettings") or {}).get("Ports") or {}
@@ -1079,8 +1282,9 @@ class PreviewManager:
             expires_at=expires,
         )
 
-    def _proxy_port(self, preview_id: str) -> int | None:
-        """Published host port of a desktop preview's proxy sidecar."""
+    def _proxy_port(self, preview_id: str, container_port: int) -> int | None:
+        """Published host port of a proxied preview's sidecar (desktop :6080,
+        server :8000 — the port the sidecar listens on inside its net)."""
         proc = self._docker(
             [
                 "ps",
@@ -1102,7 +1306,7 @@ class PreviewManager:
             row = json.loads(info.stdout)[0]
             bindings = (
                 (row.get("NetworkSettings") or {}).get("Ports") or {}
-            ).get(f"{DESKTOP_CONTAINER_PORT}/tcp") or []
+            ).get(f"{container_port}/tcp") or []
             if bindings and bindings[0].get("HostPort"):
                 return int(bindings[0]["HostPort"])
         except (json.JSONDecodeError, IndexError, TypeError, ValueError):

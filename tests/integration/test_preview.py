@@ -199,8 +199,10 @@ def test_reap_expired_removes_container(
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DESKTOP_IMAGE = "heg-preview-desktop:latest"
+SERVER_IMAGE = "heg-preview-server:latest"
 PROXY_IMAGE = "alpine/socat:1.8.1.3"
 DESKTOP_DOCKERFILE = REPO_ROOT / "sandbox/images/desktop-preview.Dockerfile"
+SERVER_DOCKERFILE = REPO_ROOT / "sandbox/images/server-preview.Dockerfile"
 
 _PYGAME_APP = """\
 import os, time
@@ -219,41 +221,56 @@ while time.time() < end:
 """
 
 
+def _build_image(dockerfile: Path, tag: str) -> str:
+    """``docker build`` unconditionally — the layer cache makes repeat
+    builds cheap, and it guarantees the image matches the CURRENT
+    Dockerfile (a stale local tag would silently skip new baked deps).
+
+    First build is heavy (apt + pip); if your daemon lacks network for the
+    build, `docker build` manually first:
+      docker build -f sandbox/images/<name>-preview.Dockerfile \\
+          -t <tag> .
+    """
+    proc = subprocess.run(
+        [
+            "docker",
+            "build",
+            "-f",
+            str(dockerfile),
+            "-t",
+            tag,
+            str(REPO_ROOT),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=False,
+    )
+    if proc.returncode != 0:
+        pytest.fail(f"failed to build {tag}:\n{proc.stderr[-3000:]}")
+    return tag
+
+
 @pytest.fixture(scope="session")
 def desktop_image() -> str:
-    """Build heg-preview-desktop once per test session (daemon caches layers).
-
-    First build is heavy (apt tigervnc/novnc + pip websockify/pygame-ce);
-    subsequent runs hit the layer cache. If your daemon lacks buildkit/network
-    for the build, `docker build` manually:
-      docker build -f sandbox/images/desktop-preview.Dockerfile \\
-          -t heg-preview-desktop:latest .
-    """
-    if _docker("image", "inspect", DESKTOP_IMAGE).returncode != 0:
-        proc = subprocess.run(
-            [
-                "docker",
-                "build",
-                "-f",
-                str(DESKTOP_DOCKERFILE),
-                "-t",
-                DESKTOP_IMAGE,
-                str(REPO_ROOT),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=900,
-            check=False,
-        )
-        if proc.returncode != 0:
-            pytest.fail(
-                f"failed to build {DESKTOP_IMAGE}:\n{proc.stderr[-3000:]}"
-            )
+    """heg-preview-desktop: TigerVNC + noVNC + pygame-ce/pyglet/arcade/tkinter."""
+    _build_image(DESKTOP_DOCKERFILE, DESKTOP_IMAGE)
     if _docker("image", "inspect", PROXY_IMAGE).returncode != 0:
         proc = _docker("pull", PROXY_IMAGE)
         if proc.returncode != 0:
             pytest.fail(f"failed to pull {PROXY_IMAGE}:\n{proc.stderr[-2000:]}")
     return DESKTOP_IMAGE
+
+
+@pytest.fixture(scope="session")
+def server_image() -> str:
+    """heg-preview-server: baked web frameworks (flask/fastapi/django/...)."""
+    _build_image(SERVER_DOCKERFILE, SERVER_IMAGE)
+    if _docker("image", "inspect", PROXY_IMAGE).returncode != 0:
+        proc = _docker("pull", PROXY_IMAGE)
+        if proc.returncode != 0:
+            pytest.fail(f"failed to pull {PROXY_IMAGE}:\n{proc.stderr[-2000:]}")
+    return SERVER_IMAGE
 
 
 def _wait_log_marker(container: str, marker: str, seconds: float = 30) -> str:
@@ -332,3 +349,239 @@ def test_desktop_preview_pygame(
     assert (
         _docker("inspect", f"{preview.container}-proxy").returncode != 0
     )
+
+
+# ---------------------------------------------------------------------------
+# PR3 — more desktop GUI stacks (pyglet / arcade / tkinter, baked deps)
+# ---------------------------------------------------------------------------
+
+
+def test_desktop_image_gui_deps_import(desktop_image: str) -> None:
+    """All PR3 GUI stacks import inside the baked image (no egress needed —
+    deps were installed at build time)."""
+    proc = subprocess.run(
+        [
+            "docker", "run", "--rm", "--entrypoint", "python",
+            desktop_image, "-c",
+            "import pyglet, arcade, tkinter; print('GUI_DEPS_OK')",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "GUI_DEPS_OK" in proc.stdout
+
+
+_TK_APP = """\
+import time
+import tkinter as tk
+root = tk.Tk()
+root.geometry("320x240")
+root.title("tk preview")
+print("TK_OK", flush=True)
+root.update()
+time.sleep(8)
+"""
+
+
+def test_desktop_preview_tkinter(
+    manager: PreviewManager, desktop_image: str, tmp_path: Path
+) -> None:
+    """A tkinter app executes under Xvnc — proves the baked `tk` libs +
+    DISPLAY plumbing work end-to-end (not just importable)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "main.py").write_text(_TK_APP)
+
+    plan = detect_preview(ws)
+    assert plan is not None and plan.type == "desktop" and plan.entry == "main.py"
+
+    preview = manager.spawn(
+        run_id="r", sandbox_id="s", serve_dir=ws, plan=plan, ttl_seconds=300
+    )
+    try:
+        logs = _wait_log_marker(preview.container, "TK_OK")
+        assert "TK_OK" in logs, f"tkinter app did not start:\n{logs[-2000:]}"
+    finally:
+        manager.stop(preview.preview_id)
+
+
+_PYGLET_APP = """\
+import time
+import pyglet
+win = pyglet.window.Window(width=320, height=240, caption="pyglet preview")
+print("PYGLET_OK", flush=True)
+time.sleep(8)
+"""
+
+
+def test_desktop_preview_pyglet(
+    manager: PreviewManager, desktop_image: str, tmp_path: Path
+) -> None:
+    """A pyglet window opens under Xvnc — exercises the baked mesa/GL stack
+    (libgl/libglx/dri) that pyglet/arcade need for real rendering."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "main.py").write_text(_PYGLET_APP)
+
+    plan = detect_preview(ws)
+    assert plan is not None and plan.type == "desktop" and plan.entry == "main.py"
+
+    preview = manager.spawn(
+        run_id="r", sandbox_id="s", serve_dir=ws, plan=plan, ttl_seconds=300
+    )
+    try:
+        logs = _wait_log_marker(preview.container, "PYGLET_OK")
+        assert "PYGLET_OK" in logs, f"pyglet app did not start:\n{logs[-2000:]}"
+    finally:
+        manager.stop(preview.preview_id)
+
+
+_ARCADE_APP = """\
+import time
+import arcade
+win = arcade.Window(320, 240, "arcade preview")
+print("ARCADE_OK", flush=True)
+time.sleep(8)
+"""
+
+
+def test_desktop_preview_arcade(
+    manager: PreviewManager, desktop_image: str, tmp_path: Path
+) -> None:
+    """An arcade window opens under Xvnc — arcade rides on pyglet, so this
+    also smoke-tests the heaviest baked dep chain (arcade+pymunk)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "main.py").write_text(_ARCADE_APP)
+
+    plan = detect_preview(ws)
+    assert plan is not None and plan.type == "desktop" and plan.entry == "main.py"
+
+    preview = manager.spawn(
+        run_id="r", sandbox_id="s", serve_dir=ws, plan=plan, ttl_seconds=300
+    )
+    try:
+        logs = _wait_log_marker(preview.container, "ARCADE_OK")
+        assert "ARCADE_OK" in logs, f"arcade app did not start:\n{logs[-2000:]}"
+    finally:
+        manager.stop(preview.preview_id)
+
+
+# ---------------------------------------------------------------------------
+# PR3 — python-server previews (executed web apps, same isolated topology)
+# ---------------------------------------------------------------------------
+
+_FLASK_APP = """\
+from flask import Flask
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "flask-ok"
+
+if __name__ == "__main__":
+    # deliberately loopback + non-canonical port — the runner's relay must
+    # bridge it to the sidecar's :8000 target
+    app.run(host="127.0.0.1", port=5000)
+"""
+
+
+def test_python_server_preview_flask(
+    manager: PreviewManager, server_image: str, tmp_path: Path
+) -> None:
+    """Flask app on 127.0.0.1:5000 → runner detects the listener, relays
+    :8000 → :5000, socat sidecar publishes it on localhost."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "app.py").write_text(_FLASK_APP)
+
+    plan = detect_preview(ws)
+    assert plan is not None
+    assert plan.type == "python-server" and plan.entry == "app.py"
+
+    preview = manager.spawn(
+        run_id="r", sandbox_id="s", serve_dir=ws, plan=plan, ttl_seconds=300
+    )
+    try:
+        assert preview.type == "python-server" and preview.port is not None
+        assert preview.url == f"http://localhost:{preview.port}/"
+
+        # Runner: internal net only, no published ports, resource bounds.
+        info = json.loads(_docker("inspect", preview.container).stdout)[0]
+        assert set(info["NetworkSettings"]["Networks"]) == {"heg-desktop"}
+        assert not (info["NetworkSettings"]["Ports"] or {})
+        host = info["HostConfig"]
+        assert host["NanoCpus"] == 1_000_000_000
+        assert host["Memory"] == 512 * 1024 * 1024
+        assert host["PidsLimit"] == 256
+
+        # Proxy straddles both nets, publishes localhost:8000 only.
+        proxy = json.loads(
+            _docker("inspect", f"{preview.container}-proxy").stdout
+        )[0]
+        assert set(proxy["NetworkSettings"]["Networks"]) == {
+            PREVIEW_NETWORK,
+            "heg-desktop",
+        }
+        bindings = proxy["NetworkSettings"]["Ports"]["8000/tcp"]
+        assert {b["HostIp"] for b in bindings} == {"127.0.0.1"}
+
+        # The relay came up, then the app actually served through it.
+        logs = _wait_log_marker(preview.container, "relay")
+        assert "-> 127.0.0.1:5000" in logs
+        code, body = _wait_http(preview.url, seconds=30)
+        assert code == 200, f"app returned {code}: {body[:300]}"
+        assert "flask-ok" in body
+    finally:
+        assert manager.stop(preview.preview_id)
+    assert manager.get(preview.preview_id) is None
+    assert (
+        _docker("inspect", f"{preview.container}-proxy").returncode != 0
+    )
+
+
+_STDLIB_SERVER_APP = """\
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"stdlib-ok")
+    def log_message(self, *a):
+        pass
+
+# honors the runner's PORT/HOST env — binds 0.0.0.0:8000 directly, so the
+# runner takes the no-relay path
+import os
+HTTPServer((os.environ.get("HOST", "0.0.0.0"),
+            int(os.environ.get("PORT", "8000"))), H).serve_forever()
+"""
+
+
+def test_python_server_preview_stdlib_direct(
+    manager: PreviewManager, server_image: str, tmp_path: Path
+) -> None:
+    """A stdlib app honoring PORT/HOST binds 0.0.0.0:8000 itself — the
+    runner detects the non-loopback :8000 listener and skips the relay."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "serve.py").write_text(_STDLIB_SERVER_APP)
+
+    plan = detect_preview(ws)
+    assert plan is not None and plan.type == "python-server"
+
+    preview = manager.spawn(
+        run_id="r", sandbox_id="s", serve_dir=ws, plan=plan, ttl_seconds=300
+    )
+    try:
+        logs = _wait_log_marker(preview.container, "no relay needed")
+        assert "no relay needed" in logs
+        code, body = _wait_http(preview.url, seconds=30)
+        assert code == 200 and "stdlib-ok" in body
+    finally:
+        assert manager.stop(preview.preview_id)

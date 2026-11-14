@@ -10,9 +10,9 @@
  * expiry shown here is informational.
  *
  * The dropdown lists detected candidates plus type-override variants: a
- * `.py` entry can run as a desktop app or be served as a file ("view
- * source"). An explicit pick that differs from the live preview's plan
- * replaces the running container server-side.
+ * `.py` entry can run as a desktop/server app or be served as a file
+ * ("view source"). An explicit pick that differs from the live preview's
+ * plan replaces the running container server-side.
  */
 import { useEffect, useState } from "react";
 import {
@@ -37,15 +37,23 @@ interface Option {
   label: string;
 }
 
+/** Short dropdown label for a preview type. */
+function typeLabel(type: string): string {
+  if (type === "static") return "site";
+  if (type === "python-server") return "server";
+  return type;
+}
+
 function buildOptions(candidates: PreviewCandidate[]): Option[] {
   return candidates.flatMap((c) => {
     const base: Option = {
       key: `${c.entry}|${c.type}`,
       entry: c.entry,
       type: c.type,
-      label: `${c.entry} (${c.type === "static" ? "site" : c.type})`,
+      label: `${c.entry} (${typeLabel(c.type)})`,
     };
-    return c.type === "desktop"
+    // Every executed-code candidate (.py) can also be served as a file.
+    return c.type !== "static"
       ? [
           base,
           {
@@ -153,10 +161,16 @@ export default function PreviewControls({
           title={
             preview.type === "desktop"
               ? "Desktop preview — the artifact executes in an isolated container (no egress), streamed via noVNC"
-              : "Static preview — workspace files served read-only, nothing executed"
+              : preview.type === "python-server"
+                ? "Server preview — the artifact's web app executes in an isolated container (no egress) and is served on localhost"
+                : "Static preview — workspace files served read-only, nothing executed"
           }
         >
-          {preview.type === "desktop" ? "🖥 desktop" : preview.type}
+          {preview.type === "desktop"
+            ? "🖥 desktop"
+            : preview.type === "python-server"
+              ? "🌐 server"
+              : preview.type}
         </span>
         {preview.url ? (
           <a
@@ -236,14 +250,14 @@ export default function PreviewControls({
             type="button"
             className="btn btn--sm"
             disabled
-            title="Preview isn't supported for this artifact — it needs an HTML entry point or a pygame app. The artifact itself is fine and still downloadable above."
+            title="Preview isn't supported for this artifact — it needs an HTML entry point, a GUI app, or a web app. The artifact itself is fine and still downloadable above."
           >
             ▶ Preview
           </button>
           <span
             className="faint"
             style={{ fontSize: "0.75rem" }}
-            title="Preview supports static sites and pygame apps for now"
+            title="Preview supports static sites, GUI apps (pygame/pyglet/arcade/tkinter), and web apps (flask/fastapi/django/…)"
           >
             not supported
           </span>
