@@ -41,6 +41,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Theme:** `web/app/globals.css` — dark "instrument panel" tokens
   (near-black surfaces, hairline borders, signal-lime `--accent`, mono
   kickers, square badges, per-event-type colors via `.tl-type[data-type]`).
+  The `/` landing page is a marketing-style long scroll:
+  `web/app/landing.css` + `web/components/landing/*` (scripted run-console
+  replay in `web/lib/sim.ts`), plain CSS, no framework.
 - **Verify:**
   - `docker compose up -d` → `curl localhost:8001/health` + `/health/db` ok
   - `DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5433/harness_eval alembic upgrade head` → all tables present

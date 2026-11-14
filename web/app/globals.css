@@ -1217,81 +1217,6 @@ a.chip:hover {
 }
 
 /* ==========================================================================
-   Landing (/)
-   ========================================================================== */
-
-.landing {
-  padding-top: 4rem;
-}
-.landing__kicker-row {
-  display: flex;
-  align-items: center;
-  gap: 0.8rem;
-  flex-wrap: wrap;
-}
-.landing__kicker-row .hline {
-  height: 1px;
-  width: 3.5rem;
-  background: var(--border-strong);
-}
-.landing h1 {
-  margin-top: 1.6rem;
-  font-size: clamp(1.9rem, 4.6vw, 3.1rem);
-  font-weight: 560;
-  letter-spacing: -0.025em;
-  line-height: 1.06;
-  max-width: 20ch;
-}
-.landing h1 .sig {
-  color: var(--accent);
-}
-.landing__lede {
-  margin-top: 1.2rem;
-  max-width: 34rem;
-  color: var(--text-dim);
-  font-size: 0.95rem;
-  line-height: 1.65;
-}
-.landing__ctas {
-  display: flex;
-  gap: 0.6rem;
-  margin-top: 1.9rem;
-  flex-wrap: wrap;
-}
-.landing__ctas .btn {
-  padding: 0.7rem 1.3rem;
-  font-size: 0.72rem;
-}
-.landing__spec {
-  margin-top: 3rem;
-  border: 1px solid var(--border);
-}
-.landing__spec-row {
-  display: grid;
-  grid-template-columns: 9rem 1fr;
-  gap: 1rem;
-  padding: 0.6rem 1rem;
-  border-bottom: 1px solid var(--border);
-  font-size: 0.8rem;
-}
-.landing__spec-row:last-child {
-  border-bottom: none;
-}
-.landing__spec-row dt {
-  font-family: var(--mono);
-  font-size: 0.64rem;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-  padding-top: 0.15rem;
-}
-.landing__spec-row dd {
-  color: var(--text-dim);
-  font-family: var(--mono);
-  font-size: 0.74rem;
-}
-
-/* ==========================================================================
    Modal (F11 — GitHub skill-pack import dialog)
    ========================================================================== */
 
@@ -1402,16 +1327,6 @@ a.chip:hover {
   }
   .api-dot__label {
     display: none;
-  }
-  .landing {
-    padding-top: 2.5rem;
-  }
-  .landing__spec-row {
-    grid-template-columns: 1fr;
-    gap: 0.2rem;
-  }
-  .landing__spec-row dd {
-    padding-bottom: 0.15rem;
   }
   .tl-id {
     display: none;
