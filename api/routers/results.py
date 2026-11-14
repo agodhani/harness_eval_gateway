@@ -43,17 +43,28 @@ from sqlalchemy.orm import Session
 
 from api.config import get_settings
 from api.deps import get_db
-from api.schemas import RubricOut
+from api.schemas import AnalysisReport, RubricOut
 from db.models import Artifact, Rubric, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
 from orchestrator import events as orch_events
 from orchestrator import runner, state_machine
 from orchestrator.rubric import RubricContent, create_rubric_version
-from sandbox.preview import resolve_workspace_dir, scan_preview
+from sandbox.preview import ScanCache
+from scoring.render import ANALYSIS_JSON_FILENAME
 
 router = APIRouter(tags=["results"])
 
 DbSession = Annotated[Session, Depends(get_db)]
+
+# F12: the per-sandbox preview probe (workspace resolve + candidate scan) is
+# an FS walk — memoized for PREVIEW_SCAN_TTL_SECONDS; workspaces only change
+# on (re-)snapshot.
+_scan_cache = ScanCache()
+
+
+def reset_scan_cache() -> None:
+    """Test hook: drop cached workspace scans."""
+    _scan_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -99,11 +110,15 @@ class SandboxResult(BaseModel):
     # F12: whether the snapshot workspace has a previewable entry —
     # drives the results-page Preview button. preview_candidates lists
     # EVERY detected runnable entry, default-first (previewable/preview_type
-    # describe candidates[0]); the UI renders a dropdown + POST {entry}.
-    # Empty + previewable=false = unsupported.
+    # describe candidates[0]); the UI renders a dropdown + POST {entry,
+    # type}. Empty + previewable=false = unsupported.
     previewable: bool = False
     preview_type: str | None = None
     preview_candidates: list[PreviewCandidate] = Field(default_factory=list)
+    # PR6: objective signals measured on the workspace before judging
+    # (``<artifact>/analysis.json``). None when the evaluator ran without
+    # signal collection or the report is unreadable.
+    analysis: AnalysisReport | None = None
 
 
 class RubricVersionOut(BaseModel):
@@ -186,6 +201,30 @@ class ScoreOut(BaseModel):
     score: float
     rationale: str
     created_at: datetime
+
+
+def _load_analysis(jail: Path, sandbox: Sandbox) -> AnalysisReport | None:
+    """Read ``<artifact>/analysis.json`` (PR6), jailed + schema-validated.
+
+    Returns None when the report is absent, outside the artifact jail, or
+    doesn't validate — analysis is best-effort extra detail, never a 500.
+    """
+    if not sandbox.artifact_path:
+        return None
+    try:
+        path = (Path(sandbox.artifact_path) / ANALYSIS_JSON_FILENAME).resolve()
+    except OSError:
+        return None
+    if not (path == jail or jail in path.parents):
+        return None
+    try:
+        if not path.is_file():
+            return None
+        return AnalysisReport.model_validate_json(
+            path.read_text(encoding="utf-8", errors="replace")
+        )
+    except Exception:  # noqa: BLE001 — unreadable/invalid report -> absent
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -333,17 +372,19 @@ def get_run_results(
         artifacts_by_sandbox.setdefault(art.sandbox_id, []).append(art)
 
     jail = _artifact_jail()
+    scan_ttl = get_settings().PREVIEW_SCAN_TTL_SECONDS
     results: list[SandboxResult] = []
     for sb in sandboxes:
-        # F12: cheap FS probe so the UI only offers Preview when the snapshot
-        # workspace actually has a detectable entry point.
-        ws = resolve_workspace_dir(
+        # F12: FS probe so the UI only offers Preview when the snapshot
+        # workspace actually has a detectable entry point — cached per
+        # sandbox for PREVIEW_SCAN_TTL_SECONDS.
+        scan = _scan_cache.scan(
             jail=jail,
             run_id=str(run_id),
             sandbox_id=str(sb.id),
             artifact_path=sb.artifact_path,
+            ttl_seconds=scan_ttl,
         )
-        scan = scan_preview(ws) if ws is not None else None
         plan = scan.plan if scan is not None else None
         dimensions: dict[str, DimensionScore] = {}
         overall: DimensionScore | None = None
@@ -387,6 +428,7 @@ def get_run_results(
                     if scan is not None
                     else []
                 ),
+                analysis=_load_analysis(jail, sb),
             )
         )
 
