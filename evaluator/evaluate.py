@@ -17,8 +17,9 @@ What it does:
    (i.e. ``data/eval``), a sibling of the artifact store so it lives on the
    same host-visible mount. Contents: a copy of the artifact ``workspace/``
    (the candidate repo) plus ``rubric.json`` (frozen rubric),
-   ``EVAL_PROMPT.md`` (judge brief), and ``EVAL_TRANSCRIPT.log`` when a
-   transcript exists.
+   ``EVAL_PROMPT.md`` (judge brief), ``ANALYSIS.md``/``analysis.json``
+   (measured signals, PR6), and ``EVAL_TRANSCRIPT.log`` when a transcript
+   exists.
 2. Spawns a miniloop sandbox (``heg-sandbox:latest`` on the egress-locked
    ``heg-sandbox`` network) with the run-scoped gateway cred, the evaluator
    model, and a judge TASK_PROMPT. The agent reads the rubric + files and

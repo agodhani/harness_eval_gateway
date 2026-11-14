@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from scoring.models import AnalysisReport, SignalReport
 
-#: Filename staged into the eval workspace (and written alongside
-#: ``analysis.json`` in the artifact dir).
+#: Filename staged into the eval workspace (judge-facing only — only
+#: ``analysis.json`` is persisted to the artifact dir).
 ANALYSIS_MD_FILENAME = "ANALYSIS.md"
 #: Machine-readable report filename.
 ANALYSIS_JSON_FILENAME = "analysis.json"

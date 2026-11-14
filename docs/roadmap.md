@@ -25,6 +25,7 @@ append-mostly; rebase on main before merge.
   ids: `particle-ai/particle-1:free`, `inclusionai/ling-3.2-flash:free`,
   `dots-studio/dots-3-note-preview:free`. Mandatory-reasoning models (ernie,
   lfm) 400 on miniloop's `reasoning_effort:"none"`.
+- **PR6 — static-analysis signals** (`scoring/` package, see below).
 
 ## Dependency DAG
 
@@ -50,14 +51,16 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR2, PR5, PR6, PR9, PR11, PR12,
-  PR15, PR19 — plus PR13/PR17 if soft-only deps are acceptable.
-- **Depth 1:** PR3 (←2), PR7 (←6, +5 soft), PR10 (←9), PR14 (←1, +12 soft),
+- **Depth 0 (start immediately):** PR1, PR2, PR5, PR9, PR11, PR12,
+  PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
+  PR13/PR17 if soft-only deps are acceptable.
+- **Depth 1:** PR3 (←2), PR10 (←9), PR14 (←1, +12 soft),
   PR16 (←15), PR18 (←12).
 - **Depth 2:** PR4 (←3), PR8 (←7).
 - **Floating:** PR20 (soft ←15).
 
-Critical path depth = 3 (`6→7→8` / `2→3→4`). Max safe concurrency ≈ 9 lanes.
+Critical path depth = 2 remaining (`7→8`, `2→3→4`; was 3 via `6→7→8` before
+PR6 landed). Max safe concurrency ≈ 9 lanes.
 
 ## Shared-file hotspots (merge-conflict risk)
 
@@ -126,12 +129,11 @@ Critical path depth = 3 (`6→7→8` / `2→3→4`). Max safe concurrency ≈ 9 
 - **Verify:** `tests/unit/evaluator/`, orchestrator unit tests; re-score on a
   stored run end-to-end.
 
-### PR6 — Objective scoring I: static analysis
-- **Scope:** real cyclomatic complexity + static metrics as rubric signals
-  (today LLM-assessed). No code execution — parse/analyze only.
-- **Touch:** new module (e.g. `evaluator/analysis/` or `scoring/`),
-  `evaluator/evaluate.py` wiring, `api/schemas.py` score payloads.
-- **Verify:** unit tests on sample workspaces with known complexity.
+### PR6 — Objective scoring I: static analysis — ✅ landed
+Landed as the `scoring/` collector registry (lizard, parse-only): the
+evaluator stages `ANALYSIS.md`/`analysis.json` judge evidence, persists
+`<artifact>/analysis.json`, emits an `eval_analysis` checkpoint, and the
+results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 
 ### PR7 — Objective scoring II: exec + coverage
 - **Scope:** execute candidate code in a locked sandbox — build success,
