@@ -74,6 +74,7 @@ export default function RunsPage() {
     <main className="container">
       <div className="page-header">
         <div>
+          <span className="kicker"><b>01</b> — run index</span>
           <h1>Runs</h1>
           <p className="subtitle">Every evaluation submission, newest first.</p>
         </div>

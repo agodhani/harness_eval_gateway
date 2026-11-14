@@ -14,6 +14,6 @@ test.describe("smoke", () => {
 
     const heading = page.getByRole("heading", { level: 1 });
     await expect(heading).toContainText("harness_eval_gateway");
-    await expect(heading).toContainText("MVP scaffold");
+    await expect(heading).toContainText("harness");
   });
 });

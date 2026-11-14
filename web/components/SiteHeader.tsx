@@ -78,6 +78,9 @@ export default function SiteHeader() {
     <header className="site-header">
       <div className="site-header__inner">
         <Link href="/" className="site-header__brand">
+          <span className="brand-mark" aria-hidden>
+            H
+          </span>
           harness_eval_gateway
         </Link>
         {/* usePathname is URL data — streams in behind Suspense on dynamic

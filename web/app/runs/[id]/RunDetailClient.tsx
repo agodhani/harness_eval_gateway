@@ -13,14 +13,17 @@ import {
   ApiError,
   approveRun,
   getRun,
+  getRunResults,
   TERMINAL_RUN_STATUSES,
   updateRubric,
   type HarnessConfig,
   type RubricContent,
   type RubricOut,
   type RunOut,
+  type RunResults,
 } from "@/lib/api";
 import { formatTs, shortId, truncate } from "@/lib/format";
+import RunConsoleLive from "@/components/RunConsoleLive";
 import {
   Badge,
   Card,
@@ -42,6 +45,12 @@ function errMsg(err: unknown, fallback: string): string {
 
 function isTerminal(status: string): boolean {
   return TERMINAL_RUN_STATUSES.includes(status);
+}
+
+function scoreTone(score: number): "good" | "mid" | "bad" {
+  if (score >= 8) return "good";
+  if (score >= 5) return "mid";
+  return "bad";
 }
 
 // ---------------------------------------------------------------------------
@@ -76,11 +85,35 @@ function ConfigSummary({ configs }: { configs: HarnessConfig[] }) {
   );
 }
 
-function RubricView({ rubric }: { rubric: RubricOut }) {
+function RubricView({
+  rubric,
+  results,
+  runId,
+}: {
+  rubric: RubricOut;
+  results: RunResults | null;
+  runId: string;
+}) {
   const content = rubric.content ?? {};
   const dims = content.dimensions ?? [];
   const criteria = content.criteria ?? [];
   const [showCriteria, setShowCriteria] = useState(false);
+  const scored = results?.sandboxes ?? [];
+  const hasScores = scored.length > 0;
+  const anyOverall = scored.some((s) => s.overall);
+
+  function scoreCell(sb: RunResults["sandboxes"][number], dim: string) {
+    const entry = sb.dimensions?.[dim];
+    if (!entry) return <span className="score-na">—</span>;
+    return (
+      <span
+        className={`score-value score-value--${scoreTone(entry.score)}`}
+        title={entry.rationale || undefined}
+      >
+        {entry.score}
+      </span>
+    );
+  }
 
   return (
     <div className="stack">
@@ -93,9 +126,58 @@ function RubricView({ rubric }: { rubric: RubricOut }) {
                 <th>Dimension</th>
                 <th>Scale</th>
                 <th>Description</th>
+                {scored.map((sb) => (
+                  <th
+                    key={sb.sandbox_id}
+                    className="num"
+                    style={{ whiteSpace: "nowrap", fontWeight: 500 }}
+                  >
+                    <Link
+                      href={`/runs/${runId}/timeline?sandbox=${sb.sandbox_id}`}
+                      className="mono"
+                      title={sb.sandbox_id}
+                      style={{ fontSize: "0.72rem" }}
+                    >
+                      {shortId(sb.sandbox_id)}
+                    </Link>
+                    <div className="faint" style={{ fontSize: "0.66rem", fontWeight: 400 }}>
+                      {String(sb.harness_config?.adapter ?? sb.harness_config?.harness ?? "?")}
+                    </div>
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
+              {hasScores && anyOverall ? (
+                <tr className="row-overall">
+                  <td>
+                    <div className="mono" style={{ fontSize: "0.8rem", fontWeight: 600 }}>
+                      overall
+                    </div>
+                    <div className="faint" style={{ fontSize: "0.78rem" }}>
+                      judge-reported aggregate
+                    </div>
+                  </td>
+                  <td className="num faint">—</td>
+                  <td className="muted" style={{ fontSize: "0.82rem" }}>
+                    evaluator aggregate score
+                  </td>
+                  {scored.map((sb) => (
+                    <td key={sb.sandbox_id} className="num">
+                      {sb.overall ? (
+                        <span
+                          className={`score-value score-value--${scoreTone(sb.overall.score)}`}
+                          title={sb.overall.rationale || undefined}
+                        >
+                          {sb.overall.score}
+                        </span>
+                      ) : (
+                        <span className="score-na">—</span>
+                      )}
+                    </td>
+                  ))}
+                </tr>
+              ) : null}
               {dims.map((d, i) => (
                 <tr key={i}>
                   <td>
@@ -113,6 +195,11 @@ function RubricView({ rubric }: { rubric: RubricOut }) {
                   <td className="muted" style={{ fontSize: "0.82rem" }}>
                     {d.description ?? "—"}
                   </td>
+                  {scored.map((sb) => (
+                    <td key={sb.sandbox_id} className="num">
+                      {scoreCell(sb, d.name ?? "")}
+                    </td>
+                  ))}
                 </tr>
               ))}
             </tbody>
@@ -169,6 +256,9 @@ export default function RunDetailClient({ runId }: { runId: string }) {
   const [rubricBusy, setRubricBusy] = useState(false);
   const [rubricError, setRubricError] = useState<string | null>(null);
 
+  // evaluator scores for the rubric table (null until results endpoint has data)
+  const [results, setResults] = useState<RunResults | null>(null);
+
   const refresh = useCallback(
     async (silent = true) => {
       try {
@@ -210,6 +300,28 @@ export default function RunDetailClient({ runId }: { runId: string }) {
     }, POLL_MS);
     return () => clearInterval(t);
   }, [status, refresh]);
+
+  // Fetch evaluator scores once the run reaches evaluating/done/failed; poll
+  // while evaluating so per-dimension scores stream into the rubric table.
+  useEffect(() => {
+    if (!["evaluating", "done", "failed"].includes(status)) return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const r = await getRunResults(runId);
+        if (!cancelled) setResults(r);
+      } catch {
+        // results 404s until the evaluator lane lands — keep table scoreless
+      }
+    };
+    void load();
+    if (status !== "evaluating") return () => { cancelled = true; };
+    const t = setInterval(load, 6_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [runId, status]);
 
   const rubric = run?.rubric ?? null;
   const rubricEditable =
@@ -309,6 +421,7 @@ export default function RunDetailClient({ runId }: { runId: string }) {
     <main className="container">
       <div className="page-header">
         <div>
+          <span className="kicker"><b>02</b> — run detail</span>
           <div className="row" style={{ marginBottom: "0.35rem" }}>
             <h1 className="mono" style={{ fontSize: "1.15rem" }} title={run.id}>
               {shortId(run.id, 13)}…
@@ -435,6 +548,8 @@ export default function RunDetailClient({ runId }: { runId: string }) {
           </Card>
         </div>
 
+        <RunConsoleLive run={run} />
+
         <Card
           title={
             <span className="row" style={{ gap: "0.5rem" }}>
@@ -523,7 +638,7 @@ export default function RunDetailClient({ runId }: { runId: string }) {
               {rubricError ? <ErrorNote>{rubricError}</ErrorNote> : null}
             </div>
           ) : (
-            <RubricView rubric={rubric} />
+            <RubricView rubric={rubric} results={results} runId={run.id} />
           )}
           {rubricError && !editing ? <ErrorNote>{rubricError}</ErrorNote> : null}
         </Card>

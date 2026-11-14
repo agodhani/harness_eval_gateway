@@ -271,6 +271,7 @@ export default function ResultsClient({ runId }: { runId: string }) {
     <main className="container">
       <div className="page-header">
         <div>
+          <span className="kicker"><b>04</b> — score matrix · artifacts</span>
           <div className="row" style={{ marginBottom: "0.3rem" }}>
             <h1>Results</h1>
             <span className="mono faint" title={runId}>

@@ -379,6 +379,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
     <main className="container" style={{ maxWidth: "1280px" }}>
       <div className="page-header">
         <div>
+          <span className="kicker"><b>03</b> — event stream · append-only</span>
           <div className="row" style={{ marginBottom: "0.3rem" }}>
             <h1>Timeline</h1>
             <span className="mono faint" title={runId}>
@@ -515,7 +516,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
                     <span className="tl-src">
                       <Badge tone={sourceTone(ev.source)}>{ev.source}</Badge>
                     </span>
-                    <span className="tl-type">{ev.type}</span>
+                    <span className="tl-type" data-type={ev.type}>{ev.type}</span>
                     {ev.sandbox_id ? (
                       <span className="tl-sandbox" title={ev.sandbox_id}>
                         {shortId(ev.sandbox_id)}

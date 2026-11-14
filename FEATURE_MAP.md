@@ -38,6 +38,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Where:** `docker-compose.yml`, `Dockerfile`, `db/migrations/`,
   `pyproject.toml`, `.github/workflows/ci.yml`, `web/playwright.config.ts`,
   `web/e2e/smoke.spec.ts`, `tests/`
+- **Theme:** `web/app/globals.css` — dark "instrument panel" tokens
+  (near-black surfaces, hairline borders, signal-lime `--accent`, mono
+  kickers, square badges, per-event-type colors via `.tl-type[data-type]`).
+  The `/` landing page is a marketing-style long scroll:
+  `web/app/landing.css` + `web/components/landing/*` (scripted run-console
+  replay in `web/lib/sim.ts`), plain CSS, no framework.
 - **Verify:**
   - `docker compose up -d` → `curl localhost:8001/health` + `/health/db` ok
   - `DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5433/harness_eval alembic upgrade head` → all tables present
@@ -153,10 +159,15 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   query w/ filters+pagination, SSE tail) + timeline UI both landed.
 - **Where:** `api/routers/events.py`, `api/schemas.py` (EventSource/EventType
   enums), db `events`, `web/app/runs/[id]/timeline/`
+- **Run-detail console:** `web/components/RunConsoleLive.tsx` — per-sandbox
+  event lanes on the run detail page (backlog + SSE + `after_id` poll, same
+  merge as the timeline; evaluator/orchestrator traffic routed to a bottom
+  lane). Shares the `evc-*` stylesheet in `globals.css` with the landing
+  replay console.
 - **Verify:**
   - Unit: `tests/unit/api/test_events.py` + `test_event_types.py` (13+ tests)
   - Live: SSE verified via curl; M2 events persisted
-  - UI: run → timeline page shows live events
+  - UI: run → timeline page shows live events; run detail shows live lanes
 - **Depends on:** F0 (ingestion slice unblocks F3)
 
 ### F7 — Evaluator sandbox ✅
@@ -184,7 +195,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 - **What:** run list; per-run matrix (sandbox × rubric dimension); score +
   rationale view; link to timeline replay; artifact download; flag when
-  evaluator model == participant model.
+  evaluator model == participant model. The run-detail rubric table also
+  renders per-sandbox score columns + an `overall` row once results exist
+  (`RunDetailClient.tsx` `RubricView` + `getRunResults` poll while
+  `evaluating`).
 - **Where:** `web/app/runs/` (list, detail, `results/`), results components,
   `api/routers/results.py` (results + scores + artifact-download endpoints)
 - **Verify:**
