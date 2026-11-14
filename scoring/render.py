@@ -3,8 +3,8 @@ markdown brief staged into the eval workspace next to ``rubric.json``.
 
 Compact tables a small judge model can parse; the full machine-readable
 detail stays in ``analysis.json``. Sections are emitted per signal
-collector — currently the static-analysis roll-up; PR7's exec signals add
-their own block here via the ``metrics`` table.
+collector — the static-analysis roll-up plus PR7's exec block (build/test/
+coverage measured in the locked ``heg-exec`` container).
 """
 
 from __future__ import annotations
@@ -93,8 +93,56 @@ def _render_static(sig: SignalReport) -> list[str]:
     return lines
 
 
+def _render_exec(sig: SignalReport) -> list[str]:
+    """PR7 exec block — build/test/coverage measured in the locked container."""
+    m = sig.metrics
+    lines = [
+        "## Executed checks (sandboxed — no network, resource-capped)",
+        "",
+    ]
+
+    build_ok = m.get("build_ok")
+    if build_ok is None:
+        lines.append("- Build (byte-compile): not run")
+    elif m.get("build_timed_out"):
+        lines.append("- Build (byte-compile): **TIMED OUT**")
+    else:
+        lines.append(
+            f"- Build (byte-compile): **{'ok' if build_ok else 'FAILED'}**"
+            + ("" if build_ok else f" (exit {m.get('build_exit_code')})")
+        )
+
+    if not m.get("tests_detected"):
+        lines.append("- Tests: none detected")
+    else:
+        tests_line = (
+            f"- Tests: **{m.get('tests_passed', 0)} passed** /"
+            f" {m.get('tests_failed', 0)} failed /"
+            f" {m.get('tests_errors', 0)} errors /"
+            f" {m.get('tests_skipped', 0)} skipped"
+            f" (collected {m.get('tests_collected', 0)}"
+            f" in {m.get('test_duration_seconds') or 0:g}s"
+            f" from {m.get('test_files', 0)} test file(s))"
+        )
+        if m.get("timed_out"):
+            tests_line += " — exec container timed out"
+        lines.append(tests_line)
+
+    cov = m.get("coverage_percent")
+    if cov is None:
+        lines.append("- Coverage: not measured")
+    else:
+        lines.append(
+            f"- Coverage: **{cov}%**"
+            f" ({m.get('coverage_covered', '?')}/{m.get('coverage_statements', '?')}"
+            " statements)"
+        )
+    lines.append("")
+    return lines
+
+
 def _render_generic(sig: SignalReport) -> list[str]:
-    """Fallback block for collectors without a custom section (PR7 exec)."""
+    """Fallback block for collectors without a custom section."""
     lines = [f"## Signal: {sig.name} ({sig.status})", ""]
     scalars = {k: v for k, v in sig.metrics.items() if isinstance(v, (int, float, str, bool))}
     if scalars:
@@ -109,12 +157,24 @@ def _render_generic(sig: SignalReport) -> list[str]:
 
 def render_analysis_markdown(report: AnalysisReport) -> str:
     """``ANALYSIS.md`` body for one sandbox workspace."""
-    intro = (
-        "Measured by the evaluator before judging — **parse-only static"
-        " analysis, no code was executed**. Use these values (especially"
-        " cyclomatic complexity) as evidence; `analysis.json` holds the"
-        " machine-readable form."
+    has_exec = any(
+        s.name == "exec" and s.status == "ok" for s in report.signals
     )
+    if has_exec:
+        intro = (
+            "Measured by the evaluator before judging. Static analysis is"
+            " **parse-only**; the executed checks below ran the submission's"
+            " build/tests inside a **locked sandbox container** (no network,"
+            " resource-capped, artifact mounted read-only). Use these values"
+            " as evidence — `analysis.json` holds the machine-readable form."
+        )
+    else:
+        intro = (
+            "Measured by the evaluator before judging — **parse-only static"
+            " analysis, no code was executed**. Use these values (especially"
+            " cyclomatic complexity) as evidence; `analysis.json` holds the"
+            " machine-readable form."
+        )
     lines = [
         "# Objective workspace analysis",
         "",
@@ -131,6 +191,8 @@ def render_analysis_markdown(report: AnalysisReport) -> str:
                 lines += [f"Collector failed: {sig.error}", ""]
         elif sig.name == "static_analysis":
             lines += _render_static(sig)
+        elif sig.name == "exec":
+            lines += _render_exec(sig)
         else:
             lines += _render_generic(sig)
         for w in sig.warnings[:10]:

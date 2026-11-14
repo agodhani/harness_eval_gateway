@@ -5,11 +5,13 @@ returns a :class:`~scoring.models.SignalReport`. ``collect_signals`` runs
 every registered collector and bundles the reports into an
 :class:`~scoring.models.AnalysisReport` — the ``analysis.json`` contract.
 
-PR7 adds exec-derived signals (build success, test pass, coverage) by
-appending another collector to :data:`COLLECTORS` — the report envelope,
-``analysis.json``, the ``eval_analysis`` event, and the results payload all
-stay unchanged. Collectors are isolated: one raising yields a
-``status="error"`` report instead of breaking the bundle.
+PR7 landed the exec-derived signals (build success, test pass, coverage) as
+``ExecSandboxCollector`` — appended to :data:`COLLECTORS`. The report
+envelope, ``analysis.json``, the ``eval_analysis`` event, and the results
+payload all stay unchanged; the exec signal self-skips when disabled
+(``SCORING_EXEC=0``), when the workspace has no python sources, or when no
+docker daemon/exec image is available. Collectors are isolated: one raising
+yields a ``status="error"`` report instead of breaking the bundle.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import logging
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from scoring.exec import ExecSandboxCollector
 from scoring.models import AnalysisReport, SignalReport
 from scoring.static import StaticAnalysisCollector
 
@@ -44,10 +47,12 @@ class SignalCollector(Protocol):
         ...
 
 
-#: Default collector set, in report order. PR7 appends its exec collector
-#: here; callers needing a different set pass ``collectors=`` explicitly.
+#: Default collector set, in report order. Callers needing a different set
+#: pass ``collectors=`` explicitly (unit tests do — the exec collector would
+#: otherwise spawn containers).
 COLLECTORS: tuple[SignalCollector, ...] = (
     StaticAnalysisCollector(),
+    ExecSandboxCollector(),
 )
 
 

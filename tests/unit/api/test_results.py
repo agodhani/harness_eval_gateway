@@ -242,6 +242,85 @@ def test_run_results_includes_analysis(
     assert sb2["analysis"] is None
 
 
+def test_run_results_exec_summary(
+    client: TestClient, scored_run, session_factory, artifact_root
+) -> None:
+    """PR7: the flat `exec` field is derived from the analysis exec signal."""
+    payload = json.loads(json.dumps(ANALYSIS_JSON))
+    payload["signals"].append(
+        {
+            "name": "exec",
+            "status": "ok",
+            "metrics": {
+                "build_ok": True,
+                "tests_detected": True,
+                "tests_ok": True,
+                "tests_collected": 5,
+                "tests_passed": 5,
+                "tests_failed": 0,
+                "tests_errors": 0,
+                "tests_skipped": 1,
+                "coverage_percent": 82.5,
+                "timed_out": False,
+                "duration_seconds": 9.4,
+            },
+            "warnings": [],
+            "error": None,
+        }
+    )
+    art_dir = artifact_root / "x" / "y"
+    art_dir.mkdir(parents=True)
+    (art_dir / "analysis.json").write_text(json.dumps(payload))
+    _set_artifact_path(session_factory, scored_run["sb1"], str(art_dir))
+
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb1 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"])
+    )
+    ex = sb1["exec"]
+    assert ex["status"] == "ok"
+    assert ex["build_ok"] is True
+    assert ex["tests_detected"] is True
+    assert ex["tests_passed"] == 5
+    assert ex["tests_skipped"] == 1
+    assert ex["coverage_percent"] == 82.5
+    assert ex["timed_out"] is False
+    # no artifact -> no analysis -> no exec summary
+    sb2 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"])
+    )
+    assert sb2["exec"] is None
+
+
+def test_run_results_exec_summary_skipped(
+    client: TestClient, scored_run, session_factory, artifact_root
+) -> None:
+    """A skipped exec signal surfaces its status + reason, not zeros."""
+    payload = json.loads(json.dumps(ANALYSIS_JSON))
+    payload["signals"].append(
+        {
+            "name": "exec",
+            "status": "skipped",
+            "metrics": {},
+            "warnings": ["exec scoring disabled (SCORING_EXEC=0)"],
+            "error": None,
+        }
+    )
+    art_dir = artifact_root / "x" / "y"
+    art_dir.mkdir(parents=True)
+    (art_dir / "analysis.json").write_text(json.dumps(payload))
+    _set_artifact_path(session_factory, scored_run["sb1"], str(art_dir))
+
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb1 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"])
+    )
+    assert sb1["exec"]["status"] == "skipped"
+    assert "SCORING_EXEC" in (sb1["exec"]["detail"] or "")
+
+
 def test_run_results_invalid_analysis_is_null(
     client: TestClient, scored_run, session_factory, artifact_root
 ) -> None:
