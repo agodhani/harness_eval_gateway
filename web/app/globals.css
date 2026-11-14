@@ -1110,6 +1110,136 @@ table.table {
   background: var(--surface);
 }
 
+/* PR10 — split-view trace comparison */
+
+/* merged/split toggle — segmented control at the toolbar's left edge */
+.tl-viewtoggle {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  flex-shrink: 0;
+}
+.tl-viewtoggle button {
+  padding: 0.3rem 0.75rem;
+  background: transparent;
+  border: 0;
+  font-family: var(--mono);
+  font-size: 0.64rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.tl-viewtoggle button + button {
+  border-left: 1px solid var(--border-strong);
+}
+.tl-viewtoggle button:hover {
+  color: var(--text);
+}
+.tl-viewtoggle button.is-active {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+/* day separator — shared by merged rows and split rows */
+.tl-day {
+  padding: 0.4rem 0.8rem 0.1rem;
+  color: var(--text-faint);
+  font-size: 0.72rem;
+  font-family: var(--mono);
+}
+
+/* sticky lane header inside the scroll container — pickers + status + count */
+.tl-lanes {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+.tl-lane {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.6rem;
+  min-width: 0;
+}
+.tl-lane + .tl-lane {
+  border-left: 1px solid var(--border);
+}
+.tl-lane__tag {
+  font-family: var(--mono);
+  font-size: 0.58rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+.tl-lane__select {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0.22rem 1.4rem 0.22rem 0.45rem;
+  font-size: 0.68rem;
+  border-color: var(--border);
+  background-color: var(--bg);
+}
+.tl-lane__label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.68rem;
+  color: var(--text-faint);
+}
+.tl-lane__count {
+  font-family: var(--mono);
+  font-size: 0.64rem;
+  color: var(--text-faint);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* two-column event rows — one event per row, in its lane's cell */
+.tl-srow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  /* the separator lives on the row-pair so it spans both cells even when
+     only one lane has an event at this point */
+  border-bottom: 1px solid var(--border);
+}
+.tl-scell {
+  min-width: 0;
+}
+.tl-scell + .tl-scell {
+  border-left: 1px solid var(--border);
+}
+.tl-scell .tl-row {
+  padding-left: 0.6rem;
+  padding-right: 0.6rem;
+  border-bottom: 0;
+}
+/* lane cells drop the event-id column — the lane header identifies it */
+.tl-scell .tl-id {
+  display: none;
+}
+.tl-scell .tl-payload {
+  padding-left: 0.8rem;
+}
+
+/* footer strip inside the sticky lane header explaining shared rows */
+.tl-lanes-note {
+  grid-column: 1 / -1;
+  padding: 0.25rem 0.8rem;
+  border-top: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+}
+
 /* filter chips row under toolbar */
 .filter-bar {
   display: flex;

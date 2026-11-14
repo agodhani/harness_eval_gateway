@@ -158,18 +158,42 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   stream; UI timeline page — live during run, replayable after with
   timestamps. API side (`api/routers/events.py`: ingest batch/single,
   query w/ filters+pagination, SSE tail) + timeline UI both landed.
+  **Split view (PR10):** a `merged | split` toggle in the toolbar switches
+  the stream to two sandbox lanes — side-by-side, time-aligned event
+  streams for comparison. Design: ONE scroll container renders a merged
+  `(ts, id)` ordering of both lanes' events as two-column rows (an event
+  fills only its lane's cell; the other stays empty), so synchronized
+  scroll + time alignment are structural — no scroll mirroring. A sticky
+  lane header holds per-lane sandbox pickers (labels from analytics,
+  status badge, per-lane event count); picking the id already in the
+  other lane swaps them. Run-level (`sandbox_id` null) and non-lane
+  sandbox events render as full-width shared rows. Lanes seed from
+  `?view=split&left=&right=` URL params, else auto-default to the first
+  two discovered sandboxes (never overwriting an explicit pick); the
+  sandbox filter dropdown is merged-only — in split mode the PR9 metrics
+  chips assign lanes instead (occupant clears, new id fills first empty
+  lane else replaces right). Row rendering is shared via `EventRow.tsx`
+  (same `.tl-*` markup + per-type colors as merged).
 - **Where:** `api/routers/events.py`, `api/schemas.py` (EventSource/EventType
-  enums), db `events`, `web/app/runs/[id]/timeline/` (`TimelineClient.tsx` +
-  `SandboxMetricsBar.tsx` — the PR9 metrics strip lives here; see F9)
+  enums), db `events`, `web/app/runs/[id]/timeline/` (`TimelineClient.tsx`,
+  `SandboxMetricsBar.tsx` — PR9 strip, `SplitTimeline.tsx` + `EventRow.tsx`
+  — PR10 split view, see F9), `web/lib/splitTimeline.ts` (`buildSplitRows`
+  merged-ordering transform, `pickLane`/`toggleLane`/`laneEventCounts`/
+  `defaultLanes`) + `splitTimeline.test.ts`
 - **Run-detail console:** `web/components/RunConsoleLive.tsx` — per-sandbox
   event lanes on the run detail page (backlog + SSE + `after_id` poll, same
   merge as the timeline; evaluator/orchestrator traffic routed to a bottom
   lane). Shares the `evc-*` stylesheet in `globals.css` with the landing
   replay console.
 - **Verify:**
-  - Unit: `tests/unit/api/test_events.py` + `test_event_types.py` (13+ tests)
+  - Unit: `tests/unit/api/test_events.py` + `test_event_types.py` (13+ tests);
+    `cd web && npm test` — `splitTimeline.test.ts` covers the merged
+    `(ts,id)` ordering (incl. the mixed fractional-seconds ts edge),
+    day markers, shared rows, lane counts, and all lane-selection rules
   - Live: SSE verified via curl; M2 events persisted
-  - UI: run → timeline page shows live events; run detail shows live lanes
+  - UI: run → timeline page shows live events; `split` toggle → two lanes
+    scroll in lockstep on one time axis, lane pickers swap on collision,
+    run-level rows span both columns; run detail shows live lanes
 - **Depends on:** F0 (ingestion slice unblocks F3)
 
 ### F7 — Evaluator sandbox ✅
@@ -250,10 +274,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   Timeline page (PR9) hosts the same numbers in-context: a per-sandbox
   metrics strip between the filter toolbar and the event stream — compact
   chips (turns · tokens in→out · avg latency · est. cost · errors, plus a
-  judge-traffic line once the evaluator runs). Chips double as
-  sandbox-filter selectors (same state as the toolbar dropdown, whose
-  options gain adapter labels), and the strip refreshes every 15s while the
-  run is non-terminal.
+  judge-traffic line once the evaluator runs). Chips double as sandbox
+  selectors: merged mode toggles the sandbox filter (same state as the
+  toolbar dropdown, whose options gain adapter labels); split mode (PR10)
+  assigns the sandbox to a comparison lane instead. The strip refreshes
+  every 15s while the run is non-terminal.
 - **Where:** `api/pricing.py`, `api/routers/analytics.py`, response schemas
   in `api/schemas.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx`,
   `web/lib/api.ts` (`getRunAnalytics`, `estimateCostUsd`),
@@ -268,7 +293,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - API: `curl localhost:8001/api/runs/<id>/analytics?price_model=gpt-4o`
   - UI: results page → "Analytics" card → switch price model → cost updates;
     timeline page → strip shows per-sandbox stats live → click a chip →
-    stream filters to that sandbox
+    stream filters to that sandbox (merged) / chip assigns a split lane
 - **Depends on:** F6 (events), F8 (results page)
 
 ### F10 — Multi-harness adapters ✅

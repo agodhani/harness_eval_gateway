@@ -271,9 +271,15 @@ or tests change.
   `web/app/runs/[id]/timeline/` (turns/tokens/latency/cost/errors chips +
   judge line; chips double as sandbox-filter selectors; 15s refresh while
   non-terminal). Leftover idea: on-event-hover cumulative stats.
-- Split-view trace comparison — side-by-side, time-aligned event streams for
-  two sandboxes on the traces/timeline page (today it's one merged stream
-  with a single-sandbox filter dropdown); scrolling/diff-alignment UX TBD
+- Split-view trace comparison — **landed (PR10)**: `merged | split` toggle
+  on `web/app/runs/[id]/timeline/`. Split renders two sandbox lanes on ONE
+  merged `(ts,id)` ordering inside a single scroll container — synchronized
+  scroll + time alignment are structural (no scroll mirroring); sticky lane
+  pickers (labels/status/count, swap-on-collision, `?view=split&left=&right=`
+  seeds), run-level + non-lane-sandbox events as full-width shared rows,
+  PR9 metrics chips assign lanes in split mode. Transform + tests:
+  `web/lib/splitTimeline.ts(.test.ts)`; shared row markup:
+  `timeline/EventRow.tsx`.
 - Lightweight artifact thumbnails — capture screenshots of produced artifacts
   for at-a-glance review before spawning a full live preview sandbox
 - Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.

@@ -11,6 +11,12 @@
  * Filters (source / type / sandbox) are client-side over the loaded window.
  * Rows expand to raw payload JSON; auto-scroll follows the tail unless the
  * user scrolls up ("jump to latest" appears instead).
+ *
+ * PR10 adds a merged/split view toggle: split renders two sandbox lanes on
+ * one merged `(ts, id)` ordering inside the same scroll container —
+ * synchronized scroll and time alignment by construction (see
+ * lib/splitTimeline.ts + SplitTimeline.tsx). The sandbox filter dropdown is
+ * merged-only; in split mode the lanes pick their own sandboxes.
  */
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
@@ -27,10 +33,20 @@ import {
   type EventOut,
   type RunAnalytics,
 } from "@/lib/api";
-import { formatTimeMs, shortId, truncate } from "@/lib/format";
+import { shortId } from "@/lib/format";
+import {
+  buildSplitRows,
+  laneEventCounts,
+  pickLane,
+  toggleLane,
+  type LaneSelection,
+  type LaneSide,
+} from "@/lib/splitTimeline";
 import { sandboxStrips } from "@/lib/timelineAnalytics";
-import { Badge, Card, EmptyState, ErrorNote, InfoNote, Loading, sourceTone, statusTone } from "@/components/ui";
+import { Badge, Card, EmptyState, ErrorNote, InfoNote, Loading, statusTone } from "@/components/ui";
+import { DayMarker, EventRow } from "./EventRow";
 import SandboxMetricsBar from "./SandboxMetricsBar";
+import SplitTimeline from "./SplitTimeline";
 
 const POLL_MS = 6_000;
 /** Metrics strip refresh — heavier query (server re-aggregates all events). */
@@ -38,153 +54,7 @@ const ANALYTICS_POLL_MS = 15_000;
 const MAX_EVENTS = 10_000;
 const STICK_THRESHOLD_PX = 90;
 
-// ---------------------------------------------------------------------------
-// payload summarizers — one-line human summaries per event type
-// ---------------------------------------------------------------------------
-
-function str(v: unknown): string {
-  return typeof v === "string" ? v : v == null ? "" : String(v);
-}
-
-function num(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? v : null;
-}
-
-function jpreview(v: unknown, max = 160): string {
-  if (v == null) return "";
-  let s: string;
-  try {
-    s = typeof v === "string" ? v : JSON.stringify(v);
-  } catch {
-    s = String(v);
-  }
-  s = s.replace(/\s+/g, " ").trim();
-  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
-}
-
-function kvPairs(payload: Record<string, unknown>, keys: string[]): string {
-  return keys
-    .filter((k) => payload[k] != null && payload[k] !== "")
-    .map((k) => `${k}=${jpreview(payload[k], 60)}`)
-    .join(" · ");
-}
-
-function summarize(ev: EventOut): React.ReactNode {
-  const p = ev.payload ?? {};
-  switch (ev.type) {
-    case "llm_request": {
-      const parts = [
-        p.model ? <code key="m">{str(p.model)}</code> : null,
-        num(p.message_count) != null ? `${p.message_count} msgs` : null,
-        num(p.tool_count) != null ? `${p.tool_count} tools` : null,
-      ].filter(Boolean);
-      return <>LLM request{parts.length ? <> · {parts}</> : null}</>;
-    }
-    case "llm_response": {
-      const usage = (p.usage ?? {}) as Record<string, unknown>;
-      const status = num(p.http_status);
-      const bad = status != null && status >= 400;
-      return (
-        <>
-          LLM response
-          {p.model ? <> · <code>{str(p.model)}</code></> : null}
-          {num(usage.prompt_tokens) != null || num(usage.completion_tokens) != null ? (
-            <>
-              {" · "}
-              <span className="mono">
-                {num(usage.prompt_tokens) ?? "?"}→{num(usage.completion_tokens) ?? "?"} tok
-              </span>
-            </>
-          ) : null}
-          {num(p.latency_ms) != null ? <> · {Math.round(num(p.latency_ms)!)}ms</> : null}
-          {status != null ? (
-            <> · <Badge tone={bad ? "red" : "green"}>HTTP {status}</Badge></>
-          ) : null}
-        </>
-      );
-    }
-    case "tool_call": {
-      const args = p.args;
-      const argStr = args && typeof args === "object" ? jpreview(args, 140) : "";
-      return (
-        <>
-          tool <code>{str(p.name) || "?"}</code>
-          {argStr ? <span className="cmd muted"> {argStr}</span> : null}
-        </>
-      );
-    }
-    case "shell_command": {
-      const code = num(p.exit_code);
-      const timedOut = p.timed_out === true;
-      return (
-        <>
-          <span className="cmd">$ {truncate(str(p.command) || "(no command)", 160)}</span>
-          {code != null ? (
-            <> · <Badge tone={code === 0 && !timedOut ? "green" : "red"}>exit {code}</Badge></>
-          ) : null}
-          {timedOut ? <Badge tone="amber">timed out</Badge> : null}
-          {num(p.duration_ms) != null ? <span className="faint"> {Math.round(num(p.duration_ms)!)}ms</span> : null}
-        </>
-      );
-    }
-    case "file_op": {
-      const bytes = num(p.bytes);
-      return (
-        <>
-          <span className="mono">{str(p.op) || "op"}</span>{" "}
-          <code>{str(p.path) || "?"}</code>
-          {bytes != null ? <span className="faint"> · {bytes} B</span> : null}
-        </>
-      );
-    }
-    case "checkpoint": {
-      const keys = ["phase", "stage", "iter", "prompt_tokens", "terminal_reason", "model"];
-      const s = kvPairs(p, keys) || jpreview(p, 120);
-      return <>checkpoint{s ? ` · ${s}` : ""}</>;
-    }
-    case "done_signal": {
-      return (
-        <>
-          <Badge tone={p.status === "success" ? "green" : "amber"}>{str(p.status) || "done"}</Badge>
-          {p.summary ? <span className="muted"> {truncate(str(p.summary), 140)}</span> : null}
-        </>
-      );
-    }
-    case "error": {
-      const detail = str(p.detail) || str(p.reason) || str(p.message) || jpreview(p, 120);
-      return (
-        <span style={{ color: "var(--red)" }}>
-          error{detail ? ` · ${truncate(detail, 160)}` : ""}
-        </span>
-      );
-    }
-    case "skill_invocation": {
-      return <>skill · <code>{str(p.skill ?? p.name ?? p.skill_name) || jpreview(p, 80)}</code></>;
-    }
-    case "test_execution": {
-      return (
-        <>
-          test{p.command ? <> · <span className="cmd">{truncate(str(p.command), 120)}</span></> : null}
-          {p.exit_code != null ? <> · exit {String(p.exit_code)}</> : null}
-        </>
-      );
-    }
-    case "run_started":
-    case "terminal_state":
-    case "context_compacted":
-    case "miniloop_result": {
-      const s = kvPairs(p, ["terminal_state", "status", "reason", "iter", "model", "phase"]);
-      return (
-        <>
-          {ev.type.replace(/_/g, " ")}
-          {s ? ` · ${s}` : p && Object.keys(p).length ? ` · ${jpreview(p, 120)}` : ""}
-        </>
-      );
-    }
-    default:
-      return <span className="muted">{jpreview(p, 140) || "—"}</span>;
-  }
-}
+type ViewMode = "merged" | "split";
 
 // ---------------------------------------------------------------------------
 // component
@@ -211,6 +81,20 @@ export default function TimelineClient({ runId }: { runId: string }) {
   const [filterType, setFilterType] = useState(() => searchParams.get("type") ?? "");
   const [filterSandbox, setFilterSandbox] = useState(() => searchParams.get("sandbox") ?? ""); // "" all | "__none__" run-level | uuid
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
+
+  // PR10 split view (?view=split, ?left=, ?right= seed the lanes). Once the
+  // user touches a lane (picker, chip, or an explicit URL pair) the auto-
+  // default effect below never overwrites their choice.
+  const [viewMode, setViewMode] = useState<ViewMode>(() =>
+    searchParams.get("view") === "split" ? "split" : "merged",
+  );
+  const [lanes, setLanes] = useState<LaneSelection>(() => ({
+    left: searchParams.get("left") ?? "",
+    right: searchParams.get("right") ?? "",
+  }));
+  const laneTouchedRef = useRef(
+    searchParams.get("left") != null && searchParams.get("right") != null,
+  );
 
   const loading = loadInfo?.forId !== runId;
   const fatalError = loadInfo?.forId === runId ? loadInfo.error : null;
@@ -369,12 +253,17 @@ export default function TimelineClient({ runId }: { runId: string }) {
       events.filter((e) => {
         if (filterSource && e.source !== filterSource) return false;
         if (filterType && e.type !== filterType) return false;
-        if (filterSandbox === "__none__" && e.sandbox_id !== null) return false;
-        if (filterSandbox && filterSandbox !== "__none__" && e.sandbox_id !== filterSandbox)
-          return false;
+        // The sandbox dropdown is a merged-view control — in split mode the
+        // lane pickers govern which sandboxes appear (their events stay in
+        // `filtered` so lane counts and shared rows see the full stream).
+        if (viewMode === "merged") {
+          if (filterSandbox === "__none__" && e.sandbox_id !== null) return false;
+          if (filterSandbox && filterSandbox !== "__none__" && e.sandbox_id !== filterSandbox)
+            return false;
+        }
         return true;
       }),
-    [events, filterSource, filterType, filterSandbox],
+    [events, filterSource, filterType, filterSandbox, viewMode],
   );
 
   // PR9 metrics strip data + adapter labels for the sandbox filter dropdown.
@@ -388,6 +277,90 @@ export default function TimelineClient({ runId }: { runId: string }) {
       m.set(sb.sandbox_id, sb.label);
     return m;
   }, [scopedAnalytics]);
+
+  // PR10 — split-view lanes. Default to the first two discovered sandboxes
+  // until the user picks explicitly (laneTouchedRef latches on first touch);
+  // the right lane never duplicates the left.
+  //
+  // Lanes are per-run: on client-side navigation to another run's timeline
+  // the component instance is reused, so re-seed from the URL and unlatch
+  // auto-default — foreign sandbox ids must not carry over.
+  const prevRunIdRef = useRef(runId);
+  useEffect(() => {
+    if (prevRunIdRef.current === runId) return;
+    prevRunIdRef.current = runId;
+    laneTouchedRef.current =
+      searchParams.get("left") != null && searchParams.get("right") != null;
+    setLanes({
+      left: searchParams.get("left") ?? "",
+      right: searchParams.get("right") ?? "",
+    });
+  }, [runId, searchParams]);
+
+  useEffect(() => {
+    if (laneTouchedRef.current || sandboxIds.length === 0) return;
+    setLanes((prev) => {
+      if (prev.left && prev.right) return prev;
+      const left = prev.left || sandboxIds[0];
+      const right = prev.right || sandboxIds.find((id) => id !== left) || "";
+      if (left === prev.left && right === prev.right) return prev;
+      return { left, right };
+    });
+  }, [sandboxIds]);
+
+  const splitRows = useMemo(
+    () => (viewMode === "split" ? buildSplitRows(filtered, lanes) : []),
+    [viewMode, filtered, lanes],
+  );
+  const splitCounts = useMemo(
+    () =>
+      viewMode === "split"
+        ? laneEventCounts(filtered, lanes)
+        : { left: 0, right: 0, shared: 0 },
+    [viewMode, filtered, lanes],
+  );
+  /** Chips active in the metrics strip: merged → the filtered sandbox;
+   * split → both lane occupants. */
+  const chipSelected = useMemo(() => {
+    if (viewMode === "split") {
+      const s = new Set<string>();
+      if (lanes.left) s.add(lanes.left);
+      if (lanes.right) s.add(lanes.right);
+      return s;
+    }
+    return new Set(
+      filterSandbox && filterSandbox !== "__none__" ? [filterSandbox] : [],
+    );
+  }, [viewMode, lanes, filterSandbox]);
+
+  function switchView(mode: ViewMode) {
+    setViewMode(mode);
+    // Carry a single-sandbox merged filter into the left lane as a starting
+    // point — existing lane picks are never overwritten, and the auto-
+    // default still fills whichever lane stays empty.
+    if (mode === "split" && filterSandbox && filterSandbox !== "__none__") {
+      setLanes((prev) => ({ ...prev, left: prev.left || filterSandbox }));
+    }
+  }
+
+  const onPickLane = useCallback((side: LaneSide, sandboxId: string) => {
+    laneTouchedRef.current = true;
+    setLanes((prev) => pickLane(prev, side, sandboxId));
+  }, []);
+
+  /** Metrics-chip click: merged → toggle the sandbox filter; split → lane
+   * assignment (occupant clears, new id fills first empty lane else right). */
+  const onChipSelect = useCallback(
+    (id: string) => {
+      if (viewMode === "split") {
+        laneTouchedRef.current = true;
+        setLanes((prev) => toggleLane(prev, id));
+      } else {
+        setFilterSandbox((cur) => (cur === id ? "" : id));
+      }
+    },
+    [viewMode],
+  );
 
   // ---- scroll behaviour --------------------------------------------------
 
@@ -474,6 +447,25 @@ export default function TimelineClient({ runId }: { runId: string }) {
 
       <Card className="card--flush">
         <div className="timeline-toolbar">
+          <div className="tl-viewtoggle" role="group" aria-label="Timeline view">
+            <button
+              type="button"
+              className={viewMode === "merged" ? "is-active" : ""}
+              onClick={() => switchView("merged")}
+              aria-pressed={viewMode === "merged"}
+            >
+              merged
+            </button>
+            <button
+              type="button"
+              className={viewMode === "split" ? "is-active" : ""}
+              onClick={() => switchView("split")}
+              aria-pressed={viewMode === "split"}
+              title="Two sandbox lanes on one time axis — pick lanes below or via the metrics chips"
+            >
+              split
+            </button>
+          </div>
           <select
             className="select"
             value={filterSource}
@@ -501,21 +493,23 @@ export default function TimelineClient({ runId }: { runId: string }) {
               </option>
             ))}
           </select>
-          <select
-            className="select"
-            value={filterSandbox}
-            onChange={(e) => setFilterSandbox(e.target.value)}
-            aria-label="Filter by sandbox"
-          >
-            <option value="">all sandboxes</option>
-            <option value="__none__">run-level (no sandbox)</option>
-            {sandboxIds.map((id) => (
-              <option key={id} value={id}>
-                sandbox {shortId(id)}
-                {sandboxLabels.get(id) ? ` — ${sandboxLabels.get(id)}` : ""}
-              </option>
-            ))}
-          </select>
+          {viewMode === "merged" ? (
+            <select
+              className="select"
+              value={filterSandbox}
+              onChange={(e) => setFilterSandbox(e.target.value)}
+              aria-label="Filter by sandbox"
+            >
+              <option value="">all sandboxes</option>
+              <option value="__none__">run-level (no sandbox)</option>
+              {sandboxIds.map((id) => (
+                <option key={id} value={id}>
+                  sandbox {shortId(id)}
+                  {sandboxLabels.get(id) ? ` — ${sandboxLabels.get(id)}` : ""}
+                </option>
+              ))}
+            </select>
+          ) : null}
           {(filterSource || filterType || filterSandbox) && (
             <button
               type="button"
@@ -537,10 +531,8 @@ export default function TimelineClient({ runId }: { runId: string }) {
 
         <SandboxMetricsBar
           strips={strips}
-          selected={filterSandbox}
-          onSelect={(id) =>
-            setFilterSandbox((cur) => (cur === id ? "" : id))
-          }
+          selectedIds={chipSelected}
+          onSelect={onChipSelect}
         />
 
         <div className="timeline-scroll" ref={scrollRef} onScroll={handleScroll}>
@@ -552,54 +544,31 @@ export default function TimelineClient({ runId }: { runId: string }) {
                 ? "No events yet — they appear here live as the run executes."
                 : "No events match the current filters."}
             </EmptyState>
+          ) : viewMode === "split" ? (
+            <SplitTimeline
+              rows={splitRows}
+              lanes={lanes}
+              sandboxIds={sandboxIds}
+              labels={sandboxLabels}
+              strips={strips}
+              counts={splitCounts}
+              expanded={expanded}
+              onToggle={toggleExpand}
+              onPickLane={onPickLane}
+            />
           ) : (
             filtered.map((ev, i) => {
-              const isOpen = expanded.has(ev.id);
               const prev = i > 0 ? filtered[i - 1] : null;
               const day = ev.ts.slice(5, 10); // MM-DD
               const newDay = !prev || prev.ts.slice(5, 10) !== day;
-              const isErr = ev.type === "error";
               return (
                 <div key={ev.id}>
-                  {newDay ? (
-                    <div className="tl-time" style={{ padding: "0.4rem 0.8rem 0.1rem", color: "var(--text-faint)", fontSize: "0.72rem" }}>
-                      — {day} —
-                    </div>
-                  ) : null}
-                  <div
-                    className={`tl-row${isOpen ? " tl-row--expanded" : ""}${isErr ? " tl-row--error" : ""}`}
-                    onClick={() => toggleExpand(ev.id)}
-                    role="button"
-                    tabIndex={0}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        toggleExpand(ev.id);
-                      }
-                    }}
-                    title={`event #${ev.id} · ${ev.ts}`}
-                  >
-                    <span className="tl-id">#{ev.id}</span>
-                    <span className="tl-time">{formatTimeMs(ev.ts)}</span>
-                    <span className="tl-src">
-                      <Badge tone={sourceTone(ev.source)}>{ev.source}</Badge>
-                    </span>
-                    <span className="tl-type" data-type={ev.type}>{ev.type}</span>
-                    {ev.sandbox_id ? (
-                      <span className="tl-sandbox" title={ev.sandbox_id}>
-                        {shortId(ev.sandbox_id)}
-                      </span>
-                    ) : (
-                      <span className="tl-sandbox faint">run</span>
-                    )}
-                    <span className="tl-summary">{summarize(ev)}</span>
-                    <span className="tl-expand-hint">{isOpen ? "▾" : "▸"}</span>
-                  </div>
-                  {isOpen ? (
-                    <div className="tl-payload">
-                      <pre>{JSON.stringify(ev.payload, null, 2)}</pre>
-                    </div>
-                  ) : null}
+                  {newDay ? <DayMarker day={day} /> : null}
+                  <EventRow
+                    ev={ev}
+                    expanded={expanded.has(ev.id)}
+                    onToggle={toggleExpand}
+                  />
                 </div>
               );
             })
@@ -616,6 +585,9 @@ export default function TimelineClient({ runId }: { runId: string }) {
       </Card>
 
       <p className="footer-note">
+        {viewMode === "split"
+          ? "Split view — both lanes share one time axis; run-level and other-sandbox events span both columns. "
+          : ""}
         Click a row for the raw payload · events are append-only — corrections
         arrive as new rows · timestamps are UTC.
       </p>
