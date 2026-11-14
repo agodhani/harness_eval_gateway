@@ -21,6 +21,7 @@ import {
   type RunOut,
 } from "@/lib/api";
 import { formatTs, shortId, truncate } from "@/lib/format";
+import RunConsoleLive from "@/components/RunConsoleLive";
 import {
   Badge,
   Card,
@@ -435,6 +436,8 @@ export default function RunDetailClient({ runId }: { runId: string }) {
             )}
           </Card>
         </div>
+
+        <RunConsoleLive run={run} />
 
         <Card
           title={

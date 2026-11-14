@@ -70,7 +70,7 @@ export default function Gateway() {
               <span className="lp-t-violet">.7f3a9c…</span>
             </div>
             <p>
-              HMAC-signed, scoped to one sandbox in one run. Traffic can't
+              HMAC-signed, scoped to one sandbox in one run. Traffic can’t
               impersonate a sibling — and a leaked cred attributes itself.
             </p>
           </Reveal>
@@ -88,7 +88,7 @@ export default function Gateway() {
               Cross a token or cost budget and the gateway answers{" "}
               <span className="mono-inline lp-t-warn">429</span> and writes the{" "}
               <span className="mono-inline lp-t-warn">budget_exceeded</span>{" "}
-              event itself — enforcement lives below the agent, where it can't
+              event itself — enforcement lives below the agent, where it can’t
               be argued with.
             </p>
           </Reveal>

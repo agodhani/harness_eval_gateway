@@ -89,8 +89,8 @@ export default function Pipeline() {
         {/* termination policy */}
         <div>
           <Reveal delay={120} className="lp-sticky">
-            <div className="lp-panel lp-ticks">
-              <span className="lp-tick-b" />
+            <div className="lp-panel ticks">
+              <span className="tick-b" />
               <div className="lp-cell__head">
                 <span className="kicker">termination policy</span>
               </div>

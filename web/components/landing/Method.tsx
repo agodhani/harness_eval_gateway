@@ -68,7 +68,7 @@ export default function Method() {
             <p>
               When sandbox <span className="mono-inline">a</span> scores 8.4 and
               sandbox <span className="mono-inline">b</span> scores 5.9 on the
-              same rubric, the model didn't change — the harness did. The delta
+              same rubric, the model didn’t change — the harness did. The delta
               is attributable.
             </p>
           </Reveal>

@@ -22,14 +22,14 @@ function fmtClock(ms: number) {
 }
 
 const TERMINAL_MOD: Record<string, string> = {
-  agent_done: "lp-lane__state--signal",
-  stuck_loop: "lp-lane__state--warn",
+  agent_done: "evc-lane__state--signal",
+  stuck_loop: "evc-lane__state--warn",
 };
 
 export default function RunConsole() {
   const [tick, setTick] = useState(0);
   const [cycle, setCycle] = useState(0);
-  const colRefs = [useRef<HTMLDivElement>(null), useRef<HTMLDivElement>(null)];
+  const colRefs = useRef(new Map<number, HTMLDivElement>());
   const evalRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -45,9 +45,8 @@ export default function RunConsole() {
   }, [tick]);
 
   useEffect(() => {
-    for (const r of colRefs) {
-      const el = r.current;
-      if (el) el.scrollTop = el.scrollHeight;
+    for (const el of colRefs.current.values()) {
+      el.scrollTop = el.scrollHeight;
     }
     const el = evalRef.current;
     if (el) el.scrollTop = el.scrollHeight;
@@ -58,61 +57,67 @@ export default function RunConsole() {
   const elapsed = Math.min(tick, TOTAL_TICKS) * TICK_MS;
 
   return (
-    <div className="lp-console lp-panel lp-ticks lp-sweep">
-      <span className="lp-tick-b" />
+    <div className="evc lp-panel ticks lp-sweep">
+      <span className="tick-b" />
       {/* console header */}
-      <div className="lp-console__head">
-        <span className="lp-console__run">
-          <span className="lp-dot lp-dot-live" />
+      <div className="evc__head">
+        <span className="evc__run">
+          <span className="evc-dot evc-dot-live" />
           RUN&nbsp;a58dd3de
         </span>
-        <span className="lp-console__meta">task — “replica of 2048”</span>
-        <span className="lp-console__meta">model — qwen3:8b</span>
-        <span className="lp-console__right">
+        <span className="evc__meta">task — “replica of 2048”</span>
+        <span className="evc__meta">model — qwen3:8b</span>
+        <span className="evc__right">
           <span>{fmtClock(elapsed)}</span>
           <span className="lp-t-signal">{results ? "evaluating" : "running"}</span>
         </span>
       </div>
 
       {/* sandbox lanes */}
-      <div className="lp-lanes">
+      <div className="evc-lanes">
         {SANDBOXES.map((sb, i) => {
           const sbEvents = events.filter((e) => e.sb === i);
           const toks = sbEvents.reduce((a, e) => a + (e.tok ?? 0), 0);
           const term = sbEvents.findLast((e) => e.type === "terminal_state");
           return (
-            <div key={sb.id} className="lp-lane">
-              <div className="lp-lane__head">
-                <span className="lp-lane__id">{sb.id}</span>
-                <span className="lp-lane__spec">
+            <div key={sb.id} className="evc-lane">
+              <div className="evc-lane__head">
+                <span className="evc-lane__id">{sb.id}</span>
+                <span className="evc-lane__spec">
                   {sb.adapter} · {sb.packs}
                 </span>
                 <span
-                  className={`lp-lane__state ${term ? TERMINAL_MOD[sb.terminal] : ""}`}
+                  className={`evc-lane__state ${term ? TERMINAL_MOD[sb.terminal] : ""}`}
                 >
                   {term ? sb.terminal : "exec"}
                 </span>
               </div>
-              <div ref={colRefs[i]} className="lp-lane__events">
+              <div
+                ref={(el) => {
+                  if (el) colRefs.current.set(i, el);
+                  else colRefs.current.delete(i);
+                }}
+                className="evc-lane__events"
+              >
                 {sbEvents.map((e: SimEvent, j) => (
-                  <div key={`${cycle}-${i}-${j}`} className="lp-ev lp-ev-line">
-                    <span className={`lp-ev__type ${TYPE_COLOR[e.type]}`}>
+                  <div key={`${cycle}-${i}-${j}`} className="evc-ev evc-line">
+                    <span className={`evc-ev__type ${TYPE_COLOR[e.type]}`}>
                       {e.type}
                     </span>
-                    <span className="lp-ev__text">{e.text}</span>
+                    <span className="evc-ev__text">{e.text}</span>
                     {e.tok ? (
-                      <span className="lp-ev__tok">{fmtTok(e.tok)} tok</span>
+                      <span className="evc-ev__tok">{fmtTok(e.tok)} tok</span>
                     ) : null}
                   </div>
                 ))}
                 {!term && sbEvents.length > 0 && (
-                  <span className="lp-caret lp-caret-block" />
+                  <span className="evc-caret evc-caret-block" />
                 )}
               </div>
-              <div className="lp-lane__foot">
+              <div className="evc-lane__foot">
                 <span>{fmtTok(toks)} tok</span>
                 <span>$0.00 ollama</span>
-                <span className="lp-lane__score">
+                <span className="evc-lane__score">
                   score{" "}
                   <b className={results ? "lp-t-signal" : "lp-t-faint"}>
                     {results ? sb.score.toFixed(1) : "—"}
@@ -125,20 +130,20 @@ export default function RunConsole() {
       </div>
 
       {/* evaluator lane */}
-      <div className="lp-eval">
-        <div className="lp-eval__head">
-          <span className="lp-eval__label">evaluator</span>
-          <span className="lp-eval__sub">sandboxed judge · rubric v1 frozen</span>
+      <div className="evc-eval">
+        <div className="evc-eval__head">
+          <span className="evc-eval__label">evaluator</span>
+          <span className="evc-eval__sub">sandboxed judge · rubric v1 frozen</span>
         </div>
-        <div ref={evalRef} className="lp-eval__events">
+        <div ref={evalRef} className="evc-eval__events">
           {events
             .filter((e) => e.sb === 2)
             .map((e, j) => (
-              <div key={`${cycle}-e-${j}`} className="lp-ev lp-ev-line">
-                <span className={`lp-ev__type ${TYPE_COLOR[e.type]}`}>
+              <div key={`${cycle}-e-${j}`} className="evc-ev evc-line">
+                <span className={`evc-ev__type ${TYPE_COLOR[e.type]}`}>
                   {e.type}
                 </span>
-                <span className="lp-ev__text">{e.text}</span>
+                <span className="evc-ev__text">{e.text}</span>
               </div>
             ))}
           {tick < RESULTS_AT && (

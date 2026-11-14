@@ -51,7 +51,7 @@ export default function Quickstart() {
               <span className="lp-t-dim">
                 submit a run — “replica of 2048”, 2 harnesses, 1 model
               </span>
-              <span className="lp-caret lp-caret-block" style={{ height: "0.9rem", width: "0.5rem" }} />
+              <span className="evc-caret evc-caret-block" style={{ height: "0.9rem", width: "0.5rem" }} />
             </div>
           </div>
         </Reveal>

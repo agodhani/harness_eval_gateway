@@ -159,10 +159,15 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   query w/ filters+pagination, SSE tail) + timeline UI both landed.
 - **Where:** `api/routers/events.py`, `api/schemas.py` (EventSource/EventType
   enums), db `events`, `web/app/runs/[id]/timeline/`
+- **Run-detail console:** `web/components/RunConsoleLive.tsx` — per-sandbox
+  event lanes on the run detail page (backlog + SSE + `after_id` poll, same
+  merge as the timeline; evaluator/orchestrator traffic routed to a bottom
+  lane). Shares the `evc-*` stylesheet in `globals.css` with the landing
+  replay console.
 - **Verify:**
   - Unit: `tests/unit/api/test_events.py` + `test_event_types.py` (13+ tests)
   - Live: SSE verified via curl; M2 events persisted
-  - UI: run → timeline page shows live events
+  - UI: run → timeline page shows live events; run detail shows live lanes
 - **Depends on:** F0 (ingestion slice unblocks F3)
 
 ### F7 — Evaluator sandbox ✅

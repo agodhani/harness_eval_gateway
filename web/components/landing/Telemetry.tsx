@@ -81,8 +81,8 @@ export default function Telemetry() {
 
         {/* event type matrix */}
         <Reveal delay={120}>
-          <div className="lp-panel lp-ticks" style={{ height: "100%" }}>
-            <span className="lp-tick-b" />
+          <div className="lp-panel ticks" style={{ height: "100%" }}>
+            <span className="tick-b" />
             <div className="lp-cell__head">
               <span className="kicker">event types</span>
               <span
@@ -103,7 +103,7 @@ export default function Telemetry() {
               </div>
             </div>
             <div className="lp-panel__foot">
-              a contract test AST-scans every emitter — an event type can't
+              a contract test AST-scans every emitter — an event type can’t
               ship without schema coverage.
             </div>
           </div>
