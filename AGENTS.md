@@ -249,6 +249,10 @@ or tests change.
   `ollama list` (gateway `/v1/models` pass-through already exists) instead of
   the hardcoded `MODEL_SUGGESTIONS`, plus an install option (api endpoint →
   `ollama pull`, stream pull progress into the UI)
+- Named harness configs — optional per-config label set at submit, persisted
+  onto the sandbox and surfaced in the timeline filter, results matrix, and
+  analytics so same-adapter sandboxes are distinguishable; default to
+  `<adapter>-<sandbox short id>` when left blank
 - Cross-run analytics & cost dashboards
 - Timeline-side analytics — per-sandbox metrics rendered alongside the
   execution timeline or on event hover (cost/tokens/latency in context)
