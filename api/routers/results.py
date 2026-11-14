@@ -84,6 +84,27 @@ class ExecSummary(BaseModel):
     detail: str | None = None  # skip reason / error message
 
 
+class GeneratedTestsSummary(BaseModel):
+    """Flat generated-tests headline (PR8) — the evaluator-authored pytest
+    suite's outcome, derived from ``analysis.json``'s ``generated_tests``
+    signal. ``status`` mirrors the SignalReport status: ``ok`` = measured
+    (the suite may still be red), ``skipped``/``error`` = not measured."""
+
+    status: str = "ok"
+    model: str | None = None
+    files_written: int = 0
+    files_rejected: int = 0
+    tests_detected: bool = False
+    tests_collected: int = 0
+    tests_passed: int = 0
+    tests_failed: int = 0
+    tests_errors: int = 0
+    pass_rate: float | None = None
+    coverage_percent: float | None = None
+    timed_out: bool = False
+    detail: str | None = None  # skip reason / error message
+
+
 class ArtifactRef(BaseModel):
     """Artifact row exposed for the download endpoint."""
 
@@ -126,6 +147,9 @@ class SandboxResult(BaseModel):
     # PR7: flat view of the ``exec`` signal (build/test/coverage measured
     # in the locked heg-exec container) — None when no analysis exists.
     exec: ExecSummary | None = None
+    # PR8: flat view of the ``generated_tests`` signal (LLM-written suite
+    # executed against the submission) — None when no analysis exists.
+    generated_tests: GeneratedTestsSummary | None = None
 
 
 class RunResults(BaseModel):
@@ -201,6 +225,34 @@ def _exec_summary(analysis: AnalysisReport | None) -> ExecSummary | None:
         detail=sig.error or (sig.warnings[0] if sig.warnings else None),
     )
     return summary
+
+
+def _generated_tests_summary(
+    analysis: AnalysisReport | None,
+) -> GeneratedTestsSummary | None:
+    """Flatten ``analysis``'s ``generated_tests`` signal (PR8) — same
+    contract as :func:`_exec_summary`."""
+    if analysis is None:
+        return None
+    sig = analysis.signal("generated_tests")
+    if sig is None:
+        return None
+    m = sig.metrics
+    return GeneratedTestsSummary(
+        status=sig.status,
+        model=m.get("model"),
+        files_written=int(m.get("files_written") or 0),
+        files_rejected=int(m.get("files_rejected") or 0),
+        tests_detected=bool(m.get("tests_detected")),
+        tests_collected=int(m.get("tests_collected") or 0),
+        tests_passed=int(m.get("tests_passed") or 0),
+        tests_failed=int(m.get("tests_failed") or 0),
+        tests_errors=int(m.get("tests_errors") or 0),
+        pass_rate=m.get("pass_rate"),
+        coverage_percent=m.get("coverage_percent"),
+        timed_out=bool(m.get("timed_out")),
+        detail=sig.error or (sig.warnings[0] if sig.warnings else None),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +362,7 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
                 ),
                 analysis=analysis,
                 exec=_exec_summary(analysis),
+                generated_tests=_generated_tests_summary(analysis),
             )
         )
 

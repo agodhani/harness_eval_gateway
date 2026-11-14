@@ -31,6 +31,13 @@ append-mostly; rebase on main before merge.
   `dots-studio/dots-3-note-preview:free`. Mandatory-reasoning models (ernie,
   lfm) 400 on miniloop's `reasoning_effort:"none"`.
 - **PR6 — static-analysis signals** (`scoring/` package, see below).
+- **PR8 — Automated test-suite generation**: `evaluator/testgen.py` writes
+  a pytest suite via the gateway (eval cred, metered), persists it to
+  `<artifact>/generated_tests/`, runs it via `ExecRunner` `test_target`
+  (`EXEC_TEST_TARGET` env → `/srv/test_target` ro mount in `heg-exec`),
+  and folds pass rate into the `generated_tests` `SignalReport` →
+  `ANALYSIS.md`/judge brief/results API flat summary. `SCORING_TESTGEN=0`
+  opts out; `TESTGEN_*` knobs bound prompt budget, files, tokens, timeout.
 - **PR11 — Graphical analysis + cross-run dashboards** (F13): recharts,
   `GET /api/analytics/runs`, results-matrix totals row.
 
@@ -143,11 +150,10 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 - **Depends on:** PR6 (signal plumbing), PR5 soft (evaluator wiring settles).
 - **Verify:** integration test executing a trivial artifact.
 
-### PR8 — Automated test-suite generation
-- **Scope:** LLM-generated tests as the eval target — generate suite via
-  gateway, run via PR7 exec infra, fold pass-rate into scoring.
-- **Touch:** `evaluator/` (gen + exec orchestration), prompts.
-- **Depends on:** PR7.
+### PR8 — Automated test-suite generation — ✅ landed
+See "Already landed" — `evaluator/testgen.py` + `ExecRunner` `test_target`
+(`EXEC_TEST_TARGET`), `generated_tests` SignalReport → judge brief,
+`SCORING_TESTGEN`/`TESTGEN_*` flags.
 
 ### PR9 — Timeline-side analytics
 - **Scope:** per-sandbox metrics (cost/tokens/latency) rendered alongside

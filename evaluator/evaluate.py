@@ -40,6 +40,14 @@ What it does:
    same ``analysis.json`` envelope + ANALYSIS.md exec section. When tests
    ran, a ``test_execution`` event records pass/fail counts on the sandbox
    timeline. Disable via ``SCORING_EXEC=0``.
+
+   PR8: a third signal, ``generated_tests``, is appended after collection —
+   an LLM call (via the gateway, metered on the eval cred) writes a pytest
+   suite for the submission, persisted at ``<artifact>/generated_tests/``
+   and executed against the untouched workspace in the same locked
+   container (``ExecRunner`` ``test_target=``). The pass rate lands in the
+   same envelope + a ``generated_tests/`` copy staged for the judge.
+   Disable via ``SCORING_TESTGEN=0``.
 3. Waits for container exit (or ``timeout_seconds`` → docker stop), removes
    the container, parses ``scores.json``, validates it, and inserts
    ``Score`` rows (one per rubric dimension + an ``overall`` pseudo-row when
@@ -84,8 +92,9 @@ from evaluator.scores import (
     ScoresFileError,
     load_scores_file,
 )
+from evaluator.testgen import GENERATED_TESTS_DIRNAME, generate_tests_signal
 from sandbox.runtime import DEFAULT_IMAGE, SandboxRuntime
-from scoring import AnalysisReport, collect_signals
+from scoring import AnalysisReport, SignalReport, collect_signals
 from scoring.render import (
     ANALYSIS_JSON_FILENAME,
     ANALYSIS_MD_FILENAME,
@@ -178,6 +187,38 @@ def _collect_analysis(workspace: Path) -> AnalysisReport | None:
         return None
 
 
+async def _collect_generated_tests(
+    *,
+    ws_path: Path,
+    art_path: Path,
+    rubric: dict[str, Any],
+    model: str,
+    gateway_base_url: str,
+    cred: str,
+) -> SignalReport | None:
+    """PR8: generate + execute an LLM-written pytest suite; never raises.
+
+    A catastrophic failure (LLM call stack, exec plumbing) degrades to
+    ``None`` — evaluation continues with the signal absent, mirroring
+    ``_collect_analysis``. Routine degradation (disabled, unrunnable output,
+    no docker) is a ``skipped``/``error`` report, NOT ``None``.
+    """
+    try:
+        return await generate_tests_signal(
+            workspace=ws_path,
+            gen_dir=art_path / GENERATED_TESTS_DIRNAME,
+            gateway_base_url=gateway_base_url,
+            cred=cred,
+            model=model,
+            rubric=rubric,
+        )
+    except Exception:
+        logger.warning(
+            "evaluator: test-suite generation failed for %s", ws_path, exc_info=True
+        )
+        return None
+
+
 def _analysis_event_payload(report: AnalysisReport | None) -> dict[str, Any]:
     """Compact summary for the ``eval_analysis`` checkpoint event."""
     if report is None:
@@ -203,6 +244,16 @@ def _analysis_event_payload(report: AnalysisReport | None) -> dict[str, Any]:
     exec_sig = report.signal("exec")
     if exec_sig is not None and exec_sig.status == "ok":
         payload["exec"] = _exec_summary(exec_sig.metrics)
+    gen_sig = report.signal("generated_tests")
+    if gen_sig is not None and gen_sig.status == "ok":
+        payload["generated_tests"] = {
+            "model": gen_sig.metrics.get("model"),
+            "files_written": gen_sig.metrics.get("files_written", 0),
+            "tests_collected": gen_sig.metrics.get("tests_collected", 0),
+            "tests_passed": gen_sig.metrics.get("tests_passed", 0),
+            "tests_failed": gen_sig.metrics.get("tests_failed", 0),
+            "pass_rate": gen_sig.metrics.get("pass_rate"),
+        }
     return payload
 
 
@@ -270,6 +321,7 @@ def _stage_eval_workspace(
     rubric: dict[str, Any],
     terminal_reason: str | None,
     analysis: AnalysisReport | None = None,
+    generated_tests_dir: Path | None = None,
 ) -> Path:
     """Build ``<eval_root>/<run>/<sandbox>/eval_workspace/`` and return it.
 
@@ -282,6 +334,7 @@ def _stage_eval_workspace(
           EVAL_TRANSCRIPT.log     # candidate transcript, when available
           ANALYSIS.md             # measured signals summary (PR6), when collected
           analysis.json           # machine-readable signals report (PR6)
+          generated_tests/        # LLM-written suite (PR8), when generated
           scores.json             # <- written later by the judge agent
     """
     stage_dir = eval_root / str(run_uuid) / str(sandbox_uuid)
@@ -305,6 +358,8 @@ def _stage_eval_workspace(
     # below through the link to an arbitrary host path. ANALYSIS.md /
     # analysis.json are evaluator-generated (PR6): a candidate-authored file
     # under those names could inject fake "measured" evidence into the brief.
+    # generated_tests/ (PR8) is likewise evaluator-authored — a candidate dir
+    # under that name could plant fake "LLM-generated" tests for the judge.
     for reserved in (
         SCORES_FILENAME,
         "rubric.json",
@@ -312,6 +367,7 @@ def _stage_eval_workspace(
         "EVAL_TRANSCRIPT.log",
         ANALYSIS_MD_FILENAME,
         ANALYSIS_JSON_FILENAME,
+        GENERATED_TESTS_DIRNAME,
     ):
         p = eval_ws / reserved
         if p.is_dir() and not p.is_symlink():
@@ -336,6 +392,8 @@ def _stage_eval_workspace(
         (eval_ws / ANALYSIS_JSON_FILENAME).write_text(
             analysis.model_dump_json(indent=2) + "\n", encoding="utf-8"
         )
+    if generated_tests_dir is not None and Path(generated_tests_dir).is_dir():
+        shutil.copytree(generated_tests_dir, eval_ws / GENERATED_TESTS_DIRNAME)
     return eval_ws
 
 
@@ -467,6 +525,39 @@ async def evaluate_sandbox(
     # so ANALYSIS.md/analysis.json land in the eval workspace as judge
     # evidence. Also persisted to the artifact dir for the results API.
     analysis_report = await asyncio.to_thread(_collect_analysis, ws_path)
+
+    # PR8: LLM-generated pytest suite — written to <artifact>/generated_tests/
+    # (never the candidate workspace), executed against the untouched ws in
+    # the locked heg-exec container, folded into the same AnalysisReport
+    # envelope BEFORE persisting/staging so the judge sees the pass rate.
+    # Generation traffic uses the eval cred → metered/budgeted like the
+    # judge's own calls. Degrades to None on catastrophic failure.
+    gen_sig = await _collect_generated_tests(
+        ws_path=ws_path,
+        art_path=art_path,
+        rubric=rubric,
+        model=model_name,
+        gateway_base_url=gateway_base_url,
+        cred=cred_token,
+    )
+    if gen_sig is not None:
+        # A declined (``skipped``) signal rides along inside an existing
+        # report but must not resurrect an analysis that never measured —
+        # a fully absent report stays absent (see
+        # test_analysis_failure_does_not_block_eval).
+        if analysis_report is not None:
+            analysis_report.signals.append(gen_sig)
+        elif gen_sig.status != "skipped":
+            analysis_report = AnalysisReport(workspace=str(ws_path))
+            analysis_report.signals.append(gen_sig)
+    # The suite only goes to the judge when THIS attempt wrote files — a
+    # stale dir from an earlier attempt is provenance, not fresh evidence.
+    gen_stage_dir = (
+        art_path / GENERATED_TESTS_DIRNAME
+        if gen_sig is not None and gen_sig.metrics.get("files_written")
+        else None
+    )
+
     analysis_path = await asyncio.to_thread(
         _persist_analysis, art_path, analysis_report
     )
@@ -508,6 +599,29 @@ async def evaluate_sandbox(
             },
         )
 
+    # PR8: mirror for the generated suite — pass rate on the timeline next
+    # to the candidate's own test results.
+    if (
+        gen_sig is not None
+        and gen_sig.status == "ok"
+        and gen_sig.metrics.get("tests_detected")
+    ):
+        _emit_event(
+            session_factory,
+            run_id=run_uuid,
+            sandbox_id=sandbox_uuid,
+            event_type="test_execution",
+            payload={
+                "phase": "eval_testgen",
+                "eval_sandbox_id": eval_sid,
+                "image": gen_sig.metrics.get("image"),
+                "generator_model": gen_sig.metrics.get("model"),
+                "generated_files": gen_sig.metrics.get("files_written", 0),
+                "pass_rate": gen_sig.metrics.get("pass_rate"),
+                **_exec_summary(gen_sig.metrics),
+            },
+        )
+
     # ---- stage + spawn ------------------------------------------------------
     eval_ws = await asyncio.to_thread(
         _stage_eval_workspace,
@@ -519,6 +633,7 @@ async def evaluate_sandbox(
         rubric=rubric,
         terminal_reason=terminal_reason,
         analysis=analysis_report,
+        generated_tests_dir=gen_stage_dir,
     )
 
     _emit_event(

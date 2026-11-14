@@ -207,28 +207,66 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   event. Collector registry (`scoring/collectors.py::COLLECTORS`) is the
   extension point for further signal types; `SCORING_EXEC=0` disables the
   exec collector (conftest pins it for unit tests).
+  **Generated test suite (PR8):** a third `generated_tests` signal is
+  appended by the evaluator itself (`evaluator/testgen.py`, not a
+  registry collector — it needs gateway creds + the artifact dir).
+  Before staging, the evaluator calls the model through the gateway on
+  the per-eval cred (metered/budgeted like the judge; draws on the same
+  `EVAL_TOKEN_BUDGET` allowance) with the rubric + budget-capped source
+  listing (`build_testgen_prompt` in `prompts.py`) → parses output into
+  `test_*.py` files via `### FILE:` markers (deterministic containment:
+  every file must `compile()` AND define a `test_*`; rejected chunks are
+  reported, a fully unusable generation → `status="skipped"`) → persists
+  the suite + `_manifest.json` to `<artifact>/generated_tests/`
+  (provenance — never the candidate's `workspace/`) → runs it via
+  `ExecRunner.execute(workspace, test_target=…)` — PR8's
+  `EXEC_TEST_TARGET` contract: the dir mounts read-only at
+  `/srv/test_target`, exec_runner copies it to `/tmp/gen_tests`, pytest
+  runs there, coverage stays `--source=/work` and the build phase never
+  compiles generated files (a broken generated test can't be attributed
+  to the candidate's build). JUnit parsing now also captures failing
+  test names (`failed_tests`). The signal lands in the same envelope —
+  `ANALYSIS.md` "Generated test suite" section + `analysis.json` +
+  `eval_analysis` summary + `test_execution` `phase=eval_testgen` event
+  + flat `generated_tests` summary on the results API — and the suite is
+  staged into the eval workspace for the judge (a candidate-authored
+  `generated_tests/` is a reserved name, evicted at staging).
+  `SCORING_TESTGEN=0` disables (conftest pins it); knobs:
+  `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
+  `TESTGEN_MAX_FILES` (8), `TESTGEN_MAX_TOKENS` (4096),
+  `TESTGEN_TIMEOUT_SECONDS` (240).
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
-  `prompts.py`), `scoring/` (`models.py` — analysis.json/API pydantic
+  `prompts.py`, `testgen.py` — PR8 suite generation + exec orchestration),
+  `scoring/` (`models.py` — analysis.json/API pydantic
   contract, `collectors.py` — SignalCollector protocol + registry,
   `static.py` — lizard collector, `exec.py` — exec collector,
   `render.py` — ANALYSIS.md), `sandbox/exec.py` (ExecRunner — docker
-  lifecycle + result parsing) + `sandbox/images/exec.Dockerfile` +
-  `exec_runner.py` (in-image build/test/coverage phases), db `scores`,
-  `api/routers/results.py` (`SandboxResult.analysis` + `.exec`),
-  `api/schemas.py` (AnalysisReport re-export)
+  lifecycle + result parsing + `test_target` mount) +
+  `sandbox/images/exec.Dockerfile` + `exec_runner.py` (in-image
+  build/test/coverage phases + `EXEC_TEST_TARGET` mode), db `scores`,
+  `api/routers/results.py` (`SandboxResult.analysis` + `.exec` +
+  `.generated_tests`), `api/schemas.py` (AnalysisReport re-export)
 - **Verify:**
   - Unit: `tests/unit/evaluator/` (`test_evaluate.py`, `test_scores.py`,
     `test_prompts.py`) — mocked runtime; staging, timeout salvage, malformed
-    scores covered; `tests/unit/scoring/` (`test_static.py`,
+    scores covered; `tests/unit/evaluator/test_testgen.py` — fake gateway
+    client + fake exec runner: skip/error semantics, deterministic
+    containment of bad output (fences/markers/syntax/no-test rejection),
+    provenance layout, pass-rate metrics, cap knobs;
+    `tests/unit/scoring/` (`test_static.py`,
     `test_collectors.py`, `test_render.py`, `test_exec.py`) — workspaces
     with known CC values, skip/cap/symlink rules, collector isolation,
     markdown render, exec metric mapping/status semantics;
-    `tests/unit/sandbox/test_exec.py` — exec run-argv isolation posture,
-    result file/sentinel parsing, timeout/missing-image paths
+    `tests/unit/sandbox/test_exec.py` — exec run-argv isolation posture
+    (incl. `test_target` mount/env), result file/sentinel parsing,
+    timeout/missing-image paths; `tests/unit/sandbox/test_exec_runner.py`
+    — in-image helpers (junit failed names, target staging, discovery)
   - Exec integration: `tests/integration/test_exec_scoring.py`
     (`@pytest.mark.docker`) — real `heg-exec` container executes a trivial
     artifact: build ok, 2/2 tests pass, coverage measured, container --rm'd,
-    workspace untouched
+    workspace untouched; PR8 cases run an external `generated_tests` dir
+    via `test_target` (pass + red suite w/ failing names, mount stays
+    byte-identical)
   - Results API: `tests/unit/api/test_results.py` — analysis embedded when
     `<artifact>/analysis.json` exists+valid, null otherwise
   - Manual: scores + rationale visible on results page; rationale for

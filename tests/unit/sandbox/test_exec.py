@@ -140,6 +140,73 @@ def test_container_prefix_avoids_heg_namespace() -> None:
     assert not CONTAINER_PREFIX.startswith("heg-")
 
 
+def test_run_args_with_test_target(tmp_path: Path) -> None:
+    """PR8: test_target adds a read-only suite mount + EXEC_TEST_TARGET env;
+    the candidate workspace stays untouched and the image stays last."""
+    from sandbox.exec import CONTAINER_TEST_TARGET
+
+    rt = _FakeRuntime(tmp_path)
+    runner = _runner(tmp_path, rt)
+    ws = _ws(tmp_path)
+    target = tmp_path / "generated_tests"
+    target.mkdir()
+    out_dir = tmp_path / "exec-scratch" / "x" / "out"
+    args = runner._build_args(
+        name="hegexec-test", workspace=ws, out_dir=out_dir, test_target=target
+    )
+    vols = [args[i + 1] for i, a in enumerate(args) if a == "-v"]
+    assert f"{ws}:/srv/src:ro" in vols
+    assert f"{target}:{CONTAINER_TEST_TARGET}:ro" in vols
+    envs = [args[i + 1] for i, a in enumerate(args) if a == "-e"]
+    assert f"EXEC_TEST_TARGET={CONTAINER_TEST_TARGET}" in envs
+    # base args unchanged: still network-less, image still the last token
+    assert args[args.index("--network") + 1] == "none"
+    assert args[-1] == runner.image
+
+
+def test_run_args_without_test_target_has_no_mount(tmp_path: Path) -> None:
+    rt = _FakeRuntime(tmp_path)
+    runner = _runner(tmp_path, rt)
+    ws = _ws(tmp_path)
+    out_dir = tmp_path / "exec-scratch" / "x" / "out"
+    args = runner._build_args(
+        name="hegexec-test", workspace=ws, out_dir=out_dir
+    )
+    assert not any("EXEC_TEST_TARGET" in a for a in args)
+    vols = [args[i + 1] for i, a in enumerate(args) if a == "-v"]
+    assert len(vols) == 2  # /srv/src + /out only
+
+
+def test_execute_non_dir_test_target_fails_fast(tmp_path: Path) -> None:
+    """A bogus target must not reach docker run — ``-v`` would silently
+    auto-create the missing source dir on the host."""
+    rt = _FakeRuntime(tmp_path)
+    runner = _runner(tmp_path, rt)
+    outcome = runner.execute(
+        _ws(tmp_path), test_target=tmp_path / "does-not-exist"
+    )
+    assert outcome.ok is False
+    assert "not a directory" in (outcome.error or "")
+    assert not [c for c in rt.calls if c and c[0] == "run"]
+
+
+def test_execute_with_test_target_passes_mount(tmp_path: Path) -> None:
+    payload = {"version": 1, "phases": {}, "warnings": []}
+    rt = _FakeRuntime(
+        tmp_path,
+        write_result=payload,
+        run_proc=subprocess.CompletedProcess([], 0, "", ""),
+    )
+    runner = _runner(tmp_path, rt)
+    target = tmp_path / "generated_tests"
+    target.mkdir()
+    outcome = runner.execute(_ws(tmp_path), test_target=target)
+    assert outcome.ok is True
+    run_args = next(c for c in rt.calls if c and c[0] == "run")
+    assert any("EXEC_TEST_TARGET" in a for a in run_args)
+    assert any(f"{target}" in a and ":ro" in a for a in run_args)
+
+
 # ----------------------------------------------------------------------
 # result parsing — file primary, sentinel fallback, spoof ordering
 # ----------------------------------------------------------------------

@@ -102,6 +102,7 @@ def _flat_metrics(outcome: ExecOutcome) -> dict[str, Any]:
                 "tests_failed": tests.get("failed", 0),
                 "tests_errors": tests.get("errors", 0),
                 "tests_skipped": tests.get("skipped", 0),
+                "failed_tests": tests.get("failed_tests") or [],
                 "test_files": tests.get("test_files", 0),
                 "test_duration_seconds": tests.get("duration_seconds"),
             }

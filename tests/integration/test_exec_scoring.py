@@ -181,3 +181,74 @@ def test_default_registry_skips_exec_under_test_env(workspace: Path) -> None:
     rep = collect_signals(workspace)
     exec_sig = rep.signal("exec")
     assert exec_sig is not None and exec_sig.status == "skipped"
+
+
+# ----------------------------------------------------------------------
+# PR8 — EXEC_TEST_TARGET: external suite runs against the workspace
+# ----------------------------------------------------------------------
+
+
+def test_exec_with_test_target_runs_external_suite(
+    workspace: Path, tmp_path: Path, exec_image: str
+) -> None:
+    """An externally supplied suite (e.g. LLM-generated) mounts read-only
+    and runs INSTEAD of workspace tests — the workspace has no test files,
+    so autodetect would find nothing; the target suite still runs + passes
+    against the candidate module, and coverage attributes to /work."""
+    gen = tmp_path / "generated_tests"
+    gen.mkdir()
+    (gen / "test_gen_calc.py").write_text(
+        "from calc import add, mul\n\n\n"
+        "def test_add_generated():\n    assert add(2, 3) == 5\n\n\n"
+        "def test_mul_generated():\n    assert mul(2, 5) == 10\n"
+    )
+
+    runner = ExecRunner(image=exec_image, work_root=tmp_path / "exec-scratch")
+    outcome = runner.execute(workspace, test_target=gen)
+
+    assert outcome.ok, outcome.error or outcome.warnings
+    result = outcome.result or {}
+    assert result.get("test_target")  # mount path recorded in the payload
+    phases = result.get("phases") or {}
+    tests = phases.get("tests") or {}
+    assert tests.get("detected") is True
+    assert tests.get("collected") == 2
+    assert tests.get("passed") == 2
+    assert tests.get("ok") is True
+    # coverage measured on the candidate code, not the test suite
+    cov = phases.get("coverage") or {}
+    assert cov.get("percent") is not None
+    assert float(cov["percent"]) >= 80.0
+    # the suite mount is never written to (read-only in-container too)
+    assert sorted(p.name for p in gen.iterdir()) == ["test_gen_calc.py"]
+    assert not (gen / "__pycache__").exists()
+    # nothing leaked
+    leftover = _docker(
+        "ps", "-aq", "--filter", "name=^/hegexec-", check=False
+    ).stdout.split()
+    assert leftover == []
+
+
+def test_exec_with_test_target_records_failures(
+    workspace: Path, tmp_path: Path, exec_image: str
+) -> None:
+    """A generated suite that fails reports pass counts + failed names —
+    the red suite IS the measurement (status semantics unchanged)."""
+    gen = tmp_path / "generated_tests"
+    gen.mkdir()
+    (gen / "test_gen_calc.py").write_text(
+        "from calc import add, mul\n\n\n"
+        "def test_add_ok():\n    assert add(1, 1) == 2\n\n\n"
+        "def test_mul_wrong():\n    assert mul(2, 2) == 5  # intentionally wrong\n"
+    )
+
+    runner = ExecRunner(image=exec_image, work_root=tmp_path / "exec-scratch")
+    outcome = runner.execute(workspace, test_target=gen)
+
+    assert outcome.ok, outcome.error
+    tests = (outcome.result or {}).get("phases", {}).get("tests") or {}
+    assert tests.get("collected") == 2
+    assert tests.get("passed") == 1
+    assert tests.get("failed") == 1
+    assert tests.get("ok") is False
+    assert "test_gen_calc::test_mul_wrong" in (tests.get("failed_tests") or [])
