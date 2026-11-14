@@ -92,10 +92,11 @@ def _as_uuid(value: Any, field: str) -> uuid.UUID:
         raise ValueError(f"evaluate_sandbox: {field} is not a UUID: {value!r}") from exc
 
 
-def _lookup_rubric_id(
+def _lookup_rubric(
     session_factory: sessionmaker[Session], run_uuid: uuid.UUID
-) -> uuid.UUID | None:
-    """Latest rubric for the run — approved preferred, then highest version."""
+) -> tuple[uuid.UUID | None, int | None]:
+    """Latest rubric (id, version) for the run — approved preferred, then
+    highest version."""
     try:
         with session_factory() as s:
             rows = s.execute(
@@ -105,12 +106,30 @@ def _lookup_rubric_id(
             ).all()
     except Exception:
         logger.warning("evaluator: rubric lookup failed for run %s", run_uuid, exc_info=True)
-        return None
+        return None, None
     if not rows:
-        return None
+        return None, None
     approved = [r for r in rows if r.status == "approved"]
     pool = approved or list(rows)
-    return max(pool, key=lambda r: r.version).id
+    latest = max(pool, key=lambda r: r.version)
+    return latest.id, latest.version
+
+
+def _rubric_version_of(
+    session_factory: sessionmaker[Session], rubric_uuid: uuid.UUID
+) -> int | None:
+    """Version of one rubric row — fills ``scores.rubric_version`` when the
+    caller passed ``rubric_id`` without a version."""
+    try:
+        with session_factory() as s:
+            return s.execute(
+                select(Rubric.version).where(Rubric.id == rubric_uuid)
+            ).scalar_one_or_none()
+    except Exception:
+        logger.warning(
+            "evaluator: rubric version lookup failed for %s", rubric_uuid, exc_info=True
+        )
+        return None
 
 
 def _emit_event(
@@ -262,6 +281,7 @@ async def evaluate_sandbox(
     run_id: uuid.UUID | str,
     sandbox_id: uuid.UUID | str,
     rubric_id: uuid.UUID | str | None = None,
+    rubric_version: int | None = None,
     rubric: dict[str, Any] | None = None,
     artifact_dir: Path | str | None = None,
     workspace_dir: Path | str | None = None,
@@ -282,7 +302,9 @@ async def evaluate_sandbox(
 
     Plan §5 params are keyword-only and match the orchestrator contract;
     ``runtime``/``max_iters``/``eval_root``/``poll_interval_seconds``/
-    ``image`` are DI/test knobs.
+    ``image`` are DI/test knobs. ``rubric_version`` (PR5) stamps the
+    Score rows' provenance — omitted, it is resolved from ``rubric_id``
+    (or the run's latest rubric when no id is passed).
 
     Returns the persisted ``Score`` ORM rows (detached). Raises ``ValueError``
     on missing required inputs, ``FileNotFoundError`` when the artifact
@@ -323,11 +345,19 @@ async def evaluate_sandbox(
         else (art_path / "transcript.log" if art_path else None)
     )
 
-    rid_uuid = (
-        _as_uuid(rubric_id, "rubric_id")
-        if rubric_id is not None
-        else _lookup_rubric_id(session_factory, run_uuid)
-    )
+    looked_up_version: int | None = None
+    if rubric_id is not None:
+        rid_uuid = _as_uuid(rubric_id, "rubric_id")
+        # Provenance denormalized onto Score rows (PR5): explicit kwarg
+        # wins; otherwise read the row's version.
+        rver = (
+            rubric_version
+            if rubric_version is not None
+            else _rubric_version_of(session_factory, rid_uuid)
+        )
+    else:
+        rid_uuid, looked_up_version = _lookup_rubric(session_factory, run_uuid)
+        rver = rubric_version if rubric_version is not None else looked_up_version
     rt = runtime if runtime is not None else SandboxRuntime()
     if eval_root is not None:
         eval_root_path = Path(eval_root)
@@ -368,6 +398,8 @@ async def evaluate_sandbox(
             "eval_workspace": str(eval_ws),
             "terminal_reason": terminal_reason,
             "max_iters": max_iters,
+            "rubric_id": str(rid_uuid) if rid_uuid is not None else None,
+            "rubric_version": rver,
         },
     )
 
@@ -450,6 +482,7 @@ async def evaluate_sandbox(
         Score(
             sandbox_id=sandbox_uuid,
             rubric_id=rid_uuid,
+            rubric_version=rver,
             dimension=entry.dimension,
             score=entry.score,
             rationale=entry.rationale,
@@ -461,6 +494,7 @@ async def evaluate_sandbox(
             Score(
                 sandbox_id=sandbox_uuid,
                 rubric_id=rid_uuid,
+                rubric_version=rver,
                 dimension=OVERALL_DIMENSION,
                 score=parsed.overall,
                 rationale=parsed.summary,
@@ -486,6 +520,8 @@ async def evaluate_sandbox(
                     "summary": parsed.summary[:500],
                     "warnings": parsed.warnings,
                     "scores_path": str(scores_path),
+                    "rubric_id": str(rid_uuid) if rid_uuid is not None else None,
+                    "rubric_version": rver,
                 },
             )
         )

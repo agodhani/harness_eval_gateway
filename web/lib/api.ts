@@ -224,7 +224,9 @@ export interface RubricOut {
   id: string;
   run_id: string;
   version: number;
-  status: string; // draft | approved
+  status: string; // draft | approved | superseded
+  /** PR5: the version this row was edited from (null on the original). */
+  parent_id: string | null;
   content: RubricContent;
   created_at: string;
 }
@@ -277,6 +279,8 @@ export interface SandboxResult {
   terminal_reason: string | null;
   artifact_path: string | null;
   rubric_id: string | null;
+  /** PR5: rubric version the displayed scores were judged under. */
+  rubric_version?: number | null;
   dimensions: Record<string, DimensionScore>;
   overall: DimensionScore | null;
   /** Optional artifact ids if/when the results API exposes them. */
@@ -292,12 +296,27 @@ export interface SandboxResult {
   preview_candidates?: PreviewCandidate[];
 }
 
+/** PR5: one rubric version as listed in results — drives the version
+ * selector. `score_count` = Score rows carrying this version's provenance. */
+export interface RubricVersionOut {
+  id: string;
+  version: number;
+  status: string; // draft | approved | superseded
+  parent_id: string | null;
+  created_at: string;
+  score_count: number;
+}
+
 export interface RunResults {
   run_id: string;
   status: string;
   model_name: string;
   evaluator_model: string | null;
   same_model_eval: boolean | null;
+  /** PR5: the ?rubric_version= filter echoed back (null = newest-wins). */
+  selected_rubric_version?: number | null;
+  /** PR5: every rubric version + score counts for the selector. */
+  rubric_versions?: RubricVersionOut[];
   sandboxes: SandboxResult[];
 }
 
@@ -305,10 +324,41 @@ export interface ScoreOut {
   id: string;
   sandbox_id: string;
   rubric_id: string | null;
+  /** PR5 provenance — denormalized rubrics.version at write time. */
+  rubric_version?: number | null;
   dimension: string;
   score: number;
   rationale: string;
   created_at: string;
+}
+
+/** PR5: POST /api/runs/{id}/rubrics — post-run rubric edit → new version. */
+export interface RubricVersionCreate {
+  content: RubricContent;
+  /** Which row the edit derives from (default: latest version). */
+  base_rubric_id?: string | null;
+  /** Also queue a re-score against the new version. */
+  rescore?: boolean;
+}
+
+/** PR5: POST /api/runs/{id}/rescore body — everything optional. */
+export interface RescoreIn {
+  /** Pin a specific rubric version (default: latest approved). */
+  rubric_id?: string | null;
+  /** Restrict re-judging to these sandboxes. */
+  sandbox_ids?: string[] | null;
+  /** Judge-model override for this pass only. */
+  model?: string | null;
+}
+
+/** PR5: 202 response — re-score accepted and queued. */
+export interface RescoreOut {
+  run_id: string;
+  status: string; // "evaluating"
+  rubric_id: string;
+  rubric_version: number;
+  model: string;
+  sandboxes: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -488,8 +538,47 @@ export function eventsStreamUrl(runId: string): string {
 // results (F7/F8 — may 404 until the evaluator lane lands)
 // ---------------------------------------------------------------------------
 
-export function getRunResults(runId: string): Promise<RunResults> {
-  return request<RunResults>(`/api/runs/${encodeURIComponent(runId)}/results`);
+export function getRunResults(runId: string, rubricVersion?: number): Promise<RunResults> {
+  return request<RunResults>(
+    `/api/runs/${encodeURIComponent(runId)}/results${qs({ rubric_version: rubricVersion })}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// eval iteration (PR5 — rubric versions + re-score)
+// ---------------------------------------------------------------------------
+
+export function listRubricVersions(runId: string): Promise<RubricVersionOut[]> {
+  return request<RubricVersionOut[]>(
+    `/api/runs/${encodeURIComponent(runId)}/rubrics`,
+  );
+}
+
+/** One rubric version incl. content — prefills the post-run edit editor. */
+export function getRubricVersion(rubricId: string): Promise<RubricOut> {
+  return request<RubricOut>(`/api/rubrics/${encodeURIComponent(rubricId)}`);
+}
+
+/** Post-run rubric edit — creates a new approved version (vN+1); the previous
+ * approved version is superseded, never mutated. Pass `rescore: true` to also
+ * queue a re-score against the new version. */
+export function createRubricVersion(
+  runId: string,
+  body: RubricVersionCreate,
+): Promise<RubricOut> {
+  return request<RubricOut>(`/api/runs/${encodeURIComponent(runId)}/rubrics`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Re-run the evaluator on stored artifacts (terminal runs only). Empty body
+ * = latest approved rubric on every artifact-bearing sandbox. */
+export function rescoreRun(runId: string, body: RescoreIn = {}): Promise<RescoreOut> {
+  return request<RescoreOut>(`/api/runs/${encodeURIComponent(runId)}/rescore`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 }
 
 // ---------------------------------------------------------------------------

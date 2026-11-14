@@ -20,13 +20,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Callable, Collection, Coroutine
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from db.models import Rubric, Run, Sandbox
+from db.models import Rubric, Run, Sandbox, Score
 from sandbox.runtime import SandboxRuntime
 
 from . import lifecycle, state_machine
@@ -83,12 +84,16 @@ def reset_runtime() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _track(kind: str, run_id: uuid.UUID, coro: Any) -> asyncio.Task[None]:
+def _track(
+    kind: str, run_id: uuid.UUID, make_coro: Callable[[], Coroutine[Any, Any, None]]
+) -> asyncio.Task[None]:
     key = (run_id, kind)
     existing = _TASKS.get(key)
     if existing is not None and not existing.done():
         return existing
-    task = asyncio.create_task(coro)
+    # coroutine built only when a task actually spawns — dedup returns early
+    # so nothing is left unawaited.
+    task = asyncio.create_task(make_coro())
     _TASKS[key] = task
 
     def _discard(t: asyncio.Task[None]) -> None:
@@ -109,7 +114,7 @@ def start_rubric_task(
     return _track(
         "rubric",
         run_id,
-        rubric_mod.draft_rubric(
+        lambda: rubric_mod.draft_rubric(
             run_id,
             session_factory=session_factory or _session_factory(),
             settings=settings or _settings(),
@@ -129,7 +134,7 @@ def start_lifecycle_task(
     return _track(
         "lifecycle",
         run_id,
-        lifecycle.run_lifecycle(
+        lambda: lifecycle.run_lifecycle(
             run_id,
             session_factory=session_factory or _session_factory(),
             runtime=runtime or get_runtime(),
@@ -137,6 +142,42 @@ def start_lifecycle_task(
             evaluator_fn=evaluator_fn,
         ),
     )
+
+
+def start_rescore_task(
+    run_id: uuid.UUID,
+    *,
+    rubric_id: uuid.UUID | None = None,
+    sandbox_ids: Collection[uuid.UUID] | None = None,
+    model: str | None = None,
+    session_factory: sessionmaker[Session] | None = None,
+    settings: Any | None = None,
+    runtime: SandboxRuntime | None = None,
+    evaluator_fn: Any | None = None,
+) -> asyncio.Task[None]:
+    """Register a re-score task (PR5) — re-runs the evaluator on stored
+    artifacts. Deduped by the ``rescore`` task kind: a second trigger while
+    one is in flight returns the existing task."""
+    return _track(
+        "rescore",
+        run_id,
+        lambda: lifecycle.rescore_run(
+            run_id,
+            session_factory=session_factory or _session_factory(),
+            runtime=runtime or get_runtime(),
+            settings=settings or _settings(),
+            evaluator_fn=evaluator_fn,
+            rubric_id=rubric_id,
+            sandbox_ids=sandbox_ids,
+            model=model,
+        ),
+    )
+
+
+def in_flight(run_id: uuid.UUID, kind: str) -> bool:
+    """True while a registered task of ``kind`` for ``run_id`` is running."""
+    task = _TASKS.get((run_id, kind))
+    return task is not None and not task.done()
 
 
 async def shutdown() -> None:
@@ -179,14 +220,35 @@ def _stale_runs(
 def _fail_run_and_sandboxes(
     session_factory: sessionmaker[Session], run_id: uuid.UUID
 ) -> None:
-    """Mark a stale run failed + its non-terminal sandboxes failed/error."""
+    """Mark a stale run failed + its non-terminal sandboxes failed/error.
+
+    Exception: a run cut off in ``evaluating`` keeps the lifecycle's own
+    rule — done iff ≥1 Score row exists. This covers first-pass evals with
+    partial scores AND a re-score (done → evaluating) interrupted by an api
+    restart, which would otherwise demote a previously-done run to failed
+    despite complete old scores.
+    """
     with session_factory() as session:
         run = session.get(Run, run_id)
+        rescued = False
         if run is not None and run.status not in state_machine.RUN_TERMINAL:
+            to_status = "failed"
+            if run.status == "evaluating":
+                scores = int(
+                    session.execute(
+                        select(func.count(Score.id))
+                        .select_from(Score)
+                        .join(Sandbox, Score.sandbox_id == Sandbox.id)
+                        .where(Sandbox.run_id == run_id)
+                    ).scalar_one()
+                )
+                if scores > 0:
+                    to_status = "done"
+                    rescued = True
             try:
-                state_machine.transition(session, run, "failed")
+                state_machine.transition(session, run, to_status)
             except state_machine.InvalidTransition:
-                run.status = "failed"
+                run.status = to_status
             run.finished_at = datetime.now(UTC)
         sandboxes = session.execute(
             select(Sandbox).where(
@@ -205,10 +267,14 @@ def _fail_run_and_sandboxes(
             emit(
                 session,
                 run_id=run.id,
-                event_type="error",
+                event_type="checkpoint" if rescued else "error",
                 payload={
                     "stage": "startup_sweep",
-                    "message": "run was mid-flight at api restart — marked failed",
+                    "message": (
+                        "run was mid-eval at api restart — done via existing scores"
+                        if rescued
+                        else "run was mid-flight at api restart — marked failed"
+                    ),
                 },
             )
         session.commit()

@@ -25,6 +25,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
 | F11 | Skillpack import from GitHub | ✅ | `skillpack_import/`, `api/routers/skillpacks.py`, `web/app/submit/ImportSkillPackDialog.tsx` | `tests/unit/api/test_skillpacks.py`, `test_skillpack_import.py` |
 | F12 | Artifact preview (static html + desktop/pygame via noVNC, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
+| F13 | Eval iteration (re-score + versioned rubrics) | ✅ | `api/routers/results.py`, `orchestrator/lifecycle.py` (`rescore_run`), `orchestrator/rubric.py` (`create_rubric_version`), `web/app/runs/[id]/results/RescoreControls.tsx` | `tests/unit/orchestrator/test_rescore.py`, `tests/unit/api/test_results.py`, `tests/unit/evaluator/test_evaluate.py` |
 
 ## Feature details
 
@@ -428,6 +429,63 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     pages grow large.
 - **Depends on:** F4 (runtime plumbing/host-path translation), F8 (results
   page + artifact store layout)
+
+### F13 — Eval iteration: re-score + versioned rubrics ✅
+
+- **What:** iterate on evaluation after a run finishes — without touching
+  participant sandboxes:
+  - **Post-run rubric edits** (`POST /api/runs/{id}/rubrics`): edits to a
+    completed run's rubric are persisted as a NEW `Rubric` row
+    (`version = max+1`, `parent_id` → the edited row, `status="approved"`);
+    the previous approved version is marked `superseded`, never mutated.
+    Old `Score` rows keep pointing at their original rubric version.
+  - **Re-score** (`POST /api/runs/{id}/rescore`): re-runs the evaluator on
+    stored artifact snapshots for terminal (`done`/`failed`) runs —
+    `done|failed → evaluating → done|failed` via the dedicated
+    `orchestrator.lifecycle.rescore_run` task (registered as `rescore` in
+    the runner task registry; a concurrent trigger → 409). Optional
+    `rubric_id` pin, `sandbox_ids` subset, and judge `model` override.
+    `POST …/rubrics` with `rescore=true` creates the version and queues
+    the re-score in one request.
+  - **Score provenance:** every `Score` carries `rubric_id` +
+    denormalized `rubric_version` (stamped at write time, survives rubric
+    lookups). `GET /api/runs/{id}/results?rubric_version=N` filters the
+    matrix to one version's scores; the default view is per-sandbox
+    newest-wins (created_at, version tiebreak). `GET /api/runs/{id}/rubrics`
+    lists versions + score counts; `GET /api/rubrics/{id}` returns one
+    version incl. content (prefills the editor).
+  - **Events stay append-only:** `rescore_requested` /
+    `rescore_started` / `rescore_finished` / `rubric_version_created`
+    checkpoints; eval `started`/`scored` payloads carry
+    `rubric_id`+`rubric_version`.
+  - **UI:** results page gains a "Re-score & rubric versions" card —
+    version selector (latest = newest-wins), re-score button, JSON rubric
+    editor that saves as the next version (+ optional re-score); per-
+    sandbox "judged: rubric vN" provenance in the matrix header.
+  - **Crash semantics:** an api restart mid-re-score keeps the startup-
+    sweep rule — `evaluating` runs with ≥1 Score row recover to `done`,
+    so a re-score interrupted after the original eval doesn't fail a
+    previously-done run.
+- **Where:** `db/models.py` (`Rubric.parent_id`, `Score.rubric_version`) +
+  migration `b3e7a1c9d2f4`; `orchestrator/rubric.py`
+  (`create_rubric_version`), `orchestrator/lifecycle.py` (`rescore_run`,
+  `_evaluate_all` refactor), `orchestrator/runner.py`
+  (`start_rescore_task`, `_track` coroutine-factory dedup),
+  `orchestrator/state_machine.py` (`done|failed → evaluating`);
+  `evaluator/evaluate.py` (`rubric_version` kwarg → Score rows + event
+  payloads); `api/routers/results.py` (rubrics/rescore endpoints, version
+  filter); `web/lib/api.ts`,
+  `web/app/runs/[id]/results/RescoreControls.tsx` + `ResultsClient.tsx`.
+- **Verify:**
+  - Unit: `tests/unit/orchestrator/test_rescore.py` (rescore_run paths,
+    task dedup, sweep rescue), `tests/unit/api/test_results.py`
+    (endpoints, guards, version filter), `tests/unit/evaluator/
+    test_evaluate.py` (provenance stamping), `test_state_machine.py`.
+  - API: `POST /api/runs/<id>/rescore` on a finished run → 202 → new
+    Score rows with the pinned `rubric_version`.
+  - UI: results page → pick an older version → matrix shows that pass's
+    scores; edit rubric → save & re-score → run returns to `evaluating`.
+- **Depends on:** F7 (evaluator), F8 (results page), F4 (artifact store)
 
 ## Implementation sequence
 

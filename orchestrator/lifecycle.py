@@ -9,6 +9,12 @@
    docs/orchestrator-plan.md §5, implemented by F7 in ``evaluator/``).
 4. ``done`` when ≥1 Score row exists for the run, else ``failed``.
 
+``rescore_run(run_id)`` (PR5) re-enters ``evaluating`` from a terminal
+state and re-runs the same evaluator pass on the stored artifacts —
+optionally against an explicit rubric version, a subset of sandboxes, or a
+different judge model. Old Score rows are kept; new rows carry their own
+``rubric_id``/``rubric_version`` provenance.
+
 The evaluator is imported lazily so the api works while F7 is in flight — a
 missing/broken evaluator degrades to per-sandbox error events and a failed
 run (zero scores), never a crash.
@@ -19,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -78,17 +84,18 @@ def _running_sandbox_ids(
 
 
 def _sandboxes_with_artifacts(
-    session_factory: sessionmaker[Session], run_id: uuid.UUID
+    session_factory: sessionmaker[Session],
+    run_id: uuid.UUID,
+    sandbox_ids: Collection[uuid.UUID] | None = None,
 ) -> list[Sandbox]:
+    stmt = select(Sandbox).where(
+        Sandbox.run_id == run_id, Sandbox.artifact_path.is_not(None)
+    )
+    if sandbox_ids is not None:
+        stmt = stmt.where(Sandbox.id.in_(list(sandbox_ids)))
     with session_factory() as session:
         return list(
-            session.execute(
-                select(Sandbox)
-                .where(Sandbox.run_id == run_id, Sandbox.artifact_path.is_not(None))
-                .order_by(Sandbox.id)
-            )
-            .scalars()
-            .all()
+            session.execute(stmt.order_by(Sandbox.id)).scalars().all()
         )
 
 
@@ -102,6 +109,35 @@ def _latest_approved_rubric(
             .order_by(Rubric.version.desc())
             .limit(1)
         ).scalar_one_or_none()
+
+
+def _rubric_for_run(
+    session_factory: sessionmaker[Session],
+    run_id: uuid.UUID,
+    rubric_id: uuid.UUID,
+) -> Rubric | None:
+    """Fetch one rubric row — only when it belongs to ``run_id``."""
+    with session_factory() as session:
+        return session.execute(
+            select(Rubric).where(Rubric.id == rubric_id, Rubric.run_id == run_id)
+        ).scalar_one_or_none()
+
+
+def _rubric_score_count(
+    session_factory: sessionmaker[Session],
+    run_id: uuid.UUID,
+    rubric_id: uuid.UUID,
+) -> int:
+    """Score rows for one rubric version — rescore progress reporting."""
+    with session_factory() as session:
+        return int(
+            session.execute(
+                select(func.count(Score.id))
+                .select_from(Score)
+                .join(Sandbox, Score.sandbox_id == Sandbox.id)
+                .where(Sandbox.run_id == run_id, Score.rubric_id == rubric_id)
+            ).scalar_one()
+        )
 
 
 def _run_tokens_used(
@@ -200,9 +236,18 @@ async def _evaluate_all(
     settings: Any,
     run: Run,
     evaluator_fn: EvaluatorFn | None,
+    rubric: Rubric | None = None,
+    sandbox_ids: Collection[uuid.UUID] | None = None,
+    model: str | None = None,
 ) -> None:
-    """Score every sandbox that produced artifacts; per-sandbox try/except."""
-    rubric = _latest_approved_rubric(session_factory, run.id)
+    """Score every sandbox that produced artifacts; per-sandbox try/except.
+
+    ``rubric``/``sandbox_ids``/``model`` are the PR5 re-score overrides —
+    defaults reproduce the original lifecycle pass (latest approved rubric,
+    all artifact-bearing sandboxes, run's evaluator_model).
+    """
+    if rubric is None:
+        rubric = _latest_approved_rubric(session_factory, run.id)
     if rubric is None:
         _emit_run_event(
             session_factory,
@@ -228,10 +273,10 @@ async def _evaluate_all(
             )
             return
 
-    evaluator_model = (run.config or {}).get("evaluator_model") or run.model_name
+    evaluator_model = model or (run.config or {}).get("evaluator_model") or run.model_name
     timeout = float(settings.EVAL_TIMEOUT_SECONDS)
 
-    sandboxes = _sandboxes_with_artifacts(session_factory, run.id)
+    sandboxes = _sandboxes_with_artifacts(session_factory, run.id, sandbox_ids)
     # Eval workspaces must live under the data root so the sandbox runtime's
     # host-path translation (HOST_DATA_ROOT in compose) covers their -v
     # sources — the evaluator's own default anchors at the repo root, which
@@ -244,6 +289,7 @@ async def _evaluate_all(
             "run_id": run.id,
             "sandbox_id": sb.id,
             "rubric_id": rubric.id,
+            "rubric_version": rubric.version,
             "rubric": rubric.content,
             "artifact_dir": artifact_dir,
             "workspace_dir": artifact_dir / "workspace",
@@ -446,3 +492,173 @@ async def _run_lifecycle(
                 "message": "evaluation produced no scores",
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# re-score (PR5)
+# ---------------------------------------------------------------------------
+
+
+def _enter_evaluating(
+    session_factory: sessionmaker[Session],
+    run_id: uuid.UUID,
+    payload: dict[str, Any],
+) -> None:
+    """done|failed → evaluating + clear finished_at + event, in one tx."""
+    with session_factory() as session:
+        run = session.get(Run, run_id)
+        if run is None:
+            return
+        try:
+            state_machine.transition(session, run, "evaluating")
+        except state_machine.InvalidTransition:
+            run.status = "evaluating"
+        run.finished_at = None
+        emit(session, run_id=run.id, event_type="checkpoint", payload=payload)
+        session.commit()
+
+
+def _finalize_rescore(
+    session_factory: sessionmaker[Session],
+    run_id: uuid.UUID,
+    *,
+    rubric: Rubric | None,
+    message: str | None = None,
+) -> None:
+    """Close a rescore pass: done iff ≥1 Score row exists for the run (the
+    lifecycle rule — old scores still count, so a no-op rescore restores the
+    previous terminal state). Emits rescore_finished (+ error on message)."""
+    total = _score_count(session_factory, run_id)
+    to_status = "done" if total > 0 else "failed"
+    payload: dict[str, Any] = {
+        "stage": "rescore_finished",
+        "scores_total": total,
+        "to_status": to_status,
+    }
+    if rubric is not None:
+        payload["rubric_id"] = str(rubric.id)
+        payload["rubric_version"] = rubric.version
+        payload["scores_for_rubric"] = _rubric_score_count(
+            session_factory, run_id, rubric.id
+        )
+    _set_run_status(
+        session_factory,
+        run_id,
+        to_status,
+        finished=True,
+        event_payload=(
+            payload
+            if message is None
+            else {"type": "error", "stage": "rescore", "message": message}
+        ),
+    )
+
+
+async def rescore_run(
+    run_id: uuid.UUID,
+    *,
+    session_factory: sessionmaker[Session],
+    runtime: SandboxRuntime,
+    settings: Any,
+    evaluator_fn: EvaluatorFn | None = None,
+    rubric_id: uuid.UUID | None = None,
+    sandbox_ids: Collection[uuid.UUID] | None = None,
+    model: str | None = None,
+) -> None:
+    """Re-run the evaluator on stored artifacts. Never raises.
+
+    ``rubric_id`` targets a specific rubric version (default: latest
+    approved); ``sandbox_ids`` limits which artifacts get re-judged;
+    ``model`` overrides the run's evaluator_model for this pass only.
+    """
+    try:
+        await _rescore_run(
+            run_id,
+            session_factory=session_factory,
+            runtime=runtime,
+            settings=settings,
+            evaluator_fn=evaluator_fn,
+            rubric_id=rubric_id,
+            sandbox_ids=sandbox_ids,
+            model=model,
+        )
+    except Exception as exc:
+        log.exception("rescore_run: run %s crashed", run_id)
+        try:
+            _finalize_rescore(
+                session_factory,
+                run_id,
+                rubric=None,
+                message=f"{type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            log.exception("rescore_run: could not finalize run %s", run_id)
+
+
+async def _rescore_run(
+    run_id: uuid.UUID,
+    *,
+    session_factory: sessionmaker[Session],
+    runtime: SandboxRuntime,
+    settings: Any,
+    evaluator_fn: EvaluatorFn | None,
+    rubric_id: uuid.UUID | None,
+    sandbox_ids: Collection[uuid.UUID] | None,
+    model: str | None,
+) -> None:
+    run = _load_run(session_factory, run_id)
+    if run is None:
+        log.warning("rescore_run: run %s not found", run_id)
+        return
+
+    if rubric_id is not None:
+        rubric = _rubric_for_run(session_factory, run_id, rubric_id)
+        if rubric is None:
+            _emit_run_event(
+                session_factory,
+                run_id,
+                event_type="error",
+                payload={
+                    "stage": "rescore",
+                    "message": f"rubric {rubric_id} not found for run",
+                },
+            )
+            _finalize_rescore(session_factory, run_id, rubric=None)
+            return
+    else:
+        rubric = _latest_approved_rubric(session_factory, run_id)
+        if rubric is None:
+            _emit_run_event(
+                session_factory,
+                run_id,
+                event_type="error",
+                payload={"stage": "rescore", "message": "no approved rubric found"},
+            )
+            _finalize_rescore(session_factory, run_id, rubric=None)
+            return
+
+    evaluator_model = model or (run.config or {}).get("evaluator_model") or run.model_name
+    _enter_evaluating(
+        session_factory,
+        run_id,
+        {
+            "stage": "rescore_started",
+            "rubric_id": str(rubric.id),
+            "rubric_version": rubric.version,
+            "model": evaluator_model,
+            "sandbox_ids": (
+                [str(s) for s in sorted(sandbox_ids)] if sandbox_ids else "all"
+            ),
+        },
+    )
+    await _evaluate_all(
+        session_factory=session_factory,
+        runtime=runtime,
+        settings=settings,
+        run=run,
+        evaluator_fn=evaluator_fn,
+        rubric=rubric,
+        sandbox_ids=sandbox_ids,
+        model=model,
+    )
+    _finalize_rescore(session_factory, run_id, rubric=rubric)

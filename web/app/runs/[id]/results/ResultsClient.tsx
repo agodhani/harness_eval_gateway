@@ -8,6 +8,9 @@
  * landing) but the run exists, falls back to per-sandbox
  * GET /api/sandboxes/{id}/scores and synthesizes the same matrix shape.
  * Polls while the run is non-terminal.
+ *
+ * PR5 adds eval iteration: a rubric-version selector (?rubric_version=) plus
+ * re-score / edit-rubric controls ({@link RescoreControls}).
  */
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -37,6 +40,7 @@ import {
 } from "@/components/ui";
 import AnalyticsSection from "./AnalyticsSection";
 import PreviewControls from "./PreviewControls";
+import RescoreControls from "./RescoreControls";
 
 const POLL_MS = 5_000;
 
@@ -68,8 +72,10 @@ async function fetchResultsViaScores(run: RunOut): Promise<RunResults> {
     const dimensions: Record<string, DimensionScore> = {};
     let overall: DimensionScore | null = null;
     let rubricId: string | null = null;
+    let rubricVersion: number | null = null;
     for (const sc of scores) {
       rubricId = sc.rubric_id ?? rubricId;
+      rubricVersion = sc.rubric_version ?? rubricVersion;
       const entry = { score: sc.score, rationale: sc.rationale ?? "" };
       if (sc.dimension === "overall") overall = entry;
       else dimensions[sc.dimension] = entry;
@@ -81,6 +87,7 @@ async function fetchResultsViaScores(run: RunOut): Promise<RunResults> {
       terminal_reason: sb.terminal_reason,
       artifact_path: sb.artifact_path,
       rubric_id: rubricId,
+      rubric_version: rubricVersion,
       dimensions,
       overall,
     });
@@ -106,6 +113,13 @@ export default function ResultsClient({ runId }: { runId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [unavailable, setUnavailable] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // PR5: pinned rubric version for the score matrix — null = newest-wins.
+  // Scoped to runId like the other loaded state (no remount between runs).
+  const [versionSel, setVersionSel] = useState<{ id: string; v: number | null }>({
+    id: runId,
+    v: null,
+  });
+  const selectedVersion = versionSel.id === runId ? versionSel.v : null;
 
   // Scope loaded data to the current runId — survives client-side navigation
   // between /runs/A/results and /runs/B/results without a remount.
@@ -114,10 +128,13 @@ export default function ResultsClient({ runId }: { runId: string }) {
   const loading = attemptedId !== runId;
 
   const refresh = useCallback(
-    async (silent = true) => {
+    async (silent = true, version: number | null = selectedVersion) => {
       try {
         // Run detail gives task/status context; results gives the matrix.
-        const [r, res] = await Promise.allSettled([getRun(runId), getRunResults(runId)]);
+        const [r, res] = await Promise.allSettled([
+          getRun(runId),
+          getRunResults(runId, version ?? undefined),
+        ]);
         if (r.status === "fulfilled") {
           setRunData(r.value);
           setLoadedRunId(runId);
@@ -164,7 +181,7 @@ export default function ResultsClient({ runId }: { runId: string }) {
         return false;
       }
     },
-    [runId],
+    [runId, selectedVersion],
   );
 
   useEffect(() => {
@@ -186,6 +203,12 @@ export default function ResultsClient({ runId }: { runId: string }) {
     const t = setInterval(() => refresh(true), POLL_MS);
     return () => clearInterval(t);
   }, [status, refresh]);
+
+  function selectVersion(v: number | null) {
+    setVersionSel({ id: runId, v });
+    // refresh's identity changes with selectedVersion → the mount effect
+    // refetches the matrix at the new pin.
+  }
 
   const sandboxes = useMemo(() => currentResults?.sandboxes ?? [], [currentResults]);
 
@@ -305,6 +328,19 @@ export default function ResultsClient({ runId }: { runId: string }) {
         {error ? <ErrorNote>{error}</ErrorNote> : null}
         {unavailable ? <InfoNote>{unavailable}</InfoNote> : null}
 
+        {currentResults ? (
+          <Card title="Re-score &amp; rubric versions">
+            <RescoreControls
+              runId={runId}
+              results={currentResults}
+              latestRubric={run?.rubric ?? null}
+              selectedVersion={selectedVersion}
+              onSelectVersion={selectVersion}
+              onChanged={() => void refresh(true)}
+            />
+          </Card>
+        ) : null}
+
         {sandboxes.length === 0 ? (
           <Card>
             <EmptyState>
@@ -344,6 +380,9 @@ export default function ResultsClient({ runId }: { runId: string }) {
                             <div className="dim-desc">
                               <Badge tone={statusTone(sb.terminal_reason)}>{sb.terminal_reason}</Badge>
                             </div>
+                          ) : null}
+                          {sb.rubric_version != null ? (
+                            <div className="dim-desc">judged: rubric v{sb.rubric_version}</div>
                           ) : null}
                         </th>
                       ))}
