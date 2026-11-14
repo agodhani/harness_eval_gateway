@@ -116,15 +116,12 @@ describe("sandboxStrips", () => {
     assert.equal(b.evalLine, null);
   });
 
-  test("price_model override + local model short-circuits cost", () => {
-    const [a] = sandboxStrips(fixture(), "qwen3:8b");
+  test("local price model short-circuits cost", () => {
+    const f = fixture();
+    f.price_model = "qwen3:8b";
+    const [a] = sandboxStrips(f);
     assert.equal(chip(a, "cost").value, "$0");
     assert.match(chip(a, "cost").title ?? "", /local/);
-  });
-
-  test("unknown price model renders a dash, not a crash", () => {
-    const [a] = sandboxStrips(fixture(), "no-such-model");
-    assert.equal(chip(a, "cost").value, "—");
   });
 
   test("evaluator traffic becomes a separate judge line, not mixed into chips", () => {

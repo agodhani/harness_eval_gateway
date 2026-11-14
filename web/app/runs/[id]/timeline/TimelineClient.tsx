@@ -349,9 +349,11 @@ export default function TimelineClient({ runId }: { runId: string }) {
 
   const sandboxIds = useMemo(() => {
     const set = new Set<string>();
+    for (const sb of analytics?.sandboxes ?? []) set.add(sb.sandbox_id);
     for (const e of events) if (e.sandbox_id) set.add(e.sandbox_id);
+    if (filterSandbox && filterSandbox !== "__none__") set.add(filterSandbox);
     return [...set].sort();
-  }, [events]);
+  }, [events, analytics, filterSandbox]);
 
   const typeOptions = useMemo(() => {
     const set = new Set(events.map((e) => e.type));

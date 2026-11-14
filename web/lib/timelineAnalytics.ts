@@ -44,21 +44,19 @@ export interface SandboxStrip {
 
 /**
  * Convert the analytics response into one strip per sandbox, in API order
- * (server sorts by started_at). `priceModel` overrides the server-selected
- * default; an unknown model simply renders "—" for cost.
+ * (server sorts by started_at). `price_model` is resolved server-side — the
+ * API 422s unknown models — so it always indexes `price_table`.
  */
-export function sandboxStrips(
-  analytics: RunAnalytics,
-  priceModel?: string,
-): SandboxStrip[] {
-  const selected = priceModel ?? analytics.price_model;
-  const price: ModelPrice | undefined = analytics.price_table?.[selected];
-  return (analytics.sandboxes ?? []).map((sb) => toStrip(sb, price, selected));
+export function sandboxStrips(analytics: RunAnalytics): SandboxStrip[] {
+  const price = analytics.price_table[analytics.price_model];
+  return analytics.sandboxes.map((sb) =>
+    toStrip(sb, price, analytics.price_model),
+  );
 }
 
 function toStrip(
   sb: SandboxAnalytics,
-  price: ModelPrice | undefined,
+  price: ModelPrice,
   priceName: string,
 ): SandboxStrip {
   const chips: StatChip[] = [
@@ -109,16 +107,9 @@ function latencyChip(sb: SandboxAnalytics): StatChip {
 
 function costChip(
   sb: SandboxAnalytics,
-  price: ModelPrice | undefined,
+  price: ModelPrice,
   priceName: string,
 ): StatChip {
-  if (!price) {
-    return {
-      label: "cost",
-      value: "—",
-      title: `no price table entry for ${priceName}`,
-    };
-  }
   if (price.local) {
     return { label: "cost", value: "$0", title: `${priceName} — local, $0` };
   }
