@@ -35,7 +35,9 @@ _FILE_TOOLS = {
 }
 
 
-def _truncate(value: Any, limit: int = MAX_SNIPPET) -> str:
+def _truncate(value: Any, limit: int = MAX_SNIPPET) -> str | None:
+    if value is None:
+        return None
     text = value if isinstance(value, str) else str(value)
     return text if len(text) <= limit else text[:limit] + "…[truncated]"
 
@@ -213,7 +215,7 @@ def translate_events(lines: Any) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Extension hook (PR17) — argv JSON via adapters.common.hooks
+# Extension hook (PR17) — stdin JSON via adapters.common.hooks
 # ---------------------------------------------------------------------------
 
 

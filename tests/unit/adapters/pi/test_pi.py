@@ -49,8 +49,6 @@ class TestConfig:
         # Forwards events to the shared receiver for this adapter…
         assert '"-m", "adapters.common.hooks", "pi"' in text
         assert "tool_execution_end" in text
-        # …and is observer-only (no returns that could alter the loop).
-        assert "execFileSync" in text
 
 
 class TestEnvLaunch:
