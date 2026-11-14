@@ -881,7 +881,8 @@ table.table {
 }
 
 /* PR9 — per-sandbox metrics strip between the toolbar and the event stream;
-   chips double as sandbox-filter selectors (click toggles ?sandbox= state). */
+   chips double as sandbox-filter selectors (click toggles the same filter
+   state ?sandbox= seeds; the URL param itself isn't rewritten). */
 .tl-metrics {
   display: flex;
   gap: 0.45rem;
