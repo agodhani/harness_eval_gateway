@@ -166,7 +166,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   per-sandbox cred); writes score + rationale per rubric dimension
   (functional requirements, acceptance criteria, code quality, cyclomatic
   complexity); `scores.json` parsed into `Score` rows with salvage-mode
-  parsing; `EVAL_TRANSCRIPT.log` written for evidence.
+  parsing (incl. flat `{dimension: score}` normalization); `EVAL_TRANSCRIPT.log`
+  written for evidence. Bounded retry: a judge run that produces zero Score
+  rows is re-spawned up to `EVAL_SCORE_RETRIES` times (default 1) with a fresh
+  cred, emitting an `eval_retry` checkpoint — covers small-model flake modes
+  (malformed JSON, stuck-loop wander); infra exceptions are not retried.
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
   `prompts.py`), db `scores`, `api/routers/results.py`
 - **Verify:**

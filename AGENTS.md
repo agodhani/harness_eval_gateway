@@ -240,7 +240,15 @@ or tests change.
 - Memory-aware spawn scheduling — gate `spawn_one` on host memory pressure
   (docker info / cgroup stats) and queue pending sandboxes until headroom
   exists, instead of launching all N configs at once (matters at 8x)
+- Run submission queue — pace/serialize whole runs so a new submission waits
+  behind the active run instead of overlapping; combined with memory-aware
+  spawn scheduling this bounds concurrent sandboxes when >2 would exceed
+  headroom for the loaded model
 - Auth, saved run templates, share links
+- Dynamic model picker — populate the submit form's model suggestions from
+  `ollama list` (gateway `/v1/models` pass-through already exists) instead of
+  the hardcoded `MODEL_SUGGESTIONS`, plus an install option (api endpoint →
+  `ollama pull`, stream pull progress into the UI)
 - Cross-run analytics & cost dashboards
 - Timeline-side analytics — per-sandbox metrics rendered alongside the
   execution timeline or on event hover (cost/tokens/latency in context)
@@ -351,6 +359,14 @@ or tests change.
 - **Preview registry lives on docker labels**, not in memory or Postgres —
   restart-safe discovery + the TTL reaper (default 15 min) works
   out-of-process; runner+proxy share `heg.preview_id`, stop removes all.
+- **Eval judge retries** — a judge that produces zero Score rows
+  (missing/invalid `scores.json`) is re-spawned up to `EVAL_SCORE_RETRIES`
+  (default 1) with a fresh cred; `eval_retry` checkpoints make it visible in
+  the timeline. Keyed on persisted Score rows, not the evaluator's return —
+  infra exceptions are deterministic and not retried. Motivation: small local
+  judge models flake ~1-in-3 evals (observed modes: flat dimension-map JSON,
+  paged-read stuck loops, grep-loop wander, unescaped quotes in rationale) —
+  `EVAL_PROMPT.md` carries targeted counter-hints (paging, no inner `"`).
 - One live preview per sandbox (POST is idempotent — re-clicking returns the
   existing preview); dead containers are cleared on respawn.
 

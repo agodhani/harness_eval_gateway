@@ -123,6 +123,17 @@ def _score_count(session_factory: sessionmaker[Session], run_id: uuid.UUID) -> i
         )
 
 
+def _sandbox_score_count(
+    session_factory: sessionmaker[Session], sandbox_id: uuid.UUID
+) -> int:
+    with session_factory() as session:
+        return int(
+            session.execute(
+                select(func.count(Score.id)).where(Score.sandbox_id == sandbox_id)
+            ).scalar_one()
+        )
+
+
 def _set_run_status(
     session_factory: sessionmaker[Session],
     run_id: uuid.UUID,
@@ -226,55 +237,74 @@ async def _evaluate_all(
     # sources — the evaluator's own default anchors at the repo root, which
     # inside the api container is /app (not daemon-visible).
     eval_root = Path(runtime.artifact_root).parent / "eval"
+    retries = int(getattr(settings, "EVAL_SCORE_RETRIES", 1))
     for sb in sandboxes:
-        try:
-            # Fresh cred per eval: a single cred's TTL can't span N sequential
-            # evals. max_tokens = tokens already spent + EVAL_TOKEN_BUDGET so
-            # the judge keeps its own allowance instead of 429ing on
-            # participant spend.
-            eval_cred = mint_cred(
-                run_id=run.id,
-                sandbox_id=sb.id,
-                secret=settings.GATEWAY_CRED_SECRET,
-                ttl_seconds=int(settings.EVAL_TIMEOUT_SECONDS) + 600,
-                max_tokens=_run_tokens_used(session_factory, run.id)
-                + int(settings.EVAL_TOKEN_BUDGET),
-            )
-            artifact_dir = Path(sb.artifact_path)  # type: ignore[arg-type]
-            kwargs = {
-                "run_id": run.id,
-                "sandbox_id": sb.id,
-                "rubric_id": rubric.id,
-                "rubric": rubric.content,
-                "artifact_dir": artifact_dir,
-                "workspace_dir": artifact_dir / "workspace",
-                "transcript_path": artifact_dir / "transcript.log",
-                "terminal_reason": sb.terminal_reason,
-                "model": evaluator_model,
-                "gateway_base_url": settings.GATEWAY_URL,
-                "gateway_cred": eval_cred,
-                "session_factory": session_factory,
-                "timeout_seconds": timeout,
-                # F7 DI knobs (accepted extras beyond the §5 contract):
-                "eval_root": eval_root,
-                "image": settings.SANDBOX_IMAGE,
-            }
-            await asyncio.wait_for(
-                evaluator_fn(**kwargs),
-                timeout=timeout + _EVAL_TIMEOUT_MARGIN_SECONDS,
-            )
-        except Exception as exc:  # noqa: BLE001 — per-sandbox isolation
-            log.warning("evaluation failed for sandbox %s: %s", sb.id, exc)
-            _emit_run_event(
-                session_factory,
-                run.id,
-                sandbox_id=sb.id,
-                event_type="error",
-                payload={
-                    "stage": "evaluation",
-                    "message": f"{type(exc).__name__}: {exc}",
-                },
-            )
+        artifact_dir = Path(sb.artifact_path)  # type: ignore[arg-type]
+        kwargs = {
+            "run_id": run.id,
+            "sandbox_id": sb.id,
+            "rubric_id": rubric.id,
+            "rubric": rubric.content,
+            "artifact_dir": artifact_dir,
+            "workspace_dir": artifact_dir / "workspace",
+            "transcript_path": artifact_dir / "transcript.log",
+            "terminal_reason": sb.terminal_reason,
+            "model": evaluator_model,
+            "gateway_base_url": settings.GATEWAY_URL,
+            "session_factory": session_factory,
+            "timeout_seconds": timeout,
+            # F7 DI knobs (accepted extras beyond the §5 contract):
+            "eval_root": eval_root,
+            "image": settings.SANDBOX_IMAGE,
+        }
+        for attempt in range(1, retries + 2):
+            try:
+                # Fresh cred per attempt: a single cred's TTL can't span N
+                # sequential evals. max_tokens = tokens already spent +
+                # EVAL_TOKEN_BUDGET so the judge keeps its own allowance
+                # instead of 429ing on participant spend.
+                kwargs["gateway_cred"] = mint_cred(
+                    run_id=run.id,
+                    sandbox_id=sb.id,
+                    secret=settings.GATEWAY_CRED_SECRET,
+                    ttl_seconds=int(settings.EVAL_TIMEOUT_SECONDS) + 600,
+                    max_tokens=_run_tokens_used(session_factory, run.id)
+                    + int(settings.EVAL_TOKEN_BUDGET),
+                )
+                await asyncio.wait_for(
+                    evaluator_fn(**kwargs),
+                    timeout=timeout + _EVAL_TIMEOUT_MARGIN_SECONDS,
+                )
+            except Exception as exc:  # noqa: BLE001 — per-sandbox isolation
+                log.warning("evaluation failed for sandbox %s: %s", sb.id, exc)
+                _emit_run_event(
+                    session_factory,
+                    run.id,
+                    sandbox_id=sb.id,
+                    event_type="error",
+                    payload={
+                        "stage": "evaluation",
+                        "message": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                break  # infra failure is deterministic — don't retry
+            if _sandbox_score_count(session_factory, sb.id) > 0:
+                break  # scored — done with this sandbox
+            if attempt <= retries:
+                # Judge ran but produced no usable scores.json — the observed
+                # failure mode of small local judge models (malformed JSON,
+                # stuck-loop wander). Bounded re-spawn, event-visible.
+                _emit_run_event(
+                    session_factory,
+                    run.id,
+                    sandbox_id=sb.id,
+                    event_type="checkpoint",
+                    payload={
+                        "stage": "eval_retry",
+                        "attempt": attempt + 1,
+                        "reason": "no scores produced",
+                    },
+                )
 
 
 # ---------------------------------------------------------------------------

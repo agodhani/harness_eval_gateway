@@ -122,6 +122,9 @@ same object. Valid JSON in this schema:
   missing pieces. "Looks good" is not a rationale.
 - `overall` is your holistic 0–10 judgment across all dimensions.
 - `summary` is a short paragraph for the human reviewer.
+- Do not use `"` characters inside `rationale` or `summary` strings — quote
+  file or symbol names with single quotes instead (inner double quotes make
+  the JSON invalid and the scores cannot be read).
 
 ## Rules
 

@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     # judge). Carried as max_tokens = tokens already spent + this allowance,
     # so it is independent of participant spend against the run budget.
     EVAL_TOKEN_BUDGET: int = 200_000
+    # Extra judge attempts per sandbox when the eval produced zero Score rows
+    # (missing/invalid scores.json) — small judge models flake ~1 in 3 evals;
+    # one retry is a cheap coin-flip recover. Infra exceptions are not retried.
+    EVAL_SCORE_RETRIES: int = 1
     # Host path of ./data as seen by the docker daemon — set by compose
     # (HOST_DATA_ROOT=${PWD}/data) so sandbox -v sources resolve on the host.
     # Empty (host-run dev / tests) => paths pass through verbatim.

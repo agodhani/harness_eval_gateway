@@ -276,6 +276,113 @@ async def test_lifecycle_missing_evaluator_module_fails_gracefully(
         assert errs
 
 
+async def test_lifecycle_eval_retry_recovers_empty_scores(
+    session_factory, settings, artifact_root
+) -> None:
+    """Judge flakes once (no scores), retry scores -> run done + retry event."""
+    cfg = run_config()
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+    settings.EVAL_SCORE_RETRIES = 1
+
+    fake = FakeRuntime(artifact_root=artifact_root, default_logs=RESULT_DONE)
+    calls: list = []
+
+    async def flaky_eval(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return []  # judge produced no usable scores.json
+        with kwargs["session_factory"]() as s:
+            s.add(
+                Score(
+                    sandbox_id=kwargs["sandbox_id"],
+                    rubric_id=kwargs["rubric_id"],
+                    dimension="d",
+                    score=8.0,
+                    rationale="ok",
+                )
+            )
+            s.commit()
+        return []
+
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=flaky_eval,
+    )
+
+    assert len(calls) == 2
+    with session_factory() as s:
+        assert s.get(type(run), run.id).status == "done"
+        evs = s.execute(select(Event).where(Event.run_id == run.id)).scalars().all()
+        retries = [
+            e for e in evs
+            if e.type == "checkpoint" and e.payload.get("stage") == "eval_retry"
+        ]
+        assert len(retries) == 1
+        assert retries[0].payload["attempt"] == 2
+
+
+async def test_lifecycle_eval_retry_exhausted_still_fails(
+    session_factory, settings, artifact_root
+) -> None:
+    """Judge never produces scores -> bounded attempts, run still failed."""
+    cfg = run_config()
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+    settings.EVAL_SCORE_RETRIES = 1
+
+    fake = FakeRuntime(artifact_root=artifact_root, default_logs=RESULT_DONE)
+    calls: list = []
+
+    async def no_scores(**kwargs):
+        calls.append(kwargs)
+        return []
+
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=no_scores,
+    )
+
+    assert len(calls) == 2  # initial attempt + 1 retry, then give up
+    with session_factory() as s:
+        assert s.get(type(run), run.id).status == "failed"
+
+
+async def test_lifecycle_eval_exception_not_retried(
+    session_factory, settings, artifact_root
+) -> None:
+    """Infra-level evaluator exceptions are deterministic — no retry."""
+    cfg = run_config()
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+    settings.EVAL_SCORE_RETRIES = 2
+
+    fake = FakeRuntime(artifact_root=artifact_root, default_logs=RESULT_DONE)
+    calls: list = []
+
+    async def boom_eval(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("spawn exploded")
+
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=boom_eval,
+    )
+
+    assert len(calls) == 1
+    with session_factory() as s:
+        assert s.get(type(run), run.id).status == "failed"
+
+
 async def test_lifecycle_no_approved_rubric_fails(
     session_factory, settings, artifact_root
 ) -> None:
