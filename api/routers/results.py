@@ -31,9 +31,11 @@ from sqlalchemy.orm import Session
 
 from api.config import get_settings
 from api.deps import get_db
+from api.schemas import AnalysisReport
 from db.models import Artifact, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
 from sandbox.preview import resolve_workspace_dir, scan_preview
+from scoring.render import ANALYSIS_JSON_FILENAME
 
 router = APIRouter(tags=["results"])
 
@@ -85,6 +87,10 @@ class SandboxResult(BaseModel):
     previewable: bool = False
     preview_type: str | None = None
     preview_candidates: list[PreviewCandidate] = Field(default_factory=list)
+    # PR6: objective signals measured on the workspace before judging
+    # (``<artifact>/analysis.json``). None when the evaluator ran without
+    # signal collection or the report is unreadable.
+    analysis: AnalysisReport | None = None
 
 
 class RunResults(BaseModel):
@@ -106,6 +112,30 @@ class ScoreOut(BaseModel):
     score: float
     rationale: str
     created_at: datetime
+
+
+def _load_analysis(jail: Path, sandbox: Sandbox) -> AnalysisReport | None:
+    """Read ``<artifact>/analysis.json`` (PR6), jailed + schema-validated.
+
+    Returns None when the report is absent, outside the artifact jail, or
+    doesn't validate — analysis is best-effort extra detail, never a 500.
+    """
+    if not sandbox.artifact_path:
+        return None
+    try:
+        path = (Path(sandbox.artifact_path) / ANALYSIS_JSON_FILENAME).resolve()
+    except OSError:
+        return None
+    if not (path == jail or jail in path.parents):
+        return None
+    try:
+        if not path.is_file():
+            return None
+        return AnalysisReport.model_validate_json(
+            path.read_text(encoding="utf-8", errors="replace")
+        )
+    except Exception:  # noqa: BLE001 — unreadable/invalid report -> absent
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +240,7 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
                     if scan is not None
                     else []
                 ),
+                analysis=_load_analysis(jail, sb),
             )
         )
 

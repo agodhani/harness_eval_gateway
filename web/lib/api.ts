@@ -270,6 +270,48 @@ export interface DimensionScore {
   rationale: string;
 }
 
+/** PR6 — objective scoring signals (scoring/ AnalysisReport).
+ * Measured on the workspace before judging; analysis.json is re-validated
+ * server-side and embedded on SandboxResult.analysis. Collector-agnostic:
+ * PR7's exec/coverage collector adds another SignalReport to `signals`. */
+export interface FunctionMetric {
+  name: string;
+  file: string;
+  line: number;
+  cyclomatic_complexity: number;
+  nloc: number;
+  params: number;
+  max_nesting_depth: number;
+}
+
+export interface FileMetric {
+  path: string;
+  language: string;
+  lines: number;
+  nloc: number;
+  function_count: number;
+  avg_cyclomatic_complexity: number;
+  max_cyclomatic_complexity: number;
+  max_nesting_depth: number;
+}
+
+export interface SignalReport {
+  name: string; // e.g. "static_analysis"; PR7 adds exec-derived signals
+  status: "ok" | "error" | "skipped" | string;
+  metrics: Record<string, unknown>;
+  files: FileMetric[];
+  functions: FunctionMetric[];
+  warnings: string[];
+  error: string | null;
+}
+
+export interface AnalysisReport {
+  schema_version: number;
+  generated_at: string; // ISO-8601
+  workspace: string;
+  signals: SignalReport[];
+}
+
 export interface SandboxResult {
   sandbox_id: string;
   harness_config: Record<string, unknown>;
@@ -279,6 +321,8 @@ export interface SandboxResult {
   rubric_id: string | null;
   dimensions: Record<string, DimensionScore>;
   overall: DimensionScore | null;
+  /** PR6: measured signals (analysis.json); null when not collected. */
+  analysis?: AnalysisReport | null;
   /** Optional artifact ids if/when the results API exposes them. */
   artifact_ids?: string[];
   artifacts?: { id: string; kind?: string; path?: string }[];

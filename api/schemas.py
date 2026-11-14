@@ -15,6 +15,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from api.pricing import ModelPrice
 
+# Re-exported so the control-plane score payloads live in one module — the
+# results API embeds AnalysisReport on SandboxResult (see bottom section).
+from scoring.models import AnalysisReport  # noqa: F401
+
 
 class EventSource(str, Enum):
     """Who produced the event (db Event.source)."""
@@ -385,3 +389,15 @@ class RunAnalytics(BaseModel):
     price_model: str
     price_table: dict[str, ModelPrice] = Field(default_factory=dict)
     sandboxes: list[SandboxAnalytics] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# PR6 — objective scoring signals (scoring/ package)
+# ---------------------------------------------------------------------------
+
+# ``AnalysisReport`` (imported at top) is the score payload for objective
+# signals: the evaluator writes ``<artifact_dir>/analysis.json`` in this
+# exact shape, the results API re-validates it and embeds it on
+# ``SandboxResult.analysis``. ``scoring.models`` is pydantic-only (no heavy
+# deps) so importing it from this module is cheap for every service that
+# loads api.schemas.
