@@ -94,19 +94,26 @@ detected runnable entry as typed `PreviewPlan`s, ordered default-first;
 - `plan_for_entry()` validates an explicit `entry` against the workspace
   jail (exists, not a symlink, `.html`/`.htm`/`.py`, resolves inside) — the
   API escape hatch; an explicit `.py` skips evidence scanning because the
-  pick *is* the disambiguation and isolation is identical either way.
+  pick *is* the disambiguation and isolation is identical either way. A
+  `type=` override forces the plan: `plan_for_type()` picks the first
+  candidate of a type (a both-matching workspace defaults to static), and
+  `plan_for_entry(..., type)` overrides the suffix — `static` serves any
+  jailed file (view a `.py`'s source), `desktop` requires `.py`.
 
 ## Endpoints (`api/routers/preview.py`)
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/api/runs/{run}/sandboxes/{sb}/preview` | `201 PreviewOut`; optional body `{entry: "game/main.py"}`; idempotent — returns the live preview if one exists; `422` when no runnable candidate / bad entry |
+| `POST` | `/api/runs/{run}/sandboxes/{sb}/preview` | `201 PreviewOut`; optional body `{entry: "game/main.py", type: "static"\|"desktop"}` — `type` alone picks the first candidate of that type, with `entry` it overrides the suffix-derived plan; idempotent — returns the live preview if one exists (an explicit different plan stops + respawns it); `422` when no runnable candidate / bad entry / bad type |
 | `GET` | …same | current preview or `404` |
 | `DELETE` | …same | `204`; removes runner + proxy |
 
 `GET /api/runs/{id}/results` now returns per-sandbox `previewable`,
 `preview_type`, and `preview_candidates: [{entry, type}]` (every detected
 option, default-first) so the UI can render choices without extra calls.
+The FS probe behind these fields is memoized by `ScanCache` for
+`PREVIEW_SCAN_TTL_SECONDS` (default 30s) — workspaces only change on
+re-snapshot.
 
 `PreviewPlan.type`/`PreviewOut.type` stay open (`static | desktop | …`) for
 `python-server` previews later.

@@ -114,10 +114,13 @@ def artifact_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point both routers' ARTIFACT_ROOT jail at a tmp dir."""
 
     def fake_settings() -> SimpleNamespace:
-        return SimpleNamespace(ARTIFACT_ROOT=tmp_path)
+        return SimpleNamespace(
+            ARTIFACT_ROOT=tmp_path, PREVIEW_SCAN_TTL_SECONDS=60
+        )
 
     monkeypatch.setattr(preview_router, "get_settings", fake_settings)
     monkeypatch.setattr(results_router, "get_settings", fake_settings)
+    results_router.reset_scan_cache()  # per-test isolation for the probe cache
     return tmp_path
 
 
@@ -605,3 +608,190 @@ def test_start_preview_entry_desktop_over_static_default(
     )
     assert resp.status_code == 201
     assert resp.json()["type"] == "desktop"
+
+
+# ---------------------------------------------------------------------------
+# POST .../preview with {type} override
+# ---------------------------------------------------------------------------
+
+
+def test_start_preview_type_desktop_on_both_match(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """Both-matching workspace defaults to static — {"type": "desktop"}
+    picks the first desktop candidate instead."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {"index.html": "x", "main.py": "import pygame\n"},
+    )
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"type": "desktop"},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["type"] == "desktop"
+    assert body["entry"] == "main.py"
+    kw = fake_manager.spawn_calls[0]
+    assert kw["plan"].type == "desktop"
+    assert kw["plan"].entry == "main.py"
+
+
+def test_start_preview_type_static_on_both_match(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """{"type": "static"} picks the first static candidate explicitly."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {"a.html": "a", "b.html": "b", "main.py": "import pygame\n"},
+    )
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"type": "static"},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["type"] == "static"
+    assert fake_manager.spawn_calls[0]["plan"].entry == "a.html"
+
+
+def test_start_preview_type_no_candidate(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """No candidate of the requested type → 422 naming what was detected."""
+    _workspace(artifact_root, run["run_id"], run["sb1"], {"index.html": "x"})
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"type": "desktop"},
+    )
+    assert resp.status_code == 422
+    assert "no 'desktop' preview candidate" in resp.json()["detail"]
+    assert "index.html" in resp.json()["detail"]
+    assert fake_manager.spawn_calls == []
+
+
+def test_start_preview_type_invalid(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    _workspace(artifact_root, run["run_id"], run["sb1"], {"index.html": "x"})
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"type": "weird"},
+    )
+    assert resp.status_code == 422
+    assert "unsupported preview type" in resp.json()["detail"]
+    assert fake_manager.spawn_calls == []
+
+
+def test_start_preview_entry_type_static_on_py(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """{"entry": "main.py", "type": "static"} serves the file instead of
+    executing it — view source."""
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {"main.py": "import pygame\n"},
+    )
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"entry": "main.py", "type": "static"},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["type"] == "static"
+    assert body["entry"] == "main.py"
+    assert fake_manager.spawn_calls[0]["plan"].type == "static"
+
+
+def test_start_preview_entry_type_desktop_on_html_rejected(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """desktop requires a .py entry — html + type=desktop → 422."""
+    _workspace(artifact_root, run["run_id"], run["sb1"], {"index.html": "x"})
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"entry": "index.html", "type": "desktop"},
+    )
+    assert resp.status_code == 422
+    assert ".py" in resp.json()["detail"]
+    assert fake_manager.spawn_calls == []
+
+
+def test_start_preview_replaces_live_on_different_plan(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """An explicit request for a DIFFERENT plan stops the live preview and
+    respawns — the type override would be unreachable otherwise."""
+    live = _preview(run["run_id"], run["sb1"])  # static index.html
+    fake_manager.previews.append(live)
+    _workspace(
+        artifact_root,
+        run["run_id"],
+        run["sb1"],
+        {"index.html": "x", "main.py": "import pygame\n"},
+    )
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"type": "desktop"},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["type"] == "desktop"
+    assert live.preview_id in fake_manager.stop_calls
+    assert len(fake_manager.spawn_calls) == 1
+
+
+def test_start_preview_same_plan_returns_live(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """An explicit request matching the live plan stays idempotent."""
+    live = _preview(run["run_id"], run["sb1"])  # static index.html
+    fake_manager.previews.append(live)
+    _workspace(artifact_root, run["run_id"], run["sb1"], {"index.html": "x"})
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview",
+        json={"entry": "index.html"},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["preview_id"] == live.preview_id
+    assert fake_manager.spawn_calls == []
+    assert fake_manager.stop_calls == []
+
+
+# ---------------------------------------------------------------------------
+# results endpoint: preview probe cache
+# ---------------------------------------------------------------------------
+
+
+def test_results_preview_probe_cached(
+    client: TestClient, run, artifact_root
+) -> None:
+    """The results GET memoizes the per-sandbox FS probe for
+    PREVIEW_SCAN_TTL_SECONDS — workspace changes inside the TTL are
+    invisible until the cache entry expires/resets."""
+    ws = _workspace(artifact_root, run["run_id"], run["sb1"], {"index.html": "x"})
+    resp = client.get(f"/api/runs/{run['run_id']}/results")
+    assert resp.status_code == 200
+    sandboxes = {s["sandbox_id"]: s for s in resp.json()["sandboxes"]}
+    assert sandboxes[str(run["sb1"])]["preview_type"] == "static"
+
+    # Mutate the workspace within the TTL — the cached probe still answers.
+    (ws / "index.html").unlink()
+    (ws / "main.py").write_text("import pygame\n")
+    resp = client.get(f"/api/runs/{run['run_id']}/results")
+    sandboxes = {s["sandbox_id"]: s for s in resp.json()["sandboxes"]}
+    assert sandboxes[str(run["sb1"])]["preview_type"] == "static"
+
+    # After reset the probe re-runs and sees the change.
+    results_router.reset_scan_cache()
+    resp = client.get(f"/api/runs/{run['run_id']}/results")
+    sandboxes = {s["sandbox_id"]: s for s in resp.json()["sandboxes"]}
+    sb1 = sandboxes[str(run["sb1"])]
+    assert sb1["preview_type"] == "desktop"
+    assert sb1["preview_candidates"] == [
+        {"entry": "main.py", "type": "desktop"}
+    ]

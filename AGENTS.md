@@ -274,12 +274,8 @@ or tests change.
 - "Add next prompt" — continue a finished sandbox with a follow-up prompt
   on the same workspace (multi-turn runs: new phase in the event stream +
   artifact re-snapshotted; resume-in-place vs respawn-from-snapshot TBD)
-- Preview `?type=` override (entry= picks the file but type still follows
-  the suffix; a workspace matching both detectors always gets static),
-  more desktop types (pyglet/arcade/tkinter — needs baked deps or a
-  wheelhouse mount), python-server previews
-- Cache `previewable`/`preview_type` probe on results GET (per-sandbox FS
-  probe on every call — fine at MVP scale, revisit if pages get large)
+- More desktop preview types (pyglet/arcade/tkinter — needs baked deps or
+  a wheelhouse mount — no egress in preview nets), python-server previews
 - dsh native helpers (spawn-helper, node-pty) — npm ≥11 blocks their
   postinstall scripts; CLI works without them, but revisit `--allow-scripts`
   for the dsh package set if evals hit TTY-dependent tasks
@@ -364,7 +360,18 @@ or tests change.
   `.py` overrides evidence (the pick IS the disambiguation). Zero
   candidates → UI shows disabled "not supported". Deps beyond baked-in
   pygame-ce can't install (no egress) — the app fails at import and the
-  runner exits visibly. Static defaults when both match.
+  runner exits visibly. Static defaults when both match. `type=` POST
+  overrides the pick: alone it selects the first detected candidate of
+  that type (a both-matching workspace defaults to static —
+  `{type:"desktop"}` reaches the game); with `entry=` it forces the plan —
+  `static` serves any jailed file (the entry is only the URL opened —
+  view a `.py`'s source instead of executing it), `desktop` still
+  requires a `.py` entry. A live preview is returned as-is unless an
+  explicit different plan is requested, then it's stopped and respawned.
+  The results-GET probe is memoized by `sandbox.preview.ScanCache`
+  (`PREVIEW_SCAN_TTL_SECONDS`, default 30s) keyed on
+  (jail, run, sandbox, artifact_path) — workspaces only change on
+  re-snapshot.
 - **Preview registry lives on docker labels**, not in memory or Postgres —
   restart-safe discovery + the TTL reaper (default 15 min) works
   out-of-process; runner+proxy share `heg.preview_id`, stop removes all.
