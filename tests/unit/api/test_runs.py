@@ -24,8 +24,9 @@ from sqlalchemy import select
 from api.deps import get_db
 from api.main import app
 from api.routers import runs as runs_router
-from db.models import Base, Event, Rubric, Run
+from db.models import Base, Event, Rubric, Run, Sandbox
 from db.session import make_engine, make_session_factory
+from orchestrator import continuation as continuation_mod
 from orchestrator import lifecycle as lifecycle_mod
 from orchestrator import rubric as rubric_mod
 from orchestrator import runner, state_machine
@@ -506,3 +507,260 @@ def test_rubric_endpoints_404_and_409(api) -> None:
         f"/api/runs/{bare_id}/rubric", json={"content": _rubric_content()}
     ).status_code == 409
     assert client.post(f"/api/runs/{bare_id}/approve").status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# PR16 — POST /api/runs/{id}/continuations ("add next prompt")
+# ---------------------------------------------------------------------------
+
+
+def _finished_run_with_sandbox(
+    api,
+    *,
+    run_status: str = "done",
+    sb_status: str = "done",
+    continuations: list | None = None,
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """Run + one sandbox row in arbitrary DB states for continuation tests."""
+    with api.session_factory() as s:
+        run = Run(
+            status=run_status,
+            task_prompt="create hello.txt",
+            model_name="qwen3:8b",
+            config={
+                "harness_configs": [{"adapter": "miniloop"}],
+                "budgets": {
+                    "max_iters": 10,
+                    "token_budget": 50_000,
+                    "wall_clock_seconds": 600,
+                },
+            },
+            started_at=datetime.now(UTC) - timedelta(hours=1),
+            finished_at=datetime.now(UTC),
+        )
+        s.add(run)
+        s.flush()
+        sb = Sandbox(
+            run_id=run.id,
+            harness_config={
+                "adapter": "miniloop",
+                "skill_packs": [],
+                **({"continuations": continuations} if continuations else {}),
+            },
+            status=sb_status,
+            started_at=datetime.now(UTC) - timedelta(hours=1),
+            finished_at=datetime.now(UTC),
+            terminal_reason="agent_done",
+            artifact_path="/tmp/artifacts/x",
+        )
+        s.add(sb)
+        s.commit()
+        return run.id, sb.id
+
+
+def test_continuation_accepts_and_registers_task(api, monkeypatch) -> None:
+    """Happy path: finished run+sandbox -> 201, run re-holds the slot, the
+    sandbox records the phase and a continuation task starts."""
+    calls: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+    async def fake_continuation(run_id, sandbox_id, **_kwargs):
+        calls.append((run_id, sandbox_id))
+
+    monkeypatch.setattr(continuation_mod, "run_continuation", fake_continuation)
+
+    run_id, sb_id = _finished_run_with_sandbox(api)
+    resp = api.client.post(
+        f"/api/runs/{run_id}/continuations",
+        json={"sandbox_id": str(sb_id), "prompt": "now add tests"},
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["status"] == "provisioning"
+    assert body["finished_at"] is None
+
+    with api.session_factory() as s:
+        run = s.get(Run, run_id)
+        assert run.status == "provisioning"
+        sb = s.get(Sandbox, sb_id)
+        assert sb.status == "provisioning"
+        assert sb.finished_at is None
+        assert sb.terminal_reason is None
+        conts = sb.harness_config["continuations"]
+        assert len(conts) == 1
+        assert conts[0]["phase"] == 2
+        assert conts[0]["prompt"] == "now add tests"
+        stages = [
+            e.payload.get("stage")
+            for e in s.execute(select(Event).where(Event.run_id == run_id))
+            .scalars()
+            if e.type == "checkpoint"
+        ]
+    assert "continuation_started" in stages
+
+    deadline = time.monotonic() + 5.0
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert calls == [(run_id, sb_id)]
+
+
+def test_continuation_404s(api, monkeypatch) -> None:
+    calls: list = []
+
+    async def fake_continuation(*a, **k):
+        calls.append(a)
+
+    monkeypatch.setattr(continuation_mod, "run_continuation", fake_continuation)
+    client = api.client
+
+    assert client.post(
+        f"/api/runs/{uuid.uuid4()}/continuations",
+        json={"sandbox_id": str(uuid.uuid4()), "prompt": "x"},
+    ).status_code == 404
+
+    run_id, _sb_id = _finished_run_with_sandbox(api)
+    # sandbox id that doesn't exist / belongs to another run
+    assert client.post(
+        f"/api/runs/{run_id}/continuations",
+        json={"sandbox_id": str(uuid.uuid4()), "prompt": "x"},
+    ).status_code == 404
+    _other_run, other_sb = _finished_run_with_sandbox(api)
+    assert client.post(
+        f"/api/runs/{run_id}/continuations",
+        json={"sandbox_id": str(other_sb), "prompt": "x"},
+    ).status_code == 404
+    assert calls == []
+
+
+def test_continuation_409s(api, monkeypatch) -> None:
+    calls: list = []
+
+    async def fake_continuation(*a, **k):
+        calls.append(a)
+
+    monkeypatch.setattr(continuation_mod, "run_continuation", fake_continuation)
+    client = api.client
+
+    # sandbox not finished
+    run_id, sb_id = _finished_run_with_sandbox(api, sb_status="running")
+    resp = client.post(
+        f"/api/runs/{run_id}/continuations",
+        json={"sandbox_id": str(sb_id), "prompt": "x"},
+    )
+    assert resp.status_code == 409
+
+    # run not finished and its active work is NOT continuation-driven
+    run_id, sb_id = _finished_run_with_sandbox(
+        api, run_status="running", sb_status="running"
+    )
+    resp = client.post(
+        f"/api/runs/{run_id}/continuations",
+        json={"sandbox_id": str(sb_id), "prompt": "x"},
+    )
+    assert resp.status_code == 409
+
+    # run in rubric_review — human gate not passed
+    run_id, sb_id = _finished_run_with_sandbox(api, run_status="rubric_review")
+    resp = client.post(
+        f"/api/runs/{run_id}/continuations",
+        json={"sandbox_id": str(sb_id), "prompt": "x"},
+    )
+    assert resp.status_code == 409
+
+    # queued run is parked, not finished
+    run_id, sb_id = _finished_run_with_sandbox(api, run_status="queued")
+    resp = client.post(
+        f"/api/runs/{run_id}/continuations",
+        json={"sandbox_id": str(sb_id), "prompt": "x"},
+    )
+    assert resp.status_code == 409
+
+    # evaluating with NO in-flight continuation sandboxes — normal lifecycle
+    # tail must not admit follow-ups (empty active set ≠ continuation-driven)
+    run_id, sb_id = _finished_run_with_sandbox(api, run_status="evaluating")
+    resp = client.post(
+        f"/api/runs/{run_id}/continuations",
+        json={"sandbox_id": str(sb_id), "prompt": "x"},
+    )
+    assert resp.status_code == 409
+
+    # another run holds the execution slot -> 409 (continuations don't queue)
+    run_id, sb_id = _finished_run_with_sandbox(api)
+    with api.session_factory() as s:
+        s.add(Run(status="provisioning", task_prompt="busy", model_name="m", config={}))
+        s.commit()
+    resp = client.post(
+        f"/api/runs/{run_id}/continuations",
+        json={"sandbox_id": str(sb_id), "prompt": "x"},
+    )
+    assert resp.status_code == 409
+    assert calls == []
+
+
+def test_continuation_parallel_sibling_admission(api, monkeypatch) -> None:
+    """While THIS run's active work is itself continuations, a follow-up for
+    another finished sibling joins in parallel (run already holds the slot)."""
+    calls: list = []
+
+    async def fake_continuation(*a, **k):
+        calls.append(a)
+
+    monkeypatch.setattr(continuation_mod, "run_continuation", fake_continuation)
+    client = api.client
+
+    with api.session_factory() as s:
+        run = Run(
+            status="running",
+            task_prompt="create hello.txt",
+            model_name="qwen3:8b",
+            config={},
+            started_at=datetime.now(UTC) - timedelta(hours=1),
+        )
+        s.add(run)
+        s.flush()
+        active = Sandbox(
+            run_id=run.id,
+            harness_config={
+                "adapter": "miniloop",
+                "continuations": [
+                    {"phase": 2, "prompt": "first follow-up", "started_at": "t"}
+                ],
+            },
+            status="running",
+            started_at=datetime.now(UTC) - timedelta(minutes=30),
+        )
+        done = Sandbox(
+            run_id=run.id,
+            harness_config={"adapter": "miniloop"},
+            status="done",
+            started_at=datetime.now(UTC) - timedelta(hours=1),
+            finished_at=datetime.now(UTC),
+            terminal_reason="agent_done",
+            artifact_path="/tmp/artifacts/x",
+        )
+        s.add_all([active, done])
+        s.commit()
+        run_id, done_sb = run.id, done.id
+
+    resp = client.post(
+        f"/api/runs/{run_id}/continuations",
+        json={"sandbox_id": str(done_sb), "prompt": "second follow-up"},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["status"] == "running"  # slot already held — stays
+    with api.session_factory() as s:
+        sb = s.get(Sandbox, done_sb)
+        assert sb.status == "provisioning"
+        assert sb.harness_config["continuations"][-1]["phase"] == 2
+
+
+def test_continuation_validation(api) -> None:
+    client = api.client
+    run_id, sb_id = _finished_run_with_sandbox(api)
+    assert client.post(
+        f"/api/runs/{run_id}/continuations",
+        json={"sandbox_id": str(sb_id), "prompt": ""},
+    ).status_code == 422
+    assert client.post(
+        f"/api/runs/{run_id}/continuations",
+        json={"prompt": "x"},
+    ).status_code == 422

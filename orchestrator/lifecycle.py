@@ -200,8 +200,14 @@ async def _evaluate_all(
     settings: Any,
     run: Run,
     evaluator_fn: EvaluatorFn | None,
+    sandbox_ids: set[uuid.UUID] | None = None,
 ) -> None:
-    """Score every sandbox that produced artifacts; per-sandbox try/except."""
+    """Score every sandbox that produced artifacts; per-sandbox try/except.
+
+    ``sandbox_ids`` (PR16 continuations) limits scoring to a subset — a
+    follow-up phase re-scores only the continued sandbox so unchanged
+    siblings don't drift on judge nondeterminism.
+    """
     rubric = _latest_approved_rubric(session_factory, run.id)
     if rubric is None:
         _emit_run_event(
@@ -232,6 +238,8 @@ async def _evaluate_all(
     timeout = float(settings.EVAL_TIMEOUT_SECONDS)
 
     sandboxes = _sandboxes_with_artifacts(session_factory, run.id)
+    if sandbox_ids is not None:
+        sandboxes = [sb for sb in sandboxes if sb.id in sandbox_ids]
     # Eval workspaces must live under the data root so the sandbox runtime's
     # host-path translation (HOST_DATA_ROOT in compose) covers their -v
     # sources — the evaluator's own default anchors at the repo root, which

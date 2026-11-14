@@ -10,6 +10,12 @@ Allowed transitions mirror the lifecycle in AGENTS.md / docs/orchestrator-plan.m
 single execution slot — see ``orchestrator/pacing.py``. ``queued → failed``
 exists so sweeps / a future cancel can retire parked runs.
 
+``done``/``failed → provisioning`` on BOTH machines is the continuation
+re-entry (PR16 "add next prompt"): a finished sandbox respawns a fresh
+container on its still-live workspace dir for a follow-up phase, and the run
+re-holds the execution slot while it does — see
+``orchestrator/continuation.py``.
+
 ``transition()`` is the ONLY sanctioned way to change ``status`` — it validates
 against the table, mutates the row, and emits an orchestrator ``checkpoint``
 event (callers commit the session). Illegal transitions raise
@@ -31,16 +37,18 @@ RUN_TRANSITIONS: dict[str, frozenset[str]] = {
     "provisioning": frozenset({"running", "failed"}),
     "running": frozenset({"evaluating", "failed"}),
     "evaluating": frozenset({"done", "failed"}),
-    "done": frozenset(),
-    "failed": frozenset(),
+    # terminal → provisioning: PR16 continuation re-entry only.
+    "done": frozenset({"provisioning"}),
+    "failed": frozenset({"provisioning"}),
 }
 
 SANDBOX_TRANSITIONS: dict[str, frozenset[str]] = {
     "provisioning": frozenset({"running", "terminating", "failed"}),
     "running": frozenset({"terminating", "done", "failed"}),
     "terminating": frozenset({"done", "failed"}),
-    "done": frozenset(),
-    "failed": frozenset(),
+    # terminal → provisioning: PR16 continuation re-entry only.
+    "done": frozenset({"provisioning"}),
+    "failed": frozenset({"provisioning"}),
 }
 
 RUN_TERMINAL = frozenset({"done", "failed"})

@@ -229,10 +229,14 @@ class FakeRuntime:
 
     # -- artifacts ------------------------------------------------------------
 
-    def snapshot(self, sandbox_id: str, run_id: str) -> SnapshotResult:
+    def snapshot(
+        self, sandbox_id: str, run_id: str, *, phase: int | None = None
+    ) -> SnapshotResult:
         if self.snapshot_raises:
             raise RuntimeError("simulated snapshot failure")
         artifact_dir = self.artifact_root / run_id / sandbox_id
+        if phase is not None and phase > 1:
+            artifact_dir = artifact_dir / "continuations" / str(phase)
         workspace_dir = artifact_dir / "workspace"
         transcript_path = artifact_dir / "transcript.log"
         meta_path = artifact_dir / "meta.json"

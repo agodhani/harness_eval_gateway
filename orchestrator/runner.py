@@ -27,13 +27,13 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from db.models import Rubric, Run, Sandbox
+from db.models import Rubric, Run, Sandbox, Score
 from sandbox.runtime import SandboxRuntime
 
-from . import lifecycle, pacing, state_machine
+from . import continuation, lifecycle, pacing, state_machine
 from . import rubric as rubric_mod
 from .events import emit
 
@@ -190,6 +190,66 @@ async def _lifecycle_then_promote(
         )
 
 
+def start_continuation_task(
+    run_id: uuid.UUID,
+    sandbox_id: uuid.UUID,
+    *,
+    session_factory: sessionmaker[Session] | None = None,
+    settings: Any | None = None,
+    runtime: SandboxRuntime | None = None,
+    evaluator_fn: Any | None = None,
+) -> asyncio.Task[None]:
+    """Register a continuation phase task for one finished sandbox (PR16).
+
+    Keyed per-sandbox so parallel continuations of sibling sandboxes coexist
+    while a duplicate start for the same sandbox dedups to the live task.
+    """
+    sf = session_factory or _session_factory()
+    st = settings or _settings()
+    rt = runtime or get_runtime()
+    return _track(
+        f"continuation:{sandbox_id}",
+        run_id,
+        _continuation_then_promote(
+            run_id,
+            sandbox_id,
+            session_factory=sf,
+            settings=st,
+            runtime=rt,
+            evaluator_fn=evaluator_fn,
+        ),
+    )
+
+
+async def _continuation_then_promote(
+    run_id: uuid.UUID,
+    sandbox_id: uuid.UUID,
+    *,
+    session_factory: sessionmaker[Session],
+    settings: Any,
+    runtime: SandboxRuntime,
+    evaluator_fn: Any | None,
+) -> None:
+    """Drive one continuation phase, then free the slot (same shape as
+    :func:`_lifecycle_then_promote`)."""
+    try:
+        await continuation.run_continuation(
+            run_id,
+            sandbox_id,
+            session_factory=session_factory,
+            runtime=runtime,
+            settings=settings,
+            evaluator_fn=evaluator_fn,
+        )
+    finally:
+        await promote_next_queued(
+            session_factory=session_factory,
+            settings=settings,
+            runtime=runtime,
+            evaluator_fn=evaluator_fn,
+        )
+
+
 async def promote_next_queued(
     *,
     session_factory: sessionmaker[Session],
@@ -270,15 +330,15 @@ def _stale_runs(
 def _fail_run_and_sandboxes(
     session_factory: sessionmaker[Session], run_id: uuid.UUID
 ) -> None:
-    """Mark a stale run failed + its non-terminal sandboxes failed/error."""
+    """Mark a stale run failed + its non-terminal sandboxes failed/error.
+
+    PR16 exception: when EVERY in-flight sandbox was a continuation phase
+    (``harness_config.continuations`` non-empty), the run's original verdict
+    stands — it returns to ``done`` (or ``failed`` when it never scored)
+    instead of being failed by the sweep.
+    """
     with session_factory() as session:
         run = session.get(Run, run_id)
-        if run is not None and run.status not in state_machine.RUN_TERMINAL:
-            try:
-                state_machine.transition(session, run, "failed")
-            except state_machine.InvalidTransition:
-                run.status = "failed"
-            run.finished_at = datetime.now(UTC)
         sandboxes = session.execute(
             select(Sandbox).where(
                 Sandbox.run_id == run_id,
@@ -292,6 +352,29 @@ def _fail_run_and_sandboxes(
                 sb.status = "failed"
             sb.terminal_reason = sb.terminal_reason or "error"
             sb.finished_at = datetime.now(UTC)
+
+        continuation_only = bool(sandboxes) and all(
+            (sb.harness_config or {}).get("continuations") for sb in sandboxes
+        )
+        if run is not None and run.status not in state_machine.RUN_TERMINAL:
+            if continuation_only:
+                # A restart mid-continuation shouldn't regress a finished
+                # run's verdict — restore done iff it ever scored.
+                scores = int(
+                    session.execute(
+                        select(func.count(Score.id))
+                        .select_from(Score)
+                        .join(Sandbox, Score.sandbox_id == Sandbox.id)
+                        .where(Sandbox.run_id == run_id)
+                    ).scalar_one()
+                )
+                run.status = "done" if scores > 0 else "failed"
+            else:
+                try:
+                    state_machine.transition(session, run, "failed")
+                except state_machine.InvalidTransition:
+                    run.status = "failed"
+            run.finished_at = datetime.now(UTC)
         if run is not None:
             emit(
                 session,
@@ -299,7 +382,11 @@ def _fail_run_and_sandboxes(
                 event_type="error",
                 payload={
                     "stage": "startup_sweep",
-                    "message": "run was mid-flight at api restart — marked failed",
+                    "message": (
+                        "continuation phase interrupted at api restart"
+                        if continuation_only
+                        else "run was mid-flight at api restart — marked failed"
+                    ),
                 },
             )
         session.commit()

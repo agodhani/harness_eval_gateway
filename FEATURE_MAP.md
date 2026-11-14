@@ -25,6 +25,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
 | F11 | Skillpack import from GitHub | ✅ | `skillpack_import/`, `api/routers/skillpacks.py`, `web/app/submit/ImportSkillPackDialog.tsx` | `tests/unit/api/test_skillpacks.py`, `test_skillpack_import.py` |
 | F12 | Artifact preview (static html + desktop/pygame via noVNC, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
+| F14 | Multi-turn runs — "add next prompt" continuations | ✅ | `orchestrator/continuation.py`, `api/routers/runs.py`, `web/app/runs/[id]/RunDetailClient.tsx` | `tests/unit/orchestrator/test_continuation.py`, `tests/unit/api/test_runs.py` |
 
 ## Feature details
 
@@ -440,6 +441,77 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     pages grow large.
 - **Depends on:** F4 (runtime plumbing/host-path translation), F8 (results
   page + artifact store layout)
+
+### F14 — Multi-turn runs ("add next prompt") ✅
+
+- **What:** continue a finished sandbox with a follow-up prompt on the same
+  workspace — the run becomes multi-turn. Chosen design: **respawn-from-
+  snapshot** (fresh container, same sandbox UUID, same live workspace
+  bind-mount `data/sandboxes/<sid>/workspace`) rather than resume-in-place
+  (keeping the stopped container). Resume-in-place would preserve process
+  state but requires stopped-container retention and mutable in-container
+  state; respawn keeps lifecycle uniform (every phase is a normal
+  provision→monitor→finalize pass) at the cost of a cold harness process —
+  conversation context does NOT carry over, so the follow-up prompt is
+  wrapped with the original task + a continuation note
+  (`continuation.wrap_task_prompt`).
+- **API:** `POST /api/runs/{run_id}/continuations` body
+  `{sandbox_id, prompt}` → `201 RunOut`. `404` run/sandbox missing or
+  sandbox not in this run; `409` sandbox not finished
+  (`done|failed` only), run not continuable, or another run holds the
+  execution slot (continuations don't queue). Pydantic-validated
+  (`ContinuationCreate`, prompt 1–100k chars).
+- **Admission:** a terminal run (`done|failed`) claims the single pacing
+  slot atomically (status → `provisioning`, `finished_at` cleared). An
+  already-active run admits a follow-up only while its in-flight work is
+  itself continuations — parallel sibling phases are allowed; the run
+  returns to terminal when the last finisher's `close_run_if_idle` wins.
+- **Phase model:** `harness_config.continuations[]` on the Sandbox row
+  records `{phase, prompt, started_at}` per accepted follow-up (phase 1 =
+  original). The same sandbox row re-flows `done|failed → provisioning →
+  running → terminal`; timeline gains `continuation_started` /
+  `continuation_completed` checkpoints; the workspace is re-snapshotted
+  under `<artifact_root>/<run>/<sid>/continuations/<n>/` — a NEW artifact
+  path per phase (ScanCache keys on path, so phase artifacts coexist).
+- **Budgets/monitoring:** each phase gets a fresh sandbox credential whose
+  token budget = configured budget + tokens already used by the run
+  (per-phase allowance on top of cumulative usage). Monitor's done-signal
+  and budget-event checks are scoped by event-id boundary
+  (`since_event_id`) so a prior phase's signals can't terminate the new
+  phase; `finalize_sandbox(phase=)` routes the snapshot to the phase dir.
+- **Evaluation:** after a continuation phase, `_evaluate_all` re-scores
+  ONLY the continued sandbox (`sandbox_ids=` filter) against the phase-N
+  artifact dir — unchanged siblings aren't re-judged. A failed spawn keeps
+  the phase-1 artifact/scores untouched.
+- **Restart:** `runner.startup_sweep` treats an interrupted continuation
+  like other in-flight work (sandbox → failed/error) but restores the run's
+  prior verdict — `done` iff the run ever scored — instead of failing it.
+- **UI:** run detail page "Follow-up prompts" card (per finished sandbox:
+  prompt box + phase history) and `phase N` badges in the sandbox table;
+  mirrors the admission rules client-side and surfaces 409 details.
+- **Where:** `orchestrator/continuation.py` (respawn flow, prompt wrap,
+  idle-close), `orchestrator/state_machine.py` (terminal re-entry),
+  `orchestrator/monitor.py` (phase-scoped checks + `phase=` snapshot),
+  `sandbox/runtime.py` (`snapshot(phase=)`),
+  `orchestrator/lifecycle.py` (`sandbox_ids` filter),
+  `orchestrator/runner.py` (`start_continuation_task`, sweep restore),
+  `api/routers/runs.py` (`ContinuationCreate` + endpoint),
+  `web/lib/api.ts` (`addContinuation`, `sandboxContinuations`,
+  `sandboxPhase`), `web/app/runs/[id]/RunDetailClient.tsx`
+- **Verify:**
+  - `uv run pytest -m "not docker"` — `tests/unit/orchestrator/
+    test_continuation.py` (happy path, per-sandbox eval, per-phase token
+    budget, stale done-signal/budget-event scoping, spawn-failure verdict
+    preservation, idle-close, sweep restore), `test_state_machine.py`
+    (terminal re-entry), `tests/unit/api/test_runs.py` (201/404/409 matrix,
+    parallel-sibling admission, prompt validation)
+  - `cd web && npm run lint && npm run build`
+  - Manual: finish a run → run detail → "Follow-up prompts" → send a
+    prompt → sandbox flips provisioning→running→done, timeline shows the
+    phase boundary, results re-score only that sandbox, artifact lands
+    under `continuations/2/`.
+- **Depends on:** F2 (state machine/lifecycle), F4 (runtime spawn/snapshot),
+  PR15 pacing (`pacing.py` slot + memory gate reused for respawns)
 
 ## Implementation sequence
 

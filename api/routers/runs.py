@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -30,8 +30,8 @@ from api.schemas import (
 )
 from db.models import Rubric, Run, Sandbox
 from orchestrator import adapters as orch_adapters
+from orchestrator import continuation, pacing, provision, runner, state_machine
 from orchestrator import events as orch_events
-from orchestrator import pacing, provision, runner
 from orchestrator.rubric import RubricContent
 from skillpack_import.store import imported_root
 
@@ -44,6 +44,13 @@ class RubricUpdate(BaseModel):
     """PUT /api/runs/{id}/rubric body — full replacement of draft content."""
 
     content: RubricContent
+
+
+class ContinuationCreate(BaseModel):
+    """POST /api/runs/{id}/continuations body — "add next prompt" (PR16)."""
+
+    sandbox_id: uuid.UUID
+    prompt: str = Field(min_length=1, max_length=100_000)
 
 
 # ---------------------------------------------------------------------------
@@ -282,4 +289,112 @@ async def approve_run(run_id: uuid.UUID, session: DbSession) -> RunOut:
 
     if placed == "provisioning":
         runner.start_lifecycle_task(run.id)
+    return _run_out(session, run)
+
+
+# ---------------------------------------------------------------------------
+# PR16 — "add next prompt" (multi-turn continuations)
+# ---------------------------------------------------------------------------
+
+
+def _continuation_active_only(session: Session, run: Run) -> bool:
+    """True when the run has in-flight sandboxes AND every one of them is
+    itself a continuation phase — i.e. the run's active state is
+    continuation-driven (not its original lifecycle). An empty active set
+    means the run is in its normal lifecycle tail (e.g. evaluating) and
+    must NOT admit follow-ups."""
+    active = session.execute(
+        select(Sandbox).where(
+            Sandbox.run_id == run.id,
+            Sandbox.status.in_(continuation.ACTIVE_SANDBOX_STATES),
+        )
+    ).scalars().all()
+    return bool(active) and all(
+        (s.harness_config or {}).get("continuations") for s in active
+    )
+
+
+@router.post("/{run_id}/continuations", status_code=status.HTTP_201_CREATED)
+async def create_continuation(
+    run_id: uuid.UUID, body: ContinuationCreate, session: DbSession
+) -> RunOut:
+    """Continue a finished sandbox with a follow-up prompt on its workspace.
+
+    The sandbox respawns a fresh container on the SAME state-dir workspace
+    (resume-in-place at the filesystem level): the run re-holds the single
+    execution slot for the phase, the event stream gains a
+    ``continuation_started`` → ``continuation_completed`` phase, and the
+    workspace is re-snapshotted under ``continuations/<n>/``.
+
+    Slot rules mirror approve-time pacing: a finished run claims the slot
+    atomically here (409 while another run holds it — continuations don't
+    queue). While THIS run is already continuation-active, a follow-up for
+    another finished sibling sandbox joins in parallel.
+    """
+    run = _get_run_or_404(session, run_id)
+    sb = session.get(Sandbox, body.sandbox_id)
+    if sb is None or sb.run_id != run.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="sandbox not found"
+        )
+    if sb.status not in continuation.CONTINUABLE_SANDBOX_STATES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"sandbox not finished: status={sb.status!r}",
+        )
+
+    if run.status in state_machine.RUN_TERMINAL:
+        # Claim the slot the same way pacing claims a queued run — the
+        # committed status flip IS the claim.
+        ahead = session.scalar(
+            select(func.count(Run.id)).where(
+                Run.id != run.id,
+                Run.status.in_(pacing.BLOCKING_RUN_STATES),
+            )
+        )
+        if ahead:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="another run holds the execution slot",
+            )
+        state_machine.transition(session, run, "provisioning")
+        run.finished_at = None
+    elif run.status in pacing.ACTIVE_RUN_STATES and _continuation_active_only(
+        session, run
+    ):
+        pass  # this run already holds the slot via in-flight continuations
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"run is not continuable: status={run.status!r}",
+        )
+
+    phase = continuation.next_phase(sb.harness_config)
+    hc = dict(sb.harness_config or {})
+    hc["continuations"] = [
+        *(hc.get("continuations") or []),
+        {
+            "phase": phase,
+            "prompt": body.prompt,
+            "started_at": datetime.now(UTC).isoformat(),
+        },
+    ]
+    sb.harness_config = hc
+    sb.finished_at = None
+    sb.terminal_reason = None
+    state_machine.transition(session, sb, "provisioning")
+    orch_events.emit(
+        session,
+        run_id=run.id,
+        sandbox_id=sb.id,
+        event_type="checkpoint",
+        payload={
+            "stage": "continuation_started",
+            "phase": phase,
+            "prompt": body.prompt,
+        },
+    )
+    session.commit()
+
+    runner.start_continuation_task(run.id, sb.id)
     return _run_out(session, run)

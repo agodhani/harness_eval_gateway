@@ -10,17 +10,22 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import {
+  addContinuation,
   ApiError,
   approveRun,
   getRun,
   getRunResults,
+  sandboxContinuations,
+  sandboxPhase,
   TERMINAL_RUN_STATUSES,
   updateRubric,
+  type ContinuationEntry,
   type HarnessConfig,
   type RubricContent,
   type RubricOut,
   type RunOut,
   type RunResults,
+  type SandboxOut,
 } from "@/lib/api";
 import { formatTs, shortId, truncate } from "@/lib/format";
 import RunConsoleLive from "@/components/RunConsoleLive";
@@ -259,6 +264,11 @@ export default function RunDetailClient({ runId }: { runId: string }) {
   // evaluator scores for the rubric table (null until results endpoint has data)
   const [results, setResults] = useState<RunResults | null>(null);
 
+  // PR16 follow-up prompts — per-sandbox draft text + in-flight sandbox id
+  const [contDrafts, setContDrafts] = useState<Record<string, string>>({});
+  const [contBusy, setContBusy] = useState<string | null>(null);
+  const [contError, setContError] = useState<string | null>(null);
+
   const refresh = useCallback(
     async (silent = true) => {
       try {
@@ -384,6 +394,29 @@ export default function RunDetailClient({ runId }: { runId: string }) {
     }
   }
 
+  // PR16 — "add next prompt". Mirrors the API's admission rules: a terminal
+  // run may continue any finished sandbox; an active run may only when its
+  // in-flight work is itself continuations (parallel siblings).
+  async function sendContinuation(sb: SandboxOut) {
+    const prompt = (contDrafts[sb.id] ?? "").trim();
+    if (!prompt || contBusy) return;
+    setContBusy(sb.id);
+    setContError(null);
+    try {
+      const updated = await addContinuation(runId, sb.id, prompt);
+      setRunData(updated);
+      setLoadedId(runId);
+      setContDrafts((m) => ({ ...m, [sb.id]: "" }));
+      setNotice(
+        `Follow-up accepted for sandbox ${shortId(sb.id)} — continuing on its workspace.`,
+      );
+    } catch (err) {
+      setContError(errMsg(err, "Failed to start continuation."));
+    } finally {
+      setContBusy(null);
+    }
+  }
+
   // ---- render -----------------------------------------------------------
 
   if (!run) {
@@ -416,6 +449,24 @@ export default function RunDetailClient({ runId }: { runId: string }) {
   const configs: HarnessConfig[] = run.config?.harness_configs ?? [];
   const budgets = run.config?.budgets;
   const evaluatorModel = run.config?.evaluator_model ?? null;
+
+  // PR16 continuation admission — mirrors api/routers/runs.py: terminal runs
+  // may continue any finished sandbox; an active run only while its
+  // in-flight work is itself continuations (parallel siblings join).
+  const CONTINUABLE = new Set(["done", "failed"]);
+  const ACTIVE_SB = new Set(["provisioning", "running", "terminating"]);
+  const activeSbs = run.sandboxes.filter((s) => ACTIVE_SB.has(s.status));
+  const continuationActive =
+    activeSbs.length > 0 &&
+    activeSbs.every((s) => sandboxContinuations(s).length > 0);
+  const runContinuable =
+    isTerminal(run.status) ||
+    (["provisioning", "running", "evaluating"].includes(run.status) &&
+      continuationActive);
+  const continuableSbs = run.sandboxes.filter((s) =>
+    CONTINUABLE.has(s.status),
+  );
+  const showContinuations = runContinuable && continuableSbs.length > 0;
 
   return (
     <main className="container">
@@ -528,7 +579,17 @@ export default function RunDetailClient({ runId }: { runId: string }) {
                             </div>
                           </td>
                           <td>
-                            <Badge tone={statusTone(s.status)}>{s.status}</Badge>
+                            <div className="row" style={{ gap: "0.3rem" }}>
+                              <Badge tone={statusTone(s.status)}>{s.status}</Badge>
+                              {sandboxContinuations(s).length > 0 ? (
+                                <Badge
+                                  tone="teal"
+                                  title={`${sandboxContinuations(s).length} follow-up prompt(s) — phase ${sandboxPhase(s)}`}
+                                >
+                                  phase {sandboxPhase(s)}
+                                </Badge>
+                              ) : null}
+                            </div>
                           </td>
                           <td>
                             {s.terminal_reason ? (
@@ -547,6 +608,90 @@ export default function RunDetailClient({ runId }: { runId: string }) {
             )}
           </Card>
         </div>
+
+        {showContinuations ? (
+          <Card title="Follow-up prompts">
+            <p className="field__hint" style={{ marginBottom: "0.8rem" }}>
+              Continue a finished sandbox with a new prompt on the same
+              workspace. The container respawns fresh — conversation context
+              does not carry over, so the prompt is sent with the original
+              task — the timeline gains a new phase, and the workspace is
+              re-snapshotted as a new artifact.
+            </p>
+            <div className="stack">
+              {continuableSbs.map((s) => {
+                const conts = sandboxContinuations(s);
+                const phase = sandboxPhase(s);
+                const hc = (s.harness_config ?? {}) as Record<string, unknown>;
+                const adapter = String(hc.adapter ?? hc.harness ?? "?");
+                const busy = contBusy === s.id;
+                return (
+                  <div key={s.id} className="stack" style={{ gap: "0.45rem" }}>
+                    <div className="row" style={{ gap: "0.4rem" }}>
+                      <Link
+                        href={`/runs/${run.id}/timeline?sandbox=${s.id}`}
+                        className="mono"
+                        title={s.id}
+                      >
+                        {shortId(s.id)}
+                      </Link>
+                      <Badge tone="outline">{adapter}</Badge>
+                      <Badge tone={statusTone(s.status)}>{s.status}</Badge>
+                      <Badge tone="teal">next: phase {phase + 1}</Badge>
+                    </div>
+                    {conts.length > 0 ? (
+                      <div className="stack" style={{ gap: "0.2rem" }}>
+                        {conts.map((c: ContinuationEntry, i: number) => (
+                          <div
+                            key={i}
+                            className="faint"
+                            style={{ fontSize: "0.78rem" }}
+                          >
+                            <span className="mono">phase {c.phase}</span>
+                            {c.started_at ? ` · ${formatTs(c.started_at)}` : ""}
+                            {" — "}
+                            {truncate(c.prompt, 120)}
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                    <div
+                      className="row"
+                      style={{ gap: "0.5rem", alignItems: "flex-start" }}
+                    >
+                      <textarea
+                        className="textarea"
+                        style={{ flex: 1, minHeight: "2.4rem" }}
+                        placeholder={`Follow-up prompt for phase ${phase + 1}…`}
+                        value={contDrafts[s.id] ?? ""}
+                        onChange={(e) =>
+                          setContDrafts((m) => ({
+                            ...m,
+                            [s.id]: e.target.value,
+                          }))
+                        }
+                        disabled={contBusy !== null}
+                        rows={2}
+                        spellCheck={false}
+                      />
+                      <button
+                        type="button"
+                        className="btn btn--sm btn--primary"
+                        onClick={() => void sendContinuation(s)}
+                        disabled={
+                          contBusy !== null || !(contDrafts[s.id] ?? "").trim()
+                        }
+                      >
+                        {busy ? "Sending…" : "Send"}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+              {contError ? <ErrorNote>{contError}</ErrorNote> : null}
+            </div>
+          </Card>
+        ) : null}
 
         <RunConsoleLive run={run} />
 

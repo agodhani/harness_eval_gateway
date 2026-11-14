@@ -140,6 +140,16 @@ Every sandbox gets a `done` mechanism baked in (a `done` CLI on PATH and/or a
 done skill pack) that signals the orchestrator — `agent_done` is distinct from
 `harness_complete`.
 
+**Continuations (F14):** terminal sandbox states are re-enterable — a
+follow-up prompt (`POST /api/runs/{id}/continuations`) flips the same sandbox
+row `done|failed → provisioning` and it flows terminal again. Each accepted
+follow-up is a new **phase** (`harness_config.continuations[]`); the event
+stream gains `continuation_started`/`continuation_completed` checkpoints and
+the workspace re-snapshots under `continuations/<n>/` (new artifact path per
+phase). The run re-holds the pacing slot for the phase and re-scores only
+the continued sandbox. An api restart mid-continuation restores the run's
+prior verdict (done iff it scored) rather than failing it.
+
 ## Event model
 
 `events`: `id, run_id, sandbox_id, ts, seq, source, type, payload JSONB`
@@ -234,7 +244,10 @@ or tests change.
 | F7 | Evaluator sandbox: rubric scoring + rationale |
 | F8 | Results UI: matrix, scores, timeline, artifacts |
 | F9 | Run analytics: per-sandbox metrics + estimated cost |
+| F10 | Multi-harness CLI adapters (Codex, Claude Code, Pi, DeepSeek) |
 | F11 | Skillpack import from GitHub (discover → select → import) |
+| F12 | Artifact preview (static + desktop/pygame via noVNC) |
+| F14 | Multi-turn runs — "add next prompt" continuations |
 
 ## Post-MVP roadmap
 
@@ -274,9 +287,6 @@ or tests change.
 - Re-score runs — re-run the evaluator on stored artifacts
 - Post-run rubric edits — modify the frozen rubric after a run and re-score
   with the updated rubric (keep score provenance per rubric version)
-- "Add next prompt" — continue a finished sandbox with a follow-up prompt
-  on the same workspace (multi-turn runs: new phase in the event stream +
-  artifact re-snapshotted; resume-in-place vs respawn-from-snapshot TBD)
 - Preview `?type=` override (entry= picks the file but type still follows
   the suffix; a workspace matching both detectors always gets static),
   more desktop types (pyglet/arcade/tkinter — needs baked deps or a
@@ -387,6 +397,19 @@ or tests change.
   `EVAL_PROMPT.md` carries targeted counter-hints (paging, no inner `"`).
 - One live preview per sandbox (POST is idempotent — re-clicking returns the
   existing preview); dead containers are cleared on respawn.
+- **Continuations respawn-from-snapshot, not resume-in-place (F14)** — a
+  follow-up launches a FRESH container on the same sandbox UUID + the still-
+  live workspace bind-mount (`data/sandboxes/<sid>/workspace` survives
+  `docker rm`, so files continue byte-for-byte). Resume-in-place (keeping
+  the stopped container / `docker start`) was rejected: it needs
+  stopped-container retention, leaks phase state into container lifecycle,
+  and couples the orchestrator to whatever the old process left behind.
+  Trade-off accepted: the harness process starts cold each phase —
+  conversation context does NOT carry over — so `wrap_task_prompt` re-sends
+  the original task + a continuation note with every follow-up. Cost: one
+  container respawn per phase (seconds) + skill-pack restage; benefit:
+  uniform lifecycle (every phase is a normal provision→monitor→finalize),
+  no stopped-container bookkeeping, crash-safe by construction.
 
 ## Working conventions
 

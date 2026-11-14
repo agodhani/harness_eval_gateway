@@ -201,3 +201,61 @@ def test_can_transition_helper(session_factory) -> None:
         r = s.get(type(run), run.id)
         assert state_machine.can_transition(r, "rubric_review")
         assert not state_machine.can_transition(r, "running")
+
+
+# ---------------------------------------------------------------------------
+# PR16 continuation re-entry: done|failed -> provisioning (both machines)
+# ---------------------------------------------------------------------------
+
+
+def test_run_continuation_reentry_path(session_factory) -> None:
+    """done|failed -> provisioning -> running -> evaluating -> done."""
+    for terminal in ("done", "failed"):
+        run = make_run(session_factory, status=terminal)
+        with session_factory() as s:
+            r = s.get(type(run), run.id)
+            transition(s, r, "provisioning")
+            s.commit()
+        with session_factory() as s:
+            r = s.get(type(run), run.id)
+            assert r.status == "provisioning"
+            for to_status in ("running", "evaluating", "done"):
+                transition(s, r, to_status)
+            s.commit()
+        with session_factory() as s:
+            assert s.get(type(run), run.id).status == "done"
+
+
+def test_sandbox_continuation_reentry_path(session_factory) -> None:
+    """done|failed -> provisioning -> running -> done (second phase)."""
+    run = make_run(session_factory, status="running", config=run_config())
+    for terminal in ("done", "failed"):
+        sb = make_sandbox(session_factory, run.id, status=terminal)
+        with session_factory() as s:
+            row = s.get(Sandbox, sb.id)
+            transition(s, row, "provisioning")
+            s.commit()
+        with session_factory() as s:
+            row = s.get(Sandbox, sb.id)
+            assert row.status == "provisioning"
+            for to_status in ("running", "done"):
+                transition(s, row, to_status)
+            s.commit()
+        with session_factory() as s:
+            assert s.get(Sandbox, sb.id).status == "done"
+
+
+def test_continuation_reentry_is_narrow(session_factory) -> None:
+    """Terminal states re-enter ONLY at provisioning — no other exits."""
+    run = make_run(session_factory, status="done")
+    with session_factory() as s:
+        r = s.get(type(run), run.id)
+        for to_status in ("running", "evaluating", "rubric_review", "queued"):
+            assert not state_machine.can_transition(r, to_status)
+        assert state_machine.can_transition(r, "provisioning")
+    sb = make_sandbox(session_factory, run.id, status="done")
+    with session_factory() as s:
+        row = s.get(Sandbox, sb.id)
+        for to_status in ("running", "terminating", "done"):
+            assert not state_machine.can_transition(row, to_status)
+        assert state_machine.can_transition(row, "provisioning")

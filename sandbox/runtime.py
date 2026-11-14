@@ -593,7 +593,9 @@ class SandboxRuntime:
     # artifacts
     # ------------------------------------------------------------------
 
-    def snapshot(self, sandbox_id: str, run_id: str) -> SnapshotResult:
+    def snapshot(
+        self, sandbox_id: str, run_id: str, *, phase: int | None = None
+    ) -> SnapshotResult:
         """Capture workspace + logs + meta into ``artifact_root/<run>/<sandbox>/``.
 
         Layout produced::
@@ -601,6 +603,11 @@ class SandboxRuntime:
             <artifact_root>/<run_id>/<sandbox_id>/workspace/   # docker cp of /workspace
             <artifact_root>/<run_id>/<sandbox_id>/transcript.log  # docker logs (stdout+stderr)
             <artifact_root>/<run_id>/<sandbox_id>/meta.json       # ids, status, exit_code, finished_at
+
+        ``phase`` (PR16 continuations) redirects the capture to
+        ``<artifact_root>/<run>/<sandbox>/continuations/<phase>/`` so a
+        follow-up phase's snapshot never clobbers the prior artifact — every
+        phase writes a NEW artifact path.
 
         The container must still exist — stopped is fine, removed is not —
         so call this BEFORE ``stop()``/``remove()`` (or use
@@ -614,6 +621,8 @@ class SandboxRuntime:
             )
 
         artifact_dir = self.artifact_root / run_id / sandbox_id
+        if phase is not None and phase > 1:
+            artifact_dir = artifact_dir / "continuations" / str(phase)
         workspace_dir = artifact_dir / "workspace"
         transcript_path = artifact_dir / "transcript.log"
         meta_path = artifact_dir / "meta.json"
@@ -671,6 +680,7 @@ class SandboxRuntime:
             "container_id": container_id,
             "status": c_status,
             "exit_code": exit_code,
+            "phase": phase or 1,
             "finished_at": _utcnow_iso(),
         }
         meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")

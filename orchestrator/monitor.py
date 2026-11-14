@@ -74,32 +74,49 @@ def _load_sandbox(
 
 
 def _sandbox_done_signal_ts(
-    session_factory: sessionmaker[Session], sandbox_id: uuid.UUID
+    session_factory: sessionmaker[Session],
+    sandbox_id: uuid.UUID,
+    *,
+    since_event_id: int | None = None,
 ) -> datetime | None:
-    """Latest done_signal event ts for a sandbox, if any."""
+    """Latest done_signal event ts for a sandbox, if any.
+
+    ``since_event_id`` scopes the lookup to the current phase — a continued
+    sandbox's earlier done_signals must not count (they'd insta-trip the
+    grace stop). Event ids are monotonic and clock-free, so this is exact
+    where a timestamp cutoff isn't (sqlite stores second-precision naive
+    datetimes).
+    """
     with session_factory() as session:
-        ts = session.execute(
-            select(func.max(Event.ts)).where(
-                Event.sandbox_id == sandbox_id, Event.type == "done_signal"
-            )
-        ).scalar_one_or_none()
-        return ts
+        stmt = select(func.max(Event.ts)).where(
+            Event.sandbox_id == sandbox_id, Event.type == "done_signal"
+        )
+        if since_event_id is not None:
+            stmt = stmt.where(Event.id > since_event_id)
+        return session.execute(stmt).scalar_one_or_none()
 
 
 def _budget_event_seen(
     session_factory: sessionmaker[Session],
     run_id: uuid.UUID,
     sandbox_id: uuid.UUID,
+    *,
+    since_event_id: int | None = None,
 ) -> bool:
-    """True when a gateway ``error`` event marks this sandbox budget-limited."""
+    """True when a gateway ``error`` event marks this sandbox budget-limited.
+
+    ``since_event_id`` scopes to the current phase — a prior phase's 429
+    must not terminate a continuation.
+    """
     with session_factory() as session:
-        payloads = session.execute(
-            select(Event.payload).where(
-                Event.run_id == run_id,
-                Event.sandbox_id == sandbox_id,
-                Event.type == "error",
-            )
-        ).scalars().all()
+        stmt = select(Event.payload).where(
+            Event.run_id == run_id,
+            Event.sandbox_id == sandbox_id,
+            Event.type == "error",
+        )
+        if since_event_id is not None:
+            stmt = stmt.where(Event.id > since_event_id)
+        payloads = session.execute(stmt).scalars().all()
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
@@ -206,6 +223,7 @@ def _finalize_db(
     snapshot: Any,
     sizes: dict[str, int],
     reason: str,
+    phase: int | None = None,
 ) -> None:
     """DB half of finalize: artifact rows + sandbox terminal fields + event."""
     with session_factory() as session:
@@ -248,6 +266,7 @@ def _finalize_db(
                 "terminal_reason": reason,
                 "sandbox_status": sb.status,
                 "artifact_path": sb.artifact_path,
+                "phase": phase or 1,
             },
         )
         session.commit()
@@ -260,14 +279,22 @@ async def finalize_sandbox(
     run_id: uuid.UUID,
     sandbox_id: uuid.UUID,
     reason: str,
+    phase: int | None = None,
 ) -> str:
-    """Snapshot → artifact/DB rows → ``docker rm``. Always returns ``reason``."""
+    """Snapshot → artifact/DB rows → ``docker rm``. Always returns ``reason``.
+
+    ``phase`` (PR16) lands the snapshot under ``continuations/<n>/`` so a
+    follow-up phase writes NEW artifact rows/paths instead of clobbering the
+    prior phase's.
+    """
     sid = str(sandbox_id)
 
     # 1) Snapshot FIRST — docker cp/logs need the container to exist.
     snapshot = None
     try:
-        snapshot = await asyncio.to_thread(runtime.snapshot, sid, str(run_id))
+        snapshot = await asyncio.to_thread(
+            runtime.snapshot, sid, str(run_id), phase=phase
+        )
     except Exception as exc:  # noqa: BLE001 — e.g. container already gone
         log.warning("finalize: snapshot failed for %s: %s", sid, exc)
 
@@ -287,6 +314,7 @@ async def finalize_sandbox(
             snapshot=snapshot,
             sizes=sizes,
             reason=reason,
+            phase=phase,
         )
     except Exception:
         log.exception("finalize: DB update failed for sandbox %s", sid)
@@ -312,6 +340,7 @@ async def _terminate(
     run_id: uuid.UUID,
     sandbox_id: uuid.UUID,
     reason: str,
+    phase: int | None = None,
 ) -> str:
     """Policy-driven stop (timeout/budget/done-grace): mark terminating, stop
     the container (keep it for snapshot), then finalize."""
@@ -331,6 +360,7 @@ async def _terminate(
         run_id=run_id,
         sandbox_id=sandbox_id,
         reason=reason,
+        phase=phase,
     )
 
 
@@ -342,11 +372,18 @@ async def watch_sandbox(
     run_id: uuid.UUID,
     sandbox_id: uuid.UUID,
     budgets: dict[str, Any],
+    phase: int | None = None,
+    since_event_id: int | None = None,
 ) -> str | None:
     """Monitor one sandbox until terminal; returns its terminal_reason.
 
     Never raises — the top-level guard finalizes as ``error`` so
     ``asyncio.gather`` in the lifecycle always completes.
+
+    ``phase`` (PR16 continuation) lands the final snapshot under
+    ``continuations/<n>/``; ``since_event_id`` scopes the done-signal and
+    budget-event checks to events after that id — a prior phase's signals
+    must not prematurely terminate the new phase.
     """
     sid = str(sandbox_id)
     wall_clock = float(budgets.get("wall_clock_seconds", 3600))
@@ -374,16 +411,20 @@ async def watch_sandbox(
                     run_id=run_id,
                     sandbox_id=sandbox_id,
                     reason="timeout",
+                    phase=phase,
                 )
 
             # 2) budget: gateway error events, then run-wide token total
-            if _budget_event_seen(session_factory, run_id, sandbox_id):
+            if _budget_event_seen(
+                session_factory, run_id, sandbox_id, since_event_id=since_event_id
+            ):
                 return await _terminate(
                     session_factory=session_factory,
                     runtime=runtime,
                     run_id=run_id,
                     sandbox_id=sandbox_id,
                     reason="budget_exceeded",
+                    phase=phase,
                 )
             if token_budget:
                 used = _run_tokens_used(session_factory, run_id)
@@ -394,6 +435,7 @@ async def watch_sandbox(
                         run_id=run_id,
                         sandbox_id=sandbox_id,
                         reason="budget_exceeded",
+                        phase=phase,
                     )
 
             # 3) container state
@@ -403,7 +445,9 @@ async def watch_sandbox(
             if state == "running":
                 # done_signal safety net: agent called `done` but the process
                 # hasn't exited — give it DONE_GRACE_SECONDS, then stop it.
-                done_ts = _sandbox_done_signal_ts(session_factory, sandbox_id)
+                done_ts = _sandbox_done_signal_ts(
+                    session_factory, sandbox_id, since_event_id=since_event_id
+                )
                 done_aware = _aware(done_ts)
                 if (
                     done_aware is not None
@@ -415,12 +459,15 @@ async def watch_sandbox(
                         run_id=run_id,
                         sandbox_id=sandbox_id,
                         reason="agent_done",
+                        phase=phase,
                     )
                 continue
 
             if state in ("exited", "dead"):
                 logs = await asyncio.to_thread(runtime.logs, sid, tail=500)
-                done_ts = _sandbox_done_signal_ts(session_factory, sandbox_id)
+                done_ts = _sandbox_done_signal_ts(
+                    session_factory, sandbox_id, since_event_id=since_event_id
+                )
                 hc = sb.harness_config or {}
                 adapter = get_adapter(str(hc.get("adapter") or "miniloop"))
                 reason = _verdict(
@@ -435,6 +482,7 @@ async def watch_sandbox(
                     run_id=run_id,
                     sandbox_id=sandbox_id,
                     reason=reason,
+                    phase=phase,
                 )
 
             if state == "missing":
@@ -444,6 +492,7 @@ async def watch_sandbox(
                     run_id=run_id,
                     sandbox_id=sandbox_id,
                     reason="error",
+                    phase=phase,
                 )
             # created/restarting/paused/etc — keep polling.
     except Exception:
@@ -455,6 +504,7 @@ async def watch_sandbox(
                 run_id=run_id,
                 sandbox_id=sandbox_id,
                 reason="error",
+                phase=phase,
             )
         except Exception:
             log.exception("watch_sandbox: finalize also failed for %s", sid)

@@ -186,6 +186,14 @@ export interface RunConfig {
   [key: string]: unknown;
 }
 
+/** One accepted follow-up prompt recorded on a sandbox (PR16). Lives inside
+ * `SandboxOut.harness_config.continuations` — phase 1 is the original run. */
+export interface ContinuationEntry {
+  phase: number;
+  prompt: string;
+  started_at?: string;
+}
+
 export interface SandboxOut {
   id: string;
   harness_config: Record<string, unknown>;
@@ -194,6 +202,21 @@ export interface SandboxOut {
   artifact_path: string | null;
   started_at: string | null;
   finished_at: string | null;
+}
+
+/** Continuation history for a sandbox, oldest first ([] for phase-1-only). */
+export function sandboxContinuations(s: SandboxOut): ContinuationEntry[] {
+  const raw = (s.harness_config as Record<string, unknown> | undefined)
+    ?.continuations;
+  return Array.isArray(raw) ? (raw as ContinuationEntry[]) : [];
+}
+
+/** Current execution phase: 1 + number of accepted follow-ups. */
+export function sandboxPhase(s: SandboxOut): number {
+  const conts = sandboxContinuations(s);
+  if (conts.length === 0) return 1;
+  const last = conts[conts.length - 1].phase;
+  return typeof last === "number" ? last : conts.length + 1;
 }
 
 export interface RubricDimension {
@@ -436,6 +459,19 @@ export function approveRun(runId: string): Promise<RunOut> {
   return request<RunOut>(`/api/runs/${encodeURIComponent(runId)}/approve`, {
     method: "POST",
   });
+}
+
+/** PR16 "add next prompt": continue a finished sandbox on its workspace.
+ * 409s when the run isn't continuable or another run holds the slot. */
+export function addContinuation(
+  runId: string,
+  sandboxId: string,
+  prompt: string,
+): Promise<RunOut> {
+  return request<RunOut>(
+    `/api/runs/${encodeURIComponent(runId)}/continuations`,
+    { method: "POST", body: JSON.stringify({ sandbox_id: sandboxId, prompt }) },
+  );
 }
 
 // ---------------------------------------------------------------------------
