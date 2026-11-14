@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from api.deps import get_session_factory
 from api.pricing import PRICE_TABLE, estimate_cost_usd
-from db.models import Base, Event, Run, Sandbox
+from db.models import Base, Event, Run, Sandbox, Score
 
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 
@@ -54,7 +54,8 @@ def analytics_run(session_factory: sessionmaker[Session]):
     sb1: 2 llm_responses (in 100+200, out 40+60, latency 500/1500),
     tool_calls shell×2 + write_file×1, 1 skill_invocation, 1 shell_command,
     1 file_op, 1 test_execution, 1 error, run_started/terminal_state markers —
-    then an eval boundary + judge-side llm_response that must NOT count.
+    then an eval boundary + judge-side llm_response + judge-side error that
+    must NOT count.
     sb2: 1 llm_response only.
     """
     s = session_factory()
@@ -139,6 +140,9 @@ def analytics_run(session_factory: sessionmaker[Session]):
                     payload={"phase": "eval_started"}),
                 resp(sb1, T0 + timedelta(minutes=21), 1000, 90, 800,
                      model="gpt-4o"),
+                _ev(run.id, sandbox_id=sb1.id, source="evaluator",
+                    type_="error", ts=T0 + timedelta(minutes=21, seconds=30),
+                    payload={"message": "judge timeout"}),
                 _ev(run.id, sandbox_id=sb1.id, source="evaluator",
                     type_="checkpoint", ts=T0 + timedelta(minutes=22),
                     payload={"phase": "eval_scored"}),
@@ -226,6 +230,7 @@ def test_evaluator_phase_split_out(client: TestClient, analytics_run) -> None:
     assert sb1["evaluator"]["llm_turns"] == 1
     assert sb1["evaluator"]["tokens"]["input"] == 1000
     assert sb1["evaluator"]["tokens"]["output"] == 90
+    assert sb1["evaluator"]["errors"] == 1
     # judge priced at evaluator_model gpt-4o: (1000*2.5 + 90*10)/1e6 = 0.0034
     assert sb1["evaluator"]["estimated_cost_usd"] == pytest.approx(0.0034)
     # participant metrics unaffected
@@ -313,3 +318,202 @@ def test_zero_event_run_returns_zeros(
     assert sb["wall_clock_seconds"] == 0.0
     assert sb["estimated_cost_usd"] == 0.0
     assert sb["evaluator"] is None
+
+
+# ---------------------------------------------------------------------------
+# F13 — cross-run trends (GET /api/analytics/runs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def trend_runs(session_factory: sessionmaker[Session]):
+    """Two scored runs for cross-run aggregation.
+
+    run_old (T0): qwen3:8b (local → $0 auto-price), 1 sandbox, participant
+    tokens 100/50, one overall score 8 → mean 8; 200-char prompt (truncated
+    to 120 in the response).
+    run_new (T0+1d): gpt-4o, judge claude-sonnet-4.5, 2 sandboxes —
+    participant turns 3 (in 900 / out 300), 1 error, judge turn 1
+    (1000/200) + 1 judge error; overall scores 6 + 4 → mean 5 (a
+    code_quality row must not pollute the mean).
+    """
+    s = session_factory()
+    try:
+        old = Run(
+            task_prompt="old run " + "x" * 200,
+            model_name="qwen3:8b",
+            config={},
+            status="done",
+            created_at=T0,
+        )
+        new = Run(
+            task_prompt="new run — build 2048",
+            model_name="gpt-4o",
+            config={"evaluator_model": "claude-sonnet-4.5"},
+            status="evaluating",
+            created_at=T0 + timedelta(days=1),
+        )
+        s.add_all([old, new])
+        s.flush()
+        sb_old = Sandbox(
+            run_id=old.id, harness_config={"adapter": "miniloop"}, status="done"
+        )
+        sb_new1 = Sandbox(
+            run_id=new.id, harness_config={"adapter": "miniloop"}, status="done"
+        )
+        sb_new2 = Sandbox(
+            run_id=new.id, harness_config={"adapter": "codex"}, status="failed"
+        )
+        s.add_all([sb_old, sb_new1, sb_new2])
+        s.flush()
+
+        def resp(sb, ts, prompt, completion, source="gateway"):
+            return _ev(
+                new.id if sb.run_id == new.id else old.id,
+                sandbox_id=sb.id,
+                source=source,
+                type_="llm_response",
+                ts=ts,
+                payload={
+                    "usage": {
+                        "prompt_tokens": prompt,
+                        "completion_tokens": completion,
+                        "total_tokens": prompt + completion,
+                    },
+                    "latency_ms": 500,
+                },
+            )
+
+        t1 = T0 + timedelta(days=1)
+        s.add_all(
+            [
+                # old run: participant only
+                resp(sb_old, T0 + timedelta(minutes=1), 100, 50),
+                # new run: sb_new1 participant ×2, then judge boundary + traffic
+                resp(sb_new1, t1 + timedelta(minutes=1), 200, 100),
+                resp(sb_new1, t1 + timedelta(minutes=2), 300, 50),
+                _ev(new.id, sandbox_id=sb_new1.id, source="evaluator",
+                    type_="checkpoint", ts=t1 + timedelta(minutes=10),
+                    payload={"phase": "eval_started"}),
+                resp(sb_new1, t1 + timedelta(minutes=11), 1000, 200),
+                _ev(new.id, sandbox_id=sb_new1.id, type_="error",
+                    ts=t1 + timedelta(minutes=12),
+                    payload={"message": "judge boom"}),
+                # sb_new2 participant ×1 + an error
+                resp(sb_new2, t1 + timedelta(minutes=1), 400, 150),
+                _ev(new.id, sandbox_id=sb_new2.id, type_="error",
+                    ts=t1 + timedelta(minutes=2), payload={"message": "boom"}),
+            ]
+        )
+        s.add_all(
+            [
+                Score(sandbox_id=sb_old.id, dimension="overall", score=8.0,
+                      rationale="good"),
+                Score(sandbox_id=sb_new1.id, dimension="overall", score=6.0,
+                      rationale="ok"),
+                Score(sandbox_id=sb_new2.id, dimension="overall", score=4.0,
+                      rationale="weak"),
+                Score(sandbox_id=sb_new1.id, dimension="code_quality",
+                      score=7.0, rationale="fine"),
+            ]
+        )
+        s.commit()
+        return {"old": old.id, "new": new.id}
+    finally:
+        s.close()
+
+
+def _trend_point(body: dict, run_id) -> dict:
+    return next(p for p in body["points"] if p["run_id"] == str(run_id))
+
+
+def test_trends_shape_and_newest_first(
+    client: TestClient, trend_runs
+) -> None:
+    # limit=100 so every session run fits — points arrive newest-first.
+    body = client.get("/api/analytics/runs", params={"limit": 100}).json()
+    assert body["price_model"] is None  # auto mode → per-run pricing
+    assert set(body["price_table"]) == set(PRICE_TABLE)
+    ids = [p["run_id"] for p in body["points"]]
+    assert len(ids) == len(set(ids))  # one point per run
+    assert ids.index(str(trend_runs["new"])) < ids.index(str(trend_runs["old"]))
+
+
+def test_trends_point_aggregation(client: TestClient, trend_runs) -> None:
+    body = client.get("/api/analytics/runs", params={"limit": 100}).json()
+    pt = _trend_point(body, trend_runs["new"])
+
+    assert pt["status"] == "evaluating"
+    assert pt["model_name"] == "gpt-4o"
+    assert pt["evaluator_model"] == "claude-sonnet-4.5"
+    assert pt["task_prompt"] == "new run — build 2048"
+    assert pt["sandbox_count"] == 2
+    assert pt["llm_turns"] == 3
+    assert pt["tokens"] == {
+        "input": 900,
+        "output": 300,
+        "cache_read": 0,
+        "total": 1200,
+    }
+    assert pt["errors"] == 1
+    # judge phase split out at eval_started
+    assert pt["evaluator_llm_turns"] == 1
+    assert pt["evaluator_tokens"]["total"] == 1200
+    assert pt["evaluator_errors"] == 1
+    # auto pricing: run model gpt-4o is listed → its own rate
+    assert pt["price_model"] == "gpt-4o"
+    # (900*2.5 + 300*10)/1e6 = 0.00525
+    assert pt["estimated_cost_usd"] == pytest.approx(
+        estimate_cost_usd(PRICE_TABLE["gpt-4o"], input_tokens=900, output_tokens=300)
+    )
+    # judge priced at claude-sonnet-4.5: (1000*3 + 200*15)/1e6 = 0.006
+    assert pt["evaluator_cost_usd"] == pytest.approx(0.006)
+    # mean of overall scores 6 + 4; the code_quality row must not count
+    assert pt["mean_overall_score"] == pytest.approx(5.0)
+
+
+def test_trends_auto_pricing_uses_each_runs_model(
+    client: TestClient, trend_runs
+) -> None:
+    body = client.get("/api/analytics/runs", params={"limit": 100}).json()
+    old = _trend_point(body, trend_runs["old"])
+    assert old["price_model"] == "qwen3:8b"  # local → $0
+    assert old["estimated_cost_usd"] == 0.0
+    assert old["evaluator_cost_usd"] == 0.0
+    assert old["sandbox_count"] == 1
+    assert old["llm_turns"] == 1
+    assert old["mean_overall_score"] == pytest.approx(8.0)
+    assert len(old["task_prompt"]) == 120  # truncated server-side
+
+
+def test_trends_uniform_repricing(client: TestClient, trend_runs) -> None:
+    body = client.get(
+        "/api/analytics/runs", params={"limit": 100, "price_model": "claude-opus-4.1"}
+    ).json()
+    assert body["price_model"] == "claude-opus-4.1"
+    for pt in body["points"]:
+        assert pt["price_model"] == "claude-opus-4.1"
+    old = _trend_point(body, trend_runs["old"])
+    # (100*15 + 50*75)/1e6 = 0.00525 — even the local-model run reprices
+    assert old["estimated_cost_usd"] == pytest.approx(0.00525)
+
+
+def test_trends_unknown_price_model_422(client: TestClient, trend_runs) -> None:
+    resp = client.get("/api/analytics/runs", params={"price_model": "nope"})
+    assert resp.status_code == 422
+
+
+def test_trends_limit_bounds(client: TestClient, trend_runs) -> None:
+    body = client.get("/api/analytics/runs", params={"limit": 1}).json()
+    assert len(body["points"]) == 1
+    assert client.get("/api/analytics/runs", params={"limit": 0}).status_code == 422
+    assert client.get("/api/analytics/runs", params={"limit": 101}).status_code == 422
+
+
+def test_trends_run_without_scores_has_null_mean(
+    client: TestClient, analytics_run
+) -> None:
+    body = client.get("/api/analytics/runs", params={"limit": 100}).json()
+    pt = _trend_point(body, analytics_run["run_id"])
+    assert pt["mean_overall_score"] is None
+    assert pt["sandbox_count"] == 2

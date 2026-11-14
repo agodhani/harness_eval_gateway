@@ -93,7 +93,10 @@ adapters are added.
 5. **Postgres** — run specs, sandbox instances, frozen rubric, append-only
    event stream, artifact metadata, evaluator scores.
 6. **Evaluator** — runs in its own sandbox post-run; fetches artifact + rubric,
-   scores via gateway, returns score + rationale per dimension.
+   scores via gateway, returns score + rationale per dimension. Objective
+   signals (PR6): the `scoring` collector registry measures the workspace
+   before judging (parse-only static analysis — real cyclomatic complexity,
+   size, language mix) and feeds the judge `ANALYSIS.md`/`analysis.json`.
 7. **Artifact store** — `./data/artifacts/<run_id>/<sandbox_id>/` — repo
    tarballs, transcripts, event exports.
 
@@ -170,8 +173,13 @@ Anthropic/OpenAI post-MVP.
 ## Rubric
 
 MVP dimensions: functional requirements, acceptance criteria, code
-implementation quality, cyclomatic complexity (LLM-assessed for MVP — cheap
-static analysis is a post-MVP objective signal).
+implementation quality, cyclomatic complexity. Since PR6 the judge scores
+from **measured** signals where available — the `scoring` package's
+static-analysis collector (lizard, parse-only) computes real cyclomatic
+complexity/size/language mix before evaluation; the report is staged as
+`ANALYSIS.md`/`analysis.json` for the judge, persisted at
+`<artifact>/analysis.json`, and surfaced on the results API. Remaining
+objective signals (build/test exec, coverage) are post-MVP.
 
 Flow: auto-generated from task spec → HITL review/edit in UI → frozen →
 applied identically to all sandboxes.
@@ -196,6 +204,7 @@ api/           # control-plane HTTP API (FastAPI app)
 adapters/      # harness adapters (miniloop first; cli adapters post-MVP)
 sandbox/       # image defs, workspace prep, done mechanism, event collector
 evaluator/     # rubric scoring agent
+scoring/       # objective signal collectors (static analysis; PR7 adds exec/coverage)
 skillpacks/    # vendored default packs: superpowers, mattpocock-skills, spec-kit
 skillpack_import/  # F11 GitHub import: codeload fetch, SKILL.md scan, pack store
 web/           # Next.js app
@@ -224,9 +233,11 @@ or tests change.
 | F7 | Evaluator sandbox: rubric scoring + rationale |
 | F8 | Results UI: matrix, scores, timeline, artifacts |
 | F9 | Run analytics: per-sandbox metrics + estimated cost |
+| F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) |
 | F11 | Skillpack import from GitHub (discover → select → import) |
-| F12 | Artifact preview (static + desktop/pygame via noVNC) |
-| F13 | Submit UX: live model picker + install, named harness configs |
+| F12 | Artifact preview (static html + desktop/pygame via noVNC) |
+| F13 | Graphical analysis page + cross-run trends (recharts) |
+| F14 | Submit UX: live model picker + install, named harness configs |
 
 ## Post-MVP roadmap
 
@@ -234,7 +245,8 @@ or tests change.
 - Additional providers: OpenRouter, direct Anthropic/OpenAI
 - Anthropic-compatible gateway endpoint (`/v1/messages`)
 - Model-vs-model comparisons (multi-model matrices)
-- Objective scoring: build/test execution, coverage, static analysis
+- Objective scoring: build/test execution, coverage as score dimensions
+  (PR7 — static analysis landed in PR6 via `scoring/` signal collectors)
 - Automated test-suite generation as eval target
 - Higher-fidelity instrumentation via harness hooks/plugins
 - Gateway response caching / deterministic replay
@@ -247,18 +259,13 @@ or tests change.
   spawn scheduling this bounds concurrent sandboxes when >2 would exceed
   headroom for the loaded model
 - Auth, saved run templates, share links
-- ~~Dynamic model picker~~ + ~~named harness configs~~ — **landed as F13**
+- ~~Dynamic model picker~~ + ~~named harness configs~~ — **landed as F14**
 - Cross-run analytics & cost dashboards
 - Timeline-side analytics — per-sandbox metrics rendered alongside the
   execution timeline or on event hover (cost/tokens/latency in context)
 - Split-view trace comparison — side-by-side, time-aligned event streams for
   two sandboxes on the traces/timeline page (today it's one merged stream
   with a single-sandbox filter dropdown); scrolling/diff-alignment UX TBD
-- Graphical analysis page — charts on top of the F9 analytics + scores data:
-  per-dimension score comparison across sandboxes, token/cost/latency per
-  sandbox, tool-call mix, eval-vs-participant spend split, cross-run trends;
-  also add a totals row / aggregate column to the results score matrix so
-  the per-sandbox winner is visible at a glance
 - Lightweight artifact thumbnails — capture screenshots of produced artifacts
   for at-a-glance review before spawning a full live preview sandbox
 - Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.
@@ -269,12 +276,8 @@ or tests change.
 - "Add next prompt" — continue a finished sandbox with a follow-up prompt
   on the same workspace (multi-turn runs: new phase in the event stream +
   artifact re-snapshotted; resume-in-place vs respawn-from-snapshot TBD)
-- Preview `?type=` override (entry= picks the file but type still follows
-  the suffix; a workspace matching both detectors always gets static),
-  more desktop types (pyglet/arcade/tkinter — needs baked deps or a
-  wheelhouse mount), python-server previews
-- Cache `previewable`/`preview_type` probe on results GET (per-sandbox FS
-  probe on every call — fine at MVP scale, revisit if pages get large)
+- More desktop preview types (pyglet/arcade/tkinter — needs baked deps or
+  a wheelhouse mount — no egress in preview nets), python-server previews
 - dsh native helpers (spawn-helper, node-pty) — npm ≥11 blocks their
   postinstall scripts; CLI works without them, but revisit `--allow-scripts`
   for the dsh package set if evals hit TTY-dependent tasks
@@ -287,7 +290,10 @@ or tests change.
   events for agent-level detail.
 - HITL rubric approval; frozen pre-launch; shared across sandboxes.
 - Evaluator in own sandbox; UI flags evaluator == participant model.
-- LLM-judge scoring only for MVP; objective checks post-MVP.
+- LLM-judge scoring, fed by measured signals: PR6 added parse-only static
+  analysis (real cyclomatic complexity + static metrics via lizard) as
+  judge evidence — exec-derived checks (build/test/coverage) remain
+  post-MVP (PR7).
 - Artifacts local; metadata in Postgres.
 - Evaluator model is user-selected at submission (independence is opt-in).
 - **Ollama is the default inference** for MVP — small local models; cost ≈ 0
@@ -359,7 +365,18 @@ or tests change.
   `.py` overrides evidence (the pick IS the disambiguation). Zero
   candidates → UI shows disabled "not supported". Deps beyond baked-in
   pygame-ce can't install (no egress) — the app fails at import and the
-  runner exits visibly. Static defaults when both match.
+  runner exits visibly. Static defaults when both match. `type=` POST
+  overrides the pick: alone it selects the first detected candidate of
+  that type (a both-matching workspace defaults to static —
+  `{type:"desktop"}` reaches the game); with `entry=` it forces the plan —
+  `static` serves any jailed file (the entry is only the URL opened —
+  view a `.py`'s source instead of executing it), `desktop` still
+  requires a `.py` entry. A live preview is returned as-is unless an
+  explicit different plan is requested, then it's stopped and respawned.
+  The results-GET probe is memoized by `sandbox.preview.ScanCache`
+  (`PREVIEW_SCAN_TTL_SECONDS`, default 30s) keyed on
+  (jail, run, sandbox, artifact_path) — workspaces only change on
+  re-snapshot.
 - **Preview registry lives on docker labels**, not in memory or Postgres —
   restart-safe discovery + the TTL reaper (default 15 min) works
   out-of-process; runner+proxy share `heg.preview_id`, stop removes all.
@@ -373,13 +390,19 @@ or tests change.
   `EVAL_PROMPT.md` carries targeted counter-hints (paging, no inner `"`).
 - One live preview per sandbox (POST is idempotent — re-clicking returns the
   existing preview); dead containers are cleared on respawn.
-- **Model catalog/install ride the gateway, not Ollama direct (F13)** — the
+- **Charts: recharts** (F13) — picked over visx/chart.js: smallest fit for
+  grouped/stacked bars + a composed bar-line trend under React 19 / Next 16;
+  themed via hexes mirroring globals.css tokens (no CSS-var reads). The
+  cross-run trends endpoint (`GET /api/analytics/runs`) prices each point at
+  its own run's resolved price unless `?price_model=` forces uniform
+  repricing — same "estimate, not billing" framing as F9.
+- **Model catalog/install ride the gateway, not Ollama direct (F14)** — the
   api mints a run-null `heg.*` cred to call `GET /v1/models`, which keeps the
   provider abstraction (Ollama today, OpenRouter next) behind the gateway;
   the gateway stamps `X-HEG-Provider` so the UI only offers install when the
   upstream can `ollama pull` (`POST /v1/models/pull` → `/api/pull`, 501
   otherwise). Pull progress streams end-to-end as NDJSON — never buffered.
-- **Sandbox names are persisted, not derived (F13)** — `HarnessConfigIn.name`
+- **Sandbox names are persisted, not derived (F14)** — `HarnessConfigIn.name`
   (≤64, whitespace-normalized) lands on `sandboxes.name`; `spawn_one` fills
   blanks with `<adapter>-<shortid>` once the UUID exists. All UI surfaces
   read the column — no per-component re-derivation to drift.

@@ -455,6 +455,9 @@ export default function RunDetailClient({ runId }: { runId: string }) {
           <Link href={`/runs/${run.id}/results`} className="btn btn--sm">
             Results →
           </Link>
+          <Link href={`/runs/${run.id}/analysis`} className="btn btn--sm">
+            Analysis →
+          </Link>
           <Link href="/runs" className="btn btn--sm btn--ghost">
             ← All runs
           </Link>

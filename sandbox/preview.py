@@ -13,7 +13,18 @@ Design notes:
   ``"desktop"`` executes the artifact (pygame — see
   ``_desktop_candidates`` for the evidence heuristic) on a virtual display
   streamed via noVNC. The plan/label/API shape leaves room for
-  ``python-server`` etc.
+  ``python-server`` etc. The POST body's ``type=`` overrides the pick:
+  ``plan_for_type`` yields the first candidate of that type (a
+  both-matching workspace defaults to static), and
+  ``plan_for_entry(..., preview_type=)`` forces the plan type for an
+  explicit entry — ``"static"`` serves any jailed file (the entry is only
+  the URL opened — view a ``.py``'s source instead of executing it) while
+  ``"desktop"`` still requires a ``.py`` entry.
+- **Probe caching.** The results GET runs ``resolve_workspace_dir`` +
+  ``scan_preview`` per sandbox per request; :class:`ScanCache` memoizes
+  that probe for ``PREVIEW_SCAN_TTL_SECONDS`` — workspaces only change on
+  (re-)snapshot, so a short TTL bounds staleness while UI polling stays
+  cheap.
 - **Static network posture.** Static preview containers join a dedicated
   bridge network ``heg-preview`` — *not* ``heg-sandbox`` (which has the
   gateway attached). Docker cannot publish ports on ``--internal`` networks
@@ -55,6 +66,8 @@ import os
 import re
 import time
 import uuid
+from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -108,6 +121,10 @@ LIVE_STATUSES = frozenset({"created", "running", "restarting", "paused"})
 
 _HTML_SUFFIXES = frozenset({".html", ".htm"})
 _INDEX_NAMES = frozenset({"index.html", "index.htm"})
+
+#: Types with an implemented spawner — ``PreviewManager.spawn`` dispatches on
+#: these; ``python-server`` lands in PR3.
+PREVIEW_TYPES = frozenset({"static", "desktop"})
 
 # Desktop detection: an unambiguous .py entry (root or nested ≤3 levels) AND
 # explicit pygame evidence — a non-comment requirements.txt line mentioning
@@ -429,13 +446,22 @@ def detect_preview(workspace: Path) -> PreviewPlan | None:
     return scan_preview(workspace).plan
 
 
-def plan_for_entry(workspace: Path, raw_entry: str) -> PreviewPlan:
+def plan_for_entry(
+    workspace: Path, raw_entry: str, preview_type: str | None = None
+) -> PreviewPlan:
     """Resolve an explicit ``entry=`` override into a :class:`PreviewPlan`.
 
     The entry is jailed to ``workspace``: must be a relative path (no ``..``,
     not absolute), resolve inside it, exist as a regular non-symlinked file,
-    and have a recognized suffix — ``.html``/``.htm`` → ``static``, ``.py``
-    → ``desktop``. Anything else raises ``ValueError`` (router maps to 422).
+    and — without ``preview_type`` — have a recognized suffix:
+    ``.html``/``.htm`` → ``static``, ``.py`` → ``desktop``. Anything else
+    raises ``ValueError`` (router maps to 422).
+
+    ``preview_type`` overrides the suffix-derived type: ``"static"`` serves
+    ANY jailed file — ``http.server`` already serves the whole workspace, so
+    the entry is only the URL the browser opens (view a ``.py``'s source
+    instead of executing it); ``"desktop"`` still requires a ``.py`` entry
+    (the runner executes it). Unknown types raise ``ValueError``.
 
     Note: an explicit ``.py`` entry bypasses pygame evidence — the user's
     pick IS the disambiguation; the executed artifact runs under the same
@@ -464,6 +490,20 @@ def plan_for_entry(workspace: Path, raw_entry: str) -> PreviewPlan:
     if not cand.is_file():
         raise ValueError(f"entry {raw_entry!r} not found in the workspace")
     suffix = cand.suffix.lower()
+    if preview_type is not None:
+        if preview_type not in PREVIEW_TYPES:
+            raise ValueError(
+                f"unsupported preview type {preview_type!r} — want one of "
+                f"{', '.join(sorted(PREVIEW_TYPES))}"
+            )
+        if preview_type == "desktop":
+            if suffix != ".py":
+                raise ValueError(
+                    f"desktop previews execute a .py entry — {rel!r} is "
+                    f"{suffix or 'extensionless'}"
+                )
+            return PreviewPlan(type="desktop", entry=rel)
+        return PreviewPlan(type="static", entry=rel)
     if suffix in _HTML_SUFFIXES:
         return PreviewPlan(type="static", entry=rel)
     if suffix == ".py":
@@ -471,6 +511,101 @@ def plan_for_entry(workspace: Path, raw_entry: str) -> PreviewPlan:
     raise ValueError(
         f"unsupported entry type {cand.suffix!r} — want .html/.htm or .py"
     )
+
+
+def plan_for_type(workspace: Path, preview_type: str) -> PreviewPlan:
+    """First detected candidate of ``preview_type`` — a type-filtered default.
+
+    ``{"type": "desktop"}`` on a workspace matching both detectors picks its
+    first desktop candidate even though the scan's default is static.
+    Unknown types and types with no detected candidate raise ``ValueError``
+    (the detail lists what WAS detected so the 422 is actionable).
+    """
+    if preview_type not in PREVIEW_TYPES:
+        raise ValueError(
+            f"unsupported preview type {preview_type!r} — want one of "
+            f"{', '.join(sorted(PREVIEW_TYPES))}"
+        )
+    scan = scan_preview(workspace)
+    for cand in scan.candidates:
+        if cand.type == preview_type:
+            return cand
+    detail = f"no {preview_type!r} preview candidate in this workspace"
+    detected = ", ".join(f"{c.entry} ({c.type})" for c in scan.candidates)
+    if detected:
+        detail += f" — detected: {detected}"
+    raise ValueError(detail)
+
+
+class ScanCache:
+    """Bounded TTL cache for the results-page preview probe.
+
+    ``resolve_workspace_dir`` + ``scan_preview`` hit the filesystem per
+    sandbox per results GET. The workspace only changes on (re-)snapshot,
+    so entries are keyed on ``(jail, run_id, sandbox_id, artifact_path)`` —
+    an ``artifact_path`` change is a different entry — and expire after
+    ``ttl_seconds`` (0 disables caching). ``None`` results (no workspace /
+    nothing previewable) are cached too; a missing artifact is the common
+    case and just as expensive to re-probe.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = 30.0,
+        max_entries: int = 512,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.ttl_seconds = ttl_seconds
+        self.max_entries = max_entries
+        self._clock = clock
+        self._entries: OrderedDict[
+            tuple[str, str, str, str | None], tuple[float, PreviewScan | None]
+        ] = OrderedDict()
+
+    def scan(
+        self,
+        *,
+        jail: Path,
+        run_id: str,
+        sandbox_id: str,
+        artifact_path: str | None,
+        ttl_seconds: float | None = None,
+    ) -> PreviewScan | None:
+        """Cached ``resolve_workspace_dir`` + ``scan_preview`` probe.
+
+        ``ttl_seconds`` overrides the instance TTL per call. Concurrent
+        results GETs may race a store — the worst case is a duplicate probe.
+        """
+        ttl = self.ttl_seconds if ttl_seconds is None else ttl_seconds
+        if ttl <= 0:
+            ws = resolve_workspace_dir(
+                jail=jail,
+                run_id=run_id,
+                sandbox_id=sandbox_id,
+                artifact_path=artifact_path,
+            )
+            return scan_preview(ws) if ws is not None else None
+        key = (str(jail), run_id, sandbox_id, artifact_path)
+        now = self._clock()
+        hit = self._entries.get(key)
+        if hit is not None and hit[0] > now:
+            self._entries.move_to_end(key)
+            return hit[1]
+        ws = resolve_workspace_dir(
+            jail=jail,
+            run_id=run_id,
+            sandbox_id=sandbox_id,
+            artifact_path=artifact_path,
+        )
+        scan = scan_preview(ws) if ws is not None else None
+        self._entries[key] = (now + ttl, scan)
+        self._entries.move_to_end(key)
+        while len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+        return scan
+
+    def clear(self) -> None:
+        self._entries.clear()
 
 
 def _preview_url(

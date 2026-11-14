@@ -430,6 +430,8 @@ export default function TimelineClient({ runId }: { runId: string }) {
             <Link href={`/runs/${runId}`}>← run detail</Link>
             {" · "}
             <Link href={`/runs/${runId}/results`}>results</Link>
+            {" · "}
+            <Link href={`/runs/${runId}/analysis`}>analysis</Link>
           </p>
         </div>
       </div>

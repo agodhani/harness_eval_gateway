@@ -14,10 +14,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ApiError,
   artifactDownloadUrl,
-  CANONICAL_DIMENSIONS,
+  dimensionOrder,
   getRun,
   getRunResults,
   getSandboxScores,
+  harnessConfigLabel,
   TERMINAL_RUN_STATUSES,
   type DimensionScore,
   type RunOut,
@@ -51,13 +52,6 @@ function scoreTone(score: number): "good" | "mid" | "bad" {
   if (score >= 8) return "good";
   if (score >= 5) return "mid";
   return "bad";
-}
-
-/** Order dimension rows: canonical rubric dimensions first, then alpha. */
-function dimensionOrder(keys: string[]): string[] {
-  const canon = CANONICAL_DIMENSIONS.filter((d) => keys.includes(d));
-  const rest = keys.filter((d) => !CANONICAL_DIMENSIONS.includes(d)).sort();
-  return [...canon, ...rest];
 }
 
 /** Synthesize SandboxResult[] from per-sandbox ScoreOut rows. */
@@ -197,6 +191,34 @@ export default function ResultsClient({ runId }: { runId: string }) {
     return dimensionOrder([...set]);
   }, [sandboxes]);
 
+  /** F13 — per-sandbox Σ of dimension scores for the matrix totals row.
+   * Distinct from `overall` (judge-reported aggregate); the max gets the
+   * "leader" highlight so the winner is visible at a glance. */
+  const dimTotals = useMemo(() => {
+    const m = new Map<string, { sum: number; count: number }>();
+    for (const sb of sandboxes) {
+      let sum = 0;
+      let count = 0;
+      for (const d of dimensionKeys) {
+        const e = sb.dimensions?.[d];
+        if (e) {
+          sum += e.score;
+          count++;
+        }
+      }
+      m.set(sb.sandbox_id, { sum, count });
+    }
+    return m;
+  }, [sandboxes, dimensionKeys]);
+  const maxTotal = useMemo(
+    () =>
+      Math.max(
+        0,
+        ...[...dimTotals.values()].filter((t) => t.count > 0).map((t) => t.sum),
+      ),
+    [dimTotals],
+  );
+
   function toggleCell(sbId: string, dim: string) {
     const key = `${sbId}::${dim}`;
     setExpanded((prev) => {
@@ -283,6 +305,8 @@ export default function ResultsClient({ runId }: { runId: string }) {
             <Link href={`/runs/${runId}`}>← run detail</Link>
             {" · "}
             <Link href={`/runs/${runId}/timeline`}>timeline</Link>
+            {" · "}
+            <Link href={`/runs/${runId}/analysis`}>analysis</Link>
             {run?.task_prompt ? <> · {run.task_prompt.slice(0, 80)}{run.task_prompt.length > 80 ? "…" : ""}</> : null}
           </p>
         </div>
@@ -339,11 +363,7 @@ export default function ResultsClient({ runId }: { runId: string }) {
                             </div>
                           ) : null}
                           <div className="dim-desc">
-                            {String(sb.harness_config?.adapter ?? sb.harness_config?.harness ?? "?")}
-                            {Array.isArray(sb.harness_config?.skill_packs) &&
-                            sb.harness_config.skill_packs.length > 0
-                              ? ` · ${(sb.harness_config.skill_packs as string[]).join(", ")}`
-                              : ""}
+                            {harnessConfigLabel(sb.harness_config)}
                           </div>
                           {sb.terminal_reason ? (
                             <div className="dim-desc">
@@ -380,6 +400,40 @@ export default function ResultsClient({ runId }: { runId: string }) {
                         ))}
                       </tr>
                     ))}
+                    {dimensionKeys.length > 0 ? (
+                      <tr className="row-total">
+                        <td>
+                          <div className="dim-name">total</div>
+                          <div className="dim-desc">Σ dimension scores · computed</div>
+                        </td>
+                        {sandboxes.map((sb) => {
+                          const t = dimTotals.get(sb.sandbox_id);
+                          const isLeader = !!t && t.count > 0 && t.sum === maxTotal;
+                          return (
+                            <td
+                              key={sb.sandbox_id}
+                              className={`score-cell${isLeader ? " score-cell--leader" : ""}`}
+                            >
+                              {t && t.count > 0 ? (
+                                <>
+                                  <span className="score-value">
+                                    {Math.round(t.sum * 10) / 10}
+                                  </span>
+                                  <div
+                                    className={`dim-desc${isLeader ? " dim-desc--leader" : ""}`}
+                                  >
+                                    {t.count} dim{t.count === 1 ? "" : "s"}
+                                    {isLeader ? " · leader" : ""}
+                                  </div>
+                                </>
+                              ) : (
+                                <span className="score-na">—</span>
+                              )}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ) : null}
                   </tbody>
                 </table>
               </div>
