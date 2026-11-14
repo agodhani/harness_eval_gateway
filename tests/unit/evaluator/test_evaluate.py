@@ -357,6 +357,26 @@ async def test_candidate_analysis_files_are_not_staged(
     assert json.loads((eval_ws / "analysis.json").read_text())["schema_version"] == 1
 
 
+async def test_candidate_reserved_dirs_do_not_crash_staging(
+    seeded, session_factory
+) -> None:
+    """Directories planted at reserved names must be evicted like files —
+    unlink() on a real dir raises IsADirectoryError and would fail the
+    sandbox's entire evaluation."""
+    ws = seeded["workspace"]
+    for name in ("scores.json", "ANALYSIS.md", "analysis.json"):
+        (ws / name).mkdir()
+        (ws / name / "nested.txt").write_text("plant\n")
+
+    fake = FakeRuntime()
+    rows = await _eval(seeded, session_factory, fake)
+    assert len(rows) == 3
+    eval_ws = Path(fake.specs[0].workspace_host_path)
+    assert (eval_ws / "scores.json").is_file()
+    assert json.loads((eval_ws / "analysis.json").read_text())["schema_version"] == 1
+    assert "Cyclomatic complexity" in (eval_ws / "ANALYSIS.md").read_text()
+
+
 async def test_analysis_failure_does_not_block_eval(
     seeded, session_factory, monkeypatch
 ) -> None:

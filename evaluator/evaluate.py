@@ -284,7 +284,11 @@ def _stage_eval_workspace(
         ANALYSIS_MD_FILENAME,
         ANALYSIS_JSON_FILENAME,
     ):
-        (eval_ws / reserved).unlink(missing_ok=True)
+        p = eval_ws / reserved
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p)
+        else:
+            p.unlink(missing_ok=True)
 
     (eval_ws / "rubric.json").write_text(
         json.dumps(rubric, indent=2, ensure_ascii=False, default=str) + "\n",

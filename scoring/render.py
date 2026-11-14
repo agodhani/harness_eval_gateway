@@ -56,11 +56,12 @@ def _render_static(sig: SignalReport) -> list[str]:
         "",
         files_line,
         nloc_line,
-        fn_line,
-        cc_line,
-        depth_line,
-        "",
     ]
+    if m.get("function_count", 0):
+        lines += [fn_line, cc_line, depth_line]
+    else:
+        lines.append("- Functions: **0** — no functions detected")
+    lines.append("")
     langs = m.get("languages") or {}
     if langs:
         lines += [
@@ -121,15 +122,14 @@ def render_analysis_markdown(report: AnalysisReport) -> str:
         "",
     ]
     for sig in report.signals:
-        if sig.status == "error":
+        if sig.status != "ok":
             lines += [
-                f"## Signal: {sig.name} (error)",
-                "",
-                f"Collector failed: {sig.error or 'unknown'}",
+                f"## Signal: {sig.name} ({sig.status})",
                 "",
             ]
-            continue
-        if sig.name == "static_analysis":
+            if sig.error:
+                lines += [f"Collector failed: {sig.error}", ""]
+        elif sig.name == "static_analysis":
             lines += _render_static(sig)
         else:
             lines += _render_generic(sig)

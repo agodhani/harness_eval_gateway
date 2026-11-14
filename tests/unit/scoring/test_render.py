@@ -46,6 +46,24 @@ def test_render_error_signal(tmp_path: Path) -> None:
     assert "RuntimeError: boom" in md
 
 
+def test_render_skipped_signal_has_no_fake_metrics(tmp_path: Path) -> None:
+    """A skipped collector renders its status, not placeholder zeros read
+    as measured values."""
+    report = collect_signals(tmp_path / "does-not-exist")
+    md = render_analysis_markdown(report)
+    assert "Signal: static_analysis (skipped)" in md
+    assert "avg CC" not in md
+
+
+def test_render_zero_functions_has_no_fake_cc(tmp_path: Path) -> None:
+    """Zero measured functions must not print 'avg CC 0' as a measurement."""
+    (tmp_path / "data.py").write_text("x = 1\n")
+    report = collect_signals(tmp_path)
+    md = render_analysis_markdown(report)
+    assert "Files analyzed: **1**" in md
+    assert "avg CC" not in md
+
+
 def test_render_generic_signal_metrics(tmp_path: Path) -> None:
     """Unknown collectors (e.g. PR7 exec) get a scalar metrics table."""
     report = AnalysisReport(
