@@ -42,6 +42,15 @@ append-mostly; rebase on main before merge.
   e.g. route `claude-*` to Anthropic while the rest stays on Ollama. Every
   provider a request may resolve to must have its key (boot-time check).
   Emitted `llm_*`/`error` events record the resolved provider.
+- **Gateway response cache / deterministic replay** (PR18): opt-in
+  `GATEWAY_CACHE_ENABLED` (off by default); sqlite store
+  (`gateway/cache.py`, `GATEWAY_CACHE_PATH`) keyed on
+  `namespace+path+provider+outgoing-body` — hits replay byte-verbatim with
+  `x-heg-cache: hit`, emit `llm_*` events marked `payload.cached: true`,
+  and still count toward the run budget (gate runs before lookup). Only
+  complete 2xx bodies stored; `count_tokens`/`/v1/models` bypass;
+  `GATEWAY_CACHE_NAMESPACE` bump invalidates; `GATEWAY_CACHE_MAX_ENTRIES`
+  LRU bound.
 
 ## Dependency DAG
 
@@ -238,9 +247,17 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 - **Touch:** `adapters/common/` shim, `api/schemas.py` EventType (maybe new
   types — contract test AST-scans emitters), adapter translate fns.
 
-### PR18 — Gateway response caching / deterministic replay
+### PR18 — Gateway response caching / deterministic replay ✅ landed
 - **Scope:** cache upstream responses keyed on request for deterministic
   replay (dev/CI aid — cheap reruns).
+- **Landed:** `gateway/cache.py` sqlite store keyed on
+  `namespace + path + provider + outgoing-body`; opt-in
+  `GATEWAY_CACHE_*` flags (off by default); hits replay byte-verbatim
+  (`x-heg-cache: hit`), still emit `llm_*` events with `payload.cached:
+  true`, re-meter stored usage against the run budget, and the budget gate
+  runs before lookup — replays accrue + 429 identically to live runs. Only
+  complete 2xx bodies stored; unmetered probes bypass; failures degrade to
+  miss. Details: `FEATURE_MAP.md` F3.
 - **Touch:** `gateway/` (cache layer in proxy path, config flags).
 - **Depends on:** PR12 (gateway churn settles).
 

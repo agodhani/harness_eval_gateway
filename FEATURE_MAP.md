@@ -114,14 +114,35 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   own key/base-URL/headers (Anthropic sends `x-api-key` +
   `anthropic-version`); endpoints a provider doesn't implement return its
   native 404; Ollama-only body params are stripped for hosted providers.
-- **Where:** `gateway/` (`main.py`, `creds.py`, `metering.py`, `deps.py`,
-  `config.py`, `mint_cred.py` CLI), compose service `gateway` (:8081→8080)
+- **Response cache / deterministic replay (PR18):** opt-in via
+  `GATEWAY_CACHE_ENABLED` (OFF by default — real runs hit the live
+  upstream). Metered generation calls (`/v1/chat/completions` streamed +
+  buffered, `/v1/messages`, `/v1/responses`) replay from a sqlite store
+  (`GATEWAY_CACHE_PATH`, default `./data/gateway_cache.sqlite3`,
+  `GATEWAY_CACHE_MAX_ENTRIES` LRU bound) keyed on
+  `namespace + path + provider + outgoing-body` (post-transform — stream vs
+  buffered and per-provider routes can't collide; bump
+  `GATEWAY_CACHE_NAMESPACE` to invalidate). Hits skip the upstream, return
+  an `x-heg-cache: hit` header, and still emit `llm_request`/`llm_response`
+  with `payload.cached: true` + the stored body re-metered for usage —
+  cached spend counts toward the run budget and the budget gate runs before
+  the lookup, so a replay 429s at the same point the live run did. Only
+  complete 2xx responses are stored; `count_tokens`/`/v1/models` bypass the
+  cache; cache failures degrade to a miss (never a proxy 5xx).
+- **Where:** `gateway/` (`main.py`, `cache.py`, `creds.py`, `metering.py`,
+  `deps.py`, `config.py`, `mint_cred.py` CLI), compose service `gateway`
+  (:8081→8080)
 - **Verify:**
   - Unit: `tests/unit/gateway/` (creds, metering, proxy — hermetic; protocol
     pass-throughs + SSE usage normalization covered),
     `test_upstream_provider.py` (provider selection, key validation,
     PROVIDER_ROUTES resolution, per-provider client base/headers,
-    ollama-param stripping, provider attribution on emitted events)
+    ollama-param stripping, provider attribution on emitted events),
+    `test_cache.py` (key stability/provider+body+path keying, LRU bound,
+    file persistence, namespace invalidation, miss→hit replay for buffered +
+    SSE + /v1/messages + /v1/responses, cached-event flagging + usage
+    metering, budget gate before lookup, non-2xx and unmetered bypass,
+    lookup/store failure degradation)
   - Manual: mint cred (`uv run python -m gateway.mint_cred`) →
     `curl localhost:8081/v1/chat/completions` → completion + event rows
   - M2 e2e proven: sandbox→gateway→Ollama→events (see run

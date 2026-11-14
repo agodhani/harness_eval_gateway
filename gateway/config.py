@@ -84,6 +84,25 @@ class GatewaySettings(BaseSettings):
     UPSTREAM_TIMEOUT: float = 300.0
     INGEST_TIMEOUT: float = 10.0
 
+    # --- Response cache (PR18: deterministic replay — dev/CI aid) ---
+    # OFF by default: real runs must hit the live upstream. When enabled,
+    # metered generation calls (/v1/chat/completions, /v1/messages,
+    # /v1/responses) are served from a local sqlite store keyed on
+    # path+provider+outgoing-body; hits still emit llm_* events
+    # (payload.cached=true) and count against the run token budget so a
+    # replay meters identically to the live run.
+    GATEWAY_CACHE_ENABLED: bool = False
+    # sqlite file for cached responses ('./data' is gitignored; use
+    # ':memory:' for a per-process cache). In compose the gateway mounts
+    # ./data at /data — point this inside it to persist across rebuilds.
+    GATEWAY_CACHE_PATH: str = "./data/gateway_cache.sqlite3"
+    # Hard bound on stored entries; least-recently-used evicted beyond it.
+    GATEWAY_CACHE_MAX_ENTRIES: int = 10_000
+    # Salt mixed into every cache key — bump to invalidate all entries
+    # without deleting the file (e.g. after changing injected defaults or
+    # provider routing).
+    GATEWAY_CACHE_NAMESPACE: str = "v1"
+
     def model_post_init(self, __context: Any, /) -> None:
         # provider_routes() parses + validates the JSON so malformed config
         # fails at boot, not mid-run. Every provider a request may resolve to
