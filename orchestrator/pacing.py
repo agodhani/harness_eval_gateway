@@ -27,7 +27,9 @@ Two mechanisms:
    stats``); an unreadable probe disables the gate (logged, proceed). The
    wait is capped by ``SPAWN_MEM_WAIT_SECONDS`` — an expired wait fails
    THAT sandbox like any spawn failure, so sustained pressure can't hang a
-   run forever.
+   run forever. A recorded ``spawn_mem_timeout`` also fails later configs
+   in the SAME run fast (one probe each): fresh per-config caps would let
+   sustained pressure hold the run's single execution slot for N×cap.
 
 Pacing ``checkpoint`` events make the queue visible on the run timeline:
 ``run_queued`` / ``run_dequeued`` at run scope and ``spawn_mem_wait`` /
@@ -51,7 +53,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from db.models import Run
+from db.models import Event, Run
 
 from . import state_machine
 from .events import emit
@@ -321,6 +323,29 @@ def _mb(nbytes: int | None) -> float | None:
     return None if nbytes is None else round(nbytes / (1024 * 1024), 1)
 
 
+def _prior_mem_timeout(
+    session_factory: sessionmaker[Session], run_id: uuid.UUID
+) -> bool:
+    """True when a sibling spawn already hit the wait cap for this run.
+
+    The ``spawn_mem_timeout`` checkpoint IS the record (committed by
+    ``_gate_event`` before the caller sees False). An event-read failure
+    degrades to the full-cap wait rather than blocking or fast-failing a
+    spawn on an observability problem.
+    """
+    try:
+        with session_factory() as session:
+            payloads = session.execute(
+                select(Event.payload).where(
+                    Event.run_id == run_id, Event.type == "checkpoint"
+                )
+            ).scalars().all()
+    except Exception:
+        log.exception("pacing: could not check prior mem timeouts")
+        return False
+    return any((p or {}).get("stage") == "spawn_mem_timeout" for p in payloads)
+
+
 async def wait_for_headroom(
     *,
     session_factory: sessionmaker[Session],
@@ -335,7 +360,9 @@ async def wait_for_headroom(
     :func:`read_host_memory`). Returns True to proceed with the spawn —
     including when the gate is disabled (min free <= 0) or the host memory
     is unreadable — and False when ``SPAWN_MEM_WAIT_SECONDS`` elapsed under
-    continuous pressure.
+    continuous pressure. Once a sibling spawn in the same run has timed out
+    the cap collapses to a single probe — remaining configs fail fast under
+    continuing pressure instead of each burning a fresh full wait.
     """
     min_free = int(getattr(settings, "SPAWN_MIN_FREE_MEM_MB", 0) or 0) * 1024 * 1024
     if min_free <= 0:
@@ -343,6 +370,8 @@ async def wait_for_headroom(
     reader = mem_reader if mem_reader is not None else read_host_memory
     poll = max(float(getattr(settings, "SPAWN_MEM_POLL_SECONDS", 5.0)), 0.05)
     wait_cap = float(getattr(settings, "SPAWN_MEM_WAIT_SECONDS", 3600.0))
+    if _prior_mem_timeout(session_factory, run_id):
+        wait_cap = 0.0
 
     started = time.monotonic()
     last_emit = started

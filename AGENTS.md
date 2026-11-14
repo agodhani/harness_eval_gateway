@@ -114,8 +114,9 @@ adapters are added.
    `spawn_one` additionally gates each `docker run` on host memory headroom
    (`SPAWN_MIN_FREE_MEM_MB`, probed via `/proc/meminfo` → `sysconf` →
    `docker info`+`stats`; unreadable probe = gate off). The wait is capped
-   by `SPAWN_MEM_WAIT_SECONDS` — expiry fails that one sandbox so sustained
-   pressure can't hang the run.
+   by `SPAWN_MEM_WAIT_SECONDS` — expiry fails that one sandbox and makes
+   the remaining configs fail fast (one probe each), so sustained pressure
+   can't hold the run's slot for N×cap.
 4. **Execute** — agent loops; all model calls via gateway; adapter streams
    normalized events; UI shows live timeline.
 5. **Terminate** — each sandbox reaches a terminal state (below); workspace

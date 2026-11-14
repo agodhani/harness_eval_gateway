@@ -440,6 +440,75 @@ async def test_wait_timeout_returns_false(session_factory, settings) -> None:
     assert len(timeouts) == 1
 
 
+async def test_wait_fails_fast_after_sibling_timeout(
+    session_factory, settings
+) -> None:
+    """Once a sibling spawn timed out on memory, remaining configs get ONE
+    probe — fresh full caps would hold the run's single execution slot for
+    N×SPAWN_MEM_WAIT_SECONDS under sustained pressure."""
+    settings.SPAWN_MIN_FREE_MEM_MB = 256
+    settings.SPAWN_MEM_POLL_SECONDS = 0.01
+    settings.SPAWN_MEM_WAIT_SECONDS = 30.0  # must NOT be honored
+    run = make_run(session_factory, status="provisioning")
+    pacing._gate_event(
+        session_factory,
+        run_id=run.id,
+        sandbox_id=make_sandbox(session_factory, run.id, status="provisioning").id,
+        stage="spawn_mem_timeout",
+        waited_seconds=30.0,
+        required_mb=256.0,
+        available_mb=100.0,
+    )
+
+    probes = {"n": 0}
+
+    def counting_reader() -> MemReading:
+        probes["n"] += 1
+        return MemReading(100 * MIB, 64 * 1024 * MIB, "fake")
+
+    sid = make_sandbox(session_factory, run.id, status="provisioning").id
+    ok = await wait_for_headroom(
+        session_factory=session_factory,
+        run_id=run.id,
+        sandbox_id=sid,
+        settings=settings,
+        mem_reader=counting_reader,
+    )
+    assert ok is False
+    assert probes["n"] == 1
+    timeouts = [
+        e
+        for e in _stage_events(session_factory, run.id, "spawn_mem_timeout")
+        if e.sandbox_id == sid
+    ]
+    assert len(timeouts) == 1
+
+
+async def test_wait_proceeds_after_sibling_timeout_when_headroom(
+    session_factory, settings
+) -> None:
+    """Fail-fast collapses the WAIT, not the spawn — cleared pressure still
+    provisions (single probe shows headroom -> proceed)."""
+    settings.SPAWN_MIN_FREE_MEM_MB = 256
+    settings.SPAWN_MEM_WAIT_SECONDS = 30.0
+    run = make_run(session_factory, status="provisioning")
+    pacing._gate_event(
+        session_factory,
+        run_id=run.id,
+        sandbox_id=uuid.uuid4(),
+        stage="spawn_mem_timeout",
+        waited_seconds=30.0,
+    )
+    ok = await wait_for_headroom(
+        session_factory=session_factory,
+        run_id=run.id,
+        sandbox_id=uuid.uuid4(),
+        settings=settings,
+        mem_reader=_readings(600 * MIB),
+    )
+    assert ok is True
+
+
 async def test_wait_unreadable_probe_proceeds(session_factory, settings) -> None:
     """No usable memory reading -> gate is inert (never blocks a spawn on
     an unmeasurable host)."""
@@ -579,6 +648,48 @@ async def test_spawn_one_mem_timeout_fails_sandbox(
             ).scalars()
         ]
         assert errs and "memory" in errs[0].payload["message"]
+
+
+async def test_spawn_one_siblings_fail_fast_after_mem_timeout(
+    session_factory, settings, fake_runtime, monkeypatch
+) -> None:
+    """Sequential configs under sustained pressure: config 1 burns the wait
+    cap; config 2 probes once and fails — total stall ~= 1×cap, not N×cap."""
+    settings.SPAWN_MIN_FREE_MEM_MB = 256
+    settings.SPAWN_MEM_POLL_SECONDS = 0.01
+    settings.SPAWN_MEM_WAIT_SECONDS = 0.05
+    probes = {"n": 0}
+
+    def reader() -> MemReading:
+        probes["n"] += 1
+        return MemReading(50 * MIB, 64 * 1024 * MIB, "fake")
+
+    monkeypatch.setattr(pacing, "read_host_memory", reader)
+
+    run = make_run(session_factory, status="provisioning", config=run_config())
+    hc = run.config["harness_configs"][0]
+    first = await spawn_one(
+        session_factory=session_factory,
+        runtime=fake_runtime,
+        run_id=run.id,
+        harness_config=hc,
+        settings=settings,
+    )
+    assert first is None
+    probes_after_first = probes["n"]
+
+    second = await spawn_one(
+        session_factory=session_factory,
+        runtime=fake_runtime,
+        run_id=run.id,
+        harness_config=hc,
+        settings=settings,
+    )
+    assert second is None
+    assert probes["n"] == probes_after_first + 1
+    assert fake_runtime.spawned == []
+    timeouts = _stage_events(session_factory, run.id, "spawn_mem_timeout")
+    assert len(timeouts) == 2
 
 
 async def test_spawn_one_ungated_probe_failure_still_spawns(

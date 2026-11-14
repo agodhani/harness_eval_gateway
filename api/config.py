@@ -80,7 +80,8 @@ class Settings(BaseSettings):
     # 0 disables. Default 2 GiB — headroom for the model + siblings.
     SPAWN_MIN_FREE_MEM_MB: int = 2048
     # Poll cadence + cap for the gate wait. An expired wait fails THAT
-    # sandbox like any spawn error, so sustained pressure can't hang a run.
+    # sandbox like any spawn error — and collapses remaining configs' waits
+    # to a single probe, so sustained pressure can't hang a run for N×cap.
     SPAWN_MEM_POLL_SECONDS: float = 5.0
     SPAWN_MEM_WAIT_SECONDS: float = 3600.0
 

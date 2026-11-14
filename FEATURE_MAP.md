@@ -90,7 +90,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   memory gate: `spawn_one` waits for `SPAWN_MIN_FREE_MEM_MB` host headroom
   before `docker run` (probed via `/proc/meminfo` → `sysconf` → `docker
   info`+`stats`), capped by `SPAWN_MEM_WAIT_SECONDS`, expiry fails that
-  sandbox. Pacing events: `run_queued`/`run_dequeued` (run scope),
+  sandbox — remaining configs then fail fast (one probe each) so pressure
+  can't hold the slot for N×cap. Pacing events: `run_queued`/`run_dequeued`
+  (run scope),
   `spawn_mem_wait`/`spawn_mem_release`/`spawn_mem_timeout` (sandbox scope).
 - **Where:** `orchestrator/` (`state_machine.py`, `lifecycle.py`,
   `provision.py`, `monitor.py`, `rubric.py`, `runner.py`, `pacing.py`,

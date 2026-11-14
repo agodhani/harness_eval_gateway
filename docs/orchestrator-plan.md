@@ -86,16 +86,18 @@ finished_at, sandbox_count). `same_model_eval` =
 | `GET /api/runs/{id}` | `RunOut` incl. sandboxes + latest rubric. 404. |
 | `GET /api/runs/{id}/rubric` | Latest `Rubric` by version. 404 if none. |
 | `PUT /api/runs/{id}/rubric` | Body `{"content": RubricContent}` — only when `run.status=="rubric_review"` **and** `rubric.status=="draft"`; replaces `content` in place (version stays 1). Else 409. 422 on schema violation. |
-| `POST /api/runs/{id}/approve` | Same preconditions as PUT; sets `rubric.status="approved"`, transitions run → `provisioning`, sets `started_at`, emits orchestrator event, `runner.start_lifecycle_task(run_id)`. → `RunOut`. |
+| `POST /api/runs/{id}/approve` | Same preconditions as PUT; sets `rubric.status="approved"`, sets `started_at`, emits orchestrator event, `pacing.place_run` → `provisioning` + `runner.start_lifecycle_task(run_id)`, or parks in `queued` when another run holds the execution slot (FIFO promotion on lifecycle end / startup sweep — PR15). → `RunOut`. |
 
 Submit-time validation → 422: `adapter ∈ ADAPTERS`, every `skill_packs[]` entry
 is a dir under `./skillpacks/`, non-empty `task_prompt`/`model_name`,
 `evaluator_model` defaults to `model_name` when omitted.
 
 Statuses (db comment `models.py:46`): run =
-`submitted → rubric_review → provisioning → running → evaluating → done | failed`;
+`submitted → rubric_review → [queued →] provisioning → running → evaluating → done | failed`;
 sandbox = `provisioning | running | terminating | done | failed`
-(+ `terminal_reason`).
+(+ `terminal_reason`). `queued` (PR15 pacing) parks an approved run while
+another run holds the single execution slot; promotion is FIFO by approval
+time.
 
 ## 2. Rubric generation — `orchestrator/rubric.py`
 
@@ -266,7 +268,9 @@ total `Score` rows for the run == 0 → `run.status="failed"` + error event
   `submitted` runs with no rubric → respawn rubric task; `provisioning`/
   `running`/`evaluating` → `failed` (+ sandboxes `failed`/`error`, best-effort
   `docker rm -f` by `heg.run_id` label). `rubric_review` untouched (human
-  gate). In-process tasks die with the process — accepted MVP limitation,
+  gate); `queued` untouched too (no in-process task to lose) — the sweep
+  finishes by promoting the oldest queued run (`promote_next_queued`).
+  In-process tasks die with the process — accepted MVP limitation,
   documented.
 - **Duplicate submit:** no idempotency for MVP — each POST creates a run;
   UI disables double-submit. Note for post-MVP.
