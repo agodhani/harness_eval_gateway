@@ -214,10 +214,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
 
   const loading = loadInfo?.forId !== runId;
   const fatalError = loadInfo?.forId === runId ? loadInfo.error : null;
-  // Same scoping convention as loadInfo.forId — case-insensitive because the
-  // route param is verbatim while Postgres serializes UUIDs lowercase.
-  const scopedAnalytics =
-    analytics?.run_id.toLowerCase() === runId.toLowerCase() ? analytics : null;
+  const scopedAnalytics = analytics?.run_id === runId ? analytics : null;
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);

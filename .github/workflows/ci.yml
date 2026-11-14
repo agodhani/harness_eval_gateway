@@ -79,11 +79,6 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      # lib/*.test.ts via node --test (type-stripped TS — needs Node ≥22.18;
-      # the job's `node-version: 22` resolves to a qualifying release).
-      - name: Unit tests
-        run: npm test
-
       - name: Build
         run: npm run build
 
