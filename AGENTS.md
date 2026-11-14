@@ -255,6 +255,9 @@ or tests change.
 - Split-view trace comparison — side-by-side, time-aligned event streams for
   two sandboxes on the traces/timeline page (today it's one merged stream
   with a single-sandbox filter dropdown); scrolling/diff-alignment UX TBD
+- Graphical analysis page — charts on top of the F9 analytics + scores data:
+  per-dimension score comparison across sandboxes, token/cost/latency per
+  sandbox, tool-call mix, eval-vs-participant spend split, cross-run trends
 - Lightweight artifact thumbnails — capture screenshots of produced artifacts
   for at-a-glance review before spawning a full live preview sandbox
 - Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.
