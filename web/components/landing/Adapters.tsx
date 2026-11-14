@@ -37,6 +37,13 @@ const ADAPTERS = [
     desc: "DeepSeek's dsh on node:24-slim. Same shim pattern, same event contract — proof the adapter surface generalizes.",
     status: "shipped",
   },
+  {
+    name: "aider",
+    role: "Python CLI (litellm)",
+    proto: "/v1/chat/completions",
+    desc: "aider --message on python:slim. No JSONL mode — the shim maps its plain-text status lines (Applied edit, Tokens, Commit) onto the same normalized events.",
+    status: "shipped",
+  },
 ] as const;
 
 const CONTRACT = `interface HarnessAdapter {
@@ -62,7 +69,7 @@ export default function Adapters() {
       }
       lede="Each harness plugs in through a six-function adapter contract: build the
       image, install skill packs, wire gateway env, launch non-interactively,
-      translate its output, detect completion. Five adapters ship today."
+      translate its output, detect completion. Six adapters ship today."
     >
       <div className="lp-cells lp-cells-2 lp-cells-3">
         {ADAPTERS.map((a, i) => (

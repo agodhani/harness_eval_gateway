@@ -15,12 +15,13 @@ def test_list_harnesses() -> None:
     # Every registered adapter appears, miniloop included.
     assert {
         "miniloop",
+        "aider",
         "claude_code",
         "codex",
         "deepseek",
         "pi",
     } <= set(manifests)
-    for name in ("claude_code", "codex", "deepseek", "pi"):
+    for name in ("aider", "claude_code", "codex", "deepseek", "pi"):
         m = manifests[name]
         for key in ("display_name", "llm_protocol", "cli", "image", "requires"):
             assert m.get(key), f"{name}: manifest missing {key!r}"

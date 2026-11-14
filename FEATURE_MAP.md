@@ -22,7 +22,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F7 | Evaluator sandbox (rubric scoring + objective signals) | ✅ | `evaluator/`, `scoring/` | `tests/unit/evaluator/`, `tests/unit/scoring/` |
 | F8 | Results UI (matrix, scores, artifacts) | ✅ | `web/app/runs/`, `api/routers/results.py` | `tests/unit/api/test_results.py` |
 | F9 | Run analytics (per-sandbox metrics + cost) | ✅ | `api/routers/analytics.py`, `api/pricing.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx` | `tests/unit/api/test_analytics.py` |
-| F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
+| F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek, Aider) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek,aider}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
 | F11 | Skillpack import from GitHub | ✅ | `skillpack_import/`, `api/routers/skillpacks.py`, `web/app/submit/ImportSkillPackDialog.tsx` | `tests/unit/api/test_skillpacks.py`, `test_skillpack_import.py` |
 | F12 | Artifact preview (static html + desktop/pygame via noVNC, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
 | F13 | Graphical analysis page + cross-run trends (recharts) | ✅ | `web/app/runs/[id]/analysis/`, `api/routers/analytics.py` (`GET /api/analytics/runs`), `web/app/runs/[id]/results/ResultsClient.tsx` (totals row) | `tests/unit/api/test_analytics.py` (trends section) |
@@ -58,7 +58,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 ### F1 — Submission form → run spec
 
 - **What:** form captures task prompt, model, harness configs (adapter +
-  skill pack selections — five adapters available, F10), evaluator model;
+  skill pack selections — six adapters available, F10), evaluator model;
   `POST /api/runs` persists spec with status `submitted`. The adapter
   dropdown is populated live from `GET /api/harnesses` (static fallback list
   when the API is unreachable); model inputs use the ComboInput suggestion
@@ -261,22 +261,24 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **What:** pluggable adapter registry so runs can compare real harness CLIs,
   not just miniloop configs. Registered adapters: `miniloop`, `codex`
   (@openai/codex), `claude_code` (@anthropic-ai/claude-code), `pi`
-  (@mariozechner/pi-coding-agent), `deepseek` (@deepseek-ai/dsh). A shared
-  stdlib-only shim (`adapters/common/`) runs inside each image: writes the
-  harness's native config pointing at the gateway, launches the CLI in
-  machine-readable JSONL mode, translates native records → normalized
-  events, posts them to `/internal/events`, emits `terminal_state` + prints
-  `HEG_RESULT {…}`. Per-adapter Docker images pin the npm CLI version;
+  (@mariozechner/pi-coding-agent), `deepseek` (@deepseek-ai/dsh), `aider`
+  (aider-chat, PR13). A shared stdlib-only shim (`adapters/common/`) runs
+  inside each image: writes the harness's native config pointing at the
+  gateway, launches the CLI in machine-readable JSONL mode (aider emits
+  plain text only — the shim's `translate_text` hook maps its status lines
+  heuristically instead), translates records → normalized events, posts
+  them to `/internal/events`, emits `terminal_state` + prints
+  `HEG_RESULT {…}`. Per-adapter Docker images pin the CLI version;
   `orchestrator/provision.py` resolves each config's image from
   `image_spec()["image"]` (miniloop keeps the `SANDBOX_IMAGE` fallback).
   `GET /api/harnesses` serves adapter manifests (display name, LLM protocol,
   CLI, image) for the submit form; `HarnessConfigIn.adapter` validates
   against the registry. Design doc: `docs/p25-harness-adapters.md`.
 - **Where:** `adapters/common/` (`runner.py`, `contract.py`),
-  `adapters/{codex,claude_code,pi,deepseek}/` (`adapter.py`, `config.py`,
+  `adapters/{codex,claude_code,pi,deepseek,aider}/` (`adapter.py`, `config.py`,
   `translate.py`, `__main__.py`), `orchestrator/adapters.py`,
   `orchestrator/provision.py`, `sandbox/images/{codex,claude_code,pi,
-  deepseek}.Dockerfile`, `api/routers/harnesses.py`
+  deepseek,aider}.Dockerfile`, `api/routers/harnesses.py`
 - **Verify:**
   - Unit: `tests/unit/adapters/test_adapter_contract.py` (contract across all
     adapters: manifest, image_spec, env, launch, translation → valid

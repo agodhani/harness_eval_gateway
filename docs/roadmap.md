@@ -185,6 +185,10 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 - **Verify:** `tests/unit/gateway/test_upstream_provider.py` pattern.
 
 ### PR13 — Aider adapter (+ dsh helpers if needed)
+
+> **Status: landed** — `adapters/aider/` shipped; dsh native helpers
+> skipped (no TTY-dependent evals — see `docs/p25-harness-adapters.md`).
+
 - **Scope:** Aider CLI adapter following the F10 shim pattern; dsh native
   helpers (spawn-helper, node-pty via `--allow-scripts`) ONLY if evals hit
   TTY-dependent tasks — otherwise skip.
