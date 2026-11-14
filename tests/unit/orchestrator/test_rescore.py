@@ -14,7 +14,7 @@ from pathlib import Path
 from sqlalchemy import select
 
 from db.models import Event, Rubric, Run, Sandbox, Score
-from orchestrator import runner
+from orchestrator import lifecycle, runner
 from orchestrator.lifecycle import rescore_run
 from orchestrator.rubric import RubricContent, create_rubric_version
 
@@ -208,7 +208,12 @@ async def test_rescore_no_new_scores_restores_done(
     session_factory, settings, artifact_root
 ) -> None:
     """Judge produces nothing on rescore, but old scores still exist → the
-    run returns to done, not failed."""
+    run returns to done, not failed.
+
+    Pins the baseline-delta retry check: pre-existing Score rows must NOT
+    count as "this pass scored" — a flaky empty re-score still burns its
+    EVAL_SCORE_RETRIES before giving up (was dead code when the check was
+    ``count > 0``)."""
     run = make_run(session_factory, status="done", config=run_config())
     rubric = _rubric(session_factory, run.id, version=1)
     sb = _artifact_sandbox(session_factory, artifact_root, run.id)
@@ -224,8 +229,12 @@ async def test_rescore_no_new_scores_restores_done(
             )
         )
         s.commit()
+    settings.EVAL_SCORE_RETRIES = 2
+
+    calls: list = []
 
     async def empty_eval(**kwargs):
+        calls.append(kwargs)
         return []
 
     await rescore_run(
@@ -237,6 +246,210 @@ async def test_rescore_no_new_scores_restores_done(
     )
 
     assert _run(session_factory, run.id).status == "done"
+    # 1 initial attempt + EVAL_SCORE_RETRIES — not short-circuited by the
+    # stale rows that were already there before the pass.
+    assert len(calls) == 3
+    retries = [
+        e for e in _events(session_factory, run.id)
+        if e.payload.get("stage") == "eval_retry"
+    ]
+    assert [e.payload["attempt"] for e in retries] == [2, 3]
+    assert all(e.payload["reason"] == "no scores produced" for e in retries)
+
+
+async def test_rescore_retry_recovers_on_second_attempt(
+    session_factory, settings, artifact_root
+) -> None:
+    """Rescore with stale scores + a judge that flakes once, then scores →
+    the retry produces NEW rows on top of the old ones."""
+    run = make_run(session_factory, status="done", config=run_config())
+    rubric = _rubric(session_factory, run.id, version=1)
+    sb = _artifact_sandbox(session_factory, artifact_root, run.id)
+    with session_factory() as s:
+        s.add(
+            Score(
+                sandbox_id=sb.id,
+                rubric_id=rubric.id,
+                rubric_version=1,
+                dimension="functional_requirements",
+                score=7.0,
+            )
+        )
+        s.commit()
+    settings.EVAL_SCORE_RETRIES = 2
+
+    calls: list = []
+
+    async def flaky_eval(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return []  # first attempt produces nothing
+        with kwargs["session_factory"]() as s:
+            s.add(
+                Score(
+                    sandbox_id=kwargs["sandbox_id"],
+                    rubric_id=kwargs["rubric_id"],
+                    rubric_version=kwargs.get("rubric_version"),
+                    dimension="functional_requirements",
+                    score=9.0,
+                )
+            )
+            s.commit()
+        return []
+
+    await rescore_run(
+        run.id,
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        settings=settings,
+        evaluator_fn=flaky_eval,
+    )
+
+    assert len(calls) == 2  # recovered on the first retry
+    assert _run(session_factory, run.id).status == "done"
+    assert len(_scores(session_factory, sandbox_id=sb.id)) == 2
+
+
+async def test_rescore_non_terminal_run_not_hijacked(
+    session_factory, settings, artifact_root
+) -> None:
+    """A direct rescore while the run is mid-flight must not force it into
+    evaluating — the API 409s, and _rescore_run refuses non-terminal state
+    itself (defense-in-depth for non-API callers)."""
+    run = make_run(session_factory, status="running", config=run_config())
+    _rubric(session_factory, run.id, version=1)
+    _artifact_sandbox(session_factory, artifact_root, run.id)
+
+    calls: list = []
+    await rescore_run(
+        run.id,
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+
+    assert calls == []
+    assert _run(session_factory, run.id).status == "running"
+    stages = [e.payload.get("stage") for e in _events(session_factory, run.id)]
+    assert "rescore_started" not in stages
+    assert "rescore_finished" not in stages
+    errs = [
+        e for e in _events(session_factory, run.id)
+        if e.type == "error" and e.payload.get("stage") == "rescore"
+    ]
+    assert errs and "terminal" in errs[0].payload["message"]
+
+
+async def test_rescore_bare_evaluating_rejected(
+    session_factory, settings, artifact_root
+) -> None:
+    """status='evaluating' WITHOUT a rescore marker = first-pass eval in
+    flight — a direct rescore call must not piggyback on it."""
+    run = make_run(session_factory, status="evaluating", config=run_config())
+    _rubric(session_factory, run.id, version=1)
+    _artifact_sandbox(session_factory, artifact_root, run.id)
+
+    calls: list = []
+    await rescore_run(
+        run.id,
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+
+    assert calls == []
+    assert _run(session_factory, run.id).status == "evaluating"
+    errs = [
+        e for e in _events(session_factory, run.id)
+        if e.type == "error" and e.payload.get("stage") == "rescore"
+    ]
+    assert errs and "terminal" in errs[0].payload["message"]
+
+
+async def test_rescore_marked_evaluating_proceeds(
+    session_factory, settings, artifact_root
+) -> None:
+    """The API path: _prepare_rescore moves done→evaluating + stamps
+    rescore_requested in the request tx, THEN the task runs — a marked
+    evaluating state is a legit rescore pass, not a hijack."""
+    run = make_run(session_factory, status="evaluating", config=run_config())
+    _rubric(session_factory, run.id, version=1)
+    _artifact_sandbox(session_factory, artifact_root, run.id)
+    with session_factory() as s:
+        s.add(
+            Event(
+                run_id=run.id,
+                source="orchestrator",
+                type="checkpoint",
+                payload={"stage": "rescore_requested", "rubric_version": 1},
+            )
+        )
+        s.commit()
+
+    calls: list = []
+    await rescore_run(
+        run.id,
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+
+    assert len(calls) == 1
+    assert _run(session_factory, run.id).status == "done"
+    stages = [e.payload.get("stage") for e in _events(session_factory, run.id)]
+    assert "rescore_started" in stages
+    assert "rescore_finished" in stages
+
+
+async def test_rescore_crash_still_emits_rescore_finished(
+    session_factory, settings, artifact_root, monkeypatch
+) -> None:
+    """A mid-pass crash still lands the terminal checkpoint — with the
+    error attached — plus the error event, so timeline consumers always
+    see rescore_finished."""
+    run = make_run(session_factory, status="done", config=run_config())
+    rubric = _rubric(session_factory, run.id, version=1)
+    sb = _artifact_sandbox(session_factory, artifact_root, run.id)
+    with session_factory() as s:
+        s.add(
+            Score(
+                sandbox_id=sb.id,
+                rubric_id=rubric.id,
+                rubric_version=1,
+                dimension="functional_requirements",
+                score=7.0,
+            )
+        )
+        s.commit()
+
+    async def boom(**kwargs):
+        raise RuntimeError("eval exploded")
+
+    monkeypatch.setattr(lifecycle, "_evaluate_all", boom)
+
+    await rescore_run(
+        run.id,
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        settings=settings,
+        evaluator_fn=boom,  # unreachable — _evaluate_all itself raises
+    )
+
+    assert _run(session_factory, run.id).status == "done"  # old scores count
+    evs = _events(session_factory, run.id)
+    finished = [e for e in evs if e.payload.get("stage") == "rescore_finished"]
+    assert len(finished) == 1
+    assert finished[0].type == "checkpoint"
+    assert "eval exploded" in finished[0].payload["error"]
+    assert finished[0].payload["to_status"] == "done"
+    errs = [
+        e for e in evs
+        if e.type == "error" and e.payload.get("stage") == "rescore"
+    ]
+    assert errs and "eval exploded" in errs[0].payload["message"]
 
 
 async def test_rescore_zero_scores_total_stays_failed(

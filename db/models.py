@@ -23,6 +23,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
     func,
 )
@@ -131,6 +132,11 @@ class Rubric(Base):
     """
 
     __tablename__ = "rubrics"
+    __table_args__ = (
+        # One row per (run, version) — concurrent version-creating POSTs
+        # must collide on this, not silently duplicate a version number.
+        UniqueConstraint("run_id", "version", name="uq_rubrics_run_version"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     run_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("runs.id"), index=True)

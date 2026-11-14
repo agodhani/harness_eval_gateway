@@ -33,7 +33,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from db.models import Rubric, Run, Sandbox, Score
+from db.models import Event, Rubric, Run, Sandbox, Score
 from gateway.creds import mint_cred
 from gateway.metering import tokens_used
 from sandbox.runtime import SandboxRuntime
@@ -170,6 +170,29 @@ def _sandbox_score_count(
         )
 
 
+def _has_rescore_marker(
+    session_factory: sessionmaker[Session], run_id: uuid.UUID
+) -> bool:
+    """True when a rescore_requested/rescore_started checkpoint exists — the
+    marker pair that distinguishes a re-score pass from a first-pass eval
+    (runner.startup_sweep rescues on the same pair — keep in sync)."""
+    with session_factory() as session:
+        return (
+            session.execute(
+                select(Event.id)
+                .where(
+                    Event.run_id == run_id,
+                    Event.type == "checkpoint",
+                    Event.payload["stage"]
+                    .as_string()
+                    .in_(("rescore_requested", "rescore_started")),
+                )
+                .limit(1)
+            ).first()
+            is not None
+        )
+
+
 def _set_run_status(
     session_factory: sessionmaker[Session],
     run_id: uuid.UUID,
@@ -303,6 +326,11 @@ async def _evaluate_all(
             "eval_root": eval_root,
             "image": settings.SANDBOX_IMAGE,
         }
+        # Baseline BEFORE the first attempt: a re-score can target an
+        # already-judged sandbox, so "any Score rows" ≠ "this pass scored".
+        # Retry progress is measured by the DELTA — otherwise a flaky empty
+        # re-score would satisfy the check on stale rows and never retry.
+        baseline = _sandbox_score_count(session_factory, sb.id)
         for attempt in range(1, retries + 2):
             try:
                 # Fresh cred per attempt: a single cred's TTL can't span N
@@ -334,8 +362,8 @@ async def _evaluate_all(
                     },
                 )
                 break  # infra failure is deterministic — don't retry
-            if _sandbox_score_count(session_factory, sb.id) > 0:
-                break  # scored — done with this sandbox
+            if _sandbox_score_count(session_factory, sb.id) > baseline:
+                break  # this pass produced scores — done with this sandbox
             if attempt <= retries:
                 # Judge ran but produced no usable scores.json — the observed
                 # failure mode of small local judge models (malformed JSON,
@@ -527,7 +555,10 @@ def _finalize_rescore(
 ) -> None:
     """Close a rescore pass: done iff ≥1 Score row exists for the run (the
     lifecycle rule — old scores still count, so a no-op rescore restores the
-    previous terminal state). Emits rescore_finished (+ error on message)."""
+    previous terminal state). The ``rescore_finished`` checkpoint is emitted
+    unconditionally — on ``message`` it carries the error in the payload and
+    a separate error event preserves the type=error/stage=rescore signal, so
+    timeline consumers always see the terminal checkpoint."""
     total = _score_count(session_factory, run_id)
     to_status = "done" if total > 0 else "failed"
     payload: dict[str, Any] = {
@@ -541,16 +572,20 @@ def _finalize_rescore(
         payload["scores_for_rubric"] = _rubric_score_count(
             session_factory, run_id, rubric.id
         )
+    if message is not None:
+        payload["error"] = message
+        _emit_run_event(
+            session_factory,
+            run_id,
+            event_type="error",
+            payload={"stage": "rescore", "message": message},
+        )
     _set_run_status(
         session_factory,
         run_id,
         to_status,
         finished=True,
-        event_payload=(
-            payload
-            if message is None
-            else {"type": "error", "stage": "rescore", "message": message}
-        ),
+        event_payload=payload,
     )
 
 
@@ -609,6 +644,37 @@ async def _rescore_run(
     run = _load_run(session_factory, run_id)
     if run is None:
         log.warning("rescore_run: run %s not found", run_id)
+        return
+
+    # Re-score only applies to terminal runs (the API 409s earlier; this is
+    # defense-in-depth for non-API callers). The one legitimate non-terminal
+    # state is ``evaluating`` WITH a rescore marker — _prepare_rescore moves
+    # the run into evaluating + stamps rescore_requested in the request tx,
+    # before the task ever runs. A bare mid-flight state (running,
+    # provisioning, or a first-pass evaluating with no marker) must NOT be
+    # hijacked — _enter_evaluating force-sets status on InvalidTransition,
+    # so the transition table alone is not the guard.
+    if run.status not in state_machine.RUN_TERMINAL and not (
+        run.status == "evaluating"
+        and _has_rescore_marker(session_factory, run_id)
+    ):
+        log.warning(
+            "rescore_run: run %s is %r — re-score only applies to terminal runs",
+            run_id,
+            run.status,
+        )
+        _emit_run_event(
+            session_factory,
+            run_id,
+            event_type="error",
+            payload={
+                "stage": "rescore",
+                "message": (
+                    f"run is {run.status!r} — re-score only applies "
+                    "to terminal runs"
+                ),
+            },
+        )
         return
 
     if rubric_id is not None:

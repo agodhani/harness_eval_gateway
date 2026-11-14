@@ -536,7 +536,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     the runner task registry; a concurrent trigger → 409). Optional
     `rubric_id` pin, `sandbox_ids` subset, and judge `model` override.
     `POST …/rubrics` with `rescore=true` creates the version and queues
-    the re-score in one request.
+    the re-score in one request. `_rescore_run` itself refuses non-
+    terminal runs (defense-in-depth — `evaluating` is admitted only with
+    a rescore marker, i.e. the API pre-transition), and the empty-pass
+    retry checks the score-count DELTA over the pre-pass baseline so
+    stale rows don't satisfy it; `rescore_finished` is always emitted
+    (error included on crash).
   - **Score provenance:** every `Score` carries `rubric_id` +
     denormalized `rubric_version` (stamped at write time, survives rubric
     lookups). `GET /api/runs/{id}/results?rubric_version=N` filters the
@@ -557,7 +562,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     `rescore_started` checkpoint with ≥1 Score row recovers to `done`
     (a first-pass eval has no marker and still fails), so an
     interrupted re-score doesn't demote a previously-done run.
-- **Where:** `db/models.py` (`Rubric.parent_id`, `Score.rubric_version`) +
+- **Where:** `db/models.py` (`Rubric.parent_id`, `Score.rubric_version`,
+  `uq_rubrics_run_version` unique constraint) +
   migration `b3e7a1c9d2f4`; `orchestrator/rubric.py`
   (`create_rubric_version`), `orchestrator/lifecycle.py` (`rescore_run`,
   `_evaluate_all` refactor), `orchestrator/runner.py`

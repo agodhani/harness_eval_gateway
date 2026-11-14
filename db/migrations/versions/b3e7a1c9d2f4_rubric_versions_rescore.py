@@ -30,6 +30,11 @@ def upgrade() -> None:
             "fk_rubrics_parent_id", "rubrics", ["parent_id"], ["id"]
         )
         batch.create_index("ix_rubrics_parent_id", ["parent_id"])
+        # One rubric row per (run, version) — concurrent version-creating
+        # POSTs collide here instead of duplicating a version.
+        batch.create_unique_constraint(
+            "uq_rubrics_run_version", ["run_id", "version"]
+        )
 
     with op.batch_alter_table("scores") as batch:
         batch.add_column(sa.Column("rubric_version", sa.Integer(), nullable=True))
@@ -46,6 +51,7 @@ def downgrade() -> None:
     with op.batch_alter_table("scores") as batch:
         batch.drop_column("rubric_version")
     with op.batch_alter_table("rubrics") as batch:
+        batch.drop_constraint("uq_rubrics_run_version", type_="unique")
         batch.drop_index("ix_rubrics_parent_id")
         batch.drop_constraint("fk_rubrics_parent_id", type_="foreignkey")
         batch.drop_column("parent_id")
