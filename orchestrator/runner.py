@@ -48,7 +48,13 @@ _runtime: SandboxRuntime | None = None
 
 #: False once shutdown() starts — queue promotion stops so a task finishing
 #: during teardown can't launch a lifecycle that outlives the process.
+#: startup_sweep re-arms it so a same-process stop/start cycle keeps working.
 _accepting = True
+
+#: Claim retries inside promote_next_queued — a transient DB failure right as
+#: the slot frees must not strand the queue (no other in-session re-trigger).
+_CLAIM_ATTEMPTS = 3
+_CLAIM_RETRY_DELAY_SECONDS = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -197,13 +203,19 @@ async def promote_next_queued(
     queue is empty — the DB claim in :func:`pacing.claim_next_queued` is the
     single-winner gate, so concurrent/duplicate calls are safe.
     """
-    if not _accepting:
-        return
-    try:
-        nxt = pacing.claim_next_queued(session_factory)
-    except Exception:
-        log.exception("pacing: queue claim failed")
-        return
+    nxt: uuid.UUID | None = None
+    for attempt in range(_CLAIM_ATTEMPTS):
+        if not _accepting:
+            return
+        try:
+            nxt = pacing.claim_next_queued(session_factory)
+            break
+        except Exception:
+            if attempt + 1 >= _CLAIM_ATTEMPTS:
+                log.exception("pacing: queue claim failed")
+                return
+            log.warning("pacing: queue claim failed; retrying", exc_info=True)
+            await asyncio.sleep(_CLAIM_RETRY_DELAY_SECONDS)
     if nxt is None:
         return
     log.info("pacing: promoting queued run %s -> provisioning", nxt)
@@ -300,6 +312,9 @@ async def startup_sweep(
     runtime: SandboxRuntime | None = None,
 ) -> None:
     """Reconcile DB state with reality after an api restart."""
+    global _accepting
+    _accepting = True
+
     sf = session_factory or _session_factory()
     settings = settings or _settings()
     rt = runtime or get_runtime()
