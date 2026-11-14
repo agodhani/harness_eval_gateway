@@ -8,6 +8,11 @@
  * don't kill them). "Preview" POSTs a spawn and opens the URL in a new tab;
  * "stop" DELETEs it. Containers auto-stop after a server-side TTL — the
  * expiry shown here is informational.
+ *
+ * The dropdown lists detected candidates plus type-override variants: a
+ * `.py` entry can run as a desktop app or be served as a file ("view
+ * source"). An explicit pick that differs from the live preview's plan
+ * replaces the running container server-side.
  */
 import { useEffect, useState } from "react";
 import {
@@ -22,6 +27,37 @@ import {
 type Phase = "checking" | "idle" | "starting" | "active" | "stopping";
 
 const LIVE_STATUSES = new Set(["created", "running", "restarting", "paused"]);
+
+/** One selectable option: a detected candidate, or a type-override variant
+ *  of one (a `.py` can be served as a file instead of executed). */
+interface Option {
+  key: string;
+  entry: string;
+  type: string;
+  label: string;
+}
+
+function buildOptions(candidates: PreviewCandidate[]): Option[] {
+  return candidates.flatMap((c) => {
+    const base: Option = {
+      key: `${c.entry}|${c.type}`,
+      entry: c.entry,
+      type: c.type,
+      label: `${c.entry} (${c.type === "static" ? "site" : c.type})`,
+    };
+    return c.type === "desktop"
+      ? [
+          base,
+          {
+            key: `${c.entry}|static`,
+            entry: c.entry,
+            type: "static",
+            label: `${c.entry} (view source)`,
+          },
+        ]
+      : [base];
+  });
+}
 
 function expiryLabel(expiresAt: string | null): string | null {
   if (!expiresAt) return null;
@@ -42,13 +78,14 @@ export default function PreviewControls({
   sandboxId: string;
   previewable: boolean;
   /** Every detected runnable entry, default-first — >1 renders a dropdown
-   *  and the pick is POSTed as {entry}. */
+   *  and the pick is POSTed as {entry, type}. */
   candidates?: PreviewCandidate[];
 }) {
+  const options = buildOptions(candidates);
   const [phase, setPhase] = useState<Phase>("checking");
   const [preview, setPreview] = useState<PreviewOut | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [pick, setPick] = useState<string>(candidates[0]?.entry ?? "");
+  const [pick, setPick] = useState<string>(options[0]?.key ?? "");
 
   useEffect(() => {
     let cancelled = false;
@@ -71,11 +108,15 @@ export default function PreviewControls({
     };
   }, [runId, sandboxId]);
 
-  async function start(entry?: string) {
+  async function start(opt?: Option) {
     setPhase("starting");
     setError(null);
     try {
-      const p = await startPreview(runId, sandboxId, entry);
+      const p = await startPreview(
+        runId,
+        sandboxId,
+        opt ? { entry: opt.entry, type: opt.type } : undefined,
+      );
       setPreview(p);
       setPhase("active");
       if (p.url) window.open(p.url, "_blank", "noopener,noreferrer");
@@ -154,25 +195,25 @@ export default function PreviewControls({
 
   return (
     <div className="chip-row">
-      {candidates.length > 1 ? (
+      {options.length > 1 ? (
         <>
           <select
             value={pick}
             onChange={(e) => setPick(e.target.value)}
             disabled={busy}
-            title="Entry point to preview — default is the auto-detected one"
+            title="Entry point + how to preview it — 'view source' serves a .py file instead of executing it"
             style={{ fontSize: "0.8rem", maxWidth: 220 }}
           >
-            {candidates.map((c) => (
-              <option key={c.entry} value={c.entry}>
-                {c.entry} ({c.type === "static" ? "site" : c.type})
+            {options.map((o) => (
+              <option key={o.key} value={o.key}>
+                {o.label}
               </option>
             ))}
           </select>
           <button
             type="button"
             className="btn btn--sm"
-            onClick={() => void start(pick)}
+            onClick={() => void start(options.find((o) => o.key === pick))}
             disabled={busy || !pick}
             title="Serve the selected entry in a throwaway container (new tab)"
           >

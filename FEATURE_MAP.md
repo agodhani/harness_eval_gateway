@@ -19,12 +19,13 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F4 | Sandbox runtime (spawn, egress, snapshot, done) | ✅ | `sandbox/`, `data/artifacts/` | `tests/integration/test_sandbox.py` |
 | F5 | Miniloop harness + adapter + skill packs | ✅ | `adapters/miniloop/`, `skillpacks/` | `tests/unit/adapters/miniloop/` |
 | F6 | Event store + live timeline | ✅ | `api/routers/events.py`, `web/app/runs/[id]/timeline/` | `tests/unit/api/test_events.py` |
-| F7 | Evaluator sandbox (rubric scoring) | ✅ | `evaluator/` | `tests/unit/evaluator/` |
+| F7 | Evaluator sandbox (rubric scoring + objective signals) | ✅ | `evaluator/`, `scoring/` | `tests/unit/evaluator/`, `tests/unit/scoring/` |
 | F8 | Results UI (matrix, scores, artifacts) | ✅ | `web/app/runs/`, `api/routers/results.py` | `tests/unit/api/test_results.py` |
 | F9 | Run analytics (per-sandbox metrics + cost) | ✅ | `api/routers/analytics.py`, `api/pricing.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx` | `tests/unit/api/test_analytics.py` |
 | F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
 | F11 | Skillpack import from GitHub | ✅ | `skillpack_import/`, `api/routers/skillpacks.py`, `web/app/submit/ImportSkillPackDialog.tsx` | `tests/unit/api/test_skillpacks.py`, `test_skillpack_import.py` |
 | F12 | Artifact preview (static html + desktop/pygame via noVNC, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
+| F13 | Graphical analysis page + cross-run trends (recharts) | ✅ | `web/app/runs/[id]/analysis/`, `api/routers/analytics.py` (`GET /api/analytics/runs`), `web/app/runs/[id]/results/ResultsClient.tsx` (totals row) | `tests/unit/api/test_analytics.py` (trends section) |
 
 ## Feature details
 
@@ -182,13 +183,38 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   rows is re-spawned up to `EVAL_SCORE_RETRIES` times (default 1) with a fresh
   cred, emitting an `eval_retry` checkpoint — covers small-model flake modes
   (malformed JSON, stuck-loop wander); infra exceptions are not retried.
+  **Objective signals (PR6):** before staging, the candidate workspace is
+  measured by the `scoring` package's signal collectors — `static_analysis`
+  runs lizard (multi-language, parse-only, no code execution) for real
+  cyclomatic complexity, nloc, function counts, nesting depth, and language
+  mix. The report is staged into the eval workspace as `ANALYSIS.md`
+  (judge-facing brief; judge is told to score `cyclomatic_complexity` from
+  measured values) + `analysis.json`, persisted at
+  `<artifact>/analysis.json`, summarized in an `eval_analysis` checkpoint
+  event, and re-validated + embedded as `analysis` on
+  `GET /api/runs/{id}/results` sandboxes. Candidate-authored
+  `ANALYSIS.md`/`analysis.json` files are dropped at staging (reserved
+  names — fake measured evidence can't reach the judge). Collection never
+  blocks evaluation: collector failures degrade to `status="error"` signal
+  entries / `status="unavailable"` event. Collector registry
+  (`scoring/collectors.py::COLLECTORS`) is the extension point for PR7's
+  exec/coverage signals.
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
-  `prompts.py`), db `scores`, `api/routers/results.py`
+  `prompts.py`), `scoring/` (`models.py` — analysis.json/API pydantic
+  contract, `collectors.py` — SignalCollector protocol + registry,
+  `static.py` — lizard collector, `render.py` — ANALYSIS.md), db `scores`,
+  `api/routers/results.py` (`SandboxResult.analysis`),
+  `api/schemas.py` (AnalysisReport re-export)
 - **Verify:**
   - Unit: `tests/unit/evaluator/` (`test_evaluate.py`, `test_scores.py`,
     `test_prompts.py`) — mocked runtime; staging, timeout salvage, malformed
-    scores covered
-  - Manual: scores + rationale visible on results page
+    scores covered; `tests/unit/scoring/` (`test_static.py`,
+    `test_collectors.py`, `test_render.py`) — workspaces with known CC
+    values, skip/cap/symlink rules, collector isolation, markdown render
+  - Results API: `tests/unit/api/test_results.py` — analysis embedded when
+    `<artifact>/analysis.json` exists+valid, null otherwise
+  - Manual: scores + rationale visible on results page; rationale for
+    cyclomatic_complexity cites measured CC values
 - **Depends on:** F2, F4, artifacts from a completed run
 
 ### F8 — Results UI ✅
@@ -359,13 +385,20 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     `preview_type` (cheap FS probe of the jailed workspace).
   - `POST /api/runs/{run}/sandboxes/{sandbox}/preview` → `201
     {preview_id, url, type, status, entry, expires_at}`; idempotent (a live
-    preview is returned as-is); `404` run/sandbox/workspace missing, `422`
-    zero candidates / bad `entry` / unsupported type, `502` docker
-    failure. Optional body `{"entry": "rel/path"}` picks an entry —
-    jailed to the workspace, must exist and be non-symlinked;
-    `.html`/`.htm` → static, `.py` → desktop (explicit `.py` bypasses
-    pygame evidence — the pick IS the disambiguation). No body → the
-    scan's default (`candidates[0]`).
+    preview is returned as-is — unless an explicit `entry`/`type` requests
+    a different plan, which stops it and respawns); `404`
+    run/sandbox/workspace missing, `422` zero candidates / bad `entry` /
+    unsupported type, `502` docker failure. Optional body `{"entry":
+    "rel/path"}` picks an entry — jailed to the workspace, must exist and
+    be non-symlinked; `.html`/`.htm` → static, `.py` → desktop (explicit
+    `.py` bypasses pygame evidence — the pick IS the disambiguation).
+    `{"type": "static"|"desktop"}` overrides the pick: alone it selects the
+    first detected candidate of that type (a both-matching workspace
+    defaults to static — `{"type": "desktop"}` reaches the game); with
+    `entry` it forces the plan — `static` serves any jailed file (view a
+    `.py`'s source — the entry is only the URL opened), `desktop` still
+    requires a `.py` entry. No body → the scan's default
+    (`candidates[0]`).
   - `GET .../preview` → current state (any status) or `404`; `DELETE
     .../preview` → `204` stop.
 - **Detection** (`sandbox/preview.py::scan_preview` → `PreviewScan{plan,
@@ -384,10 +417,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   yet still offers the desktop entry; helper .py files with real pygame
   imports are offered too.
 - **UI**: `preview_candidates` (typed `{entry,type}`) rides
-  `SandboxResult` → >1 option renders a dropdown (`index.html (site)` /
-  `game/main.py (desktop)`) + Preview button POSTing `{entry}`; one
-  option → plain button; zero → disabled button + "not supported"
-  (artifact still downloadable — preview is an add-on).
+  `SandboxResult` → the dropdown lists each candidate plus type-override
+  variants (`index.html (site)` / `game/main.py (desktop)` /
+  `game/main.py (view source)` — a `.py` can be served instead of
+  executed) + Preview button POSTing `{entry, type}`; one option → plain
+  button; zero → disabled button + "not supported" (artifact still
+  downloadable — preview is an add-on).
 - **Static posture** (`_spawn_static`): `python:3.12-slim` running
   `python -m http.server` over the workspace bind-mounted `:ro`; nobody
   user, `--read-only` rootfs, `--cap-drop ALL`, `no-new-privileges`.
@@ -417,8 +452,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Jail:** `resolve_workspace_dir` reuses the download-jail rule —
   `artifact_path` or `<ARTIFACT_ROOT>/<run>/<sandbox>` must resolve inside
   `ARTIFACT_ROOT`, and `workspace` must not be a symlink escaping it.
-- **Where:** `sandbox/preview.py`, `api/routers/preview.py` (+ reaper),
-  `api/config.py` (`PREVIEW_*`), `api/routers/results.py` (previewable flag),
+- **Where:** `sandbox/preview.py` (detection + `plan_for_entry`/
+  `plan_for_type` overrides, `ScanCache`, `PreviewManager`),
+  `api/routers/preview.py` (+ reaper),
+  `api/config.py` (`PREVIEW_*` incl. `PREVIEW_SCAN_TTL_SECONDS`),
+  `api/routers/results.py` (cached previewable probe via `_scan_cache`),
   `sandbox/images/desktop-preview.Dockerfile` +
   `desktop-preview-entrypoint.sh`,
   `web/lib/api.ts` (`getPreview`/`startPreview`/`stopPreview`, `PreviewOut`),
@@ -427,10 +465,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - Unit: `tests/unit/sandbox/test_preview.py` (static + desktop detection
     — nested depth bound, skip-dirs, candidate ordering/default-first,
     non-named `.py` evidence, comment-stripped requirements,
-    `plan_for_entry` jail/validation; manager via stubbed docker —
+    `plan_for_entry` jail/validation + `type=` override, `plan_for_type`,
+    `ScanCache` hit/expiry/LRU/clear; manager via stubbed docker —
     runner/proxy args, role labels, stop-all) +
-    `tests/unit/api/test_preview.py` (lifecycle, `entry=` override,
-    default-spawn semantics, typed `preview_candidates`)
+    `tests/unit/api/test_preview.py` (lifecycle, `entry=`/`type=`
+    overrides, live-preview replace-on-different-plan, default-spawn
+    semantics, typed `preview_candidates`, cached results probe)
   - Docker: `tests/integration/test_preview.py` (`@pytest.mark.docker` —
     static spawn → HTTP 200, localhost-only binding, reaper; desktop spawn
     builds `heg-preview-desktop` once per session → real pygame executes
@@ -440,11 +480,61 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     opens in new tab; "■ stop". Build image first:
     `docker build -f sandbox/images/desktop-preview.Dockerfile -t
     heg-preview-desktop:latest .`
-  - Note: `previewable`/`preview_type` probe runs per-sandbox on every
-    results GET — fine at MVP scale; could be cached later if results
-    pages grow large.
+  - Note: the `previewable`/`preview_type` results-GET probe rides
+    `sandbox.preview.ScanCache` — memoized per (jail, run, sandbox,
+    artifact_path) for `PREVIEW_SCAN_TTL_SECONDS` (default 30s; 0
+    disables); the workspace only changes on re-snapshot, so staleness is
+    bounded. `reset_scan_cache()` is the test hook.
 - **Depends on:** F4 (runtime plumbing/host-path translation), F8 (results
   page + artifact store layout)
+
+### F13 — Graphical analysis page + cross-run trends ✅
+
+- **What:** `/runs/[id]/analysis` — a charts dashboard over the F9 analytics
+  + F8 scores, using **recharts** (v3.10.x — React-19-compatible, lightweight
+  enough for the plain-CSS theme; palette hexes mirror the globals.css
+  tokens in `analysis/charts.tsx`). Cards: score-by-rubric-dimension
+  (grouped horizontal bars + "Σ leader" line), tool-call mix (stacked,
+  top-7 tools + `other`), tokens in/out (stacked), LLM latency
+  (avg/p95/max), estimated cost per sandbox (price-model dropdown →
+  client-side recompute, same trick as AnalyticsSection — local models show
+  a note instead of empty bars), participant-vs-evaluator spend split
+  (stacked; judge priced at the evaluator model's rate when listed), and a
+  cross-run trends ComposedChart (stacked participant+evaluator token bars
+  + mean-overall-score line on a right 0–10 axis; newest 20 runs, current
+  run accent-highlighted, hover shows run meta). The results score matrix
+  also gains a **totals row** (Σ dimension scores, `total`) — distinct from
+  the judge-reported `overall` — with the max cell flagged `leader`.
+- **API:** `GET /api/analytics/runs?limit=&price_model=` →
+  `RunTrends{price_model|null, price_table, points[]}` — per-run roll-up of
+  the same participant/evaluator event split (eval boundary per sandbox),
+  latest-`overall`-score-per-sandbox mean, participant + judge tokens,
+  errors, cost. No `price_model` → each point costed at its own run's
+  resolved price ("auto", `price_model:null`); with it → uniform repricing.
+  Newest-first; `limit` 1–100 default 20.
+- **Where:** `api/routers/analytics.py` (`get_run_trends` +
+  `_eval_boundaries`/`_is_eval_event` helpers, also used by the per-run
+  endpoint), `api/schemas.py` (`RunTrendPoint`, `RunTrends`),
+  `web/app/runs/[id]/analysis/` (`page.tsx`, `AnalysisClient.tsx`,
+  `charts.tsx`), `web/app/runs/[id]/results/ResultsClient.tsx` (`row-total`
+  + `dimTotals`/`maxTotal` memos), `web/lib/api.ts` (`getRunTrends`,
+  `RunTrendPoint`, `RunTrends`), `web/lib/format.ts` (`formatNum`,
+  `formatUsd`), `web/app/globals.css` (`.analysis-grid`, `.chart-tip`,
+  `.chart-legend`, `.row-total`/`.score-cell--leader`), nav links in
+  `RunDetailClient`/`ResultsClient`/`TimelineClient`.
+- **Verify:**
+  - Unit: `tests/unit/api/test_analytics.py` F13 section — shape +
+    newest-first ordering, per-point aggregation (tokens/turns/errors/
+    sandbox_count/mean overall — non-overall scores excluded), auto vs
+    uniform repricing, judge priced at evaluator model, prompt truncation
+    (120 chars), `limit` bounds (1/0/101), 422 unknown price_model, null
+    mean for unscored runs.
+  - API: `curl localhost:8001/api/analytics/runs?limit=20`
+  - UI: results page → matrix `total` row sums match the dimension columns
+    and flags the leader; run detail → "Analysis →" → all cards render on a
+    scored run; cost dropdown reprices the cost + split charts client-side.
+- **Depends on:** F6 (events), F7 (scores), F8 (results page), F9
+  (analytics aggregation)
 
 ## Implementation sequence
 
