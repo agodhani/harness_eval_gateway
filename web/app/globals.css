@@ -1492,6 +1492,46 @@ a.chip:hover {
   color: var(--accent);
 }
 
+/* PR4 — artifact thumbnails: captured screenshot heads the preview cell;
+   click the shot for the full live preview. */
+.preview-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  align-items: flex-start;
+}
+.thumb-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.thumb-btn {
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  cursor: pointer;
+  line-height: 0;
+}
+.thumb-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.thumb-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.thumb-img {
+  display: block;
+  width: 148px;
+  height: 92px;
+  object-fit: cover;
+  object-position: top left;
+  background: var(--surface-2);
+}
+.thumb-empty {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+}
+
 .task-text {
   white-space: pre-wrap;
   word-break: break-word;

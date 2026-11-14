@@ -16,6 +16,7 @@ Pydantic models live here (not api/schemas.py) per Phase-2 ownership split.
 from __future__ import annotations
 
 import io
+import json
 import os
 import zipfile
 from datetime import datetime
@@ -34,7 +35,8 @@ from api.deps import get_db
 from api.schemas import AnalysisReport
 from db.models import Artifact, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
-from sandbox.preview import ScanCache
+from sandbox.preview import ScanCache, resolve_artifact_dir
+from sandbox.thumbnails import THUMB_FILENAME, THUMB_META_FILENAME
 from scoring.render import ANALYSIS_JSON_FILENAME
 
 router = APIRouter(tags=["results"])
@@ -77,6 +79,15 @@ class PreviewCandidate(BaseModel):
     type: str
 
 
+class ThumbnailRef(BaseModel):
+    """PR4 — a captured artifact screenshot; ``url`` is the PNG's GET path."""
+
+    url: str
+    captured_at: datetime | None = None
+    type: str | None = None
+    entry: str | None = None
+
+
 class SandboxResult(BaseModel):
     """One sandbox's evaluation outcome inside the run matrix."""
 
@@ -97,6 +108,11 @@ class SandboxResult(BaseModel):
     previewable: bool = False
     preview_type: str | None = None
     preview_candidates: list[PreviewCandidate] = Field(default_factory=list)
+    # PR4: a captured artifact screenshot (``<artifact>/thumbnail.png``)
+    # when present — the UI renders it small; click spawns a full preview.
+    # None when never captured. Generation is explicit-only (POST
+    # .../thumbnail) — this GET never spawns anything.
+    thumbnail: ThumbnailRef | None = None
     # PR6: objective signals measured on the workspace before judging
     # (``<artifact>/analysis.json``). None when the evaluator ran without
     # signal collection or the report is unreadable.
@@ -146,6 +162,51 @@ def _load_analysis(jail: Path, sandbox: Sandbox) -> AnalysisReport | None:
         )
     except Exception:  # noqa: BLE001 — unreadable/invalid report -> absent
         return None
+
+
+def _load_thumbnail(jail: Path, sandbox: Sandbox) -> ThumbnailRef | None:
+    """Read ``<artifact>/thumbnail.{png,json}`` (PR4), jailed — cheap FS
+    probe per sandbox; the PNG's existence gates the ref and the JSON
+    sidecar supplies captured_at/type/entry (best-effort)."""
+    artifact_dir = resolve_artifact_dir(
+        jail=jail,
+        run_id=str(sandbox.run_id),
+        sandbox_id=str(sandbox.id),
+        artifact_path=sandbox.artifact_path,
+    )
+    if artifact_dir is None:
+        return None
+    try:
+        png = (artifact_dir / THUMB_FILENAME).resolve()
+    except OSError:
+        return None
+    try:
+        if not (png == jail or jail in png.parents) or not png.is_file():
+            return None
+    except OSError:
+        return None
+    meta: dict[str, Any] = {}
+    try:
+        meta_path = artifact_dir / THUMB_META_FILENAME
+        if meta_path.is_file():
+            raw = json.loads(meta_path.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(raw, dict):
+                meta = raw
+    except Exception:  # noqa: BLE001 — meta is best-effort decoration
+        meta = {}
+    captured_at: datetime | None = None
+    raw_ts = meta.get("captured_at")
+    if isinstance(raw_ts, str):
+        try:
+            captured_at = datetime.fromisoformat(raw_ts)
+        except ValueError:
+            captured_at = None
+    return ThumbnailRef(
+        url=f"/api/runs/{sandbox.run_id}/sandboxes/{sandbox.id}/thumbnail",
+        captured_at=captured_at,
+        type=meta.get("type") if isinstance(meta.get("type"), str) else None,
+        entry=meta.get("entry") if isinstance(meta.get("entry"), str) else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +313,7 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
                     if scan is not None
                     else []
                 ),
+                thumbnail=_load_thumbnail(jail, sb),
                 analysis=_load_analysis(jail, sb),
             )
         )

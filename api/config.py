@@ -103,6 +103,25 @@ class Settings(BaseSettings):
     PREVIEW_DESKTOP_MEMORY: str = "512m"
     PREVIEW_DESKTOP_PIDS: int = 256
 
+    # --- Artifact thumbnails (PR4) ---
+    # Headless-chromium capture image — repo-built from
+    # sandbox/images/thumbnail-capture.Dockerfile. Joins heg-preview and
+    # screenshots the preview stack's in-network URL.
+    PREVIEW_THUMB_IMAGE: str = "heg-preview-thumb:latest"
+    # Bounds on one capture: wait-for-serve, the chromium run itself, and
+    # the TTL on the ephemeral thumb-purpose preview stack (safety net if
+    # the api dies mid-capture).
+    THUMB_READY_SECONDS: float = 30.0
+    THUMB_CAPTURE_SECONDS: float = 45.0
+    THUMB_PREVIEW_TTL_SECONDS: float = 300.0
+    # Pre-capture delay so a desktop app's VNC framebuffer has content —
+    # Xvnc is loopback-only inside the runner, so noVNC is the only window.
+    THUMB_DESKTOP_SETTLE_SECONDS: float = 8.0
+    THUMB_SETTLE_SECONDS: float = 0.5
+    # Viewport for the screenshot.
+    THUMB_WIDTH: int = 1280
+    THUMB_HEIGHT: int = 800
+
     LOG_LEVEL: str = "INFO"
 
 

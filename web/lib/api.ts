@@ -350,6 +350,12 @@ export interface SandboxResult {
    * dropdown and POSTs {entry, type}. Empty + previewable=false = unsupported.
    */
   preview_candidates?: PreviewCandidate[];
+  /**
+   * PR4: captured artifact screenshot ({url, captured_at, type, entry}) —
+   * present only after an explicit POST .../thumbnail; the results GET
+   * never spawns captures. `url` is api-relative (prefix API_BASE).
+   */
+  thumbnail?: ThumbRef | null;
 }
 
 export interface RunResults {
@@ -878,6 +884,65 @@ export function startPreview(
 
 export function stopPreview(runId: string, sandboxId: string): Promise<void> {
   return request<void>(previewPath(runId, sandboxId), { method: "DELETE" });
+}
+
+// ---------------------------------------------------------------------------
+// artifact thumbnails (PR4 — headless screenshots via the preview stack)
+// ---------------------------------------------------------------------------
+
+/** Thumbnail ref embedded on SandboxResult (and the POST response minus
+ * `type` narrowing). `url` is api-relative — prefix with API_BASE. */
+export interface ThumbRef {
+  url: string;
+  captured_at: string | null;
+  type: string | null;
+  entry: string | null;
+}
+
+export interface ThumbOut {
+  url: string;
+  captured_at: string | null;
+  type: string;
+  entry: string | null;
+}
+
+function thumbnailPath(runId: string, sandboxId: string): string {
+  return `/api/runs/${encodeURIComponent(runId)}/sandboxes/${encodeURIComponent(sandboxId)}/thumbnail`;
+}
+
+/** Absolute URL for the captured PNG (`<img src>`). `v` cache-busts
+ * re-captures — pass captured_at when known. */
+export function thumbnailUrl(
+  runId: string,
+  sandboxId: string,
+  v?: string | null,
+): string {
+  return `${API_BASE}${thumbnailPath(runId, sandboxId)}${v ? `?v=${encodeURIComponent(v)}` : ""}`;
+}
+
+/**
+ * Explicit screenshot capture: spawns the artifact's preview stack
+ * (purpose=thumb — invisible to the interactive preview endpoints), waits
+ * for it to serve, shoots it with headless chromium, and stores
+ * <artifact>/thumbnail.png. Synchronous but bounded server-side; 502 on
+ * capture failure (no thumbnail is still a fine outcome). Optional
+ * {entry, type} picks the captured candidate like startPreview.
+ */
+export function captureThumbnail(
+  runId: string,
+  sandboxId: string,
+  opts?: { entry?: string; type?: string },
+): Promise<ThumbOut> {
+  const body =
+    opts && (opts.entry || opts.type) ? JSON.stringify(opts) : undefined;
+  return request<ThumbOut>(thumbnailPath(runId, sandboxId), {
+    method: "POST",
+    ...(body ? { body } : {}),
+  });
+}
+
+export function deleteThumbnail(runId: string, sandboxId: string): Promise<void> {
+  return request<void>(thumbnailPath(runId, sandboxId), { method: "DELETE" });
 }
 
 /** Liveness probe for the "backend not ready" UI states. */
