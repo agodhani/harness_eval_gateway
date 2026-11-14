@@ -20,8 +20,14 @@ Phases (Python workspaces only for MVP — the collector gates detection):
    dirs pruned (they aren't the candidate's work and can be huge).
 2. ``build`` — ``python -m compileall`` over /work: "does the submission
    byte-compile" is the cheap build-success signal for interpreted code.
+   (Never compiles the test-target copy — a broken generated test must not
+   be attributed to the candidate's build.)
 3. ``tests`` — ``coverage run -m pytest`` when test files are detected
    (``test_*.py`` / ``*_test.py``); junit XML parsed for pass/fail counts.
+   With ``EXEC_TEST_TARGET`` set (PR8), pytest instead runs the externally
+   supplied suite mounted at that path — staged into ``/tmp/gen_tests`` so
+   pycache/cache writes never hit the read-only mount — while coverage
+   stays ``--source=/work`` (how much of the submission the suite covers).
 4. ``coverage`` — ``coverage json`` totals (percent covered, statements).
 
 Every phase is individually time-boxed (env knobs below) so a hanging test
@@ -34,6 +40,8 @@ Env (injected by ExecRunner, all optional):
     EXEC_BUILD_TIMEOUT_SECONDS   compileall cap            (default 60)
     EXEC_TEST_TIMEOUT_SECONDS    pytest+coverage cap       (default 180)
     EXEC_MAX_WORKSPACE_BYTES     copy cap                  (default 300 MiB)
+    EXEC_TEST_TARGET             external pytest suite dir (PR8; unset =
+                                 autodetect test files inside the workspace)
     COVERAGE_FILE                coverage data path        (default /tmp/.coverage)
 """
 
@@ -65,6 +73,13 @@ MAX_COPY_BYTES = int(
 COVERAGE_DATA = os.environ.get("COVERAGE_FILE", "/tmp/.coverage")
 JUNIT_PATH = Path("/tmp/junit.xml")
 COVERAGE_JSON_PATH = Path("/tmp/coverage.json")
+
+#: PR8: external test suite mount (read-only bind) — when set, pytest runs
+#: THIS instead of workspace-autodetected tests. Staged to a writable dir
+#: first so the copy (pycache, conftest writes) can't hit the :ro mount.
+_raw_target = os.environ.get("EXEC_TEST_TARGET") or ""
+TEST_TARGET_SRC = Path(_raw_target) if _raw_target else None
+GEN_TESTS_DIR = Path("/tmp/gen_tests")
 
 #: Captured per-phase output kept in the result payload (host truncates too).
 TAIL_CHARS = 4000
@@ -203,9 +218,9 @@ def _copy_workspace(warnings: list[str]) -> dict[str, Any]:
     }
 
 
-def _python_files() -> list[Path]:
+def _python_files(root: Path = WORK) -> list[Path]:
     out: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(WORK):
+    for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for name in filenames:
             if name.endswith(".py"):
@@ -213,12 +228,30 @@ def _python_files() -> list[Path]:
     return out
 
 
-def _test_files() -> list[Path]:
-    return [p for p in _python_files() if _TEST_FILE_RE.match(p.name)]
+def _test_files(root: Path = WORK) -> list[Path]:
+    return [p for p in _python_files(root) if _TEST_FILE_RE.match(p.name)]
 
 
-def _parse_junit(path: Path) -> dict[str, int] | None:
-    """Aggregate pytest junit XML → tests/failures/errors/skipped counts."""
+def _stage_test_target(src: Path, warnings: list[str]) -> Path | None:
+    """Copy the EXEC_TEST_TARGET mount into writable GEN_TESTS_DIR."""
+    try:
+        if not src.is_dir():
+            warnings.append(f"EXEC_TEST_TARGET is not a directory: {src}")
+            return None
+        shutil.copytree(src, GEN_TESTS_DIR)
+        return GEN_TESTS_DIR
+    except OSError as exc:
+        warnings.append(f"test target copy failed: {exc}")
+        return None
+
+
+#: Cap on junit failure names kept in the payload (judge-facing detail).
+MAX_FAILED_TEST_NAMES = 25
+
+
+def _parse_junit(path: Path) -> dict[str, Any] | None:
+    """Aggregate pytest junit XML → tests/failures/errors/skipped counts
+    plus the names of failing/errored cases (judge-citable detail)."""
     try:
         root = ET.parse(path).getroot()
     except (OSError, ET.ParseError):
@@ -226,13 +259,27 @@ def _parse_junit(path: Path) -> dict[str, int] | None:
     suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
     if not suites:
         return None
-    agg = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+    agg: dict[str, Any] = {
+        "tests": 0,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "failed_tests": [],
+    }
+    failed_tests: list[str] = []
     for suite in suites:
-        for key in agg:
+        for key in ("tests", "failures", "errors", "skipped"):
             try:
                 agg[key] += int(float(suite.get(key, 0) or 0))
             except (TypeError, ValueError):
                 continue
+        for case in suite.iter("testcase"):
+            if case.find("failure") is None and case.find("error") is None:
+                continue
+            classname = case.get("classname") or ""
+            name = case.get("name") or "?"
+            failed_tests.append(f"{classname}::{name}" if classname else name)
+    agg["failed_tests"] = failed_tests[:MAX_FAILED_TEST_NAMES]
     return agg
 
 
@@ -275,6 +322,15 @@ def main() -> int:
 
     py_files = _python_files()
     phases["scan"] = {"python_files": len(py_files)}
+
+    # PR8: an external suite overrides workspace autodetect — it is staged
+    # OUTSIDE /work so the build phase above only ever measures candidate
+    # code, and coverage keeps attributing statements to the submission.
+    tests_root: Path | None = None
+    if TEST_TARGET_SRC is not None:
+        result["test_target"] = str(TEST_TARGET_SRC)
+        tests_root = _stage_test_target(TEST_TARGET_SRC, warnings)
+
     if not py_files:
         warnings.append("no python sources found after copy — nothing to run")
         _emit(result)
@@ -288,10 +344,17 @@ def main() -> int:
     phases["build"] = build
 
     # -- tests: coverage-wrapped pytest when test files exist ---------------
-    test_files = _test_files()
+    # Default: the workspace's own test_*.py under /work. With a test target
+    # the suite comes from the staged copy instead — pytest is pointed at the
+    # dir explicitly (its basedir insertion covers sibling test modules;
+    # PYTHONPATH=/work set above covers candidate imports).
+    test_files = _test_files(tests_root if tests_root is not None else WORK)
     if not test_files:
+        if TEST_TARGET_SRC is not None:
+            warnings.append("EXEC_TEST_TARGET produced no test_*.py files")
         phases["tests"] = None
     else:
+        pytest_target = str(tests_root) if tests_root is not None else "."
         run = _run(
             [
                 sys.executable,
@@ -307,6 +370,7 @@ def main() -> int:
                 "-p",
                 "no:cacheprovider",
                 f"--junitxml={JUNIT_PATH}",
+                pytest_target,
             ],
             TEST_TIMEOUT,
         )
@@ -321,6 +385,8 @@ def main() -> int:
             "stderr_tail": run["stderr_tail"],
             "stdout_tail": run["stdout_tail"],
         }
+        if tests_root is not None:
+            tests["target_dir"] = str(tests_root)
         if junit is None:
             warnings.append("pytest produced no parseable junit report")
             tests.update(
@@ -330,6 +396,7 @@ def main() -> int:
                     "failed": 0,
                     "errors": 0,
                     "skipped": 0,
+                    "failed_tests": [],
                     # pytest exit 5 = no tests collected; anything else
                     # nonzero still means "did not pass".
                     "ok": False,
@@ -345,6 +412,7 @@ def main() -> int:
                     "failed": junit["failures"],
                     "errors": junit["errors"],
                     "skipped": junit["skipped"],
+                    "failed_tests": junit.get("failed_tests") or [],
                     # exit 0 = green; exit 5 = files matched but nothing
                     # collected — count that as detected-but-none, not fail.
                     "ok": run["exit_code"] == 0,

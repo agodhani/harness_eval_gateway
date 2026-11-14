@@ -27,6 +27,9 @@ os.environ.setdefault("LOG_LEVEL", "WARNING")
 # pin it off for the suite so a stray collect_signals() can't spawn docker
 # containers on a dev machine. Docker-marked tests enable it explicitly.
 os.environ.setdefault("SCORING_EXEC", "0")
+# PR8: same for LLM test-suite generation — the evaluator's testgen step is
+# pinned off so unit tests never call a model or spawn exec containers.
+os.environ.setdefault("SCORING_TESTGEN", "0")
 
 from fastapi.testclient import TestClient
 

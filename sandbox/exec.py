@@ -1,8 +1,10 @@
-"""Locked exec sandbox (PR7) — run candidate build/tests/coverage.
+"""Locked exec sandbox (PR7/PR8) — run candidate build/tests/coverage.
 
 Executes a candidate workspace inside a one-shot ``heg-exec`` container and
 returns the measured outcome. Used by ``scoring.exec.ExecSandboxCollector``
-(the ``exec`` signal) and reusable by PR8's generated-test-suite runner.
+(the ``exec`` signal) and by PR8's generated-test-suite runner
+(``evaluator.testgen``), which passes ``test_target=`` to point pytest at an
+externally supplied suite instead of the workspace's own tests.
 
 Isolation posture (same family as ``sandbox/preview.py``'s desktop runner,
 tightened — exec needs NO network at all, not even the gateway):
@@ -62,6 +64,10 @@ LABEL_EXEC = "heg.exec"
 #: In-container mount points (see exec.Dockerfile / exec_runner.py).
 CONTAINER_SRC = "/srv/src"
 CONTAINER_OUT = "/out"
+#: Read-only mount for an external test suite (PR8 ``test_target=``) — the
+#: in-image runner copies it to a writable dir and runs pytest against it
+#: instead of auto-detecting workspace test files.
+CONTAINER_TEST_TARGET = "/srv/test_target"
 
 
 @dataclass(frozen=True)
@@ -168,11 +174,16 @@ class ExecRunner:
     # -- docker args ---------------------------------------------------------
 
     def _build_args(
-        self, *, name: str, workspace: Path, out_dir: Path
+        self,
+        *,
+        name: str,
+        workspace: Path,
+        out_dir: Path,
+        test_target: Path | None = None,
     ) -> list[str]:
         """``docker run`` argv for one exec container (testable, no side effects)."""
         limits = self.limits
-        return [
+        args = [
             "run",
             "--rm",
             "--init",
@@ -212,8 +223,20 @@ class ExecRunner:
             f"{self._rt.to_host_path(workspace)}:{CONTAINER_SRC}:ro",
             "-v",
             f"{self._rt.to_host_path(out_dir)}:{CONTAINER_OUT}",
-            self.image,
         ]
+        if test_target is not None:
+            # PR8: an externally supplied suite (e.g. generated_tests) —
+            # mounted read-only like /srv/src; EXEC_TEST_TARGET switches the
+            # in-image runner's pytest phase from workspace autodetect to
+            # this directory. Coverage stays --source=/work (candidate code).
+            args += [
+                "-e",
+                f"EXEC_TEST_TARGET={CONTAINER_TEST_TARGET}",
+                "-v",
+                f"{self._rt.to_host_path(test_target)}:{CONTAINER_TEST_TARGET}:ro",
+            ]
+        args.append(self.image)
+        return args
 
     # -- result parsing -------------------------------------------------------
 
@@ -261,15 +284,31 @@ class ExecRunner:
     # -- lifecycle -------------------------------------------------------------
 
     def execute(
-        self, workspace: Path | str, *, timeout_seconds: float | None = None
+        self,
+        workspace: Path | str,
+        *,
+        timeout_seconds: float | None = None,
+        test_target: Path | str | None = None,
     ) -> ExecOutcome:
         """Run the exec container over ``workspace`` (never modifies it).
+
+        ``test_target`` (PR8) is a host directory holding an externally
+        supplied pytest suite — mounted read-only at
+        :data:`CONTAINER_TEST_TARGET` and run INSTEAD of the workspace's own
+        detected tests. A non-directory target is a caller bug: fail fast on
+        the outcome rather than let ``docker -v`` auto-create a stray dir.
 
         Never raises for docker problems — failures land on the outcome so a
         missing daemon/image can't break evaluation.
         """
         ws = Path(workspace).resolve()
         outcome = ExecOutcome(image=self.image)
+        target_dir: Path | None = None
+        if test_target is not None:
+            target_dir = Path(test_target).resolve()
+            if not target_dir.is_dir():
+                outcome.error = f"exec test target is not a directory: {target_dir}"
+                return outcome
         if not self.docker_available():
             outcome.error = "docker daemon unavailable"
             outcome.unavailable = True
@@ -296,7 +335,9 @@ class ExecRunner:
         try:
             out_dir.mkdir(parents=True, mode=0o777)
             out_dir.chmod(0o777)  # nobody inside the container must write here
-            args = self._build_args(name=name, workspace=ws, out_dir=out_dir)
+            args = self._build_args(
+                name=name, workspace=ws, out_dir=out_dir, test_target=target_dir
+            )
             proc = self._rt._docker(args, check=False, timeout=timeout)
         except subprocess.TimeoutExpired:
             outcome.timed_out = True
