@@ -297,8 +297,11 @@ def artifact_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         results_router,
         "get_settings",
-        lambda: SimpleNamespace(ARTIFACT_ROOT=tmp_path),
+        lambda: SimpleNamespace(
+            ARTIFACT_ROOT=tmp_path, PREVIEW_SCAN_TTL_SECONDS=0
+        ),
     )
+    results_router.reset_scan_cache()
     return tmp_path
 
 

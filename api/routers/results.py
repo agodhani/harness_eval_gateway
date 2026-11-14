@@ -34,12 +34,22 @@ from api.deps import get_db
 from api.schemas import AnalysisReport
 from db.models import Artifact, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
-from sandbox.preview import resolve_workspace_dir, scan_preview
+from sandbox.preview import ScanCache
 from scoring.render import ANALYSIS_JSON_FILENAME
 
 router = APIRouter(tags=["results"])
 
 DbSession = Annotated[Session, Depends(get_db)]
+
+# F12: the per-sandbox preview probe (workspace resolve + candidate scan) is
+# an FS walk — memoized for PREVIEW_SCAN_TTL_SECONDS; workspaces only change
+# on (re-)snapshot.
+_scan_cache = ScanCache()
+
+
+def reset_scan_cache() -> None:
+    """Test hook: drop cached workspace scans."""
+    _scan_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -82,8 +92,8 @@ class SandboxResult(BaseModel):
     # F12: whether the snapshot workspace has a previewable entry —
     # drives the results-page Preview button. preview_candidates lists
     # EVERY detected runnable entry, default-first (previewable/preview_type
-    # describe candidates[0]); the UI renders a dropdown + POST {entry}.
-    # Empty + previewable=false = unsupported.
+    # describe candidates[0]); the UI renders a dropdown + POST {entry,
+    # type}. Empty + previewable=false = unsupported.
     previewable: bool = False
     preview_type: str | None = None
     preview_candidates: list[PreviewCandidate] = Field(default_factory=list)
@@ -193,17 +203,19 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
         artifacts_by_sandbox.setdefault(art.sandbox_id, []).append(art)
 
     jail = _artifact_jail()
+    scan_ttl = get_settings().PREVIEW_SCAN_TTL_SECONDS
     results: list[SandboxResult] = []
     for sb in sandboxes:
-        # F12: cheap FS probe so the UI only offers Preview when the snapshot
-        # workspace actually has a detectable entry point.
-        ws = resolve_workspace_dir(
+        # F12: FS probe so the UI only offers Preview when the snapshot
+        # workspace actually has a detectable entry point — cached per
+        # sandbox for PREVIEW_SCAN_TTL_SECONDS.
+        scan = _scan_cache.scan(
             jail=jail,
             run_id=str(run_id),
             sandbox_id=str(sb.id),
             artifact_path=sb.artifact_path,
+            ttl_seconds=scan_ttl,
         )
-        scan = scan_preview(ws) if ws is not None else None
         plan = scan.plan if scan is not None else None
         dimensions: dict[str, DimensionScore] = {}
         overall: DimensionScore | None = None

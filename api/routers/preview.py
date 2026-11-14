@@ -4,10 +4,18 @@
   previewable artifact (static html entry, or a pygame app for desktop) and
   spawn a locked-down serving container; returns ``{preview_id, url, type,
   status, entry, expires_at}``. Idempotent per sandbox: an already-live
-  preview is returned as-is. Optional body ``{"entry": "rel/path"}`` picks
-  an explicit entry — for ambiguous scans (the 422 detail lists candidates)
-  or artifacts detection missed; ``.html``/``.htm`` → static, ``.py`` →
-  desktop, jailed to the workspace.
+  preview is returned as-is — unless an explicit ``entry``/``type``
+  requests a different plan, in which case the live container is stopped
+  and replaced. Optional body ``{"entry": "rel/path"}`` picks an explicit
+  entry — for ambiguous scans (the 422 detail lists candidates) or
+  artifacts detection missed; ``.html``/``.htm`` → static, ``.py`` →
+  desktop, jailed to the workspace. ``{"type": "static"|"desktop"}``
+  overrides the pick: alone it selects the first detected candidate of
+  that type (a both-matching workspace defaults to static, so
+  ``{"type": "desktop"}`` reaches the game); combined with ``entry`` it
+  overrides the suffix-derived type — ``{"entry": "x.py", "type":
+  "static"}`` serves the file instead of executing it, while ``desktop``
+  still requires a ``.py`` entry.
 - ``GET .../preview`` — current preview state (newest container), 404 when
   none exists.
 - ``DELETE .../preview`` — stop the preview container(s) for the sandbox.
@@ -47,6 +55,7 @@ from sandbox.preview import (
     Preview,
     PreviewManager,
     plan_for_entry,
+    plan_for_type,
     resolve_workspace_dir,
     scan_preview,
 )
@@ -64,17 +73,26 @@ DbSession = Annotated[Session, Depends(get_db)]
 
 
 class PreviewStart(BaseModel):
-    """Optional POST body — explicit entry point override.
+    """Optional POST body — explicit entry point and/or preview-type override.
 
     ``entry`` is a workspace-relative path (``game/main.py``, ``index.html``)
-    jailed to the artifact workspace: must exist, not be a symlink, and end
-    in ``.html``/``.htm`` (→ static) or ``.py`` (→ desktop). It both picks
-    one of several detected candidates and reaches artifacts auto-detection
-    missed — an explicit ``.py`` bypasses pygame evidence (the pick IS the
-    disambiguation; isolation is identical either way).
+    jailed to the artifact workspace: must exist, not be a symlink, and —
+    without ``type`` — end in ``.html``/``.htm`` (→ static) or ``.py`` (→
+    desktop). It both picks one of several detected candidates and reaches
+    artifacts auto-detection missed — an explicit ``.py`` bypasses pygame
+    evidence (the pick IS the disambiguation; isolation is identical either
+    way).
+
+    ``type`` overrides how the artifact is previewed. Alone (no ``entry``)
+    it selects the first detected candidate of that type — a both-matching
+    workspace defaults to static, so ``{"type": "desktop"}`` reaches the
+    game. With ``entry`` it forces the plan type: ``"static"`` serves any
+    jailed file (view a ``.py``'s source instead of executing it — the
+    entry is only the URL opened), ``"desktop"`` requires a ``.py`` entry.
     """
 
     entry: str | None = None
+    type: str | None = None
 
 
 class PreviewOut(BaseModel):
@@ -217,14 +235,15 @@ async def start_preview(
     sb = _find_sandbox(session, run_id, sandbox_id)
     mgr = get_preview_manager()
 
-    # Idempotent: an already-live preview for this sandbox is returned as-is.
     existing = await asyncio.to_thread(mgr.list, sandbox_id=str(sandbox_id))
-    for preview in existing:
-        if preview.live:
-            return _out(preview)
-    # Clear dead containers so names/labels don't pile up.
-    for preview in existing:
-        await asyncio.to_thread(mgr.stop, preview.preview_id)
+    live = next((p for p in existing if p.live), None)
+    entry = body.entry if body else None
+    ptype = ((body.type or "").strip().lower() or None) if body else None
+    # Idempotent: a live preview is returned as-is — unless an explicit
+    # entry/type was requested, in which case the resolved plan decides
+    # below (same plan → return it, different plan → stop + respawn).
+    if live is not None and not entry and not ptype:
+        return _out(live)
 
     workspace = resolve_workspace_dir(
         jail=_jail(),
@@ -237,28 +256,40 @@ async def start_preview(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="no snapshot workspace found for this sandbox",
         )
-    entry = body.entry if body else None
-    if entry:
-        # Explicit pick: jailed to the workspace; suffix decides the type.
-        try:
-            plan = plan_for_entry(workspace, entry)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail=str(exc),
-            ) from exc
-    else:
-        # No explicit pick → the scan's default (candidates[0]; results
-        # payload carries the full list for the UI's dropdown).
-        plan = scan_preview(workspace).plan
-        if plan is None:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail=(
-                    "no previewable artifact: expected a .html/.htm entry or "
-                    "a pygame app (.py entry with pygame evidence)"
-                ),
-            )
+    try:
+        if entry:
+            # Explicit pick: jailed to the workspace; type= may override the
+            # suffix-derived plan (e.g. serve a .py instead of executing it).
+            plan = plan_for_entry(workspace, entry, ptype)
+        elif ptype:
+            # Type-only override: first detected candidate of that type —
+            # a both-matching workspace defaults to static, {"type":
+            # "desktop"} reaches the game.
+            plan = plan_for_type(workspace, ptype)
+        else:
+            # No explicit pick → the scan's default (candidates[0]; results
+            # payload carries the full list for the UI's dropdown).
+            plan = scan_preview(workspace).plan
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+    if plan is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "no previewable artifact: expected a .html/.htm entry or "
+                "a pygame app (.py entry with pygame evidence)"
+            ),
+        )
+
+    if live is not None and live.type == plan.type and live.entry == plan.entry:
+        return _out(live)
+    # Clear stale containers — dead ones always, and a live one whose plan
+    # doesn't match the explicit request.
+    for preview in existing:
+        await asyncio.to_thread(mgr.stop, preview.preview_id)
 
     try:
         preview = await asyncio.to_thread(
