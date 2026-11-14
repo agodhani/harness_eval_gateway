@@ -282,8 +282,13 @@ or tests change.
 - "Add next prompt" — continue a finished sandbox with a follow-up prompt
   on the same workspace (multi-turn runs: new phase in the event stream +
   artifact re-snapshotted; resume-in-place vs respawn-from-snapshot TBD)
-- More desktop preview types (pyglet/arcade/tkinter — needs baked deps or
-  a wheelhouse mount — no egress in preview nets), python-server previews
+- ~~More desktop preview types~~ + ~~python-server previews~~ — **landed
+  as PR3/F12 extension**: desktop covers pygame/pyglet/arcade/tkinter
+  (deps baked into `heg-preview-desktop`, incl. a wheels stage for
+  pymunk's missing aarch64 wheel); `python-server` executes web apps via
+  `heg-preview-server` + `server-preview-runner.py` (detects the app's
+  listen socket in `/proc/net/tcp`, relays :8000 → actual port; `manage.py`
+  gets the django runserver contract).
 - dsh native helpers (spawn-helper, node-pty) — npm ≥11 blocks their
   postinstall scripts; CLI works without them, but revisit `--allow-scripts`
   for the dsh package set if evals hit TTY-dependent tasks
@@ -346,38 +351,53 @@ or tests change.
   for provenance + import pinning. `GITHUB_TOKEN` (env) is sent as a Bearer
   token when set — private repos work best-effort; proper token UX is a
   follow-up.
-- **Artifact preview (F12) ships static + desktop** — `PreviewPlan.type` +
-  `PreviewOut.type` leave room for `python-server` next. Static = serve
-  files; desktop = execute pygame under Xvnc/noVNC.
+- **Artifact preview (F12) ships static + desktop + python-server** —
+  `PreviewPlan.type` + `PreviewOut.type` carry `"static"` (serve files),
+  `"desktop"` (execute GUI under Xvnc/noVNC), `"python-server"` (execute
+  a web app, published on localhost). `PREVIEW_TYPES` is the single
+  validation set; `PreviewManager.spawn` dispatches per type.
 - Preview containers get their **own dedicated bridge `heg-preview`**, not
   `heg-sandbox` and not `--internal` — Docker silently drops published ports
   on internal networks (verified), so "isolated + host-reachable" is
   impossible; port binds `127.0.0.1` only, masquerade disabled (Linux),
   container hardened (nobody/read-only/cap-drop/no-new-priv).
-- **Desktop previews isolate the runner, not the serving hop**: the
-  executed artifact runs alone on `--internal` `heg-desktop` (zero egress —
-  api-side proxying was rejected: the api would join the runner's net,
-  giving candidate code a path to the control plane) with
-  `--cpus`/`--memory`/`--pids-limit` bounds. A pinned `alpine/socat` sidecar
-  (`heg.preview_role=proxy`, dumb TCP pipe — nothing for the artifact to
-  exploit) straddles both nets and publishes the noVNC port on localhost.
+- **Executed-code previews isolate the runner, not the serving hop**:
+  desktop + python-server runners share `--internal` `heg-desktop` (zero
+  egress — api-side proxying was rejected: the api would join the
+  runner's net, giving candidate code a path to the control plane) with
+  `--cpus`/`--memory`/`--pids-limit` bounds (`PREVIEW_DESKTOP_*`). A
+  pinned `alpine/socat` sidecar (`heg.preview_role=proxy`, dumb TCP pipe —
+  nothing for the artifact to exploit) straddles both nets and publishes
+  the runner's port on localhost — `:6080` websockify/noVNC for desktop,
+  `:8000` for python-server (the runner's `server-preview-runner.py`
+  bridges whatever port the app binds). GUI stacks (pygame-ce, pyglet,
+  arcade, tkinter) and web frameworks (flask/fastapi/django/aiohttp/
+  bottle/tornado/gunicorn) are baked into the images — preview nets have
+  zero egress so deps can NEVER pip-install at spawn.
 - **Detection produces a typed candidate list, not a hidden pick** —
   `scan_preview` returns every runnable entry (`.html` → static, evidenced
-  `.py` → desktop) ordered default-first; `plan`/`candidates[0]` is only
-  the dropdown's default. `.py` candidates need pygame evidence (file
-  imports pygame, OR entry-shaped + a non-comment requirements.txt line);
-  scanned at root + ≤3 nested levels with hidden/`_DESKTOP_SKIP_DIRS`/
-  symlinks skipped. `entry=` POST picks any workspace-relative file —
-  `.py` overrides evidence (the pick IS the disambiguation). Zero
-  candidates → UI shows disabled "not supported". Deps beyond baked-in
-  pygame-ce can't install (no egress) — the app fails at import and the
-  runner exits visibly. Static defaults when both match. `type=` POST
+  `.py` → desktop GUI or python-server) ordered default-first;
+  `plan`/`candidates[0]` is only the dropdown's default. Executed `.py`
+  candidates share `_py_candidates`: file imports a stack (pygame/
+  pyglet/arcade/tkinter → desktop; flask/fastapi/django/http.server/… →
+  python-server — line-anchored, comments can't match), OR entry-shaped +
+  a non-comment requirements.txt line naming it (bare `tk` in
+  requirements is NOT tkinter evidence — unrelated package, tkinter is
+  stdlib). Scanned at root + ≤3 nested levels with hidden/
+  `_DESKTOP_SKIP_DIRS`/`templates`/symlinks skipped. `entry=` POST picks
+  any workspace-relative file — `.py` bypasses evidence (the pick IS the
+  disambiguation; `manage.py` alone maps to python-server — only it
+  publishes the app port). Zero candidates → UI shows disabled "not
+  supported". Deps beyond the baked stacks can't install (no egress) —
+  the app fails at import and the runner exits visibly. Static defaults
+  when both match. `type=` POST
   overrides the pick: alone it selects the first detected candidate of
   that type (a both-matching workspace defaults to static —
   `{type:"desktop"}` reaches the game); with `entry=` it forces the plan —
   `static` serves any jailed file (the entry is only the URL opened —
-  view a `.py`'s source instead of executing it), `desktop` still
-  requires a `.py` entry. A live preview is returned as-is unless an
+  view a `.py`'s source instead of executing it), `desktop`/
+  `python-server` still require a `.py` entry. A live preview is returned
+  as-is unless an
   explicit different plan is requested, then it's stopped and respawned.
   The results-GET probe is memoized by `sandbox.preview.ScanCache`
   (`PREVIEW_SCAN_TTL_SECONDS`, default 30s) keyed on
