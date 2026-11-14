@@ -764,6 +764,93 @@ def test_list_models_passthrough(
     assert resp.json()["data"][0]["id"] == "m1"
     assert upstream["seen"][0]["url"].endswith("/v1/models")
     assert emitted == []  # probes are not metered
+    # PR1: the api's pull_supported flag reads the active provider here.
+    assert resp.headers["x-heg-provider"] == "ollama"
+
+
+# ---------------------------------------------------------------------------
+# PR1 — POST /v1/models/pull (ollama-only model install, streamed passthrough)
+# ---------------------------------------------------------------------------
+
+_PULL_NDJSON = b'{"status":"pulling manifest"}\n{"status":"success"}\n'
+
+
+def test_pull_models_streams_passthrough(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    upstream["handler"] = lambda _req: httpx.Response(
+        200,
+        content=_PULL_NDJSON,
+        headers={"content-type": "application/x-ndjson"},
+    )
+    resp = gw_client.post(
+        "/v1/models/pull", json={"name": "qwen3:8b"}, headers=_auth(_cred())
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/x-ndjson")
+    assert resp.content == _PULL_NDJSON
+
+    sent = upstream["seen"][0]
+    assert sent["url"].endswith("/api/pull")
+    assert sent["json"] == {"name": "qwen3:8b", "stream": True}
+    assert emitted == []  # not a generation call — unmetered
+
+
+def test_pull_models_requires_bearer(gw_client: TestClient) -> None:
+    assert gw_client.post("/v1/models/pull", json={"name": "m"}).status_code == 401
+
+
+def test_pull_models_forces_stream_and_keeps_ollama_options(
+    gw_client: TestClient, upstream: Any
+) -> None:
+    """``stream`` is forced true; other ollama pull params (e.g. insecure)
+    forward verbatim — same pass-through contract as the other routes."""
+    upstream["handler"] = lambda _req: httpx.Response(
+        200, content=_PULL_NDJSON, headers={"content-type": "application/x-ndjson"}
+    )
+    resp = gw_client.post(
+        "/v1/models/pull",
+        json={"name": "qwen3:8b", "stream": False, "insecure": True},
+        headers=_auth(_cred()),
+    )
+    assert resp.status_code == 200
+    sent = upstream["seen"][0]["json"]
+    assert sent == {"name": "qwen3:8b", "stream": True, "insecure": True}
+
+
+def test_pull_models_upstream_error_status_forwarded(
+    gw_client: TestClient, upstream: Any
+) -> None:
+    upstream["handler"] = lambda _req: httpx.Response(
+        404, json={"error": "model not found"}
+    )
+    resp = gw_client.post(
+        "/v1/models/pull", json={"name": "nope:1b"}, headers=_auth(_cred())
+    )
+    assert resp.status_code == 404
+
+
+def test_pull_models_openrouter_provider_501(
+    gw_client: TestClient, upstream: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gateway import main as gw_main
+    from gateway.config import GatewaySettings
+
+    monkeypatch.setattr(
+        gw_main,
+        "get_settings",
+        lambda: GatewaySettings(
+            _env_file=None,
+            UPSTREAM_PROVIDER="openrouter",
+            OPENROUTER_API_KEY="sk-or-k",
+        ),
+    )
+    resp = gw_client.post(
+        "/v1/models/pull", json={"name": "m"}, headers=_auth(_cred())
+    )
+    assert resp.status_code == 501
+    assert "ollama" in resp.json()["error"]["message"]
+    assert upstream["seen"] == []  # nothing forwarded upstream
 
 
 def test_passthrough_upstream_error_emits(

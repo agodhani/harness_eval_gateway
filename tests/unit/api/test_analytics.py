@@ -70,6 +70,7 @@ def analytics_run(session_factory: sessionmaker[Session]):
         s.flush()
         sb1 = Sandbox(
             run_id=run.id,
+            name="with-superpowers",
             harness_config={"adapter": "miniloop", "skill_packs": ["superpowers"]},
             status="done",
             terminal_reason="agent_done",
@@ -185,7 +186,8 @@ def test_per_sandbox_aggregation(client: TestClient, analytics_run) -> None:
 
     assert sb1["status"] == "done"
     assert sb1["terminal_reason"] == "agent_done"
-    assert sb1["label"] == "miniloop · superpowers"
+    assert sb1["name"] == "with-superpowers"  # PR1: persisted name surfaced
+    assert sb1["label"] == "miniloop · superpowers"  # legacy derived label kept
     assert sb1["llm_turns"] == 2
     assert sb1["tokens"] == {"input": 300, "output": 100, "cache_read": 0, "total": 400}
     assert sb1["latency_ms"]["avg"] == pytest.approx(1000.0)

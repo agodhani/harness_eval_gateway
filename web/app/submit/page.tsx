@@ -15,7 +15,9 @@ import {
   createRun,
   DEFAULT_BUDGETS,
   listHarnesses,
+  listModels,
   listSkillPacks,
+  pullModel,
   SKILL_PACKS,
   type Budgets,
   type HarnessConfig,
@@ -27,11 +29,14 @@ import { ComboInput } from "@/components/ComboInput";
 import { Badge, Card, ErrorNote, InfoNote } from "@/components/ui";
 import { ImportSkillPackDialog } from "./ImportSkillPackDialog";
 
+// Offline fallback for the model pickers — the live list comes from
+// GET /api/models (gateway → upstream) when the backend is reachable.
 const MODEL_SUGGESTIONS = ["qwen3:8b", "qwen2.5-coder:3b", "qwen2.5-coder:7b"];
 const MAX_CONFIGS = 8;
 
 interface ConfigRow {
   key: number;
+  name: string;
   adapter: string;
   skill_packs: string[];
   system_prompt_extra: string;
@@ -39,7 +44,13 @@ interface ConfigRow {
 
 let nextKey = 1;
 function blankConfig(): ConfigRow {
-  return { key: nextKey++, adapter: "miniloop", skill_packs: [], system_prompt_extra: "" };
+  return {
+    key: nextKey++,
+    name: "",
+    adapter: "miniloop",
+    skill_packs: [],
+    system_prompt_extra: "",
+  };
 }
 
 export default function SubmitPage() {
@@ -56,6 +67,17 @@ export default function SubmitPage() {
   // Harness registry from GET /api/harnesses; static ADAPTERS is the fallback
   // when the API isn't running (page convention: degrade gracefully).
   const [harnesses, setHarnesses] = useState<HarnessManifest[]>([]);
+  // Live model catalog from GET /api/models (gateway → upstream). Empty +
+  // pullSupported=false while offline → MODEL_SUGGESTIONS fallback.
+  const [models, setModels] = useState<string[]>([]);
+  const [pullSupported, setPullSupported] = useState(false);
+  // ollama pull ("install model") state — pullMsg doubles as progress text.
+  const [pullName, setPullName] = useState("");
+  const [pulling, setPulling] = useState(false);
+  const [pullMsg, setPullMsg] = useState<string | null>(null);
+  const [pullFailed, setPullFailed] = useState(false);
+
+  const modelSuggestions = models.length > 0 ? models : [...MODEL_SUGGESTIONS];
 
   useEffect(() => {
     let cancelled = false;
@@ -65,6 +87,33 @@ export default function SubmitPage() {
       })
       .catch(() => {
         /* offline fallback: static ADAPTERS list */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** Refetch the live catalog — called after a successful pull too. */
+  async function refreshModels() {
+    try {
+      const r = await listModels();
+      if (r.models.length) setModels(r.models.map((m) => m.id));
+      setPullSupported(r.pull_supported);
+    } catch {
+      /* gateway/api down — MODEL_SUGGESTIONS fallback stays */
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    listModels()
+      .then((r) => {
+        if (cancelled) return;
+        if (r.models.length) setModels(r.models.map((m) => m.id));
+        setPullSupported(r.pull_supported);
+      })
+      .catch(() => {
+        /* offline fallback: static MODEL_SUGGESTIONS */
       });
     return () => {
       cancelled = true;
@@ -186,6 +235,42 @@ export default function SubmitPage() {
     if (canAddConfig) setConfigs((cs) => [...cs, blankConfig()]);
   }
 
+  /** ollama pull via POST /api/models/pull — streams progress into pullMsg. */
+  async function onPull() {
+    const name = pullName.trim();
+    if (!name || pulling) return;
+    setPulling(true);
+    setPullFailed(false);
+    setPullMsg("starting pull…");
+    try {
+      const last = await pullModel(name, (ev) => {
+        const pct =
+          ev.total && ev.completed != null
+            ? ` ${Math.min(100, Math.round((100 * ev.completed) / ev.total))}%`
+            : "";
+        setPullMsg(`${ev.status ?? "pulling"}${pct}`);
+      });
+      setPullMsg(
+        last?.status === "success"
+          ? `installed ${name} — pick it from the model dropdown.`
+          : `pull finished (${last?.status ?? "done"})`,
+      );
+      setPullName("");
+      void refreshModels();
+    } catch (err) {
+      setPullFailed(true);
+      setPullMsg(
+        err instanceof ApiError
+          ? err.detail
+          : err instanceof Error
+            ? err.message
+            : "Pull failed.",
+      );
+    } finally {
+      setPulling(false);
+    }
+  }
+
   function removeConfig(key: number) {
     setConfigs((cs) => (cs.length > 1 ? cs.filter((c) => c.key !== key) : cs));
   }
@@ -200,6 +285,7 @@ export default function SubmitPage() {
       adapter: c.adapter,
       skill_packs: c.skill_packs,
       system_prompt_extra: c.system_prompt_extra.trim() || null,
+      name: c.name.trim() || null,
     }));
 
     setSubmitting(true);
@@ -271,7 +357,7 @@ export default function SubmitPage() {
                 id="model_name"
                 value={modelName}
                 onChange={setModelName}
-                suggestions={MODEL_SUGGESTIONS}
+                suggestions={modelSuggestions}
                 placeholder="qwen3:8b"
                 disabled={submitting}
                 mono
@@ -279,7 +365,11 @@ export default function SubmitPage() {
               {fieldErrors.model_name ? (
                 <span className="field__error">{fieldErrors.model_name}</span>
               ) : (
-                <span className="field__hint">Same model runs in every sandbox — we compare harnesses, not models.</span>
+                <span className="field__hint">
+                  {models.length > 0
+                    ? `${models.length} models from the gateway upstream — same model runs in every sandbox.`
+                    : "Same model runs in every sandbox — we compare harnesses, not models."}
+                </span>
               )}
             </div>
             <div className="field">
@@ -290,7 +380,7 @@ export default function SubmitPage() {
                 id="evaluator_model"
                 value={evaluatorModel}
                 onChange={setEvaluatorModel}
-                suggestions={MODEL_SUGGESTIONS}
+                suggestions={modelSuggestions}
                 placeholder={modelName.trim() || "same as participant"}
                 disabled={submitting}
                 mono
@@ -306,6 +396,55 @@ export default function SubmitPage() {
               )}
             </div>
           </div>
+          {pullSupported ? (
+            <div className="field" style={{ marginTop: "0.9rem" }}>
+              <label className="field__label" htmlFor="pull_model">
+                Install model <span className="faint">(ollama pull)</span>
+              </label>
+              <div className="row" style={{ flexWrap: "nowrap" }}>
+                <input
+                  id="pull_model"
+                  className="input input--mono"
+                  placeholder="name:tag — e.g. llama3.2:3b"
+                  value={pullName}
+                  onChange={(e) => setPullName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void onPull();
+                    }
+                  }}
+                  disabled={pulling || submitting}
+                  maxLength={255}
+                />
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => void onPull()}
+                  disabled={pulling || submitting || !pullName.trim()}
+                >
+                  {pulling ? (
+                    <>
+                      <span className="spinner" aria-hidden /> pulling…
+                    </>
+                  ) : (
+                    "pull"
+                  )}
+                </button>
+              </div>
+              {pullMsg ? (
+                pullFailed ? (
+                  <span className="field__error">{pullMsg}</span>
+                ) : (
+                  <span className="field__hint">{pullMsg}</span>
+                )
+              ) : (
+                <span className="field__hint">
+                  Downloads a model onto the gateway&apos;s Ollama upstream; progress streams here.
+                </span>
+              )}
+            </div>
+          ) : null}
         </Card>
 
         <Card
@@ -332,6 +471,20 @@ export default function SubmitPage() {
                   </button>
                 </div>
                 <div className="input-row">
+                  <div className="field">
+                    <label className="field__label">
+                      Name <span className="faint">(optional)</span>
+                    </label>
+                    <input
+                      className="input"
+                      value={cfg.name}
+                      maxLength={64}
+                      placeholder={`${cfg.adapter}-<id>`}
+                      onChange={(e) => updateConfig(cfg.key, { name: e.target.value })}
+                      disabled={submitting}
+                      title="Label shown in the timeline filter, results matrix, and analytics"
+                    />
+                  </div>
                   <div className="field">
                     <label className="field__label">Adapter</label>
                     <select

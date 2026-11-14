@@ -69,6 +69,10 @@ class Sandbox(Base):
     run_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("runs.id"), index=True)
     # Per-sandbox harness config (which adapter, skill packs, prompt overrides).
     harness_config: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
+    # Optional user label for the harness config (PR1 named configs) —
+    # surfaced in timeline/results/analytics; provisioner defaults it to
+    # "<adapter>-<sandbox short id>" when the submit left it blank.
+    name: Mapped[str | None] = mapped_column(String(255))
     # provisioning | running | terminating | done | failed (terminal_reason set)
     status: Mapped[str] = mapped_column(String(32), default="provisioning", index=True)
     docker_container_id: Mapped[str | None] = mapped_column(String(128))

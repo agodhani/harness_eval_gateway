@@ -49,6 +49,7 @@ def scored_run(session_factory: sessionmaker[Session]):
         s.flush()
         sb1 = Sandbox(
             run_id=run.id,
+            name="with-superpowers",
             harness_config={"adapter": "miniloop", "skill_packs": ["superpowers"]},
             status="done",
             terminal_reason="agent_done",
@@ -110,6 +111,7 @@ def test_run_results_shape(client: TestClient, scored_run) -> None:
     sb1 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"]))
     assert sb1["status"] == "done"
     assert sb1["terminal_reason"] == "agent_done"
+    assert sb1["name"] == "with-superpowers"  # PR1: persisted sandbox name
     assert sb1["harness_config"]["skill_packs"] == ["superpowers"]
     assert sb1["rubric_id"] == str(scored_run["rubric_id"])
     assert sb1["dimensions"]["functional_requirements"] == {
@@ -124,6 +126,7 @@ def test_run_results_shape(client: TestClient, scored_run) -> None:
     assert sb2["dimensions"] == {}
     assert sb2["overall"] is None
     assert sb2["terminal_reason"] == "timeout"
+    assert sb2["name"] is None  # unnamed sandbox serializes null
 
 
 def test_run_results_includes_artifacts(

@@ -331,9 +331,9 @@ export default function RunConsoleLive({ run }: { run: RunOut }) {
                     <span className="evc-lane__id">
                       <Link
                         href={`/runs/${run.id}/timeline?sandbox=${s.id}`}
-                        title={s.id}
+                        title={s.name ? `${s.name} · ${s.id}` : s.id}
                       >
-                        {shortId(s.id)}
+                        {s.name || shortId(s.id)}
                       </Link>
                     </span>
                     <span className="evc-lane__spec">
