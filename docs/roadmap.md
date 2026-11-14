@@ -15,6 +15,11 @@ append-mostly; rebase on main before merge.
   claude_code, pi, deepseek), evaluator w/ judge retries, results UI,
   analytics (F9), skillpack import (F11), artifact preview static+desktop
   (F12).
+- **PR2 preview fixes**: `type=` POST-body override on the artifact preview
+  (`plan_for_type` picks the first candidate of a type; `entry`+`type` forces
+  the plan — `static` serves any jailed file, `desktop` requires `.py`) and a
+  `ScanCache`'d results-GET probe (`PREVIEW_SCAN_TTL_SECONDS`, default 30s).
+  Details: `FEATURE_MAP.md` F12.
 - **OpenRouter provider** (commit 8014338): `UPSTREAM_PROVIDER=ollama|openrouter`
   in `gateway/config.py`; client base normalizes to `/api/` (httpx
   concatenates base+request paths); Ollama-only body params
@@ -50,14 +55,15 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR2, PR5, PR6, PR9, PR11, PR12,
+- **Depth 0 (start immediately):** PR1, PR3, PR5, PR6, PR9, PR11, PR12,
   PR15, PR19 — plus PR13/PR17 if soft-only deps are acceptable.
-- **Depth 1:** PR3 (←2), PR7 (←6, +5 soft), PR10 (←9), PR14 (←1, +12 soft),
+- **Depth 1:** PR7 (←6, +5 soft), PR10 (←9), PR14 (←1, +12 soft),
   PR16 (←15), PR18 (←12).
 - **Depth 2:** PR4 (←3), PR8 (←7).
 - **Floating:** PR20 (soft ←15).
 
-Critical path depth = 3 (`6→7→8` / `2→3→4`). Max safe concurrency ≈ 9 lanes.
+Critical path depth = 3 (`6→7→8`; `3→4` is depth 2 now that PR2 landed).
+Max safe concurrency ≈ 9 lanes.
 
 ## Shared-file hotspots (merge-conflict risk)
 
@@ -88,15 +94,9 @@ Critical path depth = 3 (`6→7→8` / `2→3→4`). Max safe concurrency ≈ 9 
 - **Verify:** unit tests for schema + migration; UI shows live model list
   + names in filters.
 
-### PR2 — Preview fixes
-- **Scope:** `?type=` override (entry= picks file but type should be
-  overridable — a workspace matching both detectors currently always gets
-  static); cache `previewable`/`preview_type` probe on results GET (runs a
-  per-sandbox FS probe on every call today).
-- **Touch:** `sandbox/preview.py`, `api/routers/preview.py`,
-  `api/routers/results.py`, `PreviewControls.tsx`.
-- **Verify:** existing `tests/unit/sandbox/test_preview.py`,
-  `tests/unit/api/test_preview.py` extended for type override + cache.
+### PR2 — Preview fixes ✅ landed
+`type=` POST-body override + `ScanCache`'d results-GET probe — see "Already
+landed" and `FEATURE_MAP.md` F12.
 
 ### PR3 — Preview types
 - **Scope:** `python-server` preview type (run candidate code like desktop —

@@ -287,7 +287,7 @@ export interface SandboxResult {
   preview_type?: string | null;
   /**
    * F12: every detected runnable entry, default-first — the UI renders a
-   * dropdown and POSTs {entry}. Empty + previewable=false = unsupported.
+   * dropdown and POSTs {entry, type}. Empty + previewable=false = unsupported.
    */
   preview_candidates?: PreviewCandidate[];
 }

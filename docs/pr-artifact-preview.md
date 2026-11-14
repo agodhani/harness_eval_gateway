@@ -21,12 +21,13 @@ The Artifacts table gains a Preview column (`web/app/runs/[id]/results/`):
 | Detected entries | Control |
 |---|---|
 | 1 | plain **Preview** button |
-| >1 | dropdown of every detected option (`index.html (site)`, `game/main.py (desktop)`) + Preview — the detected default is preselected, never a hidden pick |
+| >1 | dropdown of every detected option plus type-override variants (`index.html (site)`, `game/main.py (desktop)`, `game/main.py (view source)` — a `.py` can be served as a file instead of executed) + Preview — the detected default is preselected, never a hidden pick |
 | 0 | disabled button + "not supported" |
 
 Clicking spawns a preview and shows a type badge (`site`/`desktop`), an
 **↗ open** link, a **stop** chip, and the expiry time. One live preview per
-sandbox (POST is idempotent). No manual path entry anywhere in the UI.
+sandbox (POST is idempotent — an explicit pick resolving to a different plan
+stops + respawns it). No manual path entry anywhere in the UI.
 
 ## Isolation design
 
@@ -122,10 +123,10 @@ re-snapshot.
 
 | Area | Files |
 |---|---|
-| Manager/detection | `sandbox/preview.py` (new, ~1050 loc) — `Preview`, `PreviewScan`, `scan_preview`, `detect_preview`, `plan_for_entry`, `PreviewManager` (spawn/get/stop-all/reaper) |
+| Manager/detection | `sandbox/preview.py` (new) — `Preview`, `PreviewScan`, `scan_preview`, `detect_preview`, `plan_for_entry`, `plan_for_type`, `ScanCache`, `PreviewManager` (spawn/get/stop-all/reaper) |
 | API | `api/routers/preview.py` (new), `api/routers/results.py` (+`PreviewCandidate`, probing), `api/config.py` (+`PREVIEW_*`), `api/main.py` (reaper lifespan) |
 | Desktop image | `sandbox/images/desktop-preview.Dockerfile`, `…-entrypoint.sh` (Xvnc + websockify + app, supervisor-lite) |
-| Web | `web/lib/api.ts` (types + `startPreview({entry})`), `…/results/PreviewControls.tsx` (new), `…/results/ResultsClient.tsx` (Preview column) |
+| Web | `web/lib/api.ts` (types + `startPreview({entry, type})`), `…/results/PreviewControls.tsx` (new), `…/results/ResultsClient.tsx` (Preview column) |
 | Tests | `tests/unit/sandbox/test_preview.py` (~1020 loc), `tests/unit/api/test_preview.py` (~600 loc), `tests/integration/test_preview.py` (~330 loc) |
 | Docs | `FEATURE_MAP.md` (F12), `AGENTS.md` (decisions), this file |
 
@@ -134,7 +135,9 @@ re-snapshot.
 - `uv run ruff check .` — clean
 - `uv run pytest -m "not docker"` — **350 passed** (110 of them
   preview-specific: detection, jail, manager lifecycle, API contract,
-  stop-all, idempotent POST, candidate ordering, `entry=` override)
+  stop-all, idempotent POST, candidate ordering, `entry=` override).
+  Counts predate PR2 — `type=` overrides, plan-replace semantics, and
+  `ScanCache` coverage are listed in `FEATURE_MAP.md` F12.
 - `uv run pytest tests/integration/test_preview.py` — **4 passed, real
   Docker**: static container actually serves an html artifact; a real
   pygame app runs under Xvnc/noVNC and reports `display ok`, proxied via
@@ -163,7 +166,8 @@ re-snapshot.
 - `python-server` previews (uvicorn/flask apps — needs a serve-command
   contract), more desktop stacks (pyglet/arcade/tkinter — needs baked deps
   or a wheelhouse mount; no egress means deps must pre-exist).
-- Cache `previewable`/`preview_type` probing (per-sandbox FS probe on every
-  results GET — fine at MVP scale).
+- ~~Cache `previewable`/`preview_type` probing~~ — done (PR2): `ScanCache`
+  memoizes the results-GET probe for `PREVIEW_SCAN_TTL_SECONDS` (30s; the
+  workspace only changes on re-snapshot).
 - ~~F10 id collision with sibling Phase-2 branches~~ — resolved: renumbered
   to F12 on rebase onto `main` (F10/F11 claimed by in-flight siblings).
