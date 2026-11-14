@@ -11,12 +11,14 @@ CLI, Aider, custom minimal loops, ...) on coding tasks, with a **custom AI
 gateway** as the observability layer.
 
 A user submits a task (e.g. "build a replica of 2048") plus a run
-configuration. The system spawns isolated Docker sandboxes — one per harness —
-all running the **same underlying model**, so results compare *harness
-capability*, not raw model quality. An independent LLM evaluator scores each
-produced artifact against a human-approved rubric. All model traffic and agent
-activity are captured as structured events powering a live + persisted
-execution timeline.
+configuration. The system spawns isolated Docker sandboxes across a
+**config × model matrix** — each harness configuration runs on every selected
+participant model (a per-config `model` overrides the run-level model list;
+PR14 reversed the original harnesses-only stance). Results compare harness
+capability and model quality side by side. An independent LLM evaluator
+scores each produced artifact against a human-approved rubric. All model
+traffic and agent activity are captured as structured events powering a live
++ persisted execution timeline.
 
 **MVP shape:** 1 model (Ollama, small local model) × 2 harness configs → 2
 concurrent sandboxes. Evaluator runs afterwards in its own sandbox. Since
@@ -27,8 +29,10 @@ adapters are added.
 
 ## Core concepts
 
-- **Run** — one submitted evaluation. Spec = task prompt + model + set of
-  harnesses + skill packs + evaluator model.
+- **Run** — one submitted evaluation. Spec = task prompt + model(s) + set of
+  harnesses + skill packs + evaluator model. `model_name` is the default
+  participant model; `models` (normalized into `config.models`) selects the
+  full participant set.
 - **Sandbox** — a Docker container running one harness instance on the task,
   with an identical clean initial repo/workspace as its siblings.
 - **Harness adapter** — per-harness plugin: knows how to install, configure,
@@ -238,13 +242,14 @@ or tests change.
 | F12 | Artifact preview (static html + desktop/pygame via noVNC) |
 | F13 | Graphical analysis page + cross-run trends (recharts) |
 | F14 | Submit UX: live model picker + install, named harness configs |
+| F15 | Model-vs-model matrix: multi-model runs + per-model analytics |
 
 ## Post-MVP roadmap
 
 - Additional harness adapters: Claude Code CLI, Codex CLI, Aider
 - Additional providers: OpenRouter, direct Anthropic/OpenAI
 - Anthropic-compatible gateway endpoint (`/v1/messages`)
-- Model-vs-model comparisons (multi-model matrices)
+- ~~Model-vs-model comparisons (multi-model matrices)~~ — **landed as F15**
 - Objective scoring: build/test execution, coverage as score dimensions
   (PR7 — static analysis landed in PR6 via `scoring/` signal collectors)
 - Automated test-suite generation as eval target
@@ -284,12 +289,17 @@ or tests change.
 
 ## Decisions log
 
-- Compare **harnesses, not models**: same model across sandboxes in a run.
+- ~~Compare **harnesses, not models**~~ — **reversed by PR14 (F15)**: the
+  matrix is `configs × models`. `model_name` remains the default participant
+  model; `RunCreate.models` selects the full set (defaults to `[model_name]`)
+  and a per-config `model` overrides the run list for that config. Same-model
+  runs remain the default; `same_model_eval` now checks the evaluator against
+  *every* participant model.
 - Custom lightweight gateway (not LiteLLM) — observability is the core value.
 - Two-layer telemetry: passive gateway capture + adapter-translated harness
   events for agent-level detail.
 - HITL rubric approval; frozen pre-launch; shared across sandboxes.
-- Evaluator in own sandbox; UI flags evaluator == participant model.
+- Evaluator in own sandbox; UI flags evaluator == any participant model.
 - LLM-judge scoring, fed by measured signals: PR6 added parse-only static
   analysis (real cyclomatic complexity + static metrics via lizard) as
   judge evidence — exec-derived checks (build/test/coverage) remain

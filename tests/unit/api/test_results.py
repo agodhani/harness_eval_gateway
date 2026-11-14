@@ -104,6 +104,8 @@ def test_run_results_shape(client: TestClient, scored_run) -> None:
     assert body["run_id"] == str(scored_run["run_id"])
     assert body["status"] == "done"
     assert body["model_name"] == "qwen3:8b"
+    # PR14: effective participant set + per-sandbox model resolution
+    assert body["models"] == ["qwen3:8b"]
     assert body["evaluator_model"] == "qwen3:8b"
     assert body["same_model_eval"] is True
     assert len(body["sandboxes"]) == 2
@@ -112,6 +114,7 @@ def test_run_results_shape(client: TestClient, scored_run) -> None:
     assert sb1["status"] == "done"
     assert sb1["terminal_reason"] == "agent_done"
     assert sb1["name"] == "with-superpowers"  # PR1: persisted sandbox name
+    assert sb1["model"] == "qwen3:8b"  # PR14: no config model → run default
     assert sb1["harness_config"]["skill_packs"] == ["superpowers"]
     assert sb1["rubric_id"] == str(scored_run["rubric_id"])
     assert sb1["dimensions"]["functional_requirements"] == {
@@ -162,6 +165,47 @@ def test_run_results_includes_artifacts(
 def test_run_results_404(client: TestClient) -> None:
     resp = client.get(f"/api/runs/{uuid.uuid4()}/results")
     assert resp.status_code == 404
+
+
+def test_run_results_multi_model(client: TestClient, session_factory) -> None:
+    """PR14: per-sandbox model + run-level models list on a model matrix."""
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="x",
+            model_name="qwen3:8b",
+            config={"models": ["qwen3:8b", "gpt-4o"]},
+            status="done",
+        )
+        s.add(run)
+        s.flush()
+        s.add_all(
+            [
+                Sandbox(
+                    run_id=run.id,
+                    name="baseline · qwen3:8b",
+                    harness_config={"adapter": "miniloop", "model": "qwen3:8b"},
+                    status="done",
+                ),
+                Sandbox(
+                    run_id=run.id,
+                    name="baseline · gpt-4o",
+                    harness_config={"adapter": "miniloop", "model": "gpt-4o"},
+                    status="done",
+                ),
+            ]
+        )
+        s.commit()
+        run_id = run.id
+    finally:
+        s.close()
+
+    body = client.get(f"/api/runs/{run_id}/results").json()
+    assert body["models"] == ["qwen3:8b", "gpt-4o"]
+    by_model = {sb["model"]: sb for sb in body["sandboxes"]}
+    assert set(by_model) == {"qwen3:8b", "gpt-4o"}
+    assert by_model["gpt-4o"]["name"] == "baseline · gpt-4o"
+    assert by_model["gpt-4o"]["harness_config"]["model"] == "gpt-4o"
 
 
 # ---------------------------------------------------------------------------

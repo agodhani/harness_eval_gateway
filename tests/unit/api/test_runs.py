@@ -261,6 +261,84 @@ def test_create_run_harness_config_names(api) -> None:
     assert hcs[1]["name"] is None
 
 
+def test_create_run_multi_model_matrix(api) -> None:
+    """PR14: models[] expands the matrix — config.models persists the
+    effective participant set ([model_name] + deduped extras)."""
+    body = _valid_body(models=["gpt-4o", "claude-opus-4.1", "gpt-4o", "qwen3:8b"])
+    data = _post_run(api.client, body)
+    cfg = data["config"]
+    # model_name leads; extras deduped against it and each other
+    assert cfg["models"] == ["qwen3:8b", "gpt-4o", "claude-opus-4.1"]
+    # harness_configs stay unexpanded at submit — expansion happens at
+    # provisioning (orchestrator.matrix.expanded_configs).
+    assert len(cfg["harness_configs"]) == 2
+    assert all("model" not in hc for hc in cfg["harness_configs"])
+    # evaluator_model "eval-model" isn't a participant → flag stays False
+    assert cfg["same_model_eval"] is False
+    assert data["same_model_eval"] is False
+
+
+def test_create_run_models_default_single_model(api) -> None:
+    """Omitted/empty models → single-model run; config.models still records
+    the effective set ([model_name]) for downstream consumers."""
+    for models in (None, []):
+        body = _valid_body()
+        if models is not None:
+            body["models"] = models
+        data = _post_run(api.client, body)
+        assert data["config"]["models"] == ["qwen3:8b"]
+
+
+def test_create_run_same_model_eval_against_any_participant(api) -> None:
+    """PR14: the same-model flag fires when the judge equals ANY participant
+    model — non-independent judging for that matrix cell."""
+    # evaluator == an EXTRA participant model → flagged
+    body = _valid_body(models=["gpt-4o"], evaluator_model="gpt-4o")
+    data = _post_run(api.client, body)
+    assert data["config"]["same_model_eval"] is True
+    assert data["same_model_eval"] is True
+    # evaluator == primary participant → flagged (pre-PR14 behavior);
+    # drop the explicit evaluator_model so it defaults to model_name
+    body = _valid_body(models=["gpt-4o"])
+    del body["evaluator_model"]
+    data = _post_run(api.client, body)
+    assert data["config"]["evaluator_model"] == "qwen3:8b"
+    assert data["same_model_eval"] is True
+    # evaluator distinct from all participants → not flagged
+    body = _valid_body(models=["gpt-4o"], evaluator_model="eval-model")
+    data = _post_run(api.client, body)
+    assert data["same_model_eval"] is False
+
+
+def test_create_run_matrix_size_cap(api) -> None:
+    """PR14: configs × models is capped — each cell is a real sandbox."""
+    # 8 configs × (1 + 4 models) = 40 cells > MAX_MATRIX_CELLS (32)
+    body = _valid_body(
+        harness_configs=[{}] * 8,
+        models=["m2", "m3", "m4", "m5"],
+    )
+    resp = api.client.post("/api/runs", json=body)
+    assert resp.status_code == 422
+    assert "matrix" in resp.text.lower() or "sandboxes" in resp.text.lower()
+    # exactly at the cap → accepted
+    body = _valid_body(harness_configs=[{}] * 8, models=["m2", "m3"])
+    data = _post_run(api.client, body)  # 8 × 3 = 24 ≤ 32
+    assert len(data["config"]["models"]) == 3
+
+
+def test_create_run_models_field_bounds(api) -> None:
+    client = api.client
+    # >8 extra models rejected by the field bound
+    resp = client.post(
+        "/api/runs", json=_valid_body(models=[f"m{i}" for i in range(9)])
+    )
+    assert resp.status_code == 422
+    # entries longer than 255 chars are dropped by normalization (blank/
+    # over-long collapse) — an all-dropped list degrades to single-model
+    data = _post_run(client, _valid_body(models=["x" * 300]))
+    assert data["config"]["models"] == ["qwen3:8b"]
+
+
 def test_create_run_validation(api) -> None:
     client = api.client
     cases = [

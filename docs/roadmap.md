@@ -194,15 +194,22 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 - **Verify:** `tests/unit/adapters/test_adapter_contract.py` covers it
   automatically + per-adapter tests; `test_adapter_images.py` docker test.
 
-### PR14 — Model-vs-model comparisons
-- **Scope:** multi-model matrices — vary model as well as harness config
-  (matrix expansion is `configs × model` already; needs spec/UI support +
-  compare-by-model analytics). Reverses the early "harnesses not models"
-  decision — flag in docs.
+### PR14 — Model-vs-model comparisons — ✅ implemented (F15)
+- **Scope:** multi-model matrices — vary model as well as harness config.
+  Reverses the early "harnesses not models" decision — flagged in
+  `AGENTS.md` decisions log + `FEATURE_MAP.md` F15.
+- **Landed:** `RunCreate.models` + per-config `model` override
+  (`api/schemas.py`), `orchestrator/matrix.py` expansion
+  (`configs × models`, deduped, `MAX_MATRIX_CELLS` cap), per-sandbox model
+  persisted in `harness_config.model` + passed to adapters as `MODEL_NAME`,
+  `same_model_eval` across all participant models, per-model pricing +
+  `ModelAnalytics` rollup in analytics, model labels across submit/results/
+  analytics/analysis/run-detail/run-list/console UI.
 - **Touch:** `api/schemas.py` run spec, `orchestrator/` matrix expansion,
   submit form, results/analytics UI.
 - **Depends on:** PR1 (HarnessConfigIn schema churn settles); best after
-  PR12 (needs >1 usable provider to be interesting).
+  PR12 (needs >1 usable provider to be interesting). **Stacked on
+  `feat/pr1-submit-ux` @ `7a667e4`.**
 
 ### PR15 — Run pacing: submission queue + memory-aware scheduling
 - **Scope:** serialize runs so a new submission queues behind the active

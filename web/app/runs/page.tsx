@@ -143,7 +143,18 @@ export default function RunsPage() {
                       </Link>
                     </td>
                     <td style={{ maxWidth: "340px" }}>{truncate(r.task_prompt, 90)}</td>
-                    <td className="num">{r.model_name}</td>
+                    <td className="num">
+                      {r.model_name}
+                      {(r.models?.length ?? 0) > 1 ? (
+                        <span
+                          className="faint"
+                          title={`participants: ${(r.models ?? []).join(", ")}`}
+                        >
+                          {" "}
+                          +{(r.models?.length ?? 1) - 1}
+                        </span>
+                      ) : null}
+                    </td>
                     <td>
                       <Badge tone={statusTone(r.status)}>{r.status}</Badge>
                     </td>

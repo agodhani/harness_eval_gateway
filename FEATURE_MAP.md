@@ -27,6 +27,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F12 | Artifact preview (static html + desktop/pygame via noVNC, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
 | F13 | Graphical analysis page + cross-run trends (recharts) | ✅ | `web/app/runs/[id]/analysis/`, `api/routers/analytics.py` (`GET /api/analytics/runs`), `web/app/runs/[id]/results/ResultsClient.tsx` (totals row) | `tests/unit/api/test_analytics.py` (trends section) |
 | F14 | Submit UX: live model picker + install, named harness configs | ✅ | `api/routers/models.py`, `gateway/main.py` (`/v1/models/pull`), `web/app/submit/page.tsx`, `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`, `orchestrator/provision.py` | `tests/unit/api/test_models.py`, `tests/unit/gateway/test_proxy.py` (pull), `tests/unit/db/test_migrations.py`, `tests/unit/orchestrator/test_provision.py` (name) |
+| F15 | Model-vs-model matrix (config × model) + per-model analytics | ✅ | `orchestrator/matrix.py`, `orchestrator/lifecycle.py`, `orchestrator/provision.py`, `api/schemas.py`, `api/routers/runs.py`, `results.py`, `analytics.py`, `web/app/submit/page.tsx`, `web/lib/api.ts`, `web/app/runs/[id]/` (detail, results, analysis) | `tests/unit/orchestrator/test_matrix.py`, `test_lifecycle.py`, `test_provision.py`, `tests/unit/api/test_runs.py`, `test_results.py`, `test_analytics.py` |
 
 ## Feature details
 
@@ -577,6 +578,56 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     install streams progress; run detail/timeline/results/analytics show
     the configured names (or `adapter-shortid` defaults).
 - **Depends on:** F1 (submit form), F3 (gateway `/v1/models` + creds)
+
+### F15 — Model-vs-model matrix (config × model) + per-model analytics ✅
+
+- **What:** reverses the original "compare harnesses, not models" decision —
+  a run can now vary the participant model as well as the harness config.
+  - **Spec** — `RunCreate.models` (optional list, deduped/normalized against
+    `model_name`; omitted → `[model_name]`; empty/blank/over-`MAX_MATRIX_CELLS`
+    rejected). `HarnessConfigIn.model` optionally pins one config to a single
+    model, overriding the run list for that config. Normalized set persisted
+    as `run.config.models`; `RunOut`/`RunSummary` expose `models`.
+  - **Expansion** — `orchestrator/matrix.py`: `participant_models`,
+    `expanded_configs` (config × models minus explicit overrides, deduped),
+    `sandbox_model` (per-sandbox resolution). `lifecycle.py` provisions one
+    sandbox per expanded cell; `provision.py` persists the resolved model in
+    `Sandbox.harness_config.model`, folds it into the sandbox name/label,
+    and passes it to the adapter env as `MODEL_NAME`. Per-cell spawn failures
+    stay isolated.
+  - **API** — `same_model_eval` now compares the evaluator model against
+    *every* participant model; results carry `SandboxResult.model` +
+    `RunResults.models`; analytics resolves pricing per sandbox's own model
+    (`price_model` param still forces a uniform reprice, now optional) and
+    adds a `models` rollup (`ModelAnalytics`: tokens/cost/score aggregates
+    per participant model).
+  - **UI** — submit form gains a multi-model picker (chips + live catalog,
+    Ollama pull preserved); run detail/list show the model set; results
+    matrix + timeline + live console label each cell with its model;
+    AnalyticsSection gains a sandbox/model segmented view with per-model
+    aggregation and per-model cost; the analysis page prices each sandbox at
+    its own model's rate in "auto" mode.
+- **Where:** `orchestrator/matrix.py` (new), `orchestrator/lifecycle.py`,
+  `orchestrator/provision.py`, `api/schemas.py` (`RunCreate.models`,
+  `HarnessConfigIn.model`, `MAX_MATRIX_CELLS`, `models` on run/results/
+  analytics schemas), `api/routers/runs.py`, `api/routers/results.py`,
+  `api/routers/analytics.py`, `web/lib/api.ts`, `web/app/submit/page.tsx`,
+  `web/app/runs/page.tsx`, `web/app/runs/[id]/RunDetailClient.tsx`,
+  `web/app/runs/[id]/results/{ResultsClient,AnalyticsSection}.tsx`,
+  `web/app/runs/[id]/analysis/AnalysisClient.tsx`,
+  `web/components/RunConsoleLive.tsx`, `web/app/globals.css`
+- **Verify:**
+  - Unit: `tests/unit/orchestrator/test_matrix.py` (defaults, overrides,
+    dedupe, limits), `test_lifecycle.py` (matrix expansion + spawn isolation),
+    `test_provision.py` (model persisted in harness_config + env),
+    `tests/unit/api/test_runs.py` (validation, normalization, same-model
+    eval across the set), `test_results.py` (`model`/`models` fields),
+    `test_analytics.py` (per-model pricing + rollup)
+  - Manual: submit with 2 configs × 2 models → 4 sandboxes named/labeled
+    per cell; results matrix + analytics "model" view group by model; cost
+    auto-mode prices each cell at its own model.
+- **Depends on:** F14 (PR1 — named configs + live model picker this stacks
+  on); best after multi-provider support so >1 model is usable.
 
 ## Implementation sequence
 

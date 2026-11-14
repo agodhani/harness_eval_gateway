@@ -19,6 +19,7 @@ import {
   eventsStreamUrl,
   listAllEvents,
   listEvents,
+  runModels,
   type EventOut,
   type RunOut,
   type SandboxOut,
@@ -130,13 +131,14 @@ function laneTokens(events: EventOut[]): number {
   return t;
 }
 
-function laneSpec(s: SandboxOut): { adapter: string; packs: string } {
+function laneSpec(s: SandboxOut): { adapter: string; model: string; packs: string } {
   const hc = (s.harness_config ?? {}) as Record<string, unknown>;
   const adapter = String(hc.adapter ?? hc.harness ?? "?");
+  const model = String(hc.model ?? "").trim();
   const packs = Array.isArray(hc.skill_packs)
     ? (hc.skill_packs as string[]).join(" · ")
     : "";
-  return { adapter, packs };
+  return { adapter, model, packs };
 }
 
 type SseState = "connecting" | "open" | "reconnecting";
@@ -300,7 +302,10 @@ export default function RunConsoleLive({ run }: { run: RunOut }) {
             RUN&nbsp;{shortId(run.id)}
           </span>
           <span className="evc__meta">task — “{truncate(run.task_prompt, 48)}”</span>
-          <span className="evc__meta">model — {run.model_name}</span>
+          <span className="evc__meta">
+            model —{" "}
+            {runModels(run.model_name, run.config?.models).join(", ")}
+          </span>
           <span className="evc__right">
             <span>{events.length} events</span>
             <Badge tone={statusTone(run.status)}>{run.status}</Badge>
@@ -338,6 +343,7 @@ export default function RunConsoleLive({ run }: { run: RunOut }) {
                     </span>
                     <span className="evc-lane__spec">
                       {spec.adapter}
+                      {spec.model ? ` · ${spec.model}` : ""}
                       {spec.packs ? ` · ${spec.packs}` : ""}
                     </span>
                     {s.terminal_reason ? (
