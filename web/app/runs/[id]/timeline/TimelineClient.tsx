@@ -238,10 +238,15 @@ export default function TimelineClient({ runId }: { runId: string }) {
   const sandboxIds = useMemo(() => {
     const set = new Set<string>();
     for (const sb of scopedAnalytics?.sandboxes ?? []) set.add(sb.sandbox_id);
-    for (const e of events) if (e.sandbox_id) set.add(e.sandbox_id);
+    // run_id guard (case-insensitive like scopedAnalytics) — key={runId} on the
+    // page already remounts per run; this keeps foreign events from leaking a
+    // sandbox into the filter options / split lanes if that ever regresses.
+    for (const e of events)
+      if (e.sandbox_id && e.run_id.toLowerCase() === runId.toLowerCase())
+        set.add(e.sandbox_id);
     if (filterSandbox && filterSandbox !== "__none__") set.add(filterSandbox);
     return [...set].sort();
-  }, [events, scopedAnalytics, filterSandbox]);
+  }, [events, scopedAnalytics, filterSandbox, runId]);
 
   const typeOptions = useMemo(() => {
     const set = new Set(events.map((e) => e.type));
@@ -251,6 +256,8 @@ export default function TimelineClient({ runId }: { runId: string }) {
   const filtered = useMemo(
     () =>
       events.filter((e) => {
+        // Same run_id guard as sandboxIds — only this run's events may render.
+        if (e.run_id.toLowerCase() !== runId.toLowerCase()) return false;
         if (filterSource && e.source !== filterSource) return false;
         if (filterType && e.type !== filterType) return false;
         // The sandbox dropdown is a merged-view control — in split mode the
@@ -263,7 +270,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
         }
         return true;
       }),
-    [events, filterSource, filterType, filterSandbox, viewMode],
+    [events, filterSource, filterType, filterSandbox, viewMode, runId],
   );
 
   // PR9 metrics strip data + adapter labels for the sandbox filter dropdown.
