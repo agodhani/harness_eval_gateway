@@ -155,6 +155,8 @@ def cli_translate_events(
             continue
         if isinstance(obj, dict):
             events.extend(translate_obj(obj))
+        elif translate_text is not None:
+            events.extend(translate_text(line))
     return events
 
 
