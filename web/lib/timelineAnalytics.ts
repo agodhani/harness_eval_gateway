@@ -15,7 +15,7 @@ import {
   type RunAnalytics,
   type SandboxAnalytics,
 } from "./api.ts";
-import { formatInt, formatUsd } from "./format.ts";
+import { formatNum, formatUsd } from "./format.ts";
 
 /** One rendered stat on a sandbox chip — `label` pairs with `value`. */
 export interface StatChip {
@@ -62,23 +62,23 @@ function toStrip(
   const chips: StatChip[] = [
     {
       label: "llm",
-      value: formatInt(sb.llm_turns),
+      value: formatNum(sb.llm_turns),
       title: "LLM turns (llm_response events)",
     },
     {
       label: "tok",
-      value: `${formatInt(sb.tokens.input)}→${formatInt(sb.tokens.output)}`,
+      value: `${formatNum(sb.tokens.input)}→${formatNum(sb.tokens.output)}`,
       title:
-        `tokens in→out · ${formatInt(sb.tokens.total)} total` +
+        `tokens in→out · ${formatNum(sb.tokens.total)} total` +
         (sb.tokens.cache_read > 0
-          ? ` · ${formatInt(sb.tokens.cache_read)} cached`
+          ? ` · ${formatNum(sb.tokens.cache_read)} cached`
           : ""),
     },
     latencyChip(sb),
     costChip(sb, price, priceName),
     {
       label: "err",
-      value: formatInt(sb.errors),
+      value: formatNum(sb.errors),
       tone: sb.errors > 0 ? "bad" : "default",
       title: "error events",
     },
@@ -123,5 +123,6 @@ function costChip(
 function evalLine(sb: SandboxAnalytics): string | null {
   const ev = sb.evaluator;
   if (!ev) return null;
-  return `judge ${formatInt(ev.llm_turns)} turns · ${formatInt(ev.tokens.total)} tok · ${formatUsd(ev.estimated_cost_usd)}`;
+  // Same fields as the results-page evaluator row (incl. judge errors).
+  return `judge ${formatNum(ev.llm_turns)} turns · ${formatNum(ev.tokens.total)} tok · ${formatUsd(ev.estimated_cost_usd)} · ${formatNum(ev.errors)} err`;
 }

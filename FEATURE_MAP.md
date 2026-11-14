@@ -258,7 +258,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   in `api/schemas.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx`,
   `web/lib/api.ts` (`getRunAnalytics`, `estimateCostUsd`),
   `web/lib/timelineAnalytics.ts` (`sandboxStrips` transform) +
-  `timelineAnalytics.test.ts`, `web/lib/format.ts` (`formatInt`/`formatUsd`),
+  `timelineAnalytics.test.ts`, `web/lib/format.ts` (`formatNum`/`formatUsd`),
   `web/app/runs/[id]/timeline/SandboxMetricsBar.tsx` + `.tl-metric*` in
   `web/app/globals.css`
 - **Verify:**

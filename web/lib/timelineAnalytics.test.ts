@@ -49,6 +49,7 @@ function fixture(): RunAnalytics {
         evaluator: {
           llm_turns: 3,
           tokens: { input: 2000, output: 400, total: 2400 },
+          errors: 1,
           estimated_cost_usd: 0.00712,
         },
       },
@@ -127,7 +128,7 @@ describe("sandboxStrips", () => {
   test("evaluator traffic becomes a separate judge line, not mixed into chips", () => {
     const [a] = sandboxStrips(fixture());
     // sub-cent judge cost exercises the 4dp branch: 0.00712 → $0.0071
-    assert.equal(a.evalLine, "judge 3 turns · 2,400 tok · $0.0071");
+    assert.equal(a.evalLine, "judge 3 turns · 2,400 tok · $0.0071 · 1 err");
     // participant chips stay participant-only: 12 turns, not 12+3
     assert.equal(chip(a, "llm").value, "12");
   });
