@@ -880,6 +880,83 @@ table.table {
   letter-spacing: 0.06em;
 }
 
+/* PR9 — per-sandbox metrics strip between the toolbar and the event stream;
+   chips double as sandbox-filter selectors (click toggles the same filter
+   state ?sandbox= seeds; the URL param itself isn't rewritten). */
+.tl-metrics {
+  display: flex;
+  gap: 0.45rem;
+  padding: 0.5rem 0.8rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  overflow-x: auto;
+}
+.tl-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 0.28rem;
+  min-width: 200px;
+  padding: 0.4rem 0.6rem 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--bg);
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.tl-metric:hover {
+  border-color: var(--border-strong);
+}
+.tl-metric.is-active {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.tl-metric__head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
+.tl-metric__id {
+  font-size: 0.72rem;
+  color: var(--text);
+}
+.tl-metric__label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.68rem;
+  color: var(--text-faint);
+}
+.tl-metric__stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.65rem;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--text);
+}
+.tl-metric__stat {
+  white-space: nowrap;
+}
+.tl-metric__k {
+  color: var(--text-faint);
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.tl-metric__stat--bad {
+  color: var(--red);
+}
+.tl-metric__eval {
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  color: var(--amber);
+}
+
 .timeline-scroll {
   max-height: calc(100vh - 320px);
   min-height: 320px;
