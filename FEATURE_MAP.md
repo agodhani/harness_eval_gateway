@@ -38,6 +38,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Where:** `docker-compose.yml`, `Dockerfile`, `db/migrations/`,
   `pyproject.toml`, `.github/workflows/ci.yml`, `web/playwright.config.ts`,
   `web/e2e/smoke.spec.ts`, `tests/`
+- **Theme:** `web/app/globals.css` — dark "instrument panel" tokens
+  (near-black surfaces, hairline borders, signal-lime `--accent`, mono
+  kickers, square badges, per-event-type colors via `.tl-type[data-type]`).
 - **Verify:**
   - `docker compose up -d` → `curl localhost:8001/health` + `/health/db` ok
   - `DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5433/harness_eval alembic upgrade head` → all tables present

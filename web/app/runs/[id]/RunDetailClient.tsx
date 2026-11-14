@@ -309,6 +309,7 @@ export default function RunDetailClient({ runId }: { runId: string }) {
     <main className="container">
       <div className="page-header">
         <div>
+          <span className="kicker"><b>02</b> — run detail</span>
           <div className="row" style={{ marginBottom: "0.35rem" }}>
             <h1 className="mono" style={{ fontSize: "1.15rem" }} title={run.id}>
               {shortId(run.id, 13)}…

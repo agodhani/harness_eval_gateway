@@ -2,30 +2,54 @@ import Link from "next/link";
 
 export default function Home() {
   return (
-    <main className="container container--narrow" style={{ paddingTop: "3rem" }}>
-      <div className="card">
-        <div className="card__body" style={{ textAlign: "center", padding: "2.5rem 2rem" }}>
-          <h1 style={{ fontSize: "1.6rem", marginBottom: "0.5rem" }}>
-            harness_eval_gateway — MVP scaffold
-          </h1>
-          <p className="muted" style={{ maxWidth: "34rem", margin: "0 auto 1.5rem" }}>
-            Comparative evaluation of AI coding-agent harnesses. Submit a task,
-            approve the rubric, and watch sandboxes race on the same model while
-            a custom AI gateway captures every token.
-          </p>
-          <div className="row" style={{ justifyContent: "center" }}>
-            <Link href="/submit" className="btn btn--primary">
-              Submit a run
-            </Link>
-            <Link href="/runs" className="btn">
-              Browse runs
-            </Link>
-          </div>
-          <p className="faint" style={{ marginTop: "1.75rem", fontSize: "0.8rem" }}>
-            Control API: <code>http://localhost:8001</code> · events stream over SSE
-          </p>
-        </div>
+    <main className="container container--narrow landing">
+      <div className="landing__kicker-row">
+        <span className="kicker">comparative agent-harness evaluation</span>
+        <span className="hline" aria-hidden />
+        <span className="kicker" style={{ color: "var(--accent)" }}>
+          local · single-user · oss
+        </span>
       </div>
+
+      <h1>
+        harness_eval_gateway — benchmark the <span className="sig">harness</span>,
+        not the model.
+      </h1>
+
+      <p className="landing__lede">
+        One task, one model, N harness configurations in locked-down Docker
+        sandboxes. A custom AI gateway meters every token, a frozen rubric
+        scores every artifact, and an append-only event stream remembers
+        everything.
+      </p>
+
+      <div className="landing__ctas">
+        <Link href="/submit" className="btn btn--primary">
+          Submit a run
+        </Link>
+        <Link href="/runs" className="btn">
+          Browse runs
+        </Link>
+      </div>
+
+      <dl className="landing__spec">
+        <div className="landing__spec-row">
+          <dt>lifecycle</dt>
+          <dd>submitted → rubric_review → provisioning → running → evaluating → done</dd>
+        </div>
+        <div className="landing__spec-row">
+          <dt>adapters</dt>
+          <dd>miniloop · codex · claude_code · pi · deepseek</dd>
+        </div>
+        <div className="landing__spec-row">
+          <dt>gateway</dt>
+          <dd>/v1/chat/completions · /v1/messages · /v1/responses · per-run creds</dd>
+        </div>
+        <div className="landing__spec-row">
+          <dt>control api</dt>
+          <dd>http://localhost:8001 · events stream over SSE</dd>
+        </div>
+      </dl>
     </main>
   );
 }

@@ -228,6 +228,7 @@ export default function SubmitPage() {
     <main className="container container--narrow">
       <div className="page-header">
         <div>
+          <span className="kicker"><b>01</b> — experiment spec</span>
           <h1>Submit a run</h1>
           <p className="subtitle">
             One task, one model, N harness configurations — evaluated side by side.
