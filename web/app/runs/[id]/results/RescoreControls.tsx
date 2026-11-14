@@ -139,9 +139,10 @@ export default function RescoreControls({
           ? `Rubric v${out.version} saved (edit of ${baseLabel}) — re-score queued.`
           : `Rubric v${out.version} saved (edit of ${baseLabel}).`,
       );
-      // The new version becomes the latest — drop the pinned view (which
-      // also triggers a refetch through the parent).
+      // The new version becomes the latest — drop the pinned view, then
+      // refetch so the new version + re-score status show immediately.
       onSelectVersion(null);
+      onChanged();
     } catch (err) {
       setError(errMsg(err, "Failed to save rubric version."));
     } finally {

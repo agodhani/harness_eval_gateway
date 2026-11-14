@@ -27,7 +27,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from db.models import Rubric, Run, Sandbox, Score
+from db.models import Event, Rubric, Run, Sandbox, Score
 from sandbox.runtime import SandboxRuntime
 
 from . import lifecycle, state_machine
@@ -222,11 +222,13 @@ def _fail_run_and_sandboxes(
 ) -> None:
     """Mark a stale run failed + its non-terminal sandboxes failed/error.
 
-    Exception: a run cut off in ``evaluating`` keeps the lifecycle's own
-    rule — done iff ≥1 Score row exists. This covers first-pass evals with
-    partial scores AND a re-score (done → evaluating) interrupted by an api
-    restart, which would otherwise demote a previously-done run to failed
-    despite complete old scores.
+    Exception: a run cut off mid-RE-SCORE keeps the lifecycle's own rule —
+    done iff ≥1 Score row exists — so a restart doesn't demote a
+    previously-done run to failed despite complete old scores. The
+    ``rescore_requested``/``rescore_started`` checkpoints (emitted in the
+    same transaction as the terminal → evaluating transition) mark a
+    re-score pass; first-pass evals carry no marker and still fail,
+    partial scores included.
     """
     with session_factory() as session:
         run = session.get(Run, run_id)
@@ -234,17 +236,32 @@ def _fail_run_and_sandboxes(
         if run is not None and run.status not in state_machine.RUN_TERMINAL:
             to_status = "failed"
             if run.status == "evaluating":
-                scores = int(
+                rescore_pass = (
                     session.execute(
-                        select(func.count(Score.id))
-                        .select_from(Score)
-                        .join(Sandbox, Score.sandbox_id == Sandbox.id)
-                        .where(Sandbox.run_id == run_id)
-                    ).scalar_one()
+                        select(Event.id)
+                        .where(
+                            Event.run_id == run_id,
+                            Event.type == "checkpoint",
+                            Event.payload["stage"]
+                            .as_string()
+                            .in_(("rescore_requested", "rescore_started")),
+                        )
+                        .limit(1)
+                    ).first()
+                    is not None
                 )
-                if scores > 0:
-                    to_status = "done"
-                    rescued = True
+                if rescore_pass:
+                    scores = int(
+                        session.execute(
+                            select(func.count(Score.id))
+                            .select_from(Score)
+                            .join(Sandbox, Score.sandbox_id == Sandbox.id)
+                            .where(Sandbox.run_id == run_id)
+                        ).scalar_one()
+                    )
+                    if scores > 0:
+                        to_status = "done"
+                        rescued = True
             try:
                 state_machine.transition(session, run, to_status)
             except state_machine.InvalidTransition:
@@ -271,7 +288,7 @@ def _fail_run_and_sandboxes(
                 payload={
                     "stage": "startup_sweep",
                     "message": (
-                        "run was mid-eval at api restart — done via existing scores"
+                        "run was mid-rescore at api restart — done via existing scores"
                         if rescued
                         else "run was mid-flight at api restart — marked failed"
                     ),

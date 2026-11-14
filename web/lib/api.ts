@@ -548,12 +548,6 @@ export function getRunResults(runId: string, rubricVersion?: number): Promise<Ru
 // eval iteration (PR5 — rubric versions + re-score)
 // ---------------------------------------------------------------------------
 
-export function listRubricVersions(runId: string): Promise<RubricVersionOut[]> {
-  return request<RubricVersionOut[]>(
-    `/api/runs/${encodeURIComponent(runId)}/rubrics`,
-  );
-}
-
 /** One rubric version incl. content — prefills the post-run edit editor. */
 export function getRubricVersion(rubricId: string): Promise<RubricOut> {
   return request<RubricOut>(`/api/rubrics/${encodeURIComponent(rubricId)}`);

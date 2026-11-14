@@ -463,9 +463,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     editor that saves as the next version (+ optional re-score); per-
     sandbox "judged: rubric vN" provenance in the matrix header.
   - **Crash semantics:** an api restart mid-re-score keeps the startup-
-    sweep rule — `evaluating` runs with ≥1 Score row recover to `done`,
-    so a re-score interrupted after the original eval doesn't fail a
-    previously-done run.
+    sweep rule — an `evaluating` run carrying a `rescore_requested`/
+    `rescore_started` checkpoint with ≥1 Score row recovers to `done`
+    (a first-pass eval has no marker and still fails), so an
+    interrupted re-score doesn't demote a previously-done run.
 - **Where:** `db/models.py` (`Rubric.parent_id`, `Score.rubric_version`) +
   migration `b3e7a1c9d2f4`; `orchestrator/rubric.py`
   (`create_rubric_version`), `orchestrator/lifecycle.py` (`rescore_run`,

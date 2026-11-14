@@ -478,10 +478,52 @@ async def test_start_rescore_task_registers_and_dedups(
     assert _run(session_factory, run.id).status == "done"
 
 
-async def test_sweep_rescues_evaluating_run_with_scores(
+async def test_sweep_rescues_mid_rescore_run_with_scores(
     session_factory, settings, artifact_root
 ) -> None:
-    """api restart mid-eval keeps prior scores → done (not failed)."""
+    """api restart mid-RE-SCORE keeps prior scores → done (not failed).
+
+    The rescore_requested checkpoint (emitted in the same transaction as
+    the done → evaluating transition) is what marks this as a re-score
+    pass rather than a first-pass eval.
+    """
+    run = make_run(session_factory, status="evaluating", config=run_config())
+    rubric = _rubric(session_factory, run.id, version=1)
+    sb = _artifact_sandbox(session_factory, artifact_root, run.id)
+    with session_factory() as s:
+        s.add(
+            Score(
+                sandbox_id=sb.id,
+                rubric_id=rubric.id,
+                rubric_version=1,
+                dimension="functional_requirements",
+                score=7.0,
+            )
+        )
+        s.add(
+            Event(
+                run_id=run.id,
+                source="orchestrator",
+                type="checkpoint",
+                payload={"stage": "rescore_requested", "rubric_version": 1},
+            )
+        )
+        s.commit()
+
+    await runner.startup_sweep(
+        session_factory=session_factory,
+        settings=settings,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+    )
+
+    assert _run(session_factory, run.id).status == "done"
+
+
+async def test_sweep_fails_first_pass_eval_with_scores(
+    session_factory, settings, artifact_root
+) -> None:
+    """Mid-FIRST-PASS eval with partial scores still fails — the rescue
+    only applies to re-score passes (rescore checkpoint present)."""
     run = make_run(session_factory, status="evaluating", config=run_config())
     rubric = _rubric(session_factory, run.id, version=1)
     sb = _artifact_sandbox(session_factory, artifact_root, run.id)
@@ -503,7 +545,7 @@ async def test_sweep_rescues_evaluating_run_with_scores(
         runtime=FakeRuntime(artifact_root=artifact_root),
     )
 
-    assert _run(session_factory, run.id).status == "done"
+    assert _run(session_factory, run.id).status == "failed"
 
 
 async def test_sweep_fails_evaluating_run_without_scores(
