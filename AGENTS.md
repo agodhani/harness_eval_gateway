@@ -437,7 +437,9 @@ or tests change.
   `x-api-key` + `anthropic-version` (`ANTHROPIC_VERSION`, default
   2023-06-01; caller `anthropic-beta`/`anthropic-version` headers are
   forwarded when the resolved provider is anthropic). An `x-heg-provider`
-  request header forces the provider outright (unknown values 400). Emitted
+  request header forces the provider outright on service creds
+  (`sandbox_id=None`; unknown/unkeyed values 400 — silently ignored on
+  sandbox-scoped creds so agent code can't pick paid upstreams). Emitted
   `llm_request`/`llm_response`/`error` events record the resolved provider.
   Tests pin `UPSTREAM_PROVIDER=ollama` in `tests/conftest.py`.
 - `GET /api/skillpacks` (F11) lists vendored + imported packs (the submit

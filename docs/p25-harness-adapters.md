@@ -45,8 +45,8 @@ base URL:
 So the gateway stays a **pure pass-through with metering** — no protocol
 translation. Each new endpoint gets: cred auth → run-budget gate → forward to
 the resolved upstream verbatim (`OLLAMA_UPSTREAM_URL` by default;
-`PROVIDER_ROUTES` model globs or an `x-heg-provider` header can route to a
-hosted provider) → `llm_request`/`llm_response`/`error` events.
+`PROVIDER_ROUTES` model globs or — for service creds — an `x-heg-provider`
+header can route to a hosted provider) → `llm_request`/`llm_response`/`error` events.
 For `stream: true` bodies the response is an SSE stream that is tee'd to the
 client while usage is scraped from the terminal SSE events
 (`message_start`/`message_delta` for Anthropic, `response.completed` for

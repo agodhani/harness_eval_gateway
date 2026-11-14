@@ -42,10 +42,12 @@ append-mostly; rebase on main before merge.
   overrides the process-wide provider per request model, so one gateway can
   e.g. route `claude-*` to Anthropic while the rest stays on Ollama. Every
   provider a request may resolve to must have its key (boot-time check).
-  An `x-heg-provider` request header forces the provider outright (unknown
-  values 400); caller `anthropic-beta`/`anthropic-version` headers forward
-  to the anthropic upstream. Emitted `llm_*`/`error` events record the
-  resolved provider.
+  An `x-heg-provider` request header forces the provider outright on
+  service creds (`sandbox_id=None`; unknown or unkeyed values 400) and is
+  silently ignored on sandbox-scoped creds — agent code can't retarget
+  onto paid upstreams; caller `anthropic-beta`/`anthropic-version` headers
+  forward to the anthropic upstream. Emitted `llm_*`/`error` events record
+  the resolved provider.
 
 ## Dependency DAG
 
@@ -194,7 +196,7 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
   wanted (today's switch is process-wide).
 - **Landed:** `openai` + `anthropic` providers; `PROVIDER_ROUTES` JSON
   model-glob → provider overrides resolved per request `model`;
-  `x-heg-provider` request header override; caller
+  `x-heg-provider` request header override (service creds only); caller
   `anthropic-beta`/`anthropic-version` headers forward to the anthropic
   upstream; provider recorded on emitted `llm_*`/`error` events.
 - **Touch:** `gateway/config.py`, `gateway/deps.py`,

@@ -160,6 +160,19 @@ class GatewaySettings(BaseSettings):
                     return provider
         return self.UPSTREAM_PROVIDER
 
+    def provider_keyed(self, provider: ProviderName) -> bool:
+        """Whether ``provider`` has credentials configured — ``ollama``
+        always (no key required); hosted providers only when their
+        ``*_API_KEY`` is set.
+
+        ``model_post_init`` already keys the default + every routed
+        provider; this exists for the ``x-heg-provider`` override, which
+        may name ANY valid provider — an unkeyed one would resolve fine
+        then 401 upstream, so service-cred overrides check against this.
+        """
+        field = _PROVIDER_KEY_FIELDS.get(provider)
+        return field is None or bool(getattr(self, field))
+
     def upstream_base_url_for(self, provider: ProviderName) -> str:
         """httpx client base for ``provider``.
 

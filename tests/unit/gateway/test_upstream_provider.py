@@ -2,7 +2,8 @@
 
 Covers the four providers (ollama | openrouter | openai | anthropic),
 PROVIDER_ROUTES model-glob resolution, the ``x-heg-provider`` request-header
-override, and protocol-header forwarding to the anthropic upstream.
+override (service creds only — ignored on sandbox-scoped creds), and
+protocol-header forwarding to the anthropic upstream.
 
 Hermetic: settings are constructed directly (env file reads disabled), the
 upstream is an httpx.MockTransport injected via dependency override, and
@@ -12,6 +13,7 @@ ingest emission is monkeypatched — no live upstream/api.
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, Self
 
 import httpx
@@ -22,7 +24,7 @@ from pydantic import ValidationError
 
 from gateway import deps, main, metering
 from gateway.config import GatewaySettings
-from gateway.creds import DEV_CRED_TOKEN
+from gateway.creds import DEV_CRED_TOKEN, CredClaims, mint_cred
 from gateway.deps import get_upstream_client
 
 _UPSTREAM_OK = {
@@ -37,6 +39,34 @@ _UPSTREAM_OK = {
     ],
     "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
 }
+
+# Claims for direct ``deps.get_provider`` calls: sandbox-shaped (like every
+# participant/evaluator cred — and ``heg-dev``) vs run-scoped service creds.
+_SANDBOX_CLAIMS = CredClaims(
+    run_id="run", sandbox_id="sandbox", iat=0, exp=2**31 - 1
+)
+_SERVICE_CLAIMS = CredClaims(run_id="run", sandbox_id=None, iat=0, exp=2**31 - 1)
+
+
+def _service_cred() -> str:
+    """Mint a run-scoped SERVICE cred (``sandbox_id=None``) keyed to whatever
+    settings the gateway's auth currently resolves."""
+    return mint_cred(
+        run_id=uuid.uuid4(),
+        sandbox_id=None,
+        secret=deps.get_settings().GATEWAY_CRED_SECRET,
+        ttl_seconds=3600,
+    )
+
+
+def _sandbox_cred() -> str:
+    """Mint a sandbox-scoped participant cred."""
+    return mint_cred(
+        run_id=uuid.uuid4(),
+        sandbox_id=uuid.uuid4(),
+        secret=deps.get_settings().GATEWAY_CRED_SECRET,
+        ttl_seconds=3600,
+    )
 
 
 def _settings(**kwargs) -> GatewaySettings:
@@ -208,14 +238,48 @@ class TestGetProvider:
             ),
         )
         assert (
-            deps.get_provider(_request(), {"model": "claude-sonnet-4-5"})
+            deps.get_provider(
+                _request(), _SERVICE_CLAIMS, {"model": "claude-sonnet-4-5"}
+            )
             == "anthropic"
         )
         # Unmatched model + absent body fall back to the default.
-        assert deps.get_provider(_request(), {"model": "qwen3:8b"}) == "ollama"
-        assert deps.get_provider(_request()) == "ollama"
+        assert (
+            deps.get_provider(_request(), _SERVICE_CLAIMS, {"model": "qwen3:8b"})
+            == "ollama"
+        )
+        assert deps.get_provider(_request(), _SERVICE_CLAIMS) == "ollama"
 
     def test_header_overrides_routes_and_default(self, monkeypatch) -> None:
+        """Service creds (``sandbox_id=None``) get the header override."""
+        monkeypatch.setattr(
+            deps,
+            "get_settings",
+            lambda: _settings(
+                PROVIDER_ROUTES='{"claude-*": "anthropic"}',
+                ANTHROPIC_API_KEY="a",
+                OPENAI_API_KEY="o",
+            ),
+        )
+        req = _request({"x-heg-provider": "openai"})
+        assert (
+            deps.get_provider(
+                req, _SERVICE_CLAIMS, {"model": "claude-sonnet-4-5"}
+            )
+            == "openai"
+        )
+
+    def test_header_value_is_case_and_space_tolerant(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            deps, "get_settings", lambda: _settings(OPENROUTER_API_KEY="k")
+        )
+        req = _request({"x-heg-provider": " OpenRouter "})
+        assert deps.get_provider(req, _SERVICE_CLAIMS) == "openrouter"
+
+    def test_sandbox_cred_ignores_header(self, monkeypatch) -> None:
+        """Sandbox-scoped creds get NO override — agent-controlled code must
+        not retarget its traffic onto paid upstreams. The header is ignored
+        and normal PROVIDER_ROUTES/default resolution runs."""
         monkeypatch.setattr(
             deps,
             "get_settings",
@@ -226,19 +290,45 @@ class TestGetProvider:
         )
         req = _request({"x-heg-provider": "openai"})
         assert (
-            deps.get_provider(req, {"model": "claude-sonnet-4-5"}) == "openai"
+            deps.get_provider(
+                req, _SANDBOX_CLAIMS, {"model": "claude-sonnet-4-5"}
+            )
+            == "anthropic"
+        )
+        assert (
+            deps.get_provider(req, _SANDBOX_CLAIMS, {"model": "qwen3:8b"})
+            == "ollama"
         )
 
-    def test_header_value_is_case_and_space_tolerant(self) -> None:
-        req = _request({"x-heg-provider": " OpenRouter "})
-        assert deps.get_provider(req) == "openrouter"
+    def test_sandbox_cred_bogus_header_ignored_not_400(self) -> None:
+        """Ignoring is total for sandbox creds — no loud 400 signal either
+        (silent-ignore is the safe, consistent answer for agent callers)."""
+        req = _request({"x-heg-provider": "bogus"})
+        assert (
+            deps.get_provider(req, _SANDBOX_CLAIMS, {"model": "m"}) == "ollama"
+        )
 
     def test_unknown_header_value_400s(self) -> None:
         req = _request({"x-heg-provider": "bogus"})
         with pytest.raises(HTTPException) as excinfo:
-            deps.get_provider(req, {"model": "m"})
+            deps.get_provider(req, _SERVICE_CLAIMS, {"model": "m"})
         assert excinfo.value.status_code == 400
         assert "bogus" in str(excinfo.value.detail)
+
+    def test_unkeyed_header_override_400s(self, monkeypatch) -> None:
+        """A valid provider NAME with no configured key must also 400 for
+        service creds — resolving it would only 401 upstream."""
+        monkeypatch.setattr(deps, "get_settings", lambda: _settings())
+        req = _request({"x-heg-provider": "anthropic"})
+        with pytest.raises(HTTPException) as excinfo:
+            deps.get_provider(req, _SERVICE_CLAIMS, {"model": "m"})
+        assert excinfo.value.status_code == 400
+        assert "anthropic" in str(excinfo.value.detail)
+        # Once keyed, the same override is honored.
+        monkeypatch.setattr(
+            deps, "get_settings", lambda: _settings(ANTHROPIC_API_KEY="k")
+        )
+        assert deps.get_provider(req, _SERVICE_CLAIMS, {"model": "m"}) == "anthropic"
 
 
 class TestUpstreamClient:
@@ -318,7 +408,9 @@ class TestUpstreamClient:
                 ANTHROPIC_API_KEY="sk-ant",
             ),
         )
-        provider = deps.get_provider(_request(), {"model": "claude-sonnet-4-5"})
+        provider = deps.get_provider(
+            _request(), _SANDBOX_CLAIMS, {"model": "claude-sonnet-4-5"}
+        )
         agen = deps.get_upstream_client(provider=provider)
         client = await agen.__anext__()
         try:
@@ -419,9 +511,10 @@ class TestRealDepRouting:
     def test_header_override_routes_through_real_dep(
         self, gw_client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``x-heg-provider`` forces the provider for the upstream client and
-        body rewriting — a model that would otherwise route elsewhere (here:
-        default ollama) still lands on the overridden provider."""
+        """``x-heg-provider`` on a SERVICE cred forces the provider for the
+        upstream client and body rewriting — a model that would otherwise
+        route elsewhere (here: default ollama) still lands on the
+        overridden provider."""
         settings = _settings(OPENAI_API_KEY="sk-oai")
         monkeypatch.setattr(deps, "get_settings", lambda: settings)
         monkeypatch.setattr(main, "get_settings", lambda: settings)
@@ -431,7 +524,7 @@ class TestRealDepRouting:
         resp = gw_client.post(
             "/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {DEV_CRED_TOKEN}",
+                "Authorization": f"Bearer {_service_cred()}",
                 "x-heg-provider": "openai",
             },
             json={
@@ -448,17 +541,70 @@ class TestRealDepRouting:
         # defaults injected for a non-ollama provider.
         assert "num_ctx" not in seen["json"]
 
+    def test_sandbox_cred_header_override_ignored(
+        self, gw_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A sandbox-scoped cred's ``x-heg-provider`` is ignored end-to-end:
+        the upstream client is built for the normally-resolved provider
+        (ollama default here), never the named paid provider."""
+        settings = _settings(ANTHROPIC_API_KEY="sk-ant")
+        monkeypatch.setattr(deps, "get_settings", lambda: settings)
+        monkeypatch.setattr(main, "get_settings", lambda: settings)
+        seen = self._fake_client(monkeypatch)
+        self._no_ingest(monkeypatch)
+
+        resp = gw_client.post(
+            "/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {_sandbox_cred()}",
+                "x-heg-provider": "anthropic",
+            },
+            json={
+                "model": "qwen3:8b",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 200
+
+        # Header ignored → default ollama client (no anthropic key sent),
+        # with its ollama-only defaults injected as usual.
+        assert seen["init"]["base_url"] == "http://host.docker.internal:11434"
+        assert seen["init"]["headers"] == {}
+        assert seen["json"]["num_ctx"] == 32_768
+
     def test_unknown_header_override_400s(
         self, gw_client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A bogus ``x-heg-provider`` must never silently fall back to
-        model/default routing — the request 400s."""
+        """A bogus ``x-heg-provider`` on a service cred must never silently
+        fall back to model/default routing — the request 400s."""
         self._no_ingest(monkeypatch)
         resp = gw_client.post(
             "/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {DEV_CRED_TOKEN}",
+                "Authorization": f"Bearer {_service_cred()}",
                 "x-heg-provider": "bogus",
+            },
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 400
+
+    def test_unkeyed_header_override_400s(
+        self, gw_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A service-cred override naming a provider with no configured API
+        key 400s — resolving it would only 401 upstream."""
+        settings = _settings()  # ollama default; no hosted keys
+        monkeypatch.setattr(deps, "get_settings", lambda: settings)
+        monkeypatch.setattr(main, "get_settings", lambda: settings)
+        self._no_ingest(monkeypatch)
+        resp = gw_client.post(
+            "/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {_service_cred()}",
+                "x-heg-provider": "anthropic",
             },
             json={
                 "model": "m",
@@ -700,12 +846,19 @@ class TestAnthropicHeaderForwarding:
         monkeypatch.setattr(metering, "post_ingest_events", fake_post)
 
     def test_protocol_headers_forwarded_to_anthropic(
-        self, gw_client: TestClient, forwarded: dict[str, Any]
+        self,
+        gw_client: TestClient,
+        forwarded: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # The override needs a service cred + a keyed anthropic provider.
+        settings = _settings(ANTHROPIC_API_KEY="sk-ant")
+        monkeypatch.setattr(deps, "get_settings", lambda: settings)
+        monkeypatch.setattr(main, "get_settings", lambda: settings)
         resp = gw_client.post(
             "/v1/messages",
             headers={
-                "Authorization": f"Bearer {DEV_CRED_TOKEN}",
+                "Authorization": f"Bearer {_service_cred()}",
                 "x-heg-provider": "anthropic",
                 "anthropic-beta": "context-1m-2025-08-07,interleaved-thinking-2025-05-14",
                 "anthropic-version": "2024-06-01",
@@ -732,6 +885,28 @@ class TestAnthropicHeaderForwarding:
             "/v1/messages",
             headers={
                 "Authorization": f"Bearer {DEV_CRED_TOKEN}",
+                "anthropic-beta": "context-1m-2025-08-07",
+            },
+            json={
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 200
+        assert "anthropic-beta" not in forwarded["headers"]
+
+    def test_sandbox_cred_provider_header_ignored(
+        self, gw_client: TestClient, forwarded: dict[str, Any]
+    ) -> None:
+        """A sandbox cred's ``x-heg-provider: anthropic`` is ignored — the
+        request resolves ollama, so anthropic protocol headers must NOT
+        reach the upstream either."""
+        resp = gw_client.post(
+            "/v1/messages",
+            headers={
+                "Authorization": f"Bearer {_sandbox_cred()}",
+                "x-heg-provider": "anthropic",
                 "anthropic-beta": "context-1m-2025-08-07",
             },
             json={

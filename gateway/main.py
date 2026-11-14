@@ -30,7 +30,9 @@ Upstream providers: ``UPSTREAM_PROVIDER`` (``ollama`` default, ``openrouter``,
 ``openai``, ``anthropic``) is the process-wide default; ``PROVIDER_ROUTES``
 maps model globs → provider for per-request overrides resolved from the
 request body's ``model``; an ``x-heg-provider`` request header forces a
-provider outright (unknown values 400). Caller ``anthropic-beta``/
+provider outright for SERVICE creds only (``sandbox_id=None`` — unknown or
+unkeyed values 400; the header is ignored on sandbox-scoped creds so agent
+code can't retarget onto paid upstreams). Caller ``anthropic-beta``/
 ``anthropic-version`` headers are forwarded when the resolved provider is
 ``anthropic``. Endpoint coverage differs per provider — a path the
 resolved upstream doesn't implement returns its native 404 verbatim (e.g.
@@ -47,7 +49,6 @@ this matches the ingest token sandboxes may be configured with.
 from __future__ import annotations
 
 import asyncio
-import secrets
 import time
 import uuid
 from collections.abc import Mapping
@@ -55,7 +56,7 @@ from datetime import datetime
 from typing import Annotated, Any
 
 import httpx
-from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -63,88 +64,16 @@ from pydantic import BaseModel, Field
 from api.schemas import EventSource, EventType
 from gateway import metering
 from gateway.config import ProviderName, get_settings
-from gateway.creds import CredClaims, CredError, verify_cred
+from gateway.creds import CredClaims
 from gateway.deps import (
+    get_cred,
+    get_events_auth,
     get_provider,
     get_session_factory,
     get_upstream_client,
 )
 
 router = APIRouter()
-
-
-# ---------------------------------------------------------------------------
-# auth
-# ---------------------------------------------------------------------------
-
-
-def _bearer_token(request: Request) -> str:
-    auth = request.headers.get("authorization", "")
-    scheme, _, token = auth.partition(" ")
-    if scheme.lower() != "bearer" or not token.strip():
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="missing Bearer credential",
-        )
-    return token.strip()
-
-
-def _credential_token(request: Request) -> str:
-    """Bearer token, falling back to Anthropic-style ``x-api-key``.
-
-    Anthropic-SDK clients (dsh's DeepSeek Messages adapter) send the
-    credential as ``x-api-key`` rather than ``Authorization: Bearer``.
-    """
-    auth = request.headers.get("authorization", "")
-    scheme, _, token = auth.partition(" ")
-    if scheme.lower() == "bearer" and token.strip():
-        return token.strip()
-    api_key = request.headers.get("x-api-key", "").strip()
-    if api_key:
-        return api_key
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="missing Bearer credential",
-    )
-
-
-def get_cred(request: Request) -> CredClaims:
-    """Strict credential auth — used by the proxy and /internal/done."""
-    settings = get_settings()
-    try:
-        return verify_cred(
-            _credential_token(request), secret=settings.GATEWAY_CRED_SECRET
-        )
-    except CredError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"invalid credential: {exc}",
-        ) from exc
-
-
-def get_events_auth(request: Request) -> tuple[CredClaims | None, bool]:
-    """Auth for /internal/events.
-
-    Returns ``(claims, via_cred)``. A valid ``heg.*``/``heg-dev`` credential
-    stamps run/sandbox ids onto every event; the static ``INGEST_TOKEN``
-    bearer is accepted as pass-through for producers that carry their own
-    run_id/sandbox_id (the api ingest validates them).
-    """
-    settings = get_settings()
-    token = _bearer_token(request)
-    try:
-        return (
-            verify_cred(token, secret=settings.GATEWAY_CRED_SECRET),
-            True,
-        )
-    except CredError:
-        pass
-    if secrets.compare_digest(token, settings.INGEST_TOKEN):
-        return None, False
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="invalid credential",
-    )
 
 
 # ---------------------------------------------------------------------------

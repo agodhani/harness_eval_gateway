@@ -111,7 +111,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `ollama` (default), `openrouter`, `openai`, `anthropic` — and
   `PROVIDER_ROUTES` (JSON `{"model-glob": provider}`) overrides it per
   request model (first match wins, case-insensitive); an `x-heg-provider`
-  request header forces the provider outright (unknown values 400). Each
+  request header forces the provider outright on service creds
+  (`sandbox_id=None`; unknown/unkeyed values 400, ignored on
+  sandbox-scoped creds). Each
   provider gets its own key/base-URL/headers (Anthropic sends `x-api-key` +
   `anthropic-version`; caller `anthropic-beta`/`anthropic-version` headers
   forward to the anthropic provider); endpoints a provider doesn't
