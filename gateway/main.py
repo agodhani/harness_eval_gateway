@@ -182,6 +182,17 @@ def _tokens_used(run_uuid: uuid.UUID) -> int:
         return metering.tokens_used(session, run_uuid)
 
 
+# Body params only Ollama understands — harnesses tuned for Ollama (miniloop's
+# `think`/`num_ctx`) emit them; hosted providers may 400 on unknown fields.
+_OLLAMA_ONLY_KEYS = ("num_ctx", "keep_alive", "think", "options")
+
+
+def _strip_ollama_only(body: dict[str, Any]) -> dict[str, Any]:
+    if get_settings().inject_ollama_defaults:
+        return body
+    return {k: v for k, v in body.items() if k not in _OLLAMA_ONLY_KEYS}
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(
     body: Annotated[dict[str, Any], Body()],
@@ -194,14 +205,15 @@ async def chat_completions(
     # passthrough applies the budget gate + llm_request emit, so this branch
     # must run before the non-streamed gate below.
     if body.get("stream"):
-        out = dict(body)
+        out = _strip_ollama_only(dict(body))
         # Ask the upstream for a terminal usage chunk so streamed calls stay
         # metered (no-op for upstreams that ignore it).
         stream_options = dict(out.get("stream_options") or {})
         stream_options.setdefault("include_usage", True)
         out["stream_options"] = stream_options
-        out.setdefault("num_ctx", 32_768)
-        out.setdefault("keep_alive", "30m")
+        if get_settings().inject_ollama_defaults:
+            out.setdefault("num_ctx", 32_768)
+            out.setdefault("keep_alive", "30m")
         return await _passthrough(
             path="/v1/chat/completions",
             api="openai",
@@ -216,10 +228,11 @@ async def chat_completions(
         return gated
 
     # --- prepare upstream request: force non-streaming, inject defaults ---
-    out = dict(body)
+    out = _strip_ollama_only(dict(body))
     out["stream"] = False
-    out.setdefault("num_ctx", 32_768)
-    out.setdefault("keep_alive", "30m")
+    if get_settings().inject_ollama_defaults:
+        out.setdefault("num_ctx", 32_768)
+        out.setdefault("keep_alive", "30m")
 
     await metering.emit_llm_request(claims, out)
 

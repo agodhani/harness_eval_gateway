@@ -18,6 +18,9 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 os.environ.setdefault("OLLAMA_BASE_URL", "http://localhost:11434")
 os.environ.setdefault("GATEWAY_URL", "http://localhost:8081")
+# Pin the gateway upstream to ollama so a developer's .env provider switch
+# (e.g. UPSTREAM_PROVIDER=openrouter for live testing) can't leak into tests.
+os.environ.setdefault("UPSTREAM_PROVIDER", "ollama")
 os.environ.setdefault("ARTIFACT_ROOT", str(ROOT / "data" / "artifacts"))
 os.environ.setdefault("LOG_LEVEL", "WARNING")
 

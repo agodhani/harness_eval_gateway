@@ -100,6 +100,12 @@ services:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/harness_eval
       # Host Ollama from inside the container.
       OLLAMA_UPSTREAM_URL: http://host.docker.internal:11434
+      # Upstream provider switch: ollama (default) | openrouter (hosted
+      # free-tier models for testing). Set in .env (gitignored) — never
+      # commit the key here.
+      UPSTREAM_PROVIDER: ${UPSTREAM_PROVIDER:-ollama}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       # Control-plane ingest for metering events.
       API_INGEST_URL: http://api:8000
       INGEST_TOKEN: dev-ingest-token

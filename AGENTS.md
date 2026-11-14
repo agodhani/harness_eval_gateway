@@ -391,6 +391,18 @@ or tests change.
   e2e `cd web && E2E_PORT=3100 npm run test:e2e`.
 - `GET /api/runs/{id}/analytics?price_model=` (F9) serves per-sandbox metrics
   + estimated cost; price table lives in `api/pricing.py` (`PRICE_TABLE`).
+- `UPSTREAM_PROVIDER=openrouter` + `OPENROUTER_API_KEY` (gitignored `.env`;
+  compose `${VAR}` passthrough) switches the gateway upstream to OpenRouter
+  for free-model testing without local Ollama. Only `/v1/chat/completions` +
+  `/v1/models` are supported there — `/v1/messages`/`/v1/responses` will 404,
+  so claude_code/codex adapters still need `ollama`. Client base is the API
+  root (`/api/`): httpx concatenates base+request paths and request paths
+  carry `/v1/…`. Callers' Ollama-only body params (`think`, `num_ctx`,
+  `keep_alive`, `options`) are stripped for non-ollama providers; note
+  mandatory-reasoning models (e.g. ernie-5.5) 400 on miniloop's
+  `reasoning_effort:"none"` — pick tolerant free ids (particle-1,
+  ling-3.2-flash, dots-3 verified). Tests pin `UPSTREAM_PROVIDER=ollama`
+  in `tests/conftest.py`.
 - `GET /api/skillpacks` (F11) lists vendored + imported packs (the submit
   form's source of truth); `POST /api/skillpacks/discover` (GitHub URL →
   skills), `POST /api/skillpacks/import` (selection → `data/skillpacks/`;

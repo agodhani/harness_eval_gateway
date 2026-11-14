@@ -39,7 +39,8 @@ def get_db() -> Iterator[Session]:
 async def get_upstream_client() -> AsyncIterator[httpx.AsyncClient]:
     settings = get_settings()
     async with httpx.AsyncClient(
-        base_url=settings.OLLAMA_UPSTREAM_URL.rstrip("/"),
+        base_url=settings.upstream_base_url,
+        headers=settings.upstream_headers,
         timeout=settings.UPSTREAM_TIMEOUT,
     ) as client:
         yield client
