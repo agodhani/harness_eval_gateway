@@ -22,6 +22,7 @@ import {
   listAllEvents,
   listEvents,
   EVENT_SOURCES,
+  TERMINAL_RUN_STATUSES,
   type EventOut,
   type SandboxOut,
 } from "@/lib/api";
@@ -31,8 +32,6 @@ import { Badge, Card, EmptyState, ErrorNote, InfoNote, Loading, sourceTone, stat
 const POLL_MS = 6_000;
 const MAX_EVENTS = 10_000;
 const STICK_THRESHOLD_PX = 90;
-// Mirrors orchestrator/state_machine.py RUN_TERMINAL.
-const TERMINAL_RUN_STATUSES = new Set(["done", "failed"]);
 
 // ---------------------------------------------------------------------------
 // payload summarizers — one-line human summaries per event type
@@ -319,7 +318,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
       } catch {
         // transient — next tick retries
       }
-      if (TERMINAL_RUN_STATUSES.has(runStatusRef.current ?? "")) return;
+      if (TERMINAL_RUN_STATUSES.includes(runStatusRef.current ?? "")) return;
       try {
         const run = await getRun(runId);
         setRunStatus(run.status);
