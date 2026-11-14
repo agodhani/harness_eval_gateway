@@ -2,8 +2,13 @@
 
 Allowed transitions mirror the lifecycle in AGENTS.md / docs/orchestrator-plan.md:
 
-    run:     submitted → rubric_review → provisioning → running → evaluating → done | failed
+    run:     submitted → rubric_review → [queued →] provisioning → running
+             → evaluating → done | failed
     sandbox: provisioning → running → terminating → done | failed
+
+``queued`` (PR15 pacing) parks an approved run while another run holds the
+single execution slot — see ``orchestrator/pacing.py``. ``queued → failed``
+exists so sweeps / a future cancel can retire parked runs.
 
 ``transition()`` is the ONLY sanctioned way to change ``status`` — it validates
 against the table, mutates the row, and emits an orchestrator ``checkpoint``
@@ -21,7 +26,8 @@ from .events import emit
 
 RUN_TRANSITIONS: dict[str, frozenset[str]] = {
     "submitted": frozenset({"rubric_review", "failed"}),
-    "rubric_review": frozenset({"provisioning", "failed"}),
+    "rubric_review": frozenset({"provisioning", "queued", "failed"}),
+    "queued": frozenset({"provisioning", "failed"}),
     "provisioning": frozenset({"running", "failed"}),
     "running": frozenset({"evaluating", "failed"}),
     "evaluating": frozenset({"done", "failed"}),

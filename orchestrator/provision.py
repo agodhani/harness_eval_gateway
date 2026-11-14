@@ -29,7 +29,7 @@ from sandbox.runtime import SandboxRuntime
 from sandbox.spec import SandboxSpec
 from skillpack_import.store import imported_root
 
-from . import state_machine
+from . import pacing, state_machine
 from .adapters import adapter_image, get_adapter
 from .events import emit
 
@@ -329,6 +329,28 @@ async def spawn_one(
             image=adapter_image(adapter, settings.SANDBOX_IMAGE),
             env=env,
         )
+
+        # PR15 pacing: gate `docker run` on host memory headroom — at 8
+        # configs, launching every sandbox at once can OOM the host/VM that
+        # also hosts the model. Bounded wait; a timeout fails THIS sandbox
+        # like any other spawn failure (siblings unaffected).
+        headroom = await pacing.wait_for_headroom(
+            session_factory=session_factory,
+            run_id=run_id,
+            sandbox_id=sid,
+            settings=settings,
+        )
+        if not headroom:
+            _mark_spawn_failed(
+                session_factory,
+                run_id=run_id,
+                sandbox_id=sid,
+                message=(
+                    "spawn deferred: host memory stayed below "
+                    "SPAWN_MIN_FREE_MEM_MB past SPAWN_MEM_WAIT_SECONDS"
+                ),
+            )
+            return None
 
         result = await asyncio.to_thread(runtime.spawn, spec)
         _mark_spawned(

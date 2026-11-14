@@ -70,6 +70,20 @@ class Settings(BaseSettings):
     # codeload accepts a Bearer token). Public repos work without it.
     GITHUB_TOKEN: str = ""
 
+    # --- Run pacing (PR15) ---
+    # One active run at a time: approvals landing while a run executes (or
+    # is already queued) park in status="queued" and promote FIFO when the
+    # slot frees. No knob — it's the run state machine.
+    # Spawn memory gate: spawn_one waits for >= this much free host/VM
+    # memory before `docker run` (MiB). Probed via /proc/meminfo, then
+    # sysconf, then docker info+stats (unreadable probe => gate off).
+    # 0 disables. Default 2 GiB — headroom for the model + siblings.
+    SPAWN_MIN_FREE_MEM_MB: int = 2048
+    # Poll cadence + cap for the gate wait. An expired wait fails THAT
+    # sandbox like any spawn error, so sustained pressure can't hang a run.
+    SPAWN_MEM_POLL_SECONDS: float = 5.0
+    SPAWN_MEM_WAIT_SECONDS: float = 3600.0
+
     # --- Artifact preview (F12) ---
     # Static-preview container image (`python -m http.server`); shares the
     # python:3.12-slim base with the api/sandbox images — no extra pull.

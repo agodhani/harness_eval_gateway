@@ -9,6 +9,10 @@ in ``orchestrator/``. Tasks are in-process — an api restart kills them, so
   ``failed``/``error``), best-effort ``docker rm`` by the ``heg.run_id``
   label — accepted MVP limitation, documented in the plan (§6).
 - ``rubric_review`` is untouched (human gate).
+- ``queued`` (PR15 pacing) is untouched too — a parked run never had an
+  in-process task to lose. After the sweep, :func:`promote_next_queued`
+  runs once so a run parked behind work the api lost (or behind a run that
+  finished while it was down) gets its slot.
 
 ``session_factory``/``settings``/``runtime`` are injectable for tests; the
 defaults resolve lazily from ``api.*`` so importing this module never pulls
@@ -29,7 +33,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from db.models import Rubric, Run, Sandbox
 from sandbox.runtime import SandboxRuntime
 
-from . import lifecycle, state_machine
+from . import lifecycle, pacing, state_machine
 from . import rubric as rubric_mod
 from .events import emit
 
@@ -41,6 +45,10 @@ log = logging.getLogger(__name__)
 _TASKS: dict[tuple[uuid.UUID, str], asyncio.Task[None]] = {}
 
 _runtime: SandboxRuntime | None = None
+
+#: False once shutdown() starts — queue promotion stops so a task finishing
+#: during teardown can't launch a lifecycle that outlives the process.
+_accepting = True
 
 
 # ---------------------------------------------------------------------------
@@ -125,22 +133,93 @@ def start_lifecycle_task(
     runtime: SandboxRuntime | None = None,
     evaluator_fn: Any | None = None,
 ) -> asyncio.Task[None]:
-    """Register the post-approval lifecycle task for a run."""
+    """Register the post-approval lifecycle task for a run.
+
+    The task is :func:`_lifecycle_then_promote` — the run's own lifecycle
+    followed by a queue-promotion attempt (PR15 pacing), so a finishing run
+    hands the execution slot to the oldest queued run without a poller.
+    """
+    sf = session_factory or _session_factory()
+    st = settings or _settings()
+    rt = runtime or get_runtime()
     return _track(
         "lifecycle",
         run_id,
-        lifecycle.run_lifecycle(
+        _lifecycle_then_promote(
             run_id,
-            session_factory=session_factory or _session_factory(),
-            runtime=runtime or get_runtime(),
-            settings=settings or _settings(),
+            session_factory=sf,
+            settings=st,
+            runtime=rt,
             evaluator_fn=evaluator_fn,
         ),
     )
 
 
+async def _lifecycle_then_promote(
+    run_id: uuid.UUID,
+    *,
+    session_factory: sessionmaker[Session],
+    settings: Any,
+    runtime: SandboxRuntime,
+    evaluator_fn: Any | None,
+) -> None:
+    """Drive one run to terminal, then free the execution slot (PR15)."""
+    try:
+        await lifecycle.run_lifecycle(
+            run_id,
+            session_factory=session_factory,
+            runtime=runtime,
+            settings=settings,
+            evaluator_fn=evaluator_fn,
+        )
+    finally:
+        # run_lifecycle never raises, but cancellation/teardown also frees
+        # the slot — promote on ANY exit. promote_next_queued self-guards:
+        # it claims only when no other run is active.
+        await promote_next_queued(
+            session_factory=session_factory,
+            settings=settings,
+            runtime=runtime,
+            evaluator_fn=evaluator_fn,
+        )
+
+
+async def promote_next_queued(
+    *,
+    session_factory: sessionmaker[Session],
+    settings: Any,
+    runtime: SandboxRuntime,
+    evaluator_fn: Any | None = None,
+) -> None:
+    """Claim the oldest queued run and start its lifecycle task.
+
+    No-op while shutting down, when a run still holds the slot, or when the
+    queue is empty — the DB claim in :func:`pacing.claim_next_queued` is the
+    single-winner gate, so concurrent/duplicate calls are safe.
+    """
+    if not _accepting:
+        return
+    try:
+        nxt = pacing.claim_next_queued(session_factory)
+    except Exception:
+        log.exception("pacing: queue claim failed")
+        return
+    if nxt is None:
+        return
+    log.info("pacing: promoting queued run %s -> provisioning", nxt)
+    start_lifecycle_task(
+        nxt,
+        session_factory=session_factory,
+        settings=settings,
+        runtime=runtime,
+        evaluator_fn=evaluator_fn,
+    )
+
+
 async def shutdown() -> None:
     """Cancel in-flight tasks on api shutdown (lifespan)."""
+    global _accepting
+    _accepting = False
     tasks = [t for t in _TASKS.values() if not t.done()]
     for t in tasks:
         t.cancel()
@@ -249,3 +328,10 @@ async def startup_sweep(
             await asyncio.to_thread(rt.remove_run_containers, str(run_id))
         except Exception:
             log.exception("startup_sweep: docker cleanup failed for run %s", run_id)
+
+    # PR15 pacing: kick the queue — a run may be parked behind work the
+    # sweep just retired (or behind a run that finished while the api was
+    # down). No-op when the slot is still taken or the queue is empty.
+    await promote_next_queued(
+        session_factory=sf, settings=settings, runtime=rt
+    )

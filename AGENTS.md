@@ -77,8 +77,9 @@ adapters are added.
    flag when evaluator model == participant model.
 2. **Control API + Orchestrator (FastAPI, async)** — validates submissions,
    expands run matrix, generates rubric via gateway, drives run state machine
-   (`submitted → rubric_review → provisioning → running → evaluating →
-   done | failed`), manages sandbox lifecycle, enforces termination policy.
+   (`submitted → rubric_review → [queued →] provisioning → running →
+   evaluating → done | failed`), manages sandbox lifecycle, enforces
+   termination policy, paces run/sandbox admission (below).
 3. **AI gateway (Python, custom)** — exposes an OpenAI-compatible
    (`/v1/chat/completions`) endpoint, translates to upstream providers
    (**Ollama is the default upstream for MVP** — small local models, e.g.
@@ -102,7 +103,16 @@ adapters are added.
 1. **Submit** — form → run spec (`POST /api/runs`).
 2. **Rubric draft** — orchestrator calls LLM via gateway → draft rubric →
    UI displays; user edits → approves → **frozen**, shared across sandboxes.
+   **Pacing (PR15):** runs serialize — one active run at a time; an approval
+   landing while a run executes (or is already queued) parks in `queued`
+   and promotes FIFO by approval when the slot frees (lifecycle end or the
+   next startup sweep). `started_at` = approval/queue-entry time.
 3. **Provision** — prepare identical initial repo; build/launch N sandboxes.
+   `spawn_one` additionally gates each `docker run` on host memory headroom
+   (`SPAWN_MIN_FREE_MEM_MB`, probed via `/proc/meminfo` → `sysconf` →
+   `docker info`+`stats`; unreadable probe = gate off). The wait is capped
+   by `SPAWN_MEM_WAIT_SECONDS` — expiry fails that one sandbox so sustained
+   pressure can't hang the run.
 4. **Execute** — agent loops; all model calls via gateway; adapter streams
    normalized events; UI shows live timeline.
 5. **Terminate** — each sandbox reaches a terminal state (below); workspace
@@ -237,13 +247,6 @@ or tests change.
 - Higher-fidelity instrumentation via harness hooks/plugins
 - Gateway response caching / deterministic replay
 - Multi-host / K8s sandbox scaling
-- Memory-aware spawn scheduling — gate `spawn_one` on host memory pressure
-  (docker info / cgroup stats) and queue pending sandboxes until headroom
-  exists, instead of launching all N configs at once (matters at 8x)
-- Run submission queue — pace/serialize whole runs so a new submission waits
-  behind the active run instead of overlapping; combined with memory-aware
-  spawn scheduling this bounds concurrent sandboxes when >2 would exceed
-  headroom for the loaded model
 - Auth, saved run templates, share links
 - Dynamic model picker — populate the submit form's model suggestions from
   `ollama list` (gateway `/v1/models` pass-through already exists) instead of
@@ -318,6 +321,12 @@ or tests change.
   returned a bare JSON body its SSE reader dropped as an empty response).
 - **CLI image pattern**: node:slim base + `python3` for the shim + pinned
   npm CLI + `adapters/` under `/opt/harness` + `done` at `/usr/local/bin`.
+- **PR15 pacing is DB-driven, not in-memory**: `queued` is a run status, so
+  the submission queue survives api restarts (startup sweep re-promotes).
+  Queue order = `started_at` (approval time). Spawn admission is a bounded
+  wait *inside* `spawn_one` (per-sandbox failure on timeout) rather than a
+  scheduler loop — sequential provisioning already makes spawns the unit of
+  queuing. `run.status` stays `String` — no migration needed for `queued`.
   npm install happens before COPY so dependency layers cache. DeepSeek's
   `dsh` needs node >=24.9 → `node:24-slim` (others stay on 22).
 - **`done` invocation**: bare `done` is a shell keyword in sh/bash — prompts
