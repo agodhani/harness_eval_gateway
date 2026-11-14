@@ -582,6 +582,53 @@ export function estimateCostUsd(
 }
 
 // ---------------------------------------------------------------------------
+// cross-run trends (F13 — GET /api/analytics/runs)
+// ---------------------------------------------------------------------------
+
+/** One run's aggregate for the cross-run trend chart. */
+export interface RunTrendPoint {
+  run_id: string;
+  status: string;
+  task_prompt: string; // truncated to 120 chars server-side
+  model_name: string;
+  evaluator_model: string | null;
+  created_at: string | null;
+  finished_at: string | null;
+  sandbox_count: number;
+  /** Participant-phase totals across all of the run's sandboxes. */
+  llm_turns: number;
+  tokens: TokenUsage;
+  errors: number;
+  /** Judge-phase totals (evaluator creds share the participant sandbox_id). */
+  evaluator_llm_turns: number;
+  evaluator_tokens: TokenUsage;
+  /** Price-table key `estimated_cost_usd` was computed at. */
+  price_model: string;
+  estimated_cost_usd: number;
+  /** Judge tokens priced at the evaluator model's rate when listed. */
+  evaluator_cost_usd: number;
+  /** Mean of the run's `overall` score rows; null when unscored. */
+  mean_overall_score: number | null;
+}
+
+export interface RunTrends {
+  /** The explicit `?price_model=` basis, or null for per-run auto pricing. */
+  price_model: string | null;
+  price_table: Record<string, ModelPrice>;
+  /** Newest-first points (server ordering). */
+  points: RunTrendPoint[];
+}
+
+export function getRunTrends(opts: {
+  limit?: number;
+  priceModel?: string;
+} = {}): Promise<RunTrends> {
+  return request<RunTrends>(
+    `/api/analytics/runs${qs({ limit: opts.limit ?? 20, price_model: opts.priceModel })}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // skillpacks (F11 — vendored listing + GitHub import)
 // ---------------------------------------------------------------------------
 

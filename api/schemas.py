@@ -385,3 +385,53 @@ class RunAnalytics(BaseModel):
     price_model: str
     price_table: dict[str, ModelPrice] = Field(default_factory=dict)
     sandboxes: list[SandboxAnalytics] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# F13 — cross-run trends (api/routers/analytics.py GET /api/analytics/runs)
+# ---------------------------------------------------------------------------
+
+
+class RunTrendPoint(BaseModel):
+    """One run's aggregate for the cross-run trend chart.
+
+    Token/cost numbers keep the participant-vs-evaluator split (same
+    ``eval_started`` boundary rule as the per-run endpoint). Cost defaults
+    to each run's own resolved price model unless an explicit
+    ``?price_model=`` reprices every point uniformly.
+    """
+
+    run_id: uuid.UUID
+    status: str
+    task_prompt: str  # truncated to 120 chars server-side
+    model_name: str
+    evaluator_model: str | None = None
+    created_at: datetime | None = None
+    finished_at: datetime | None = None
+    sandbox_count: int = 0
+    # Participant-phase totals across all of the run's sandboxes.
+    llm_turns: int = 0
+    tokens: TokenUsage = Field(default_factory=TokenUsage)
+    errors: int = 0
+    # Judge-phase totals (evaluator creds share the participant sandbox_id).
+    evaluator_llm_turns: int = 0
+    evaluator_tokens: TokenUsage = Field(default_factory=TokenUsage)
+    # Which price_table entry ``estimated_cost_usd`` was computed at —
+    # the explicit param, else this run's resolved model price.
+    price_model: str
+    estimated_cost_usd: float = 0.0
+    # Judge tokens priced at the evaluator model's rate when it's listed,
+    # else the point's price_model.
+    evaluator_cost_usd: float = 0.0
+    # Mean of the run's ``overall`` score rows; None when unscored.
+    mean_overall_score: float | None = None
+
+
+class RunTrends(BaseModel):
+    """GET /api/analytics/runs response — newest-first point list."""
+
+    # The explicit ``?price_model=`` repricing basis, or None when each
+    # point was costed at its own run's resolved price ("auto" mode).
+    price_model: str | None = None
+    price_table: dict[str, ModelPrice] = Field(default_factory=dict)
+    points: list[RunTrendPoint] = Field(default_factory=list)

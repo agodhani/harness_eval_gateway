@@ -224,7 +224,10 @@ or tests change.
 | F7 | Evaluator sandbox: rubric scoring + rationale |
 | F8 | Results UI: matrix, scores, timeline, artifacts |
 | F9 | Run analytics: per-sandbox metrics + estimated cost |
+| F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) |
 | F11 | Skillpack import from GitHub (discover → select → import) |
+| F12 | Artifact preview (static html + desktop/pygame via noVNC) |
+| F13 | Graphical analysis page + cross-run trends (recharts) |
 
 ## Post-MVP roadmap
 
@@ -259,11 +262,6 @@ or tests change.
 - Split-view trace comparison — side-by-side, time-aligned event streams for
   two sandboxes on the traces/timeline page (today it's one merged stream
   with a single-sandbox filter dropdown); scrolling/diff-alignment UX TBD
-- Graphical analysis page — charts on top of the F9 analytics + scores data:
-  per-dimension score comparison across sandboxes, token/cost/latency per
-  sandbox, tool-call mix, eval-vs-participant spend split, cross-run trends;
-  also add a totals row / aggregate column to the results score matrix so
-  the per-sandbox winner is visible at a glance
 - Lightweight artifact thumbnails — capture screenshots of produced artifacts
   for at-a-glance review before spawning a full live preview sandbox
 - Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.
@@ -378,6 +376,12 @@ or tests change.
   `EVAL_PROMPT.md` carries targeted counter-hints (paging, no inner `"`).
 - One live preview per sandbox (POST is idempotent — re-clicking returns the
   existing preview); dead containers are cleared on respawn.
+- **Charts: recharts** (F13) — picked over visx/chart.js: smallest fit for
+  grouped/stacked bars + a composed bar-line trend under React 19 / Next 16;
+  themed via hexes mirroring globals.css tokens (no CSS-var reads). The
+  cross-run trends endpoint (`GET /api/analytics/runs`) prices each point at
+  its own run's resolved price unless `?price_model=` forces uniform
+  repricing — same "estimate, not billing" framing as F9.
 
 ## Working conventions
 

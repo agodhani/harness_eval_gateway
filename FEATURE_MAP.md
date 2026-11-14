@@ -25,6 +25,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
 | F11 | Skillpack import from GitHub | ✅ | `skillpack_import/`, `api/routers/skillpacks.py`, `web/app/submit/ImportSkillPackDialog.tsx` | `tests/unit/api/test_skillpacks.py`, `test_skillpack_import.py` |
 | F12 | Artifact preview (static html + desktop/pygame via noVNC, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
+| F13 | Graphical analysis page + cross-run trends (recharts) | ✅ | `web/app/runs/[id]/analysis/`, `api/routers/analytics.py` (`GET /api/analytics/runs`), `web/app/runs/[id]/results/ResultsClient.tsx` (totals row) | `tests/unit/api/test_analytics.py` (trends section) |
 
 ## Feature details
 
@@ -428,6 +429,54 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     pages grow large.
 - **Depends on:** F4 (runtime plumbing/host-path translation), F8 (results
   page + artifact store layout)
+
+### F13 — Graphical analysis page + cross-run trends ✅
+
+- **What:** `/runs/[id]/analysis` — a charts dashboard over the F9 analytics
+  + F8 scores, using **recharts** (v3.10.x — React-19-compatible, lightweight
+  enough for the plain-CSS theme; palette hexes mirror the globals.css
+  tokens in `analysis/charts.tsx`). Cards: score-by-rubric-dimension
+  (grouped horizontal bars + "Σ leader" line), tool-call mix (stacked,
+  top-7 tools + `other`), tokens in/out (stacked), LLM latency
+  (avg/p95/max), estimated cost per sandbox (price-model dropdown →
+  client-side recompute, same trick as AnalyticsSection — local models show
+  a note instead of empty bars), participant-vs-evaluator spend split
+  (stacked; judge priced at the evaluator model's rate when listed), and a
+  cross-run trends ComposedChart (stacked participant+evaluator token bars
+  + mean-overall-score line on a right 0–10 axis; newest 20 runs, current
+  run accent-highlighted, hover shows run meta). The results score matrix
+  also gains a **totals row** (Σ dimension scores, `total`) — distinct from
+  the judge-reported `overall` — with the max cell flagged `leader`.
+- **API:** `GET /api/analytics/runs?limit=&price_model=` →
+  `RunTrends{price_model|null, price_table, points[]}` — per-run roll-up of
+  the same participant/evaluator event split (eval boundary per sandbox),
+  latest-`overall`-score-per-sandbox mean, participant + judge tokens,
+  errors, cost. No `price_model` → each point costed at its own run's
+  resolved price ("auto", `price_model:null`); with it → uniform repricing.
+  Newest-first; `limit` 1–100 default 20.
+- **Where:** `api/routers/analytics.py` (`get_run_trends` +
+  `_eval_boundaries`/`_is_eval_event` helpers, also used by the per-run
+  endpoint), `api/schemas.py` (`RunTrendPoint`, `RunTrends`),
+  `web/app/runs/[id]/analysis/` (`page.tsx`, `AnalysisClient.tsx`,
+  `charts.tsx`), `web/app/runs/[id]/results/ResultsClient.tsx` (`row-total`
+  + `dimTotals`/`maxTotal` memos), `web/lib/api.ts` (`getRunTrends`,
+  `RunTrendPoint`, `RunTrends`), `web/lib/format.ts` (`formatNum`,
+  `formatUsd`), `web/app/globals.css` (`.analysis-grid`, `.chart-tip`,
+  `.chart-legend`, `.row-total`/`.score-cell--leader`), nav links in
+  `RunDetailClient`/`ResultsClient`/`TimelineClient`.
+- **Verify:**
+  - Unit: `tests/unit/api/test_analytics.py` F13 section — shape +
+    newest-first ordering, per-point aggregation (tokens/turns/errors/
+    sandbox_count/mean overall — non-overall scores excluded), auto vs
+    uniform repricing, judge priced at evaluator model, prompt truncation
+    (120 chars), `limit` bounds (1/0/101), 422 unknown price_model, null
+    mean for unscored runs.
+  - API: `curl localhost:8001/api/analytics/runs?limit=20`
+  - UI: results page → matrix `total` row sums match the dimension columns
+    and flags the leader; run detail → "Analysis →" → all cards render on a
+    scored run; cost dropdown reprices the cost + split charts client-side.
+- **Depends on:** F6 (events), F7 (scores), F8 (results page), F9
+  (analytics aggregation)
 
 ## Implementation sequence
 
