@@ -73,7 +73,7 @@ Critical path depth = 3 (`6→7→8` / `2→3→4`). Max safe concurrency ≈ 9 
 
 ## PR cards
 
-### PR1 — Submit-form UX
+### PR1 — Submit-form UX ✅ landed (F13)
 - **Scope:** dynamic model picker (replace hardcoded `MODEL_SUGGESTIONS`
   with live list from gateway `/v1/models` — pass-through exists; add an
   api proxy route e.g. `GET /api/models` → `GATEWAY_URL`); model install

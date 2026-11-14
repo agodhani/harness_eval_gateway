@@ -25,6 +25,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
 | F11 | Skillpack import from GitHub | ✅ | `skillpack_import/`, `api/routers/skillpacks.py`, `web/app/submit/ImportSkillPackDialog.tsx` | `tests/unit/api/test_skillpacks.py`, `test_skillpack_import.py` |
 | F12 | Artifact preview (static html + desktop/pygame via noVNC, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
+| F13 | Submit UX: live model picker + install, named harness configs | ✅ | `api/routers/models.py`, `gateway/main.py` (`/v1/models/pull`), `web/app/submit/page.tsx`, `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`, `orchestrator/provision.py` | `tests/unit/api/test_models.py`, `tests/unit/gateway/test_proxy.py` (pull), `tests/unit/db/test_migrations.py`, `tests/unit/orchestrator/test_provision.py` (name) |
 
 ## Feature details
 
@@ -428,6 +429,62 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     pages grow large.
 - **Depends on:** F4 (runtime plumbing/host-path translation), F8 (results
   page + artifact store layout)
+
+### F13 — Submit UX: live model picker + install, named harness configs ✅
+
+- **What:** three submit-form upgrades shipped together.
+  - **Live model catalog** — `GET /api/models` proxies the gateway's
+    existing `GET /v1/models` (api mints a run-null `heg.*` cred with
+    `GATEWAY_CRED_SECRET`), normalizes `{object:"list",data:[...]}` →
+    `{models:[{id,...}], provider, pull_supported}`. The gateway stamps
+    `X-HEG-Provider` on the response so `pull_supported` is true only for
+    the `ollama` upstream. Submit page merges live ids over the offline
+    `MODEL_SUGGESTIONS` fallback for the two model ComboInputs.
+  - **Model install** — `POST /api/models/pull` → gateway
+    `POST /v1/models/pull` → upstream `POST /api/pull` (ollama-only —
+    `501` for other providers), NDJSON progress streamed end-to-end
+    (httpx `send(stream=True)` → `StreamingResponse`, pull body forced to
+    `{"name","stream":true}`). Submit page: install button + optional
+    name override, indeterminate progress bar with the last ollama
+    status/`completed`/`total` counters, line log; on success the model
+    catalog refreshes and the new id enters the suggestions.
+    `pull_supported=false` explains instead of offering a dead button.
+  - **Named harness configs** — optional `name` (≤64 chars) per
+    `HarnessConfigIn`; persisted on `sandboxes.name` (migration
+    `a2b3c4d5e6f7`), default `<adapter>-<sandbox-id[:8]>` assigned in
+    `spawn_one` after the UUID exists. Surfaced as `name` on
+    `SandboxOut`/`SandboxResult`/`SandboxAnalytics` and rendered —
+    with short-id fallback/tooltips — in the submit rows, run detail
+    (config summary + sandboxes table + rubric breakdown headers),
+    timeline sandbox filter + row labels, results matrix + artifacts
+    table, analytics column heads, and the live run-console lane heads.
+- **Where:** `api/routers/models.py` (+ `api/main.py` include),
+  `gateway/main.py` (`pull_models`, provider header), `api/schemas.py`
+  (`HarnessConfigIn.name`, `SandboxOut.name`, `SandboxResult.name`,
+  `SandboxAnalytics.name`, `ModelListOut`/`ModelPullIn`),
+  `db/models.py` + `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`,
+  `orchestrator/provision.py` (`_sandbox_name` default),
+  `api/routers/results.py` + `analytics.py` (`name` fields),
+  `web/lib/api.ts` (`listModels`, `pullModel` streaming),
+  `web/app/submit/page.tsx`, `web/app/runs/[id]/` (`RunDetailClient`,
+  `timeline/TimelineClient`, `results/ResultsClient`,
+  `results/AnalyticsSection`), `web/components/RunConsoleLive.tsx`
+- **Verify:**
+  - Unit: `tests/unit/api/test_models.py` (normalize, provider flag,
+    gateway error/unreachable, pull streaming + validation),
+    `tests/unit/gateway/test_proxy.py` (pull passthrough/stream-forced/
+    501 non-ollama/auth), `tests/unit/db/test_migrations.py`
+    (upgrade/downgrade on sqlite, single head, type match),
+    `tests/unit/orchestrator/test_provision.py` (custom name persisted,
+    default/whitespace → `adapter-shortid`),
+    `tests/unit/api/test_runs.py` (name round-trip, ≤40 bound),
+    `test_results.py`/`test_analytics.py` (`name` in responses)
+  - Manual: `curl localhost:8001/api/models` → catalog + `pull_supported`;
+    `curl -N -X POST localhost:8001/api/models/pull -d '{"name":"qwen3:8b"}'`
+    → ndjson progress lines; submit form → model dropdown lists live ids,
+    install streams progress; run detail/timeline/results/analytics show
+    the configured names (or `adapter-shortid` defaults).
+- **Depends on:** F1 (submit form), F3 (gateway `/v1/models` + creds)
 
 ## Implementation sequence
 

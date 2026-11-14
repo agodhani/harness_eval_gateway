@@ -23,6 +23,7 @@ import {
   listEvents,
   EVENT_SOURCES,
   type EventOut,
+  type SandboxOut,
 } from "@/lib/api";
 import { formatTimeMs, shortId, truncate } from "@/lib/format";
 import { Badge, Card, EmptyState, ErrorNote, InfoNote, Loading, sourceTone, statusTone } from "@/components/ui";
@@ -196,6 +197,9 @@ export default function TimelineClient({ runId }: { runId: string }) {
   const [sseState, setSseState] = useState<SseState>("connecting");
   const [runStatus, setRunStatus] = useState<string | null>(null);
   const [runMissing, setRunMissing] = useState(false);
+  // Sandbox rows → names for the filter dropdown + row tooltips (PR1 named
+  // harness configs); empty while the run fetch is pending/failed.
+  const [sandboxes, setSandboxes] = useState<SandboxOut[]>([]);
 
   // Filters initialize from the URL (?sandbox=, ?source=, ?type=) — the page
   // wraps this component in <Suspense> so useSearchParams is allowed.
@@ -256,7 +260,10 @@ export default function TimelineClient({ runId }: { runId: string }) {
       // run status is context only — failure is non-fatal
       try {
         const run = await getRun(runId);
-        if (!cancelled) setRunStatus(run.status);
+        if (!cancelled) {
+          setRunStatus(run.status);
+          setSandboxes(run.sandboxes ?? []);
+        }
       } catch (err) {
         if (!cancelled && err instanceof ApiError && err.status === 404) {
           setRunMissing(true);
@@ -285,6 +292,8 @@ export default function TimelineClient({ runId }: { runId: string }) {
   }, [runId, mergeEvents]);
 
   // poll safety-net — catches anything SSE misses (reconnect gaps, proxies).
+  // Also refreshes the run row so late-provisioned sandbox names land in the
+  // filter without a reload.
   useEffect(() => {
     const t = setInterval(async () => {
       try {
@@ -302,6 +311,13 @@ export default function TimelineClient({ runId }: { runId: string }) {
       } catch {
         // transient — next tick retries
       }
+      try {
+        const run = await getRun(runId);
+        setRunStatus(run.status);
+        setSandboxes(run.sandboxes ?? []);
+      } catch {
+        // transient — keep last-good status/names
+      }
     }, POLL_MS);
     return () => clearInterval(t);
   }, [runId, mergeEvents]);
@@ -313,6 +329,18 @@ export default function TimelineClient({ runId }: { runId: string }) {
     for (const e of events) if (e.sandbox_id) set.add(e.sandbox_id);
     return [...set].sort();
   }, [events]);
+
+  // sandbox_id → config label (PR1). Sandboxes absent from the run payload
+  // (or pre-migration rows with NULL name) fall back to the short id.
+  const sandboxNames = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const s of sandboxes) if (s.name) m.set(s.id, s.name);
+    return m;
+  }, [sandboxes]);
+  const sandboxLabel = useCallback(
+    (id: string) => sandboxNames.get(id) ?? `sandbox ${shortId(id)}`,
+    [sandboxNames],
+  );
 
   const typeOptions = useMemo(() => {
     const set = new Set(events.map((e) => e.type));
@@ -451,8 +479,8 @@ export default function TimelineClient({ runId }: { runId: string }) {
             <option value="">all sandboxes</option>
             <option value="__none__">run-level (no sandbox)</option>
             {sandboxIds.map((id) => (
-              <option key={id} value={id}>
-                sandbox {shortId(id)}
+              <option key={id} value={id} title={id}>
+                {sandboxLabel(id)}
               </option>
             ))}
           </select>
@@ -491,6 +519,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
               const day = ev.ts.slice(5, 10); // MM-DD
               const newDay = !prev || prev.ts.slice(5, 10) !== day;
               const isErr = ev.type === "error";
+              const sbName = ev.sandbox_id ? sandboxNames.get(ev.sandbox_id) : undefined;
               return (
                 <div key={ev.id}>
                   {newDay ? (
@@ -518,8 +547,11 @@ export default function TimelineClient({ runId }: { runId: string }) {
                     </span>
                     <span className="tl-type" data-type={ev.type}>{ev.type}</span>
                     {ev.sandbox_id ? (
-                      <span className="tl-sandbox" title={ev.sandbox_id}>
-                        {shortId(ev.sandbox_id)}
+                      <span
+                        className="tl-sandbox"
+                        title={sbName ? `${sbName} · ${ev.sandbox_id}` : ev.sandbox_id}
+                      >
+                        {sbName ? truncate(sbName, 18) : shortId(ev.sandbox_id)}
                       </span>
                     ) : (
                       <span className="tl-sandbox faint">run</span>

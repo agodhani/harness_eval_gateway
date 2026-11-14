@@ -257,6 +257,7 @@ def get_run_analytics(
         out.append(
             SandboxAnalytics(
                 sandbox_id=sb.id,
+                name=sb.name,
                 label=_sandbox_label(sb.harness_config or {}),
                 harness_config=sb.harness_config or {},
                 status=sb.status,

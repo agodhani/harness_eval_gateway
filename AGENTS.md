@@ -225,6 +225,8 @@ or tests change.
 | F8 | Results UI: matrix, scores, timeline, artifacts |
 | F9 | Run analytics: per-sandbox metrics + estimated cost |
 | F11 | Skillpack import from GitHub (discover → select → import) |
+| F12 | Artifact preview (static + desktop/pygame via noVNC) |
+| F13 | Submit UX: live model picker + install, named harness configs |
 
 ## Post-MVP roadmap
 
@@ -245,14 +247,7 @@ or tests change.
   spawn scheduling this bounds concurrent sandboxes when >2 would exceed
   headroom for the loaded model
 - Auth, saved run templates, share links
-- Dynamic model picker — populate the submit form's model suggestions from
-  `ollama list` (gateway `/v1/models` pass-through already exists) instead of
-  the hardcoded `MODEL_SUGGESTIONS`, plus an install option (api endpoint →
-  `ollama pull`, stream pull progress into the UI)
-- Named harness configs — optional per-config label set at submit, persisted
-  onto the sandbox and surfaced in the timeline filter, results matrix, and
-  analytics so same-adapter sandboxes are distinguishable; default to
-  `<adapter>-<sandbox short id>` when left blank
+- ~~Dynamic model picker~~ + ~~named harness configs~~ — **landed as F13**
 - Cross-run analytics & cost dashboards
 - Timeline-side analytics — per-sandbox metrics rendered alongside the
   execution timeline or on event hover (cost/tokens/latency in context)
@@ -378,6 +373,16 @@ or tests change.
   `EVAL_PROMPT.md` carries targeted counter-hints (paging, no inner `"`).
 - One live preview per sandbox (POST is idempotent — re-clicking returns the
   existing preview); dead containers are cleared on respawn.
+- **Model catalog/install ride the gateway, not Ollama direct (F13)** — the
+  api mints a run-null `heg.*` cred to call `GET /v1/models`, which keeps the
+  provider abstraction (Ollama today, OpenRouter next) behind the gateway;
+  the gateway stamps `X-HEG-Provider` so the UI only offers install when the
+  upstream can `ollama pull` (`POST /v1/models/pull` → `/api/pull`, 501
+  otherwise). Pull progress streams end-to-end as NDJSON — never buffered.
+- **Sandbox names are persisted, not derived (F13)** — `HarnessConfigIn.name`
+  (≤64, whitespace-normalized) lands on `sandboxes.name`; `spawn_one` fills
+  blanks with `<adapter>-<shortid>` once the UUID exists. All UI surfaces
+  read the column — no per-component re-derivation to drift.
 
 ## Working conventions
 

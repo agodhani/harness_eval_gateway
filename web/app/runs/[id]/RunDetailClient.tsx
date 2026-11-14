@@ -65,6 +65,11 @@ function ConfigSummary({ configs }: { configs: HarnessConfig[] }) {
         <div key={i} className="row" style={{ gap: "0.5rem" }}>
           <Badge tone="outline">#{i + 1}</Badge>
           <Badge tone="violet">{c.adapter}</Badge>
+          {c.name ? (
+            <Badge tone="gray" title="config label">
+              {c.name}
+            </Badge>
+          ) : null}
           {c.skill_packs.length === 0 ? (
             <span className="faint" style={{ fontSize: "0.8rem" }}>no skill packs</span>
           ) : (
@@ -141,6 +146,7 @@ function RubricView({
                       {shortId(sb.sandbox_id)}
                     </Link>
                     <div className="faint" style={{ fontSize: "0.66rem", fontWeight: 400 }}>
+                      {sb.name ? `${sb.name} · ` : ""}
                       {String(sb.harness_config?.adapter ?? sb.harness_config?.harness ?? "?")}
                     </div>
                   </th>
@@ -516,6 +522,11 @@ export default function RunDetailClient({ runId }: { runId: string }) {
                             <Link href={`/runs/${run.id}/timeline?sandbox=${s.id}`} title={s.id}>
                               {shortId(s.id)}
                             </Link>
+                            {s.name ? (
+                              <div className="faint" style={{ fontSize: "0.7rem" }} title={s.name}>
+                                {s.name}
+                              </div>
+                            ) : null}
                           </td>
                           <td>
                             <div className="row" style={{ gap: "0.35rem" }}>

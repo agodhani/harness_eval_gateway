@@ -204,6 +204,20 @@ def _load_run(session_factory: sessionmaker[Session], run_id: uuid.UUID) -> Run 
         return session.get(Run, run_id)
 
 
+def _sandbox_name(hc: dict[str, Any], sid: uuid.UUID) -> str:
+    """Display name for a sandbox row (PR1 named harness configs).
+
+    The submit form's optional config label wins; blank gets
+    ``<adapter>-<sandbox short id>`` so same-adapter siblings stay
+    distinguishable in the timeline filter, results matrix, and analytics.
+    """
+    label = str(hc.get("name") or "").strip()
+    if label:
+        return label
+    adapter = str(hc.get("adapter") or hc.get("harness") or "miniloop")
+    return f"{adapter}-{str(sid)[:8]}"
+
+
 def _insert_sandbox_row(
     session_factory: sessionmaker[Session], run_id: uuid.UUID, hc: dict[str, Any]
 ) -> uuid.UUID:
@@ -212,7 +226,13 @@ def _insert_sandbox_row(
     sid = uuid.uuid4()
     with session_factory() as session:
         session.add(
-            Sandbox(id=sid, run_id=run_id, harness_config=dict(hc), status="provisioning")
+            Sandbox(
+                id=sid,
+                run_id=run_id,
+                harness_config=dict(hc),
+                status="provisioning",
+                name=_sandbox_name(hc, sid),
+            )
         )
         session.commit()
     return sid

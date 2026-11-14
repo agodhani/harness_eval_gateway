@@ -11,7 +11,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from api.pricing import ModelPrice
 
@@ -112,11 +112,26 @@ class HarnessConfigIn(BaseModel):
     sandbox, and ``system_prompt_extra`` appends run-specific instructions
     (native ``--append-system-prompt`` where the harness has one, otherwise
     inlined into the task prompt footer — another comparison axis).
+
+    ``name`` is an optional human label persisted onto the sandbox row
+    (``sandboxes.name``) so same-adapter configs are distinguishable in the
+    timeline filter, results matrix, and analytics. Blank → the provisioner
+    assigns ``<adapter>-<sandbox short id>``.
     """
 
     adapter: str = "miniloop"
     skill_packs: list[str] = Field(default_factory=list, max_length=16)
     system_prompt_extra: str | None = Field(default=None, max_length=8000)
+    name: str | None = Field(default=None, max_length=64)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_name(cls, v: object) -> object:
+        """Collapse whitespace; empty → None (provisioner defaults the name)."""
+        if isinstance(v, str):
+            v = " ".join(v.split())
+            return v or None
+        return v
 
 
 class BudgetsIn(BaseModel):
@@ -154,6 +169,9 @@ class SandboxOut(BaseModel):
     artifact_path: str | None
     started_at: datetime | None
     finished_at: datetime | None
+    # Optional config label (PR1) — ``<adapter>-<shortid>`` default assigned
+    # at provisioning; NULL on sandboxes that predate the column.
+    name: str | None = None
 
 
 class RubricOut(BaseModel):
@@ -357,6 +375,8 @@ class SandboxAnalytics(BaseModel):
     """Per-sandbox metrics for the analytics comparison table."""
 
     sandbox_id: uuid.UUID
+    # Config label from the sandbox row (PR1 named harness configs).
+    name: str | None = None
     # Human label mirroring the results-matrix header (adapter · packs).
     label: str = ""
     harness_config: dict[str, Any] = Field(default_factory=dict)

@@ -154,6 +154,8 @@ export interface HarnessConfig {
   adapter: string;
   skill_packs: string[];
   system_prompt_extra?: string | null;
+  /** Optional label persisted onto the sandbox row (PR1 named configs). */
+  name?: string | null;
 }
 
 export interface Budgets {
@@ -187,6 +189,8 @@ export interface RunConfig {
 export interface SandboxOut {
   id: string;
   harness_config: Record<string, unknown>;
+  /** Config label; "<adapter>-<shortid>" default assigned at provisioning. */
+  name: string | null;
   status: string;
   terminal_reason: string | null;
   artifact_path: string | null;
@@ -273,6 +277,8 @@ export interface DimensionScore {
 export interface SandboxResult {
   sandbox_id: string;
   harness_config: Record<string, unknown>;
+  /** Config label from the sandbox row (PR1 named harness configs). */
+  name?: string | null;
   status: string;
   terminal_reason: string | null;
   artifact_path: string | null;
@@ -536,6 +542,8 @@ export interface EvaluatorActivity {
 
 export interface SandboxAnalytics {
   sandbox_id: string;
+  /** Config label from the sandbox row (PR1 named harness configs). */
+  name?: string | null;
   label: string;
   harness_config: Record<string, unknown>;
   status: string;
@@ -772,4 +780,106 @@ export async function checkHealth(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// models (PR1 — live picker + ollama install via the gateway)
+// ---------------------------------------------------------------------------
+
+/** One upstream model entry (OpenAI /v1/models shape, extra fields kept). */
+export interface ModelInfo {
+  id: string;
+  [key: string]: unknown;
+}
+
+export interface ModelsOut {
+  models: ModelInfo[];
+  /** Gateway UPSTREAM_PROVIDER — e.g. "ollama" | "openrouter". */
+  provider: string | null;
+  /** True when the upstream can install models (ollama pull). */
+  pull_supported: boolean;
+}
+
+export function listModels(): Promise<ModelsOut> {
+  return request<ModelsOut>("/api/models");
+}
+
+/** One NDJSON progress line from `ollama pull` (status/digest/total/completed). */
+export interface ModelPullEvent {
+  status?: string;
+  digest?: string;
+  total?: number;
+  completed?: number;
+  error?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * POST /api/models/pull — streams the gateway's NDJSON progress lines;
+ * `onProgress` fires per line. Resolves with the last event; throws ApiError
+ * on non-2xx or when the stream itself reports `{"error": ...}`.
+ */
+export async function pullModel(
+  name: string,
+  onProgress?: (ev: ModelPullEvent) => void,
+): Promise<ModelPullEvent | null> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/api/models/pull`, {
+      method: "POST",
+      headers: {
+        Accept: "application/x-ndjson",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name }),
+    });
+  } catch (err) {
+    throw new ApiError(
+      0,
+      `cannot reach API at ${API_BASE} — is the backend running? (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+  if (!res.ok) throw await parseError(res);
+  if (!res.body) return null;
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let last: ModelPullEvent | null = null;
+
+  const take = (line: string): ModelPullEvent | null => {
+    const s = line.trim();
+    if (!s) return null;
+    try {
+      return JSON.parse(s) as ModelPullEvent;
+    } catch {
+      return null; // non-JSON progress line — ignore
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const ev = take(buf.slice(0, nl));
+      buf = buf.slice(nl + 1);
+      if (ev) {
+        last = ev;
+        onProgress?.(ev);
+      }
+    }
+  }
+  buf += decoder.decode();
+  const tailEv = take(buf);
+  if (tailEv) {
+    last = tailEv;
+    onProgress?.(tailEv);
+  }
+
+  if (last?.error) {
+    throw new ApiError(502, String(last.error), last);
+  }
+  return last;
 }

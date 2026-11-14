@@ -271,6 +271,41 @@ async def test_spawn_one_unknown_adapter_fails_sandbox(
         assert row.status == "failed"
 
 
+async def test_spawn_one_persists_custom_name(
+    session_factory, settings, fake_runtime
+) -> None:
+    run = make_run(session_factory, status="provisioning", config=run_config())
+    sid = await spawn_one(
+        session_factory=session_factory,
+        runtime=fake_runtime,
+        run_id=run.id,
+        harness_config={"adapter": "miniloop", "name": "baseline-loop"},
+        settings=settings,
+    )
+    assert sid is not None
+    assert _db_sandbox(session_factory, sid).name == "baseline-loop"
+
+
+async def test_spawn_one_default_name_is_adapter_shortid(
+    session_factory, settings, fake_runtime
+) -> None:
+    run = make_run(session_factory, status="provisioning", config=run_config())
+    for hc in (
+        {"adapter": "miniloop", "name": None},
+        {"adapter": "miniloop", "name": "   "},  # whitespace counts as unset
+        {"adapter": "miniloop"},                 # key missing entirely
+    ):
+        sid = await spawn_one(
+            session_factory=session_factory,
+            runtime=fake_runtime,
+            run_id=run.id,
+            harness_config=hc,
+            settings=settings,
+        )
+        assert sid is not None
+        assert _db_sandbox(session_factory, sid).name == f"miniloop-{str(sid)[:8]}"
+
+
 async def test_spawn_one_missing_run_returns_none(session_factory, settings, fake_runtime) -> None:
     assert (
         await spawn_one(

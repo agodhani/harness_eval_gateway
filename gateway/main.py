@@ -18,7 +18,13 @@ Endpoints
                                     pass-through, no llm events — it is not a
                                     generation call).
 ``POST /v1/responses``            — OpenAI Responses pass-through (Codex CLI).
-``GET  /v1/models``               — model list pass-through (CLIs probe it).
+``GET  /v1/models``               — model list pass-through (CLIs probe it);
+                                    response carries ``x-heg-provider`` so
+                                    callers know which upstream answered.
+``POST /v1/models/pull``          — ``ollama pull`` pass-through (PR1 model
+                                    install); NDJSON progress streamed
+                                    verbatim, un-metered; 501 on non-ollama
+                                    upstreams.
 ``POST /internal/events``         — sandbox-facing event ingest (cred-stamped
                                     run/sandbox ids) → forwards to the
                                     control-plane ``/api/events/ingest``.
@@ -478,7 +484,11 @@ async def list_models(
     claims: Annotated[CredClaims, Depends(get_cred)],
     upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
 ) -> Response:
-    """Model list — harness CLIs probe it; not metered."""
+    """Model list — harness CLIs probe it; not metered.
+
+    The ``x-heg-provider`` response header names the active upstream so the
+    control plane can gate provider-only features (e.g. ollama pull).
+    """
     try:
         upstream_resp = await upstream.get("/v1/models")
     except httpx.HTTPError as exc:
@@ -492,8 +502,43 @@ async def list_models(
         headers={
             "content-type": upstream_resp.headers.get(
                 "content-type", "application/json"
-            )
+            ),
+            "x-heg-provider": get_settings().UPSTREAM_PROVIDER,
         },
+    )
+
+
+@router.post("/v1/models/pull")
+async def pull_model(
+    body: Annotated[dict[str, Any], Body()],
+    claims: Annotated[CredClaims, Depends(get_cred)],
+    upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
+) -> Response:
+    """``ollama pull`` — NDJSON progress streamed verbatim; not metered.
+
+    Ollama-only: hosted providers have no pull concept → 501 so the caller
+    can surface "install unsupported" instead of a confusing upstream error.
+    """
+    if get_settings().UPSTREAM_PROVIDER != "ollama":
+        return JSONResponse(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            content={
+                "error": {
+                    "message": (
+                        "model install is only supported for the ollama "
+                        f"upstream (active: {get_settings().UPSTREAM_PROVIDER})"
+                    ),
+                    "type": "unsupported",
+                }
+            },
+        )
+    return await _passthrough(
+        path="/api/pull",
+        api="openai",  # unused — meter=False
+        body={**body, "stream": True},
+        claims=claims,
+        upstream=upstream,
+        meter=False,
     )
 
 

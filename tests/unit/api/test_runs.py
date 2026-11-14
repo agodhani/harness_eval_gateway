@@ -247,6 +247,20 @@ def test_create_run_multi_adapter(api) -> None:
     assert adapters == ["miniloop", "claude_code", "codex", "deepseek", "pi"]
 
 
+def test_create_run_harness_config_names(api) -> None:
+    """PR1: optional per-config name survives submit -> run.config round-trip."""
+    body = _valid_body(
+        harness_configs=[
+            {"adapter": "miniloop", "name": "baseline-loop"},
+            {"adapter": "miniloop"},  # no name -> null, provision defaults it
+        ]
+    )
+    data = _post_run(api.client, body)
+    hcs = data["config"]["harness_configs"]
+    assert hcs[0]["name"] == "baseline-loop"
+    assert hcs[1]["name"] is None
+
+
 def test_create_run_validation(api) -> None:
     client = api.client
     cases = [
@@ -261,6 +275,10 @@ def test_create_run_validation(api) -> None:
         {
             **_valid_body(),
             "harness_configs": [{"system_prompt_extra": "x" * 8001}],
+        },
+        {
+            **_valid_body(),
+            "harness_configs": [{"name": "x" * 65}],
         },
         {**_valid_body(), "budgets": {"max_iters": 0}},
         # submit-time semantic validation
