@@ -124,7 +124,12 @@ Terminal states per sandbox:
 | `timeout` | Wall-clock cap hit |
 | `budget_exceeded` | Token/cost budget hit (enforced at gateway) |
 | `stuck_loop` | Repeated identical actions / retry cap hit |
-| `error` | Crash / unrecoverable failure |
+| `error` | Crash / unrecoverable failure / upstream provider outage |
+
+`budget_exceeded` keys on the gateway's own budget-gate event
+(`stage="budget"` + `reason="budget_exceeded"`) — a bare 429 from the
+*upstream provider* is NOT budget exhaustion: ≥3 `stage="upstream"` error
+events terminate the sandbox `error` instead.
 
 Provisional defaults (confirm with user): 60 min wall clock, $2 spend cap,
 stuck-loop = 3 consecutive identical tool calls.
@@ -394,6 +399,11 @@ or tests change.
   judge models flake ~1-in-3 evals (observed modes: flat dimension-map JSON,
   paged-read stuck loops, grep-loop wander, unescaped quotes in rationale) —
   `EVAL_PROMPT.md` carries targeted counter-hints (paging, no inner `"`).
+  When all attempts produce no Score rows the orchestrator emits a final
+  `error` event (`stage="evaluation"`, `phase="eval_failed"`) for the
+  sandbox; the results API surfaces it as per-sandbox `eval_error` so the UI
+  shows "eval failed" rather than an empty score matrix — a sandbox can be
+  `done` with failed eval, so check `eval_error`, not score-null alone.
 - One live preview per sandbox (POST is idempotent — re-clicking returns the
   existing preview); dead containers are cleared on respawn.
 - **Charts: recharts** (F13) — picked over visx/chart.js: smallest fit for

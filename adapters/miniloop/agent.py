@@ -92,6 +92,10 @@ class AgentConfig:
             max_iters = max(1, int(env.get("MAX_ITERS", "50")))
         except ValueError:
             max_iters = 50
+        try:
+            max_tokens = max(1, int(env.get("MAX_TOKENS", "4096")))
+        except ValueError:
+            max_tokens = 4096
 
         return cls(
             gateway_base_url=base,
@@ -102,6 +106,7 @@ class AgentConfig:
             events_ingest_url=(env.get("EVENTS_INGEST_URL") or "").strip() or None,
             ingest_token=(env.get("INGEST_TOKEN") or "").strip() or None,
             max_iters=max_iters,
+            max_tokens=max_tokens,
             system_prompt_extra=(env.get("SYSTEM_PROMPT_EXTRA") or "").strip(),
         )
 

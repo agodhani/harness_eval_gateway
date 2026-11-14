@@ -364,6 +364,7 @@ async def evaluate_sandbox(
     timeout_seconds: float = 1800.0,
     runtime: SandboxRuntime | None = None,
     max_iters: int = DEFAULT_EVAL_MAX_ITERS,
+    judge_max_tokens: int | None = None,
     eval_root: Path | str | None = None,
     poll_interval_seconds: float = 2.0,
     image: str = DEFAULT_IMAGE,
@@ -377,6 +378,9 @@ async def evaluate_sandbox(
     Returns the persisted ``Score`` ORM rows (detached). Raises ``ValueError``
     on missing required inputs, ``FileNotFoundError`` when the artifact
     workspace is absent, and propagates sandbox spawn/runtime errors.
+
+    ``judge_max_tokens`` overrides the judge's per-request output cap
+    (miniloop ``MAX_TOKENS`` env); ``None`` keeps the 4096 agent default.
     """
     # ---- resolve + validate ------------------------------------------------
     run_uuid = _as_uuid(run_id, "run_id")
@@ -491,6 +495,7 @@ async def evaluate_sandbox(
         cred=cred_token,
         model=model_name,
         max_iters=max_iters,
+        max_tokens=judge_max_tokens,
     )
     spec = build_eval_spec(
         sandbox_id=eval_sid,

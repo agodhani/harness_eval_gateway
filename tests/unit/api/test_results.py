@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from api.deps import get_session_factory
 from api.routers import results as results_router
-from db.models import Artifact, Base, Rubric, Run, Sandbox, Score
+from db.models import Artifact, Base, Event, Rubric, Run, Sandbox, Score
 
 
 @pytest.fixture()
@@ -124,6 +124,119 @@ def test_run_results_shape(client: TestClient, scored_run) -> None:
     assert sb2["dimensions"] == {}
     assert sb2["overall"] is None
     assert sb2["terminal_reason"] == "timeout"
+    # no eval-failure events seeded -> eval_error absent (not "judge failed")
+    assert sb2["eval_error"] is None
+
+
+def _error_event(session_factory, run_id, sandbox_id, payload, source="evaluator"):
+    s = session_factory()
+    try:
+        s.add(
+            Event(
+                run_id=run_id,
+                sandbox_id=sandbox_id,
+                source=source,
+                type="error",
+                payload=payload,
+            )
+        )
+        s.commit()
+    finally:
+        s.close()
+
+
+def test_run_results_surfaces_eval_failure(
+    client: TestClient, scored_run, session_factory
+) -> None:
+    """A scoreless sandbox whose judge failed reports eval_error — the UI
+    distinguishes 'judge failed' from 'no rubric scores'."""
+    _error_event(
+        session_factory,
+        scored_run["run_id"],
+        scored_run["sb2"],
+        {
+            "phase": "eval_scores_failed",
+            "reason": "scores_invalid",
+            "detail": "scores.json is not valid JSON",
+        },
+    )
+
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    body = resp.json()
+    sb2 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"]))
+    assert sb2["eval_error"] is not None
+    assert "scores_invalid" in sb2["eval_error"]
+    assert "not valid JSON" in sb2["eval_error"]
+    # scored sandbox unaffected
+    sb1 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"]))
+    assert sb1["eval_error"] is None
+
+
+def test_run_results_eval_error_cleared_when_scored(
+    client: TestClient, scored_run, session_factory
+) -> None:
+    """A failed attempt that a later retry recovered must not leave
+    eval_error on a sandbox WITH scores."""
+    _error_event(
+        session_factory,
+        scored_run["run_id"],
+        scored_run["sb1"],
+        {"phase": "eval_scores_failed", "reason": "scores_missing"},
+    )
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb1 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"])
+    )
+    assert sb1["eval_error"] is None
+
+
+def test_run_results_eval_orchestrator_failure(
+    client: TestClient, scored_run, session_factory
+) -> None:
+    """Orchestrator-emitted stage=evaluation errors (evaluate_sandbox
+    exceptions, final eval_failed marker) also surface."""
+    _error_event(
+        session_factory,
+        scored_run["run_id"],
+        scored_run["sb2"],
+        {"stage": "evaluation", "message": "RuntimeError: spawn exploded"},
+        source="orchestrator",
+    )
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb2 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"])
+    )
+    assert sb2["eval_error"] is not None
+    assert "spawn exploded" in sb2["eval_error"]
+
+
+def test_run_results_non_eval_errors_ignored(
+    client: TestClient, scored_run, session_factory
+) -> None:
+    """Budget/gateway/harness error events are NOT eval failures."""
+    _error_event(
+        session_factory,
+        scored_run["run_id"],
+        scored_run["sb2"],
+        {"stage": "budget", "reason": "budget_exceeded", "http_status": 429},
+        source="gateway",
+    )
+    _error_event(
+        session_factory,
+        scored_run["run_id"],
+        scored_run["sb2"],
+        {"stage": "spawn", "message": "docker gone"},
+        source="orchestrator",
+    )
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb2 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"])
+    )
+    assert sb2["eval_error"] is None
 
 
 def test_run_results_includes_artifacts(

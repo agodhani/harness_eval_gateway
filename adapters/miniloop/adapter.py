@@ -83,6 +83,7 @@ def env(
     events_ingest_url: str | None = None,
     ingest_token: str | None = None,
     max_iters: int | None = None,
+    max_tokens: int | None = None,
     skillpacks_root: str = "/opt/skillpacks",
     system_prompt_extra: str | None = None,
 ) -> dict[str, str]:
@@ -106,6 +107,11 @@ def env(
         out["INGEST_TOKEN"] = ingest_token
     if max_iters is not None:
         out["MAX_ITERS"] = str(max_iters)
+    if max_tokens is not None:
+        # Per-request output cap — thinking models burn completion tokens on
+        # <think> blocks, so judges/rubric callers raise it past the 4096
+        # default to keep the JSON payload from truncating.
+        out["MAX_TOKENS"] = str(max_tokens)
     if system_prompt_extra:
         out["SYSTEM_PROMPT_EXTRA"] = system_prompt_extra
     return out
@@ -119,7 +125,8 @@ def launch(task: dict[str, Any]) -> dict[str, Any]:
       - ``model``: model name to request via the gateway
       - ``workspace``: container working dir (default ``/workspace``)
       - ``gateway_url``, ``cred``: default to env GATEWAY_BASE_URL/GATEWAY_CRED
-      - ``events_ingest_url``, ``ingest_token``, ``max_iters``, ``skillpacks_root``
+      - ``events_ingest_url``, ``ingest_token``, ``max_iters``, ``max_tokens``,
+        ``skillpacks_root``
       - ``system_prompt_extra``: appended to the agent's system prompt
 
     Returns::
@@ -145,6 +152,7 @@ def launch(task: dict[str, Any]) -> dict[str, Any]:
         events_ingest_url=task.get("events_ingest_url"),
         ingest_token=task.get("ingest_token"),
         max_iters=task.get("max_iters"),
+        max_tokens=task.get("max_tokens"),
         skillpacks_root=task.get("skillpacks_root", "/opt/skillpacks"),
         system_prompt_extra=task.get("system_prompt_extra"),
     )

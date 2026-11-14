@@ -256,8 +256,13 @@ async def _evaluate_all(
             # F7 DI knobs (accepted extras beyond the §5 contract):
             "eval_root": eval_root,
             "image": settings.SANDBOX_IMAGE,
+            # Judge per-request output cap — thinking judges burn tokens on
+            # reasoning before scores.json; the 4096 default truncates.
+            "judge_max_tokens": int(settings.EVAL_JUDGE_MAX_TOKENS),
         }
+        attempts = 0
         for attempt in range(1, retries + 2):
+            attempts = attempt
             try:
                 # Fresh cred per attempt: a single cred's TTL can't span N
                 # sequential evals. max_tokens = tokens already spent +
@@ -305,6 +310,26 @@ async def _evaluate_all(
                         "reason": "no scores produced",
                     },
                 )
+        if _sandbox_score_count(session_factory, sb.id) == 0:
+            # Final per-sandbox eval-failure marker — per-attempt failures
+            # leave their own error events, but nothing else distinguishes
+            # "gave up" from "retry pending" on the timeline, and the
+            # results API derives its per-sandbox eval_error from these.
+            _emit_run_event(
+                session_factory,
+                run.id,
+                sandbox_id=sb.id,
+                event_type="error",
+                payload={
+                    "stage": "evaluation",
+                    "phase": "eval_failed",
+                    "message": (
+                        "judge produced no usable scores after "
+                        f"{attempts} attempt(s)"
+                    ),
+                    "attempts": attempts,
+                },
+            )
 
 
 # ---------------------------------------------------------------------------

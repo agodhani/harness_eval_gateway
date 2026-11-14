@@ -183,6 +183,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   rows is re-spawned up to `EVAL_SCORE_RETRIES` times (default 1) with a fresh
   cred, emitting an `eval_retry` checkpoint — covers small-model flake modes
   (malformed JSON, stuck-loop wander); infra exceptions are not retried.
+  Exhausted attempts leave a final `error` event (`stage="evaluation"`,
+  `phase="eval_failed"`) which the results API surfaces as per-sandbox
+  `eval_error` — distinguishable from "not yet scored" (F8). Judge per-request
+  output cap is `EVAL_JUDGE_MAX_TOKENS` (default 8192; thinking judges).
   **Objective signals (PR6):** before staging, the candidate workspace is
   measured by the `scoring` package's signal collectors — `static_analysis`
   runs lizard (multi-language, parse-only, no code execution) for real
@@ -224,7 +228,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   evaluator model == participant model. The run-detail rubric table also
   renders per-sandbox score columns + an `overall` row once results exist
   (`RunDetailClient.tsx` `RubricView` + `getRunResults` poll while
-  `evaluating`).
+  `evaluating`). Sandboxes whose eval failed surface an `eval failed` badge
+  (from `SandboxResult.eval_error`) instead of blank score cells.
 - **Where:** `web/app/runs/` (list, detail, `results/`), results components,
   `api/routers/results.py` (results + scores + artifact-download endpoints)
 - **Verify:**

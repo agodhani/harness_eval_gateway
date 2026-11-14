@@ -58,6 +58,11 @@ services:
       HOST_DATA_ROOT: ${PWD}/data
       # Optional: pin a different rubric-drafting model (default: run's model).
       RUBRIC_MODEL: ${RUBRIC_MODEL:-}
+      # Per-request output caps for the rubric draft + eval judge calls —
+      # thinking models burn tokens on <think> blocks; small caps truncate
+      # rubric JSON / scores.json into unparseable output.
+      RUBRIC_MAX_TOKENS: ${RUBRIC_MAX_TOKENS:-8192}
+      EVAL_JUDGE_MAX_TOKENS: ${EVAL_JUDGE_MAX_TOKENS:-8192}
       # Optional GitHub PAT for skillpack import (F11) — private repos +
       # higher rate limits; public repos work without it.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
