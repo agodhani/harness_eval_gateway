@@ -227,8 +227,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     result file/sentinel parsing, timeout/missing-image paths
   - Exec integration: `tests/integration/test_exec_scoring.py`
     (`@pytest.mark.docker`) — real `heg-exec` container executes a trivial
-    artifact: build ok, 2/2 tests pass, coverage measured, container --rm'd,
-    workspace untouched
+    artifact: build ok, 2/2 tests pass, coverage measured, container
+    force-removed, workspace untouched
   - Results API: `tests/unit/api/test_results.py` — analysis embedded when
     `<artifact>/analysis.json` exists+valid, null otherwise
   - Manual: scores + rationale visible on results page; rationale for

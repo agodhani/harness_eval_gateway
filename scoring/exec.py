@@ -10,12 +10,16 @@ Unlike ``static_analysis`` this collector DOES execute candidate code — the
 sandboxes the exec (``--network none``, nobody user, cap-drop, resource
 bounds, read-only artifact mount). The workspace is never modified.
 
-Config knobs (env, overridable via constructor for tests/PR8):
+Config knobs (env / api settings, overridable via constructor for tests/PR8):
 
 - ``SCORING_EXEC`` — ``0``/``false``/``off`` disables the collector
-  (``status="skipped"``); default on. ``tests/conftest.py`` pins it off so
-  unit tests never spawn containers.
-- ``EXEC_IMAGE`` — exec container image (default ``heg-exec:latest``).
+  (``status="skipped"``); default on. Declared in ``api.config.Settings``,
+  documented in ``.env.example``, and passed through by compose — the env
+  var wins when set, the api setting is the fallback (host-run dev where
+  only ``.env`` is loaded). ``tests/conftest.py`` pins it off so unit
+  tests never spawn containers.
+- ``EXEC_IMAGE`` — exec container image (default ``heg-exec:latest``);
+  same env → settings → default resolution in ``sandbox.exec``.
 
 Status semantics: ``skipped`` = declined (not a python workspace, disabled,
 no docker daemon, image not built); ``error`` = container ran/died without
@@ -44,11 +48,21 @@ COLLECTOR_NAME = "exec"
 _OFF_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
 
 
-def _env_enabled(flag: str, default: bool = True) -> bool:
-    val = os.environ.get(flag)
-    if val is None:
+def _exec_enabled(default: bool = True) -> bool:
+    """SCORING_EXEC resolution: env var wins, api settings is the fallback.
+
+    ``api.config`` is consulted lazily and failure-tolerated so the scoring
+    package stays usable standalone (no hard api dependency at import).
+    """
+    val = os.environ.get("SCORING_EXEC")
+    if val is not None:
+        return val.strip().lower() not in _OFF_VALUES
+    try:
+        from api.config import get_settings
+
+        return bool(get_settings().SCORING_EXEC)
+    except Exception:  # noqa: BLE001 — standalone scoring without api config
         return default
-    return val.strip().lower() not in _OFF_VALUES
 
 
 def _has_python_sources(workspace: Path) -> bool:
@@ -151,9 +165,7 @@ class ExecSandboxCollector:
         report = SignalReport(name=self.name, status="ok")
 
         enabled = (
-            self._enabled
-            if self._enabled is not None
-            else _env_enabled("SCORING_EXEC", True)
+            self._enabled if self._enabled is not None else _exec_enabled()
         )
         if not enabled:
             report.status = "skipped"

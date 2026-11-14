@@ -70,6 +70,16 @@ class Settings(BaseSettings):
     # codeload accepts a Bearer token). Public repos work without it.
     GITHUB_TOKEN: str = ""
 
+    # --- Objective scoring (PR7) ---
+    # Exec-signal kill switch — when false the collector reports "skipped"
+    # instead of running candidate build/tests/coverage inside the locked
+    # heg-exec container. Read via os.environ first (compose passes it
+    # through) so an explicit env var beats .env, then this setting.
+    SCORING_EXEC: bool = True
+    # Repo-built image ExecRunner spawns for exec scoring (never pulled):
+    #   docker build -f sandbox/images/exec.Dockerfile -t heg-exec:latest .
+    EXEC_IMAGE: str = "heg-exec:latest"
+
     # --- Artifact preview (F12) ---
     # Static-preview container image (`python -m http.server`); shares the
     # python:3.12-slim base with the api/sandbox images — no extra pull.

@@ -9,11 +9,13 @@ the flat metric shape the API ``ExecSummary`` reads.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import api.config
 from sandbox.exec import ExecOutcome
-from scoring.exec import ExecSandboxCollector
+from scoring.exec import ExecSandboxCollector, _exec_enabled
 from scoring.models import SignalReport
 
 
@@ -100,6 +102,27 @@ def test_env_flag_disables(
     monkeypatch.setenv("SCORING_EXEC", "off")
     collector = ExecSandboxCollector()  # enabled=None → env decides
     assert collector.collect(python_ws).status == "skipped"
+
+
+def test_exec_enabled_env_beats_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit SCORING_EXEC env var wins over api settings; with env
+    unset the api config value decides (host-run dev where only .env loads)."""
+    fake = SimpleNamespace(SCORING_EXEC=False)
+    monkeypatch.setattr(api.config, "get_settings", lambda: fake)
+
+    monkeypatch.setenv("SCORING_EXEC", "1")
+    assert _exec_enabled() is True  # env wins over settings=False
+
+    monkeypatch.setenv("SCORING_EXEC", "0")
+    assert _exec_enabled() is False
+
+    monkeypatch.delenv("SCORING_EXEC", raising=False)
+    assert _exec_enabled() is False  # falls through to settings
+
+    fake.SCORING_EXEC = True
+    assert _exec_enabled() is True
 
 
 def test_missing_workspace_skips(tmp_path: Path) -> None:
