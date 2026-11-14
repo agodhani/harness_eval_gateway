@@ -438,17 +438,19 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     `GATEWAY_CRED_SECRET`), normalizes `{object:"list",data:[...]}` →
     `{models:[{id,...}], provider, pull_supported}`. The gateway stamps
     `X-HEG-Provider` on the response so `pull_supported` is true only for
-    the `ollama` upstream. Submit page merges live ids over the offline
-    `MODEL_SUGGESTIONS` fallback for the two model ComboInputs.
+    the `ollama` upstream. Submit page replaces the offline
+    `MODEL_SUGGESTIONS` fallback with the live ids once the catalog is
+    non-empty, for the two model ComboInputs.
   - **Model install** — `POST /api/models/pull` → gateway
     `POST /v1/models/pull` → upstream `POST /api/pull` (ollama-only —
     `501` for other providers), NDJSON progress streamed end-to-end
     (httpx `send(stream=True)` → `StreamingResponse`, pull body forced to
-    `{"name","stream":true}`). Submit page: install button + optional
-    name override, indeterminate progress bar with the last ollama
-    status/`completed`/`total` counters, line log; on success the model
-    catalog refreshes and the new id enters the suggestions.
-    `pull_supported=false` explains instead of offering a dead button.
+    `{"name","stream":true}`). Submit page: a `name:tag` input + pull
+    button with a single status line — while streaming it shows the last
+    ollama status plus a `completed`/`total` percent, then the outcome
+    (errors styled as field errors); on success the model catalog
+    refreshes and the new id enters the suggestions. `pull_supported=false`
+    hides the control entirely.
   - **Named harness configs** — optional `name` (≤64 chars) per
     `HarnessConfigIn`; persisted on `sandboxes.name` (migration
     `a2b3c4d5e6f7`), default `<adapter>-<sandbox-id[:8]>` assigned in
@@ -458,10 +460,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     (config summary + sandboxes table + rubric breakdown headers),
     timeline sandbox filter + row labels, results matrix + artifacts
     table, analytics column heads, and the live run-console lane heads.
-- **Where:** `api/routers/models.py` (+ `api/main.py` include),
-  `gateway/main.py` (`pull_models`, provider header), `api/schemas.py`
-  (`HarnessConfigIn.name`, `SandboxOut.name`, `SandboxResult.name`,
-  `SandboxAnalytics.name`, `ModelListOut`/`ModelPullIn`),
+- **Where:** `api/routers/models.py` (`ModelsOut`/`ModelPullIn`/
+  `ModelInfo`, + `api/main.py` include), `gateway/main.py` (`pull_models`,
+  provider header), `api/schemas.py` (`HarnessConfigIn.name`,
+  `SandboxOut.name`, `SandboxResult.name`, `SandboxAnalytics.name`),
   `db/models.py` + `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`,
   `orchestrator/provision.py` (`_sandbox_name` default),
   `api/routers/results.py` + `analytics.py` (`name` fields),
@@ -477,7 +479,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     (upgrade/downgrade on sqlite, single head, type match),
     `tests/unit/orchestrator/test_provision.py` (custom name persisted,
     default/whitespace → `adapter-shortid`),
-    `tests/unit/api/test_runs.py` (name round-trip, ≤40 bound),
+    `tests/unit/api/test_runs.py` (name round-trip, 64-char bound),
     `test_results.py`/`test_analytics.py` (`name` in responses)
   - Manual: `curl localhost:8001/api/models` → catalog + `pull_supported`;
     `curl -N -X POST localhost:8001/api/models/pull -d '{"name":"qwen3:8b"}'`

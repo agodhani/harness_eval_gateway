@@ -31,6 +31,8 @@ import { Badge, Card, EmptyState, ErrorNote, InfoNote, Loading, sourceTone, stat
 const POLL_MS = 6_000;
 const MAX_EVENTS = 10_000;
 const STICK_THRESHOLD_PX = 90;
+// Mirrors orchestrator/state_machine.py RUN_TERMINAL.
+const TERMINAL_RUN_STATUSES = new Set(["done", "failed"]);
 
 // ---------------------------------------------------------------------------
 // payload summarizers — one-line human summaries per event type
@@ -215,6 +217,11 @@ export default function TimelineClient({ runId }: { runId: string }) {
   const stickRef = useRef(true);
   const [atBottom, setAtBottom] = useState(true);
   const lastIdRef = useRef(0);
+  // runStatus mirror for the poll interval (terminal → stop refetching run).
+  const runStatusRef = useRef<string | null>(null);
+  useEffect(() => {
+    runStatusRef.current = runStatus;
+  }, [runStatus]);
 
   // ---- data ingest -------------------------------------------------------
 
@@ -293,7 +300,8 @@ export default function TimelineClient({ runId }: { runId: string }) {
 
   // poll safety-net — catches anything SSE misses (reconnect gaps, proxies).
   // Also refreshes the run row so late-provisioned sandbox names land in the
-  // filter without a reload.
+  // filter without a reload; that fetch stops once the run is terminal
+  // (names are frozen at provision time).
   useEffect(() => {
     const t = setInterval(async () => {
       try {
@@ -311,6 +319,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
       } catch {
         // transient — next tick retries
       }
+      if (TERMINAL_RUN_STATUSES.has(runStatusRef.current ?? "")) return;
       try {
         const run = await getRun(runId);
         setRunStatus(run.status);
