@@ -23,7 +23,7 @@ Docker sandboxes, rubric-scored by a sandboxed evaluator.
 containers straight from the results page: static sites served on localhost,
 pygame/desktop apps streamed interactively via noVNC:
 
-![Live pygame preview over noVNC](docs/screenshots/p25-artifact-preview/live-desktop-novnc.png)
+![Live pygame preview over noVNC](docs/screenshots/app/snake-novnc.png)
 
 ## Layout
 
