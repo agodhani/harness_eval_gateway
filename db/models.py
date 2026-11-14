@@ -43,7 +43,8 @@ class Run(Base):
     __tablename__ = "runs"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    # submitted | rubric_review | provisioning | running | evaluating | done | failed
+    # submitted | rubric_review | queued (PR15 pacing: parked behind the
+    # active run) | provisioning | running | evaluating | done | failed
     status: Mapped[str] = mapped_column(String(32), default="submitted", index=True)
     task_prompt: Mapped[str] = mapped_column(Text)
     model_name: Mapped[str] = mapped_column(String(255))

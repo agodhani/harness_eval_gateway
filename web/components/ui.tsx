@@ -64,6 +64,7 @@ export function statusTone(
       return "blue";
     case "evaluating":
       return "violet";
+    case "queued":
     case "provisioning":
     case "terminating":
       return "amber";
