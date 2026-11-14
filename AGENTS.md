@@ -254,8 +254,10 @@ or tests change.
   analytics so same-adapter sandboxes are distinguishable; default to
   `<adapter>-<sandbox short id>` when left blank
 - Cross-run analytics & cost dashboards
-- Timeline-side analytics — per-sandbox metrics rendered alongside the
-  execution timeline or on event hover (cost/tokens/latency in context)
+- Timeline-side analytics — **landed (PR9)**: per-sandbox metrics strip on
+  `web/app/runs/[id]/timeline/` (turns/tokens/latency/cost/errors chips +
+  judge line; chips double as sandbox-filter selectors; 15s refresh while
+  non-terminal). Leftover idea: on-event-hover cumulative stats.
 - Split-view trace comparison — side-by-side, time-aligned event streams for
   two sandboxes on the traces/timeline page (today it's one merged stream
   with a single-sandbox filter dropdown); scrolling/diff-alignment UX TBD

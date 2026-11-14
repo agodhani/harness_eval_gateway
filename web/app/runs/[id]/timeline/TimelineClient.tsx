@@ -19,15 +19,22 @@ import {
   ApiError,
   eventsStreamUrl,
   getRun,
+  getRunAnalytics,
   listAllEvents,
   listEvents,
   EVENT_SOURCES,
+  TERMINAL_RUN_STATUSES,
   type EventOut,
+  type RunAnalytics,
 } from "@/lib/api";
 import { formatTimeMs, shortId, truncate } from "@/lib/format";
+import { sandboxStrips } from "@/lib/timelineAnalytics";
 import { Badge, Card, EmptyState, ErrorNote, InfoNote, Loading, sourceTone, statusTone } from "@/components/ui";
+import SandboxMetricsBar from "./SandboxMetricsBar";
 
 const POLL_MS = 6_000;
+/** Metrics strip refresh — heavier query (server re-aggregates all events). */
+const ANALYTICS_POLL_MS = 15_000;
 const MAX_EVENTS = 10_000;
 const STICK_THRESHOLD_PX = 90;
 
@@ -196,6 +203,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
   const [sseState, setSseState] = useState<SseState>("connecting");
   const [runStatus, setRunStatus] = useState<string | null>(null);
   const [runMissing, setRunMissing] = useState(false);
+  const [analytics, setAnalytics] = useState<RunAnalytics | null>(null);
 
   // Filters initialize from the URL (?sandbox=, ?source=, ?type=) — the page
   // wraps this component in <Suspense> so useSearchParams is allowed.
@@ -306,6 +314,37 @@ export default function TimelineClient({ runId }: { runId: string }) {
     return () => clearInterval(t);
   }, [runId, mergeEvents]);
 
+  // Metrics strip (PR9): F9 analytics powers the per-sandbox chips. Slower
+  // cadence than the event tail (the server re-aggregates the whole stream
+  // per call); polling stops once a terminal status is observed — the tick
+  // that sees it still lands one final fetch, so end-state numbers are exact.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      // getRun doubles as a status-badge refresh, keeping the header live.
+      try {
+        const run = await getRun(runId);
+        if (!cancelled) setRunStatus(run.status);
+      } catch {
+        // status refresh is non-fatal — the initial load already flags 404s
+      }
+      try {
+        const a = await getRunAnalytics(runId);
+        if (!cancelled) setAnalytics(a);
+      } catch {
+        // supplementary surface — a failed fetch just leaves the strip empty
+      }
+    };
+    void Promise.resolve().then(tick); // async context → no setState-in-effect
+    const t = setInterval(() => {
+      if (!TERMINAL_RUN_STATUSES.includes(runStatus ?? "")) void tick();
+    }, ANALYTICS_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [runId, runStatus]);
+
   // ---- filtering ---------------------------------------------------------
 
   const sandboxIds = useMemo(() => {
@@ -331,6 +370,17 @@ export default function TimelineClient({ runId }: { runId: string }) {
       }),
     [events, filterSource, filterType, filterSandbox],
   );
+
+  // PR9 metrics strip data + adapter labels for the sandbox filter dropdown.
+  const strips = useMemo(
+    () => (analytics ? sandboxStrips(analytics) : []),
+    [analytics],
+  );
+  const sandboxLabels = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const sb of analytics?.sandboxes ?? []) m.set(sb.sandbox_id, sb.label);
+    return m;
+  }, [analytics]);
 
   // ---- scroll behaviour --------------------------------------------------
 
@@ -453,6 +503,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
             {sandboxIds.map((id) => (
               <option key={id} value={id}>
                 sandbox {shortId(id)}
+                {sandboxLabels.get(id) ? ` — ${sandboxLabels.get(id)}` : ""}
               </option>
             ))}
           </select>
@@ -474,6 +525,14 @@ export default function TimelineClient({ runId }: { runId: string }) {
             {events.length >= MAX_EVENTS ? ` (capped ${MAX_EVENTS})` : ""}
           </span>
         </div>
+
+        <SandboxMetricsBar
+          strips={strips}
+          selected={filterSandbox}
+          onSelect={(id) =>
+            setFilterSandbox((cur) => (cur === id ? "" : id))
+          }
+        />
 
         <div className="timeline-scroll" ref={scrollRef} onScroll={handleScroll}>
           {loading ? (

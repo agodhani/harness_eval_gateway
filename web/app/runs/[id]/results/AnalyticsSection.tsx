@@ -17,21 +17,8 @@ import {
   type RunAnalytics,
   type SandboxAnalytics,
 } from "@/lib/api";
-import { formatDuration, shortId } from "@/lib/format";
+import { formatDuration, formatInt, formatUsd, shortId } from "@/lib/format";
 import { Badge, Card, InfoNote, statusTone } from "@/components/ui";
-
-/** Deterministic thousands separator (no toLocaleString — hydration-safe). */
-function num(n: number): string {
-  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-}
-
-/** $-formatting for small estimate values: 4dp under a cent, else 2dp. */
-function formatUsd(cost: number): string {
-  if (!Number.isFinite(cost)) return "—";
-  if (cost === 0) return "$0.00";
-  if (cost < 0.01) return `$${cost.toFixed(4)}`;
-  return `$${cost.toFixed(2)}`;
-}
 
 function errMsg(err: unknown): string {
   if (err instanceof ApiError) return err.detail;
@@ -116,16 +103,16 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
       label: "wall clock",
       cell: (sb) => formatDuration(sb.wall_clock_seconds * 1000) || "—",
     },
-    { label: "LLM turns", cell: (sb) => num(sb.llm_turns) },
-    { label: "tokens in", cell: (sb) => num(sb.tokens.input) },
-    { label: "tokens out", cell: (sb) => num(sb.tokens.output) },
+    { label: "LLM turns", cell: (sb) => formatInt(sb.llm_turns) },
+    { label: "tokens in", cell: (sb) => formatInt(sb.tokens.input) },
+    { label: "tokens out", cell: (sb) => formatInt(sb.tokens.output) },
     {
       label: "tokens total",
       cell: (sb) => (
         <>
-          {num(sb.tokens.total)}
+          {formatInt(sb.tokens.total)}
           {sb.tokens.cache_read > 0 ? (
-            <span className="faint"> · {num(sb.tokens.cache_read)} cached</span>
+            <span className="faint"> · {formatInt(sb.tokens.cache_read)} cached</span>
           ) : null}
         </>
       ),
@@ -147,7 +134,7 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
       label: "tool calls",
       cell: (sb) => (
         <>
-          <div>{num(sb.tool_calls.total)}</div>
+          <div>{formatInt(sb.tool_calls.total)}</div>
           {breakdown(sb.tool_calls.by_tool)}
         </>
       ),
@@ -156,19 +143,19 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
       label: "skill calls",
       cell: (sb) => (
         <>
-          <div>{num(sb.skill_calls.total)}</div>
+          <div>{formatInt(sb.skill_calls.total)}</div>
           {breakdown(sb.skill_calls.by_skill)}
         </>
       ),
     },
-    { label: "shell commands", cell: (sb) => num(sb.shell_commands) },
-    { label: "file ops", cell: (sb) => num(sb.file_ops) },
-    { label: "test runs", cell: (sb) => num(sb.test_executions) },
+    { label: "shell commands", cell: (sb) => formatInt(sb.shell_commands) },
+    { label: "file ops", cell: (sb) => formatInt(sb.file_ops) },
+    { label: "test runs", cell: (sb) => formatInt(sb.test_executions) },
     {
       label: "errors",
       cell: (sb) =>
         sb.errors > 0 ? (
-          <span style={{ color: "var(--red)" }}>{num(sb.errors)}</span>
+          <span style={{ color: "var(--red)" }}>{formatInt(sb.errors)}</span>
         ) : (
           "0"
         ),
@@ -255,8 +242,8 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
                   <td key={sb.sandbox_id} className="num">
                     {sb.evaluator ? (
                       <span className="faint" style={{ fontSize: "0.8rem" }}>
-                        {num(sb.evaluator.llm_turns)} ·{" "}
-                        {num(sb.evaluator.tokens.total)} ·{" "}
+                        {formatInt(sb.evaluator.llm_turns)} ·{" "}
+                        {formatInt(sb.evaluator.tokens.total)} ·{" "}
                         {formatUsd(sb.evaluator.estimated_cost_usd)}
                       </span>
                     ) : (

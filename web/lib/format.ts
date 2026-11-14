@@ -51,3 +51,16 @@ export function formatDuration(ms: unknown): string {
   const s = Math.round((ms % 60_000) / 1000);
   return `${m}m ${s}s`;
 }
+
+/** Deterministic thousands separator (no toLocaleString — hydration-safe). */
+export function formatInt(n: number): string {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+/** $-formatting for small estimate values: 4dp under a cent, else 2dp. */
+export function formatUsd(cost: number): string {
+  if (!Number.isFinite(cost)) return "—";
+  if (cost === 0) return "$0.00";
+  if (cost < 0.01) return `$${cost.toFixed(4)}`;
+  return `$${cost.toFixed(2)}`;
+}
