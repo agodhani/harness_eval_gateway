@@ -105,7 +105,13 @@ def _applied_edit(match: re.Match[str], line: str) -> list[dict[str, Any]]:
 
 
 def _skipped_dry_run(match: re.Match[str], line: str) -> list[dict[str, Any]]:
-    return [_checkpoint("edit_skipped", path=match.group(1), reason="dry_run")]
+    return [
+        _checkpoint(
+            "edit_skipped",
+            path=match.group(1),
+            reason="dry_run" if match.group(2) else None,
+        )
+    ]
 
 
 def _skipped_edit(match: re.Match[str], line: str) -> list[dict[str, Any]]:

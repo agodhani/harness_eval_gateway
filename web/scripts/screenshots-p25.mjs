@@ -112,7 +112,7 @@ await page.screenshot({ path: `${OUT}submit-harness-configs.png`, fullPage: true
 console.log("captured submit-harness-configs.png");
 
 // 2 — manifest-visible dropdown: expand config 1's select inline (size=N)
-//      so all five display names render in-page, then crop the card.
+//      so all six display names render in-page, then crop the card.
 await page.evaluate(() => {
   const el = document.querySelector(".config-row select.select");
   el.size = el.options.length;
