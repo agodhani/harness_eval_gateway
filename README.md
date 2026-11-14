@@ -13,21 +13,21 @@ Docker sandboxes, rubric-scored by a sandboxed evaluator.
 
 | Landing — hero | Landing — the method |
 |---|---|
-| ![Landing hero](docs/screenshots/app/landing-hero.png) | ![Landing method](docs/screenshots/app/landing-method.png) |
+| ![Landing hero](docs/screenshots/ui/landing-hero.png) | ![Landing method](docs/screenshots/ui/landing-method.png) |
 
 | Submit a run | Runs list | Run detail |
 |---|---|---|
-| ![Submit](docs/screenshots/app/submit.png) | ![Runs](docs/screenshots/app/runs.png) | ![Run detail](docs/screenshots/app/run-detail.png) |
+| ![Submit](docs/screenshots/ui/submit.png) | ![Runs](docs/screenshots/ui/runs.png) | ![Run detail](docs/screenshots/ui/run-detail.png) |
 
 | Results — score matrix | Timeline — live event stream |
 |---|---|
-| ![Results](docs/screenshots/app/run-results.png) | ![Timeline](docs/screenshots/app/run-timeline.png) |
+| ![Results](docs/screenshots/ui/run-results.png) | ![Timeline](docs/screenshots/ui/run-timeline.png) |
 
 **Live artifact previews** — produced artifacts run in throwaway, locked-down
 containers straight from the results page: static sites served on localhost,
 pygame/desktop apps streamed interactively via noVNC:
 
-![Live pygame preview over noVNC](docs/screenshots/app/snake-novnc.png)
+![Live pygame preview over noVNC](docs/screenshots/ui/snake-novnc.png)
 
 ## Layout
 
