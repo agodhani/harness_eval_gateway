@@ -376,7 +376,11 @@ export default function RunDetailClient({ runId }: { runId: string }) {
       const updated = await approveRun(runId);
       setRunData(updated);
       setLoadedId(runId);
-      setNotice("Rubric approved — provisioning sandboxes.");
+      setNotice(
+        updated.status === "queued"
+          ? "Rubric approved — run queued behind an active run."
+          : "Rubric approved — provisioning sandboxes.",
+      );
     } catch (err) {
       setRubricError(errMsg(err, "Approve failed."));
     } finally {

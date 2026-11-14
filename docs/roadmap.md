@@ -33,6 +33,12 @@ append-mostly; rebase on main before merge.
 - **PR6 — static-analysis signals** (`scoring/` package, see below).
 - **PR11 — Graphical analysis + cross-run dashboards** (F13): recharts,
   `GET /api/analytics/runs`, results-matrix totals row.
+- **PR15 — Run pacing** (`queued` run status + `orchestrator/pacing.py`):
+  `place_run`/`claim_next_queued` FIFO promotion via
+  `runner._lifecycle_then_promote` + `startup_sweep` re-kick; `spawn_one`
+  waits on `SPAWN_MIN_FREE_MEM_MB` headroom capped by
+  `SPAWN_MEM_WAIT_SECONDS` (timeout fails that sandbox, siblings fail
+  fast). Details: `FEATURE_MAP.md` F2.
 
 ## Dependency DAG
 
@@ -58,7 +64,7 @@ PR19 Auth/templates/share — independent
 ## Topological levels
 
 - **Depth 0 (start immediately):** PR1, PR3, PR5, PR9, PR12,
-  PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
+  PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
   PR13/PR17 if soft-only deps are acceptable.
 - **Depth 1:** PR4 (←3), PR8 (←7), PR10 (←9), PR14 (←1, +12 soft),
   PR16 (←15), PR18 (←12).
@@ -72,7 +78,7 @@ PR2 and PR6 landed). Max safe concurrency ≈ 9 lanes.
 - `api/schemas.py`, `web/lib/api.ts` — most PRs append here.
 - `AGENTS.md`, `FEATURE_MAP.md` — every PR updates docs; rebase.
 - `db/migrations/` — PR1 + PR5 add migrations; renumber revisions at merge.
-- `orchestrator/` — PR5 (re-score trigger) vs PR15/PR16 (state machine);
+- `orchestrator/` — PR5 (re-score trigger) vs PR16 (state machine);
   stagger C and I lanes or coordinate.
 - `sandbox/preview.py` + `api/routers/preview.py` + `PreviewControls.tsx` —
   all of lane B; strictly sequential.
@@ -204,13 +210,9 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 - **Depends on:** PR1 (HarnessConfigIn schema churn settles); best after
   PR12 (needs >1 usable provider to be interesting).
 
-### PR15 — Run pacing: submission queue + memory-aware scheduling
-- **Scope:** serialize runs so a new submission queues behind the active
-  one; gate `spawn_one` on host memory pressure (docker info/cgroup stats)
-  and queue pending sandboxes until headroom exists (matters at 8x).
-- **Touch:** `orchestrator/runner.py`, `orchestrator/provision.py`,
-  `orchestrator/monitor.py`, run state machine (queued state?).
-- **Verify:** unit tests with stubbed memory readings + queue ordering.
+### PR15 — Run pacing: submission queue + memory-aware scheduling — ✅ landed
+`queued` run status + `orchestrator/pacing.py` — see "Already landed" and
+`FEATURE_MAP.md` F2.
 
 ### PR16 — "Add next prompt" (multi-turn runs)
 - **Scope:** continue a finished sandbox with a follow-up prompt on the

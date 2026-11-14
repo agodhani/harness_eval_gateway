@@ -78,19 +78,33 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 ### F2 — Orchestrator ✅
 
-- **What:** run state machine (`submitted → rubric_review → provisioning →
-  running → evaluating → done | failed`); matrix expansion (harness configs ×
-  model); rubric draft generated via gateway → frozen on user approval;
-  termination policy watcher (timeout, budget, stuck-loop, done signal).
+- **What:** run state machine (`submitted → rubric_review → [queued →]
+  provisioning → running → evaluating → done | failed`); matrix expansion
+  (harness configs × model); rubric draft generated via gateway → frozen on
+  user approval; termination policy watcher (timeout, budget, stuck-loop,
+  done signal).
+- **Pacing (PR15):** one active run at a time — approvals while a run
+  executes (or is queued) park in `queued` and promote FIFO by approval
+  (`pacing.place_run` / `claim_next_queued`; promotion is wired into
+  `runner._lifecycle_then_promote` + re-kicked by `startup_sweep`). Spawn
+  memory gate: `spawn_one` waits for `SPAWN_MIN_FREE_MEM_MB` host headroom
+  before `docker run` (probed via `/proc/meminfo` → `sysconf` → `docker
+  info`+`stats`), capped by `SPAWN_MEM_WAIT_SECONDS`, expiry fails that
+  sandbox — remaining configs then fail fast (one probe each) so pressure
+  can't hold the slot for N×cap. Pacing emits `checkpoint` events keyed by
+  `payload.stage`: `run_queued`/`run_dequeued` (run scope),
+  `spawn_mem_wait`/`spawn_mem_release`/`spawn_mem_timeout` (sandbox scope).
 - **Where:** `orchestrator/` (`state_machine.py`, `lifecycle.py`,
-  `provision.py`, `monitor.py`, `rubric.py`, `runner.py`, `events.py`,
-  `adapters.py`), db `runs`/`sandboxes`/`rubrics`
+  `provision.py`, `monitor.py`, `rubric.py`, `runner.py`, `pacing.py`,
+  `events.py`, `adapters.py`), db `runs`/`sandboxes`/`rubrics`
 - **Verify:**
   - Unit: `tests/unit/orchestrator/` (`test_state_machine.py`,
     `test_lifecycle.py`, `test_monitor.py`, `test_provision.py`,
-    `test_rubric.py`)
+    `test_rubric.py`, `test_pacing.py`), queue E2E in
+    `tests/unit/api/test_runs.py::test_approve_queues_behind_active_run`
   - Manual: submit → edit/approve rubric → sandboxes spawn → terminal states
-    recorded correctly
+    recorded correctly; approve a second run mid-flight → `queued` badge →
+    promotes when the first finishes
 - **Depends on:** F3, F4, F5
 
 ### F3 — AI gateway ✅

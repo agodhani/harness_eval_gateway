@@ -9,6 +9,7 @@ is touched.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -23,7 +24,7 @@ from sqlalchemy import select
 from api.deps import get_db
 from api.main import app
 from api.routers import runs as runs_router
-from db.models import Base, Rubric, Run
+from db.models import Base, Event, Rubric, Run
 from db.session import make_engine, make_session_factory
 from orchestrator import lifecycle as lifecycle_mod
 from orchestrator import rubric as rubric_mod
@@ -385,6 +386,92 @@ def test_approve_freezes_rubric_and_starts_lifecycle(api) -> None:
         rubric = s.get(Rubric, rubric_id)
         assert rubric.status == "approved"
         assert rubric.version == 1
+
+
+def test_approve_queues_behind_active_run(api, monkeypatch) -> None:
+    """PR15 pacing: approvals serialize — a second run parks in `queued` and
+    promotes FIFO (by approval) when the active run frees the slot.
+
+    Note on mechanics: starlette's TestClient builds a fresh blocking
+    portal per request, so background tasks spawned mid-request are
+    cancelled when it completes — a test can't hold a "still running"
+    lifecycle across requests. Instead the fake marks done only runs the
+    test releases, A's task exits while A stays `provisioning` (promote
+    correctly no-ops: slot still held), and A's end is driven by calling
+    ``promote_next_queued`` on a throwaway loop. B's own task-finally
+    promotes C, so the real chain still runs.
+    """
+    client = api.client
+    calls: list[uuid.UUID] = []
+    finishable: set[uuid.UUID] = set()
+
+    async def finishable_lifecycle(run_id, **kwargs):
+        calls.append(run_id)
+        if run_id in finishable:
+            with api.session_factory() as s:
+                r = s.get(Run, run_id)
+                if r is not None:
+                    r.status = "done"
+                    s.commit()
+
+    monkeypatch.setattr(lifecycle_mod, "run_lifecycle", finishable_lifecycle)
+
+    run_a, _ = _run_with_draft_rubric(api)
+    resp = client.post(f"/api/runs/{run_a}/approve")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "provisioning"
+
+    # A's lifecycle ran but A still holds the slot (fake left it active)
+    deadline = time.monotonic() + 5.0
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert calls == [uuid.UUID(run_a)]
+
+    run_b, _ = _run_with_draft_rubric(api)
+    run_c, _ = _run_with_draft_rubric(api)
+    resp = client.post(f"/api/runs/{run_b}/approve")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "queued"
+    resp = client.post(f"/api/runs/{run_c}/approve")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "queued"
+    # parked: no lifecycle started for B or C while A holds the slot
+    assert calls == [uuid.UUID(run_a)]
+
+    # A finishes -> the queue drains FIFO through real promote calls.
+    finishable.update({uuid.UUID(run_a), uuid.UUID(run_b), uuid.UUID(run_c)})
+    with api.session_factory() as s:
+        s.get(Run, uuid.UUID(run_a)).status = "done"
+        s.commit()
+
+    async def _drain():
+        await runner.promote_next_queued(
+            session_factory=api.session_factory,
+            settings=api.settings,
+            runtime=None,  # unused by the fake
+        )
+        for _ in range(200):
+            if len(calls) >= 3:
+                return
+            await asyncio.sleep(0.01)
+
+    asyncio.run(_drain())
+
+    # FIFO by approval time: B promotes before C
+    assert calls == [uuid.UUID(run_a), uuid.UUID(run_b), uuid.UUID(run_c)]
+
+    for rid in (run_b, run_c):
+        _wait_run(client, rid, status="done")
+        with api.session_factory() as s:
+            stages = [
+                e.payload.get("stage")
+                for e in s.execute(
+                    select(Event).where(Event.run_id == uuid.UUID(rid))
+                ).scalars()
+                if e.type == "checkpoint"
+            ]
+        assert "run_queued" in stages
+        assert "run_dequeued" in stages
 
 
 def test_rubric_endpoints_404_and_409(api) -> None:
