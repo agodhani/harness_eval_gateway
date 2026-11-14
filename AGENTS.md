@@ -244,6 +244,9 @@ or tests change.
 - Cross-run analytics & cost dashboards
 - Timeline-side analytics — per-sandbox metrics rendered alongside the
   execution timeline or on event hover (cost/tokens/latency in context)
+- Split-view trace comparison — side-by-side, time-aligned event streams for
+  two sandboxes on the traces/timeline page (today it's one merged stream
+  with a single-sandbox filter dropdown); scrolling/diff-alignment UX TBD
 - Lightweight artifact thumbnails — capture screenshots of produced artifacts
   for at-a-glance review before spawning a full live preview sandbox
 - Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.
