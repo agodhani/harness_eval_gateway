@@ -133,9 +133,12 @@ LLM call can take minutes on a 3B model).
 
 ## 3. Provisioning — `orchestrator/provision.py` + `lifecycle.py`
 
-`run_lifecycle(run_id)` (the approve-triggered task) does, sequentially:
+`run_lifecycle(run_id)` (the approve/promotion-triggered task) does,
+sequentially:
 
-1. `run.status="provisioning"` (already set at approve; emit `checkpoint`).
+1. `run.status="provisioning"` (set by `place_run` at approve, or by
+   `claim_next_queued` when a parked run is promoted — PR15; emit
+   `checkpoint`).
 2. **Per `harness_config`** (N ≤ 8, sequential `to_thread` calls — docker run
    ≈1 s each):
    - `sid = uuid4()`; insert `Sandbox(id=sid, run_id, harness_config=cfg,
@@ -144,6 +147,12 @@ LLM call can take minutes on a 3B model).
    - Stage skillpacks: `shutil.copytree` each selected pack dir into
      `{rt.state_dir}/{sid}/skillpacks/` (empty list → empty dir). This dir is
      bind-mounted, so it must live under the host-visible state dir.
+   - Mem gate (PR15): `await pacing.wait_for_headroom(...)` — bounded wait
+     for `SPAWN_MIN_FREE_MEM_MB` host headroom before cred mint/`docker run`
+     (probe chain `/proc/meminfo` → `sysconf` → `docker info`+`stats`;
+     unreadable → proceed ungated). Expiry (`SPAWN_MEM_WAIT_SECONDS`) fails
+     THIS sandbox like a spawn error; the recorded `spawn_mem_timeout`
+     collapses remaining configs' waits to a single probe each.
    - Mint cred: `ttl_seconds = wall_clock + 3600`, `max_tokens = token_budget`.
    - `env = adapter.env(gateway_url="http://gateway:8080",
      cred, task_prompt, model_name, events_ingest_url=
@@ -261,7 +270,8 @@ total `Score` rows for the run == 0 → `run.status="failed"` + error event
 ## 6. Concurrency & edge cases
 
 - **N sandboxes parallel:** monitor tasks via `asyncio.gather`; provisioning
-  sequential (cheap, simpler DB handling).
+  sequential (cheap, simpler DB handling). Runs themselves serialize — one
+  execution slot, excess approvals park `queued` (PR15, §1).
 - **Partial failure:** spawn/eval failures are per-sandbox; run still reaches
   `done` if ≥1 sandbox produced scores. All-spawn-fail or zero-score → `failed`.
 - **api restart:** lifespan `startup_sweep` (`orchestrator/runner.py`):
@@ -301,7 +311,11 @@ orchestrator/
   lifecycle.py       # run_lifecycle(run_id): provision -> gather monitors ->
                      #   evaluate -> done/failed
   runner.py          # _TASKS registry {run_id: Task}; start_rubric_task,
-                     #   start_lifecycle_task, startup_sweep, shutdown
+                     #   start_lifecycle_task, promote_next_queued,
+                     #   startup_sweep, shutdown
+  pacing.py          # PR15: place_run/claim_next_queued (queued status =
+                     #   the queue, FIFO by started_at); wait_for_headroom
+                     #   spawn mem gate (SPAWN_MIN_FREE_MEM_MB / *_WAIT_SECONDS)
 api/routers/runs.py  # §1 endpoints (thin: validate -> db -> runner calls)
 api/main.py          # include runs.router; lifespan -> runner.startup_sweep /
                      #   shutdown (use @asynccontextmanager lifespan)
@@ -352,10 +366,14 @@ Unit (`tests/unit/orchestrator/`, sqlite via `tests/conftest.py` pattern —
 - `test_lifecycle.py` — `FakeRuntime` (scripted statuses/logs) + fake
   evaluator: happy path 2 sandboxes→`done`+scores; one spawn fails→still
   `done`; all fail→`failed`; evaluator raises→`failed` only if zero scores.
+- `test_pacing.py` — `place_run`/`claim_next_queued` FIFO + single-slot
+  gate; `wait_for_headroom` probe chain, wait cap, sibling fail-fast on a
+  recorded `spawn_mem_timeout`; `promote_next_queued` claim retries.
 - `tests/unit/api/test_runs.py` — POST 201/422s (bad adapter, bad pack,
   empty configs); GET list/detail; PUT rubric guards (wrong status→409,
-  bad content→422); approve guards + transition to `provisioning`
-  (mock `runner.start_lifecycle_task`).
+  bad content→422); approve guards + `place_run` (`→ provisioning`, or
+  parked `queued` behind an active run) — mock
+  `runner.start_lifecycle_task`.
 
 Integration (`tests/integration/test_orchestrator.py`, `@pytest.mark.docker`):
 build `heg-testapp` + `heg-sandbox` images; run lifecycle with
