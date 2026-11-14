@@ -183,38 +183,57 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   rows is re-spawned up to `EVAL_SCORE_RETRIES` times (default 1) with a fresh
   cred, emitting an `eval_retry` checkpoint — covers small-model flake modes
   (malformed JSON, stuck-loop wander); infra exceptions are not retried.
-  **Objective signals (PR6):** before staging, the candidate workspace is
-  measured by the `scoring` package's signal collectors — `static_analysis`
-  runs lizard (multi-language, parse-only, no code execution) for real
-  cyclomatic complexity, nloc, function counts, nesting depth, and language
-  mix. The report is staged into the eval workspace as `ANALYSIS.md`
-  (judge-facing brief; judge is told to score `cyclomatic_complexity` from
-  measured values) + `analysis.json`, persisted at
-  `<artifact>/analysis.json`, summarized in an `eval_analysis` checkpoint
-  event, and re-validated + embedded as `analysis` on
-  `GET /api/runs/{id}/results` sandboxes. Candidate-authored
-  `ANALYSIS.md`/`analysis.json` files are dropped at staging (reserved
-  names — fake measured evidence can't reach the judge). Collection never
-  blocks evaluation: collector failures degrade to `status="error"` signal
-  entries / `status="unavailable"` event. Collector registry
-  (`scoring/collectors.py::COLLECTORS`) is the extension point for PR7's
-  exec/coverage signals.
+  **Objective signals (PR6+PR7):** before staging, the candidate workspace
+  is measured by the `scoring` package's signal collectors —
+  `static_analysis` runs lizard (multi-language, parse-only, no code
+  execution) for real cyclomatic complexity, nloc, function counts,
+  nesting depth, and language mix; `exec` runs the workspace's
+  build/tests/coverage inside a locked `heg-exec` container
+  (`--network none`, nobody user, cap-drop ALL, no-new-privileges,
+  cpu/memory/pids bounds, artifact mounted read-only at `/srv/src` and
+  copied to container-local `/work` — the artifact is never written).
+  The report is staged into the eval workspace as `ANALYSIS.md`
+  (judge-facing brief incl. the executed-checks block; judge is told to
+  score `cyclomatic_complexity` from measured values and to treat
+  build/test/coverage as ground truth for functional/acceptance dims) +
+  `analysis.json`, persisted at `<artifact>/analysis.json`, summarized in
+  an `eval_analysis` checkpoint event (plus a `test_execution` event when
+  candidate tests ran), and re-validated + embedded as `analysis` + flat
+  `exec` ExecSummary on `GET /api/runs/{id}/results` sandboxes.
+  Candidate-authored `ANALYSIS.md`/`analysis.json` files are dropped at
+  staging (reserved names — fake measured evidence can't reach the judge).
+  Collection never blocks evaluation: collector failures degrade to
+  `status="error"`/`skipped` signal entries / `status="unavailable"`
+  event. Collector registry (`scoring/collectors.py::COLLECTORS`) is the
+  extension point for further signal types; `SCORING_EXEC=0` disables the
+  exec collector (conftest pins it for unit tests).
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
   `prompts.py`), `scoring/` (`models.py` — analysis.json/API pydantic
   contract, `collectors.py` — SignalCollector protocol + registry,
-  `static.py` — lizard collector, `render.py` — ANALYSIS.md), db `scores`,
-  `api/routers/results.py` (`SandboxResult.analysis`),
+  `static.py` — lizard collector, `exec.py` — exec collector,
+  `render.py` — ANALYSIS.md), `sandbox/exec.py` (ExecRunner — docker
+  lifecycle + result parsing) + `sandbox/images/exec.Dockerfile` +
+  `exec_runner.py` (in-image build/test/coverage phases), db `scores`,
+  `api/routers/results.py` (`SandboxResult.analysis` + `.exec`),
   `api/schemas.py` (AnalysisReport re-export)
 - **Verify:**
   - Unit: `tests/unit/evaluator/` (`test_evaluate.py`, `test_scores.py`,
     `test_prompts.py`) — mocked runtime; staging, timeout salvage, malformed
     scores covered; `tests/unit/scoring/` (`test_static.py`,
-    `test_collectors.py`, `test_render.py`) — workspaces with known CC
-    values, skip/cap/symlink rules, collector isolation, markdown render
+    `test_collectors.py`, `test_render.py`, `test_exec.py`) — workspaces
+    with known CC values, skip/cap/symlink rules, collector isolation,
+    markdown render, exec metric mapping/status semantics;
+    `tests/unit/sandbox/test_exec.py` — exec run-argv isolation posture,
+    result file/sentinel parsing, timeout/missing-image paths
+  - Exec integration: `tests/integration/test_exec_scoring.py`
+    (`@pytest.mark.docker`) — real `heg-exec` container executes a trivial
+    artifact: build ok, 2/2 tests pass, coverage measured, container
+    force-removed, workspace untouched
   - Results API: `tests/unit/api/test_results.py` — analysis embedded when
     `<artifact>/analysis.json` exists+valid, null otherwise
   - Manual: scores + rationale visible on results page; rationale for
-    cyclomatic_complexity cites measured CC values
+    cyclomatic_complexity cites measured CC values; build/test failures
+    visible in analysis + eval events
 - **Depends on:** F2, F4, artifacts from a completed run
 
 ### F8 — Results UI ✅

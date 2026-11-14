@@ -89,8 +89,11 @@ scoring. Your job is to read the rubric and the submission, then produce
   `criteria`). Read it first.
 - **`ANALYSIS.md`** *(if present)* — objective measurements collected from
   the submission BEFORE you ran: real cyclomatic complexity per function,
-  file sizes, language mix (parse-only; no code was executed).
-  **`analysis.json`** is the machine-readable form of the same report.
+  file sizes, language mix (parse-only static analysis), and — when an
+  "Executed checks" section is present — the submission's build/test/
+  coverage results measured by running it inside a locked, network-less
+  sandbox container. **`analysis.json`** is the machine-readable form of
+  the same report.
 - **`EVAL_TRANSCRIPT.log`** *(if present)* — the candidate agent's run
   transcript. Reference only; it is NOT part of the submission.
 - **`EVAL_PROMPT.md`** — this file.
@@ -146,7 +149,12 @@ same object. Valid JSON in this schema:
    present, score `cyclomatic_complexity` from its measured values — do NOT
    estimate complexity by skimming. Cite the numbers in the rationale (e.g.
    'avg CC 4.2, worst fn `update` at 14'); if the report shows no analyzable
-   source, note that instead of guessing.
+   source, note that instead of guessing. Likewise, when an "Executed
+   checks" section is present, treat its build/test/coverage results as
+   ground-truth evidence for `functional_requirements` and
+   `acceptance_criteria` — a submission that fails to build or has failing
+   tests is not fully working; cite the counts (e.g. 'build ok, 5/5 tests
+   pass, 82% coverage').
 5. **Never modify candidate files.** The only file you create is
    `scores.json`.
 6. After writing `scores.json`, read it back and confirm it is **one

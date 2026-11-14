@@ -61,6 +61,11 @@ services:
       # Optional GitHub PAT for skillpack import (F11) — private repos +
       # higher rate limits; public repos work without it.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # --- Objective scoring (PR7) ---
+      # Exec signal: candidate build/tests/coverage inside the locked
+      # heg-exec container. 0 disables; the image is repo-built, never pulled.
+      SCORING_EXEC: ${SCORING_EXEC:-1}
+      EXEC_IMAGE: ${EXEC_IMAGE:-heg-exec:latest}
     ports:
       - "8001:8000"
     volumes:

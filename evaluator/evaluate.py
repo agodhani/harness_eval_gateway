@@ -33,6 +33,13 @@ What it does:
    ``<artifact>/analysis.json`` for the results API, and summarized in an
    ``eval_analysis`` checkpoint event. Analysis never blocks evaluation —
    failures degrade to a missing report.
+
+   PR7: the collector registry also runs ``exec`` — the workspace's build/
+   tests/coverage are executed inside a locked ``heg-exec`` container (no
+   network, resource-capped, artifact mounted read-only) and land in the
+   same ``analysis.json`` envelope + ANALYSIS.md exec section. When tests
+   ran, a ``test_execution`` event records pass/fail counts on the sandbox
+   timeline. Disable via ``SCORING_EXEC=0``.
 3. Waits for container exit (or ``timeout_seconds`` → docker stop), removes
    the container, parses ``scores.json``, validates it, and inserts
    ``Score`` rows (one per rubric dimension + an ``overall`` pseudo-row when
@@ -193,7 +200,28 @@ def _analysis_event_payload(report: AnalysisReport | None) -> dict[str, Any]:
             "cc_mean": cc.get("mean"),
             "cc_max": cc.get("max"),
         }
+    exec_sig = report.signal("exec")
+    if exec_sig is not None and exec_sig.status == "ok":
+        payload["exec"] = _exec_summary(exec_sig.metrics)
     return payload
+
+
+def _exec_summary(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Flat exec headline shared by the eval_analysis payload + the
+    ``test_execution`` event (PR7)."""
+    return {
+        "build_ok": metrics.get("build_ok"),
+        "tests_detected": metrics.get("tests_detected", False),
+        "tests_ok": metrics.get("tests_ok"),
+        "tests_collected": metrics.get("tests_collected", 0),
+        "tests_passed": metrics.get("tests_passed", 0),
+        "tests_failed": metrics.get("tests_failed", 0),
+        "tests_errors": metrics.get("tests_errors", 0),
+        "tests_skipped": metrics.get("tests_skipped", 0),
+        "coverage_percent": metrics.get("coverage_percent"),
+        "timed_out": metrics.get("timed_out", False),
+        "duration_seconds": metrics.get("duration_seconds"),
+    }
 
 
 def _persist_analysis(artifact_dir: Path, report: AnalysisReport | None) -> Path | None:
@@ -457,6 +485,28 @@ async def evaluate_sandbox(
             ),
         },
     )
+
+    # PR7: when the exec signal actually ran candidate tests, record the
+    # outcome as a test_execution event on the sandbox timeline — same
+    # event type harness-side test runs use, sourced from the evaluator.
+    exec_sig = analysis_report.signal("exec") if analysis_report else None
+    if (
+        exec_sig is not None
+        and exec_sig.status == "ok"
+        and exec_sig.metrics.get("tests_detected")
+    ):
+        _emit_event(
+            session_factory,
+            run_id=run_uuid,
+            sandbox_id=sandbox_uuid,
+            event_type="test_execution",
+            payload={
+                "phase": "eval_exec",
+                "eval_sandbox_id": eval_sid,
+                "image": exec_sig.metrics.get("image"),
+                **_exec_summary(exec_sig.metrics),
+            },
+        )
 
     # ---- stage + spawn ------------------------------------------------------
     eval_ws = await asyncio.to_thread(
