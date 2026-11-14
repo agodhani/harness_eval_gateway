@@ -190,6 +190,81 @@ async def test_budget_error_event_terminates(session_factory, settings, fake_run
     assert row.terminal_reason == "budget_exceeded"
 
 
+async def test_upstream_429_is_not_budget_exceeded(
+    session_factory, settings, fake_runtime
+) -> None:
+    """An upstream provider 429 (stage=upstream) is NOT the gateway's budget
+    gate — the sandbox exits with its own verdict (error), not
+    budget_exceeded."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    _add_event(
+        session_factory, run.id, sb.id, "error",
+        {
+            "stage": "upstream",
+            "http_status": 429,
+            "message": "429 rate limit exceeded (daily quota)",
+        },
+    )
+    # Agent dies on the failed call -> container exits -> verdict=error.
+    fake_runtime.status_map[str(sb.id)] = {"status": "exited", "exit_code": 2}
+    fake_runtime.logs_map[str(sb.id)] = RESULT_LINE("error") + "\n"
+
+    reason = await _watch(session_factory, settings, fake_runtime, run.id, sb.id)
+    assert reason == "error"
+    row = _get_sandbox(session_factory, sb.id)
+    assert row.status == "failed"
+    assert row.terminal_reason == "error"
+
+
+async def test_upstream_error_threshold_terminates_error(
+    session_factory, settings, fake_runtime
+) -> None:
+    """>= UPSTREAM_ERROR_THRESHOLD upstream failures while still running ->
+    terminate error (provider dead for this run) — not budget_exceeded."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    for i in range(monitor.UPSTREAM_ERROR_THRESHOLD):
+        _add_event(
+            session_factory, run.id, sb.id, "error",
+            {"stage": "upstream", "http_status": 500, "message": f"boom {i}"},
+        )
+    fake_runtime.status_map[str(sb.id)] = {"status": "running", "exit_code": None}
+
+    reason = await _watch(session_factory, settings, fake_runtime, run.id, sb.id)
+    assert reason == "error"
+    row = _get_sandbox(session_factory, sb.id)
+    assert row.status == "failed"
+    assert row.terminal_reason == "error"
+    assert str(sb.id) in fake_runtime.stopped
+
+
+async def test_upstream_below_threshold_does_not_terminate(
+    session_factory, settings, fake_runtime
+) -> None:
+    """A lone transient upstream failure lets the harness keep running —
+    the container's own exit decides the verdict."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    for _ in range(monitor.UPSTREAM_ERROR_THRESHOLD - 1):
+        _add_event(
+            session_factory, run.id, sb.id, "error",
+            {"stage": "upstream", "http_status": 429, "message": "transient"},
+        )
+    states = iter(
+        [
+            {"status": "running", "exit_code": None},
+            {"status": "exited", "exit_code": 0},
+        ]
+    )
+    fake_runtime.status_map[str(sb.id)] = lambda: next(states)
+    fake_runtime.logs_map[str(sb.id)] = RESULT_LINE("agent_done") + "\n"
+
+    reason = await _watch(session_factory, settings, fake_runtime, run.id, sb.id)
+    assert reason == "agent_done"
+    assert _get_sandbox(session_factory, sb.id).status == "done"
+
+
 async def test_run_token_budget_terminates(session_factory, settings, fake_runtime) -> None:
     run = make_run(session_factory, status="running", config=run_config())
     sb = make_sandbox(session_factory, run.id, status="running")

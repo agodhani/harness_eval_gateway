@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     # (missing/invalid scores.json) — small judge models flake ~1 in 3 evals;
     # one retry is a cheap coin-flip recover. Infra exceptions are not retried.
     EVAL_SCORE_RETRIES: int = 1
+    # Per-request output cap (chat-completions max_tokens) for the rubric
+    # draft call. Thinking models burn output tokens on <think> blocks — the
+    # old 2048 cap truncated rubric JSON mid-document on qwen3-class models.
+    RUBRIC_MAX_TOKENS: int = 8192
+    # Per-request output cap for the eval judge's chat calls (miniloop
+    # MAX_TOKENS in the eval sandbox). Rationale-heavy scores.json plus
+    # thinking-model overhead need headroom over the 4096 participant
+    # default — truncation yields missing/invalid scores.json.
+    EVAL_JUDGE_MAX_TOKENS: int = 8192
     # Host path of ./data as seen by the docker daemon — set by compose
     # (HOST_DATA_ROOT=${PWD}/data) so sandbox -v sources resolve on the host.
     # Empty (host-run dev / tests) => paths pass through verbatim.

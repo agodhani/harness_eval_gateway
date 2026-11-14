@@ -337,6 +337,10 @@ export interface SandboxResult {
   rubric_id: string | null;
   dimensions: Record<string, DimensionScore>;
   overall: DimensionScore | null;
+  /** Judge/eval pipeline failure detail when the sandbox produced no Score
+   * rows — distinguishes "judge failed" from "no rubric scores" (pending or
+   * never evaluated). Null/absent when scored or not yet evaluated. */
+  eval_error?: string | null;
   /** PR6: measured signals (analysis.json); null when not collected. */
   analysis?: AnalysisReport | null;
   /** Optional artifact ids if/when the results API exposes them. */

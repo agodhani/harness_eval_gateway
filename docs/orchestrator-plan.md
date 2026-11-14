@@ -185,10 +185,13 @@ Each iteration (DB reads via short-lived sessions on the event-loop thread):
 
 1. **Deadline:** `now > sandbox.started_at + wall_clock_seconds` → terminate
    `timeout`.
-2. **Budget:** any `error` event for this sandbox with
-   `payload.reason=="budget_exceeded"` or `http_status==429` → terminate
-   `budget_exceeded`. Also `metering.tokens_used(run_id) >= token_budget` →
-   terminate `budget_exceeded` (run-wide; all monitors trip ~together — the
+2. **Budget/provider:** gateway `error` events for this sandbox —
+   `payload.reason=="budget_exceeded"` / `stage=="budget"` (the gateway's own
+   run-budget 429 signature, NOT a bare `http_status==429`) → terminate
+   `budget_exceeded`; `stage=="upstream"` provider failures (rate-limit 429s,
+   5xx, unreachable) ≥ `UPSTREAM_ERROR_THRESHOLD` (3) → terminate `error`.
+   Also `metering.tokens_used(run_id) >= token_budget` → terminate
+   `budget_exceeded` (run-wide; all monitors trip ~together — the
    gateway will 429 stragglers anyway).
 3. **Container state** (`to_thread(rt.status, sid)`):
    - `running` → check `done_signal` event seen; if older than
@@ -218,7 +221,8 @@ Mapping table (first match wins; `MINILOOP_RESULT` carries `terminal_state`):
 | result=`stuck_loop` | `stuck_loop` | done |
 | result=`error`, exit 2, other nonzero, missing | `error` | failed |
 | wall-clock deadline | `timeout` | failed |
-| gateway 429 / budget event | `budget_exceeded` | failed |
+| gateway budget-gate event (`reason=budget_exceeded`) | `budget_exceeded` | failed |
+| ≥3 gateway upstream-failure events (`stage=upstream`: provider 429/5xx/outage) | `error` | failed |
 
 ## 5. Evaluation trigger + contract — `orchestrator/lifecycle.py` tail, `evaluator/`
 
@@ -343,7 +347,8 @@ Unit (`tests/unit/orchestrator/`, sqlite via `tests/conftest.py` pattern —
   SYSTEM_PROMPT_EXTRA); skillpack staging copies only selected packs;
   cred claims (`max_tokens`, `ttl`); `SandboxSpec.skillpacks_host_path` set.
 - `test_monitor.py` — verdict mapping table (fake runtime: status/logs/
-  events); deadline→`timeout`; 429 event→`budget_exceeded`; exit-code
+  events); deadline→`timeout`; budget-gate event→`budget_exceeded`;
+  upstream 429/5xx events→`error` at threshold (not budget); exit-code
   fallbacks; done-grace.
 - `test_lifecycle.py` — `FakeRuntime` (scripted statuses/logs) + fake
   evaluator: happy path 2 sandboxes→`done`+scores; one spawn fails→still

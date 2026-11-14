@@ -27,6 +27,7 @@ SETTINGS = SimpleNamespace(
     GATEWAY_CRED_SECRET="unit-test-secret",
     RUBRIC_MODEL="",
     EVAL_TOKEN_BUDGET=200_000,
+    RUBRIC_MAX_TOKENS=8192,
 )
 
 
@@ -165,6 +166,7 @@ async def test_draft_rubric_success(session_factory) -> None:
     assert claims.max_tokens == SETTINGS.EVAL_TOKEN_BUDGET
     assert seen["body"]["model"] == "test-model"  # RUBRIC_MODEL unset -> run model
     assert seen["body"]["stream"] is False
+    assert seen["body"]["max_tokens"] == 8192  # RUBRIC_MAX_TOKENS (not 2048)
 
     with session_factory() as s:
         r = s.get(Run, run.id)
@@ -195,6 +197,24 @@ async def test_draft_rubric_uses_rubric_model_override(session_factory) -> None:
     client = _mock_client(handler)
     await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=settings, client=client)
     assert seen["model"] == "cheap-model"
+
+
+async def test_draft_rubric_max_tokens_is_configurable(session_factory) -> None:
+    """RUBRIC_MAX_TOKENS flows into the chat call — thinking models need the
+    headroom (2048 truncated rubric JSON mid-<think> on qwen3-class)."""
+    run = make_run(session_factory, status="submitted")
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["max_tokens"] = json.loads(request.content)["max_tokens"]
+        return _chat_response(json.dumps(_valid_rubric_payload()))
+
+    settings = SimpleNamespace(**{**vars(SETTINGS), "RUBRIC_MAX_TOKENS": 16384})
+    client = _mock_client(handler)
+    await rubric_mod.draft_rubric(
+        run.id, session_factory=session_factory, settings=settings, client=client
+    )
+    assert seen["max_tokens"] == 16384
 
 
 async def test_draft_rubric_retries_once_on_bad_json(session_factory) -> None:

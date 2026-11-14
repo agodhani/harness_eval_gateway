@@ -365,6 +365,13 @@ export default function ResultsClient({ runId }: { runId: string }) {
                               <Badge tone={statusTone(sb.terminal_reason)}>{sb.terminal_reason}</Badge>
                             </div>
                           ) : null}
+                          {sb.eval_error ? (
+                            <div className="dim-desc">
+                              <Badge tone="red" title={sb.eval_error}>
+                                eval failed
+                              </Badge>
+                            </div>
+                          ) : null}
                         </th>
                       ))}
                     </tr>

@@ -143,6 +143,13 @@ function RubricView({
                     <div className="faint" style={{ fontSize: "0.66rem", fontWeight: 400 }}>
                       {String(sb.harness_config?.adapter ?? sb.harness_config?.harness ?? "?")}
                     </div>
+                    {sb.eval_error ? (
+                      <div style={{ fontSize: "0.66rem", fontWeight: 400 }}>
+                        <Badge tone="red" title={sb.eval_error}>
+                          eval failed
+                        </Badge>
+                      </div>
+                    ) : null}
                   </th>
                 ))}
               </tr>

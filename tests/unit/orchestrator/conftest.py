@@ -57,6 +57,8 @@ def settings(tmp_path: Path, skillpacks_dir: Path) -> SimpleNamespace:
         MONITOR_POLL_SECONDS=0.01,
         EVAL_TIMEOUT_SECONDS=5.0,
         EVAL_TOKEN_BUDGET=200_000,
+        RUBRIC_MAX_TOKENS=8192,
+        EVAL_JUDGE_MAX_TOKENS=8192,
         HOST_DATA_ROOT="",
         SKILLPACKS_DIR=skillpacks_dir,
         ARTIFACT_ROOT=tmp_path / "artifacts",

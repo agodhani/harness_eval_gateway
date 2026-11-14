@@ -366,6 +366,20 @@ def test_config_bad_max_iters_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert AgentConfig.from_env().max_iters == 50
 
 
+def test_config_max_tokens_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """MAX_TOKENS overrides the 4096 per-request output cap (judges on
+    thinking models need headroom for scores.json + reasoning)."""
+    monkeypatch.setenv("GATEWAY_BASE_URL", "http://gw")
+    monkeypatch.setenv("MODEL_NAME", "m")
+    monkeypatch.setenv("TASK_PROMPT", "t")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    assert AgentConfig.from_env().max_tokens == 4096
+    monkeypatch.setenv("MAX_TOKENS", "8192")
+    assert AgentConfig.from_env().max_tokens == 8192
+    monkeypatch.setenv("MAX_TOKENS", "banana")
+    assert AgentConfig.from_env().max_tokens == 4096
+
+
 # ---------------------------------------------------------------------------
 # HttpChatClient request formation (MockTransport — still hermetic)
 # ---------------------------------------------------------------------------
