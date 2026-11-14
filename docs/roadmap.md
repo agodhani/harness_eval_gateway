@@ -37,8 +37,7 @@ Soft edge (╌▶) = works better after / benefits from.
 PR1  Submit UX ────────▶ PR14 Model-vs-model ◀╌╌╌╌ PR12 Providers ──▶ PR18 Cache/replay
    │                                                         │
    ├╌ labels ╌▶ PR9  Timeline-analytics ──▶ PR10 Split-view   ├╌╌╌▶ PR13 Aider ╌╌╌▶ PR17 Hooks
-   ├╌ labels ╌▶ PR10
-   └╌ labels ╌▶ PR11 Graphical analysis
+   └╌ labels ╌▶ PR10
 
 PR2  Preview fixes ────▶ PR3  Preview types ──▶ PR4  Thumbnails
 
