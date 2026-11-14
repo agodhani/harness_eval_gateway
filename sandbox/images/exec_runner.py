@@ -9,8 +9,9 @@ Baked into the ``heg-exec`` image (``exec.Dockerfile``) and launched by
   ever touching the artifact.
 - ``/out`` — a host-visible scratch dir (bind-mounted rw). The result payload
   is written to ``/out/exec_result.json`` AND printed on stdout as a
-  ``HEG_EXEC_RESULT <json>`` sentinel line (fallback channel for when the
-  mount write fails).
+  ``HEG_EXEC_RESULT <json>`` sentinel line. ExecRunner trusts the LAST
+  sentinel (the runner's final act) and uses the file as the fallback
+  channel for when stdout can't be recovered.
 - The container has ``--network none``, dropped capabilities, and resource
   caps — this script needs no privileges and must not assume DNS/TCP exist.
 
@@ -391,9 +392,10 @@ def _emit(result: dict[str, Any]) -> None:
     """Publish the result on both channels: /out file, then stdout sentinel.
 
     The file write goes last-after-everything so a candidate can't pre-place
-    a fake result (the /out dir starts empty and we overwrite atomically);
-    the sentinel is the fallback when the mount write fails, and ExecRunner
-    takes the LAST sentinel line so candidate stdout can't spoof it either.
+    a fake result (the /out dir starts empty and we overwrite atomically).
+    The stdout sentinel — emitted last, after the file — is the channel
+    ExecRunner trusts (LAST line wins, so candidate stdout can't spoof a
+    later one); the file is the fallback when stdout can't be recovered.
     """
     payload = json.dumps(result, ensure_ascii=False)
     try:

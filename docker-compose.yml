@@ -65,6 +65,11 @@ services:
       # (non-secret only — upstream keys stay inside the gateway service).
       UPSTREAM_PROVIDER: ${UPSTREAM_PROVIDER:-ollama}
       PROVIDER_ROUTES: ${PROVIDER_ROUTES:-}
+      # --- Objective scoring (PR7) ---
+      # Exec signal: candidate build/tests/coverage inside the locked
+      # heg-exec container. 0 disables; the image is repo-built, never pulled.
+      SCORING_EXEC: ${SCORING_EXEC:-1}
+      EXEC_IMAGE: ${EXEC_IMAGE:-heg-exec:latest}
     ports:
       - "8001:8000"
     volumes:

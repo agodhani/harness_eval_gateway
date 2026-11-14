@@ -6,8 +6,8 @@ Executes REAL candidate workspaces in the locked ``heg-exec`` container:
 zero-egress network, nobody user, resource caps, read-only artifact mount.
 The ``heg-exec:latest`` image is built once per session from
 ``sandbox/images/exec.Dockerfile`` (skips when the build fails, e.g. no
-network for pip). Containers are ``hegexec-*`` named and ``--rm`` — nothing
-here touches ``heg-*`` run/preview/eval containers.
+network for pip). Containers are ``hegexec-*`` named and force-removed —
+nothing here touches ``heg-*`` run/preview/eval containers.
 """
 
 from __future__ import annotations
@@ -123,7 +123,7 @@ def test_exec_collects_build_tests_coverage(
     assert {p.name for p in workspace.iterdir()} == before
     assert not (workspace / ".coverage").exists()
 
-    # container was --rm'd — nothing named hegexec-* lingers
+    # container was rm -f'd — nothing named hegexec-* lingers
     leftover = _docker(
         "ps", "-aq", "--filter", "name=^/hegexec-", check=False
     ).stdout.split()
