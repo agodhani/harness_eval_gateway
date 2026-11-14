@@ -20,6 +20,11 @@ append-mostly; rebase on main before merge.
   the plan — `static` serves any jailed file, `desktop` requires `.py`) and a
   `ScanCache`'d results-GET probe (`PREVIEW_SCAN_TTL_SECONDS`, default 30s).
   Details: `FEATURE_MAP.md` F12.
+- **PR9 timeline-side analytics**: per-sandbox metrics strip on
+  `web/app/runs/[id]/timeline/` (turns/tokens/latency/cost/errors chips +
+  judge line; chips double as sandbox-filter selectors; `sandboxStrips`
+  transform in `web/lib/timelineAnalytics.ts` + `node --test` unit tests).
+  Leftover idea: on-event-hover cumulative stats.
 - **OpenRouter provider** (commit 8014338): `UPSTREAM_PROVIDER=ollama|openrouter`
   in `gateway/config.py`; client base normalizes to `/api/` (httpx
   concatenates base+request paths); Ollama-only body params
@@ -57,10 +62,10 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR3, PR5, PR9, PR12,
-  PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
-  PR13/PR17 if soft-only deps are acceptable.
-- **Depth 1:** PR4 (←3), PR8 (←7), PR10 (←9), PR14 (←1, +12 soft),
+- **Depth 0 (start immediately):** PR1, PR3, PR5, PR12,
+  PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains),
+  PR10 (dep PR9 landed) and PR13/PR17 if soft-only deps are acceptable.
+- **Depth 1:** PR4 (←3), PR8 (←7), PR14 (←1, +12 soft),
   PR16 (←15), PR18 (←12).
 - **Floating:** PR20 (soft ←15).
 
@@ -149,13 +154,15 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 - **Touch:** `evaluator/` (gen + exec orchestration), prompts.
 - **Depends on:** PR7.
 
-### PR9 — Timeline-side analytics
+### PR9 — Timeline-side analytics — ✅ landed
 - **Scope:** per-sandbox metrics (cost/tokens/latency) rendered alongside
   the timeline or on event hover — F9 already computes everything; mostly
   UI placement.
 - **Touch:** `web/app/runs/[id]/timeline/`, `web/lib/api.ts`
   (`getRunAnalytics` exists).
 - **Verify:** visual + a unit test on any new transform.
+- **Landed:** metrics strip between toolbar and stream (`SandboxMetricsBar`
+  + `sandboxStrips`); see "Already landed" + `FEATURE_MAP.md` F9.
 
 ### PR10 — Split-view trace comparison
 - **Scope:** side-by-side, time-aligned event streams for two sandboxes on
