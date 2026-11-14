@@ -5,6 +5,8 @@
 for the request's model (the process-wide ``UPSTREAM_PROVIDER``, overridden
 by ``PROVIDER_ROUTES`` globs); tests override this dependency with a
 MockTransport.
+``get_response_cache`` — the opt-in replay cache (PR18); ``None`` unless
+``GATEWAY_CACHE_ENABLED``. Tests override it to inject a tmp-path store.
 """
 
 from __future__ import annotations
@@ -17,10 +19,12 @@ from fastapi import Body
 from sqlalchemy.orm import Session, sessionmaker
 
 from db.session import make_engine, make_session_factory
+from gateway.cache import ResponseCache
 from gateway.config import get_settings
 
 _engine = None
 _session_factory: sessionmaker[Session] | None = None
+_response_cache: ResponseCache | None = None
 
 
 def get_session_factory() -> sessionmaker[Session]:
@@ -38,6 +42,33 @@ def get_db() -> Iterator[Session]:
         yield session
     finally:
         session.close()
+
+
+def get_response_cache() -> ResponseCache | None:
+    """The process-wide replay cache, or ``None`` when disabled.
+
+    Lazily built from settings on first use (like ``get_session_factory``);
+    ``GATEWAY_CACHE_PATH``/``_MAX_ENTRIES``/``_NAMESPACE`` configure it.
+    """
+    global _response_cache
+    settings = get_settings()
+    if not settings.GATEWAY_CACHE_ENABLED:
+        return None
+    if _response_cache is None:
+        _response_cache = ResponseCache(
+            settings.GATEWAY_CACHE_PATH,
+            max_entries=settings.GATEWAY_CACHE_MAX_ENTRIES,
+            namespace=settings.GATEWAY_CACHE_NAMESPACE,
+        )
+    return _response_cache
+
+
+def reset_response_cache() -> None:
+    """Drop the singleton (tests toggling settings between cases)."""
+    global _response_cache
+    if _response_cache is not None:
+        _response_cache.close()
+        _response_cache = None
 
 
 async def get_upstream_client(

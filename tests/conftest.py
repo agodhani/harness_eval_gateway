@@ -23,6 +23,9 @@ os.environ.setdefault("GATEWAY_URL", "http://localhost:8081")
 # Same for PROVIDER_ROUTES — model-glob overrides must not reroute tests.
 os.environ.setdefault("UPSTREAM_PROVIDER", "ollama")
 os.environ.setdefault("PROVIDER_ROUTES", "")
+# Same for the PR18 replay cache — a dev's GATEWAY_CACHE_ENABLED=true must
+# not make tests silently replay stored responses.
+os.environ.setdefault("GATEWAY_CACHE_ENABLED", "false")
 os.environ.setdefault("ARTIFACT_ROOT", str(ROOT / "data" / "artifacts"))
 os.environ.setdefault("LOG_LEVEL", "WARNING")
 

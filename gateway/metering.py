@@ -293,22 +293,30 @@ async def emit_event(
 
 
 async def emit_llm_request(
-    claims: CredClaims, body: dict[str, Any], *, provider: str | None = None
+    claims: CredClaims,
+    body: dict[str, Any],
+    *,
+    provider: str | None = None,
+    cached: bool = False,
 ) -> None:
     messages = body.get("messages")
     tools = body.get("tools")
+    payload: dict[str, Any] = {
+        "model": body.get("model"),
+        "provider": provider or _resolve_provider(body.get("model")),
+        "message_count": len(messages) if isinstance(messages, list) else 0,
+        "tool_count": len(tools) if isinstance(tools, list) else 0,
+        "run_id": claims.run_id,
+        "sandbox_id": claims.sandbox_id,
+    }
+    if cached:
+        # PR18 — response was replayed from the gateway cache, not upstream.
+        payload["cached"] = True
     await emit_event(
         claims,
         source="gateway",
         event_type="llm_request",
-        payload={
-            "model": body.get("model"),
-            "provider": provider or _resolve_provider(body.get("model")),
-            "message_count": len(messages) if isinstance(messages, list) else 0,
-            "tool_count": len(tools) if isinstance(tools, list) else 0,
-            "run_id": claims.run_id,
-            "sandbox_id": claims.sandbox_id,
-        },
+        payload=payload,
     )
 
 
@@ -320,20 +328,24 @@ async def emit_llm_response(
     latency_ms: int,
     http_status: int,
     provider: str | None = None,
+    cached: bool = False,
 ) -> None:
+    payload: dict[str, Any] = {
+        "model": model,
+        "provider": provider or _resolve_provider(model),
+        "usage": usage,
+        "latency_ms": latency_ms,
+        "http_status": http_status,
+        "run_id": claims.run_id,
+        "sandbox_id": claims.sandbox_id,
+    }
+    if cached:
+        payload["cached"] = True
     await emit_event(
         claims,
         source="gateway",
         event_type="llm_response",
-        payload={
-            "model": model,
-            "provider": provider or _resolve_provider(model),
-            "usage": usage,
-            "latency_ms": latency_ms,
-            "http_status": http_status,
-            "run_id": claims.run_id,
-            "sandbox_id": claims.sandbox_id,
-        },
+        payload=payload,
     )
 
 
