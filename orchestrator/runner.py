@@ -7,7 +7,10 @@ in ``orchestrator/``. Tasks are in-process — an api restart kills them, so
 - ``submitted`` runs with no rubric → respawn the rubric task.
 - ``provisioning`` / ``running`` / ``evaluating`` → ``failed`` (+ sandboxes
   ``failed``/``error``), best-effort ``docker rm`` by the ``heg.run_id``
-  label — accepted MVP limitation, documented in the plan (§6).
+  label — accepted MVP limitation, documented in the plan (§6). PR5
+  exception: an ``evaluating`` run marked mid-re-score
+  (``rescore_requested``/``rescore_started`` checkpoint) with ≥1 Score row
+  rescues to ``done`` — see ``_fail_run_and_sandboxes``.
 - ``rubric_review`` is untouched (human gate).
 
 ``session_factory``/``settings``/``runtime`` are injectable for tests; the
