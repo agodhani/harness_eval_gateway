@@ -90,6 +90,28 @@ def test_parse_top_level_array_of_entries() -> None:
     assert parsed.entries[0].dimension == "x"
 
 
+def test_parse_flat_dimension_map() -> None:
+    # Observed small-model output: a flat {dimension: score} dict with a
+    # sum "total" key instead of the canonical scores list.
+    payload = {
+        "functional_requirements": 8.0,
+        "acceptance_criteria": 8.0,
+        "code_quality": 9.0,
+        "cyclomatic_complexity": 9.0,
+        "total": 34.0,
+    }
+    parsed = parse_scores_json(json.dumps(payload))
+    dims = {e.dimension: e.score for e in parsed.entries}
+    assert dims == {
+        "functional_requirements": 8.0,
+        "acceptance_criteria": 8.0,
+        "code_quality": 9.0,
+        "cyclomatic_complexity": 9.0,
+    }
+    # "total" is a sum on a different scale — not a per-dimension score.
+    assert "total" not in dims
+
+
 def test_parse_drops_invalid_entries_with_warnings() -> None:
     payload = {
         "scores": [

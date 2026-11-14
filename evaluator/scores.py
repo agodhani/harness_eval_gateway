@@ -183,6 +183,26 @@ def _clean_dimension(value: Any) -> str | None:
     return dim[:MAX_DIMENSION_LEN]
 
 
+#: Keys excluded when a flat ``{dimension: score}`` dict is normalized —
+#: ``overall``/``summary`` are schema fields, ``total`` is a sum on a
+#: different scale than the per-dimension 0-10 scores.
+_FLAT_MAP_SKIP_KEYS = frozenset({"scores", "overall", "summary", "total"})
+
+
+def _flat_scores_entries(obj: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize a flat ``{dimension: number}`` mapping into entry dicts.
+
+    Small judge models sometimes emit ``{"functional_requirements": 8.0,
+    "total": 34.0}`` instead of the ``scores`` list — the per-dimension
+    values are valid scores, just unwrapped.
+    """
+    return [
+        {"dimension": k, "score": v}
+        for k, v in obj.items()
+        if k not in _FLAT_MAP_SKIP_KEYS and _as_float(v) is not None
+    ]
+
+
 def parse_scores_json(text: str) -> ParsedScores:
     """Parse scores.json content into :class:`ParsedScores`.
 
@@ -203,6 +223,8 @@ def parse_scores_json(text: str) -> ParsedScores:
 
     raw_scores = obj.get("scores")
     if not isinstance(raw_scores, list):
+        raw_scores = _flat_scores_entries(obj)
+    if not raw_scores:
         raise ScoresFileError("scores.json has no 'scores' list")
 
     parsed = ParsedScores()

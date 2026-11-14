@@ -127,6 +127,9 @@ same object. Valid JSON in this schema:
 
 1. Read `rubric.json`, then inspect the submission (`ls`, `find`, `read_file`,
    `shell` are all available). Skim large files; focus on what the rubric asks.
+   `read_file` reports `total_lines` and `eof` — when `eof` is false, continue
+   with `offset` set to the next unread line. Never repeat an identical tool
+   call; vary the arguments or move on.
 2. Apply the scale **consistently and strictly** — reward working,
    requirement-matching code; penalize missing features, bugs you can point
    to, and unfinished work. Do not inflate scores.

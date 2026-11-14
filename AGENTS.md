@@ -237,6 +237,9 @@ or tests change.
 - Higher-fidelity instrumentation via harness hooks/plugins
 - Gateway response caching / deterministic replay
 - Multi-host / K8s sandbox scaling
+- Memory-aware spawn scheduling — gate `spawn_one` on host memory pressure
+  (docker info / cgroup stats) and queue pending sandboxes until headroom
+  exists, instead of launching all N configs at once (matters at 8x)
 - Auth, saved run templates, share links
 - Cross-run analytics & cost dashboards
 - Timeline-side analytics — per-sandbox metrics rendered alongside the
@@ -248,6 +251,9 @@ or tests change.
 - Re-score runs — re-run the evaluator on stored artifacts
 - Post-run rubric edits — modify the frozen rubric after a run and re-score
   with the updated rubric (keep score provenance per rubric version)
+- "Add next prompt" — continue a finished sandbox with a follow-up prompt
+  on the same workspace (multi-turn runs: new phase in the event stream +
+  artifact re-snapshotted; resume-in-place vs respawn-from-snapshot TBD)
 - Preview `?type=` override (entry= picks the file but type still follows
   the suffix; a workspace matching both detectors always gets static),
   more desktop types (pyglet/arcade/tkinter — needs baked deps or a
