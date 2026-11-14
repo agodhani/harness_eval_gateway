@@ -146,3 +146,37 @@ def translate_events(lines: Any) -> list[dict[str, Any]]:
     from adapters.common.runner import translate_lines
 
     return translate_lines(lines, translate_obj)
+
+
+# ---------------------------------------------------------------------------
+# notify hook (PR17) — argv JSON payloads via adapters.common.hooks
+# ---------------------------------------------------------------------------
+
+
+def translate_hook(obj: dict[str, Any]) -> list[dict[str, Any]]:
+    """One codex ``notify`` payload → normalized events.
+
+    ``notify`` fires exactly once per ``agent-turn-complete`` (the only event
+    it supports upstream) and delivers the JSON as the last argv token. The
+    gain over ``turn.completed``'s usage-only checkpoint is
+    ``last-assistant-message`` — the final agent text the ``--json`` item
+    stream never emits on the last turn.
+    """
+    if obj.get("type") != "agent-turn-complete":
+        return []
+    messages = obj.get("input-messages")
+    fields: dict[str, Any] = {
+        "thread_id": obj.get("thread-id"),
+        "turn_id": obj.get("turn-id"),
+        "cwd": obj.get("cwd"),
+        "input_message_count": len(messages) if isinstance(messages, list) else None,
+    }
+    last = obj.get("last-assistant-message")
+    if isinstance(last, str) and last.strip():
+        fields["last_assistant_message"] = _truncate(last, 2000)
+    return [
+        _checkpoint(
+            "agent_turn_complete",
+            **{k: v for k, v in fields.items() if v is not None},
+        )
+    ]

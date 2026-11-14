@@ -74,6 +74,7 @@ export type EventType =
   | "llm_request"
   | "llm_response"
   | "tool_call"
+  | "tool_result"
   | "shell_command"
   | "file_op"
   | "test_execution"
@@ -91,6 +92,7 @@ export const EVENT_TYPES: readonly string[] = [
   "llm_request",
   "llm_response",
   "tool_call",
+  "tool_result",
   "shell_command",
   "file_op",
   "test_execution",

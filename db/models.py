@@ -111,9 +111,9 @@ class Event(Base):
     seq: Mapped[int | None] = mapped_column(BigInteger)
     # gateway | harness | sandbox | evaluator | orchestrator
     source: Mapped[str] = mapped_column(String(32))
-    # llm_request | llm_response | tool_call | shell_command | file_op |
-    # test_execution | checkpoint | skill_invocation | done_signal | error |
-    # run_started | terminal_state | context_compacted | miniloop_result
+    # llm_request | llm_response | tool_call | tool_result | shell_command |
+    # file_op | test_execution | checkpoint | skill_invocation | done_signal |
+    # error | run_started | terminal_state | context_compacted | miniloop_result
     # (authoritative list: api/schemas.py EventType — keep in sync)
     type: Mapped[str] = mapped_column(String(64))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)

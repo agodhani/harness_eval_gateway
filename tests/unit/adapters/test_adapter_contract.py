@@ -207,6 +207,30 @@ def test_cli_translate_events_types_are_valid(name: str) -> None:
         assert ev["type"] in VALID_TYPES, f"{name}: bad type {ev['type']!r}"
 
 
+@pytest.mark.parametrize("name", CLI_ADAPTERS)
+def test_cli_hook_declaration(name: str) -> None:
+    """MANIFEST ``hooks`` (PR17) must pair with a real ``translate_hook``.
+
+    The shared receiver (``adapters.common.hooks``) dispatches per-adapter on
+    ``adapters.<name>.translate.translate_hook`` — declaring hook support in
+    the manifest without the translator (or vice versa) silently drops events.
+    ``translate_hook({})`` must also be a safe no-op: receivers feed whatever
+    the CLI sends, and a crash there still only exits 0.
+    """
+    import importlib
+
+    manifest = orch.adapter_manifest(orch.get_adapter(name), name)
+    module = importlib.import_module(f"adapters.{name}.translate")
+    translate_hook = getattr(module, "translate_hook", None)
+    if manifest.get("hooks"):
+        assert callable(translate_hook), (
+            f"{name}: manifest declares hooks={manifest['hooks']!r} "
+            "but translate.translate_hook is missing"
+        )
+        for ev in translate_hook({}):
+            assert ev["type"] in VALID_TYPES, f"{name}: bad hook type {ev['type']!r}"
+
+
 def test_adapter_image_resolution() -> None:
     """adapter_image: CLI adapters declare their image; miniloop falls back."""
     for name in CLI_ADAPTERS:
