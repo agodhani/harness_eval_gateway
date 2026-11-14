@@ -7,7 +7,7 @@ import json
 from adapters.common.runner import ShimConfig
 from adapters.pi import adapter, config
 from adapters.pi.__main__ import _argv
-from adapters.pi.translate import translate_obj
+from adapters.pi.translate import translate_hook, translate_obj
 
 
 def _cfg(tmp_path, **env):
@@ -39,6 +39,16 @@ class TestConfig:
         cfg = _cfg(tmp_path, PI_CODING_AGENT_DIR=str(tmp_path / "x" / "y"))
         path = config.write_config(cfg)
         assert path == tmp_path / "x" / "y" / "models.json"
+
+    def test_extension_written(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        config.write_config(cfg)
+        ext = tmp_path / "agent" / "extensions" / "heg-events.ts"
+        assert ext.is_file()
+        text = ext.read_text()
+        # Forwards events to the shared receiver for this adapter…
+        assert '"-m", "adapters.common.hooks", "pi"' in text
+        assert "tool_execution_end" in text
 
 
 class TestEnvLaunch:
@@ -175,3 +185,48 @@ class TestTranslate:
         assert translate_obj({"type": "message_update"}) == []
         assert translate_obj({"type": "tool_execution_update"}) == []
         assert translate_obj({"type": "mystery"}) == []
+
+
+class TestHooks:
+    """Extension-forwarded payloads → normalized events (PR17)."""
+
+    def test_tool_execution_end_result(self):
+        ev = translate_hook(
+            {
+                "hook_event_name": "tool_execution_end",
+                "event": {
+                    "toolCallId": "c1",
+                    "toolName": "bash",
+                    "isError": False,
+                    "durationMs": 42,
+                    "result": {"content": "ok"},
+                },
+            }
+        )
+        assert len(ev) == 1
+        assert ev[0]["type"] == "tool_result"
+        p = ev[0]["payload"]
+        assert p["name"] == "bash"
+        assert p["tool_call_id"] == "c1"
+        assert p["is_error"] is False
+        assert p["duration_ms"] == 42
+        assert "ok" in p["output"]
+
+    def test_tool_execution_end_error(self):
+        ev = translate_hook(
+            {
+                "hook_event_name": "tool_execution_end",
+                "event": {"toolName": "bash", "isError": True, "result": "exit 127"},
+            }
+        )
+        p = ev[0]["payload"]
+        assert p["is_error"] is True
+        assert p["output"] == "exit 127"
+
+    def test_other_hooks_dropped(self):
+        assert (
+            translate_hook({"hook_event_name": "tool_execution_start", "event": {}})
+            == []
+        )
+        assert translate_hook({"hook_event_name": "tool_execution_end"}) == []
+        assert translate_hook({}) == []

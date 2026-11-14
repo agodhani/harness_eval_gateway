@@ -39,7 +39,9 @@ _FILE_TOOLS = {
 _TEXT_LIMIT = MAX_SNIPPET
 
 
-def _truncate(value: Any, limit: int = _TEXT_LIMIT) -> str:
+def _truncate(value: Any, limit: int = _TEXT_LIMIT) -> str | None:
+    if value is None:
+        return None
     text = value if isinstance(value, str) else str(value)
     return text if len(text) <= limit else text[:limit] + "…[truncated]"
 
@@ -183,3 +185,114 @@ def translate_events(lines: Any) -> list[dict[str, Any]]:
     from adapters.common.runner import translate_lines
 
     return translate_lines(lines, translate_obj)
+
+
+# ---------------------------------------------------------------------------
+# settings.json hooks (PR17) — stdin JSON payloads via adapters.common.hooks
+# ---------------------------------------------------------------------------
+
+#: Dict ``tool_response`` keys probed for an exit-code-ish field, in order.
+_RESPONSE_EXIT_KEYS = ("returnCode", "exitCode", "exit_code")
+#: Dict ``tool_response`` keys probed for an error flag, in order.
+_RESPONSE_ERROR_KEYS = ("is_error", "isError")
+
+
+def _post_tool_use(obj: dict[str, Any]) -> dict[str, Any]:
+    """PostToolUse payload → ``tool_result`` event.
+
+    The stream translation drops ``user``/``tool_result`` records to avoid
+    double-counting the ``tool_use`` events — the hook is the ONLY place tool
+    outcomes (response body, exit code, duration) reach the timeline.
+    ``tool_response`` shape varies by tool: a dict (e.g. Bash's
+    ``{stdout, stderr, returnCode, interrupted}``) or a plain string.
+    """
+    response = obj.get("tool_response")
+    payload: dict[str, Any] = {
+        "name": obj.get("tool_name"),
+        "tool_use_id": obj.get("tool_use_id"),
+        "session_id": obj.get("session_id"),
+        "duration_ms": obj.get("duration_ms"),
+        "output": _truncate(response),
+    }
+    is_error: Any = obj.get("is_error")
+    if isinstance(response, dict):
+        for key in _RESPONSE_EXIT_KEYS:
+            if response.get(key) is not None:
+                payload["exit_code"] = response[key]
+                break
+        for key in _RESPONSE_ERROR_KEYS:
+            if response.get(key) is not None:
+                is_error = response[key]
+                break
+    if is_error is not None:
+        payload["is_error"] = bool(is_error)
+    return {
+        "type": "tool_result",
+        "payload": {k: v for k, v in payload.items() if v is not None},
+    }
+
+
+def translate_hook(obj: dict[str, Any]) -> list[dict[str, Any]]:
+    """One claude ``settings.json`` hook stdin payload → normalized events.
+
+    Only events registered in ``config.HOOK_EVENTS`` produce output — the
+    receiver tolerates (and drops) anything else so a stale hook config can't
+    feed noise into the event stream.
+    """
+    hook = obj.get("hook_event_name")
+    session_id = obj.get("session_id")
+    if hook == "PostToolUse":
+        return [_post_tool_use(obj)]
+    if hook == "SessionStart":
+        return [
+            _checkpoint(
+                "session_start",
+                session_id=session_id,
+                source=obj.get("source"),
+                model=obj.get("model"),
+            )
+        ]
+    if hook == "SessionEnd":
+        return [
+            _checkpoint(
+                "session_end", session_id=session_id, reason=obj.get("reason")
+            )
+        ]
+    if hook == "Stop":
+        return [
+            _checkpoint(
+                "stop",
+                session_id=session_id,
+                stop_hook_active=obj.get("stop_hook_active"),
+            )
+        ]
+    if hook == "SubagentStop":
+        return [
+            _checkpoint(
+                "subagent_stop",
+                session_id=session_id,
+                agent_id=obj.get("agent_id"),
+                agent_type=obj.get("agent_type"),
+                stop_hook_active=obj.get("stop_hook_active"),
+            )
+        ]
+    if hook == "Notification":
+        return [
+            _checkpoint(
+                "notification",
+                session_id=session_id,
+                title=obj.get("title"),
+                message=_truncate(obj.get("message"), 2000),
+            )
+        ]
+    if hook == "PreCompact":
+        return [
+            _checkpoint(
+                "pre_compact",
+                session_id=session_id,
+                trigger=obj.get("trigger"),
+            )
+        ]
+    # PreToolUse / UserPromptSubmit are deliberately unregistered —
+    # translated stream records already cover them (see config.py).
+    return []

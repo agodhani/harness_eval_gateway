@@ -42,6 +42,11 @@ class EventType(str, Enum):
     LLM_REQUEST = "llm_request"
     LLM_RESPONSE = "llm_response"
     TOOL_CALL = "tool_call"
+    # tool_result is hook/plugin-sourced (PR17): harnesses with a native hook
+    # surface (claude_code settings.json hooks, pi extension forwarder) report
+    # tool OUTCOMES here — the adapter-translated streams deliberately skip
+    # result records to avoid double-counting tool_call/shell_command/file_op.
+    TOOL_RESULT = "tool_result"
     SHELL_COMMAND = "shell_command"
     FILE_OP = "file_op"
     TEST_EXECUTION = "test_execution"

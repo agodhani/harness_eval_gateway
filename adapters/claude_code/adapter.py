@@ -1,7 +1,9 @@
 """Harness adapter contract for Claude Code CLI.
 
 The sandbox runs the Python shim (``python3 -m adapters.claude_code``) which
-seeds ``~/.claude.json`` (first-run onboarding completed), spawns
+seeds ``~/.claude.json`` (first-run onboarding completed) and
+``~/.claude/settings.json`` (permission bypass + command hooks →
+``adapters.common.hooks``), spawns
 ``claude -p --output-format stream-json --verbose
 --dangerously-skip-permissions``, and translates the stream into normalized
 events via ``translate.py``.
@@ -36,6 +38,10 @@ MANIFEST = {
     "install": "npm i -g @anthropic-ai/claude-code",
     "image": IMAGE,
     "requires": ["gateway:/v1/messages"],
+    "hooks": (
+        "settings.json command hooks → adapters.common.hooks "
+        "(PostToolUse → tool_result; session lifecycle → checkpoint)"
+    ),
 }
 
 

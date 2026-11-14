@@ -28,9 +28,40 @@ _ONBOARDING_STATE: dict[str, Any] = {
     "autoUpdates": False,
 }
 
+#: Command hooks registered in ~/.claude/settings.json (PR17). The receiver
+#: is the shared ``python3 -m adapters.common.hooks claude_code`` module —
+#: claude pipes one JSON payload per firing on stdin. ``matcher: ""`` is the
+#: documented match-all. Only events adding fidelity beyond the stream-json
+#: translation are registered: ``PostToolUse`` yields ``tool_result``
+#: outcomes (the stream's tool_result records are deliberately skipped), and
+#: the lifecycle/notification events land as checkpoints. ``PreToolUse`` and
+#: ``UserPromptSubmit`` would duplicate records the stream already produces
+#: (and their hook stdout feeds back into the agent's context) — not wired.
+HOOK_COMMAND = "python3 -m adapters.common.hooks claude_code"
+HOOK_EVENTS = (
+    "PostToolUse",
+    "Notification",
+    "Stop",
+    "SubagentStop",
+    "PreCompact",
+    "SessionStart",
+    "SessionEnd",
+)
+
+
+def _hooks() -> dict[str, Any]:
+    return {
+        event: [
+            {"matcher": "", "hooks": [{"type": "command", "command": HOOK_COMMAND}]}
+        ]
+        for event in HOOK_EVENTS
+    }
+
+
 #: ~/.claude/settings.json — bypass permission prompts in print mode.
 _SETTINGS: dict[str, Any] = {
     "permissions": {"defaultMode": "bypassPermissions"},
+    "hooks": _hooks(),
 }
 
 
