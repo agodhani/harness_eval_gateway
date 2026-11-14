@@ -19,31 +19,32 @@ All submitted runs with status and model. Multiple real runs completed:
 a Wordle game (both configs scored) and a 2048 replica (first live
 `stuck_loop` capture).
 
-![run list](screenshots/01-run-list.png)
+![run list](screenshots/app/runs.png)
 
 ### Submit form
 
 Task prompt, model, per-sandbox harness configs (adapter, skill packs,
 system-prompt extras), evaluator model, and budgets.
 
-![submit form](screenshots/02-submit-form.png)
+![submit form](screenshots/app/submit.png)
 
 ### Run detail
 
 Run status, harness configs, sandbox table with per-sandbox status and
-terminal reason — this run shows `stuck_loop` on one sandbox and
-`agent_done` on the other, plus the approved/frozen rubric.
+terminal reason — this run shows a miniloop sandbox reaching `agent_done`
+— plus the approved/frozen rubric.
 
-![run detail](screenshots/03-run-detail.png)
+![run detail](screenshots/app/run-detail.png)
 
 ### Live timeline
 
-247 append-only events with per-source/per-type/per-sandbox filters:
+Append-only events with per-source/per-type/per-sandbox filters:
 LLM requests and responses with token counts and latency, tool calls,
 shell commands, file ops, checkpoints, skill invocations, done signals,
-evaluator events, and the error row when a judge exits without scores.
+evaluator events, preview lifecycle checkpoints, and the error row when
+a judge exits without scores.
 
-![timeline](screenshots/04-timeline.png)
+![timeline](screenshots/app/run-timeline.png)
 
 ### Results matrix
 
@@ -51,4 +52,4 @@ Score matrix (sandbox × rubric dimension) with per-cell rationale
 ("why"), same-model-evaluation warning banner, and per-sandbox artifact
 downloads (workspace, transcript, meta).
 
-![results](screenshots/05-results.png)
+![results](screenshots/app/run-results.png)
