@@ -266,9 +266,14 @@ def _load_thumbnail(jail: Path, sandbox: Sandbox) -> ThumbnailRef | None:
         return None
     meta: dict[str, Any] = {}
     try:
-        meta_path = artifact_dir / THUMB_META_FILENAME
-        if meta_path.is_file():
-            raw = json.loads(meta_path.read_text(encoding="utf-8", errors="replace"))
+        meta_path = (artifact_dir / THUMB_META_FILENAME).resolve()
+        if (
+            (meta_path == jail or jail in meta_path.parents)
+            and meta_path.is_file()
+        ):
+            raw = json.loads(
+                meta_path.read_text(encoding="utf-8", errors="replace")
+            )
             if isinstance(raw, dict):
                 meta = raw
     except Exception:  # noqa: BLE001 — meta is best-effort decoration

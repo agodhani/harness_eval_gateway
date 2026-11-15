@@ -490,13 +490,29 @@ async def capture_thumbnail(
     chromium timeout); ``ThumbnailError`` → 502, no partial outputs.
     """
     sb = _find_sandbox(session, run_id, sandbox_id)
-    workspace = resolve_workspace_dir(
-        jail=_jail(),
+    jail = _jail()
+    # The write target is the same resolve_artifact_dir the GET/DELETE
+    # paths probe — deriving it from workspace.parent would diverge when
+    # artifact_path exists without a workspace (workspace falls back to
+    # the jail layout while reads probe artifact_path) or when the
+    # workspace is a symlink into a sibling artifact dir.
+    artifact_dir = resolve_artifact_dir(
+        jail=jail,
         run_id=str(run_id),
         sandbox_id=str(sandbox_id),
         artifact_path=sb.artifact_path,
     )
-    if workspace is None:
+    workspace = resolve_workspace_dir(
+        jail=jail,
+        run_id=str(run_id),
+        sandbox_id=str(sandbox_id),
+        artifact_path=sb.artifact_path,
+    )
+    if (
+        artifact_dir is None
+        or workspace is None
+        or artifact_dir not in workspace.parents
+    ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="no snapshot workspace found for this sandbox",
@@ -523,7 +539,7 @@ async def capture_thumbnail(
             run_id=str(run_id),
             sandbox_id=str(sandbox_id),
             workspace=workspace,
-            artifact_dir=workspace.parent,
+            artifact_dir=artifact_dir,
             plan=plan,
         )
     except ValueError as exc:

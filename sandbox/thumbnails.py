@@ -1,9 +1,10 @@
 """Artifact thumbnails (PR4) — headless screenshots of produced artifacts.
 
 Product flow: results page "📷 snapshot" → ``POST .../thumbnail`` → this
-module spawns the artifact's preview stack, waits for it to serve, runs a
-throwaway headless-chromium container against the in-network URL, then
-writes ``<artifact_dir>/thumbnail.png`` + ``thumbnail.json``. The results
+module spawns the artifact's preview stack, shoots it with a throwaway
+headless-chromium container over the in-network URL (the container polls
+until the stack serves), then writes ``<artifact_dir>/thumbnail.png`` +
+``thumbnail.json``. The results
 page shows the PNG; clicking it spawns the full interactive preview.
 Generation is explicit-only (never on results GET — that endpoint is polled
 every few seconds) and failures degrade to "no thumbnail" — the router
@@ -25,6 +26,12 @@ Design notes:
   - ``static`` → ``http://<runner>:8000/<entry path>``
   - ``python-server`` → ``http://<runner>-proxy:8000/``
   - ``desktop`` → ``http://<runner>-proxy:6080/vnc.html?autoconnect=…``
+
+  The serving-readiness poll lives inside the capture container for the
+  same reason: the preview's published port is bound to the HOST's
+  loopback, which an api running in a container itself (compose) can
+  never reach — the container's in-network view of ``CAPTURE_URL`` is
+  what chromium loads anyway.
 
   Desktop has no alternative: Xvnc binds loopback-only inside the runner,
   so the noVNC page is the only window onto the framebuffer — a settle
@@ -59,9 +66,7 @@ import os
 import shutil
 import subprocess
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -212,39 +217,28 @@ class Thumbnailer:
     # -- steps ----------------------------------------------------------------
 
     def _wait_ready(self, preview_id: str, plan: PreviewPlan) -> Preview:
-        """Poll until the stack serves HTTP (any status) or give up.
+        """Confirm the stack exists and hasn't died on spawn.
 
-        The published localhost port is probed from the host — for proxied
-        types the probe traverses socat → runner → app, so an HTTP response
-        (even an error page) proves the whole chain is up. A dead runner
-        fails fast (the artifact crashed on startup — waiting won't help).
+        Serving readiness is probed inside the capture container — it
+        shares the preview network, so its view of ``CAPTURE_URL`` is
+        exactly what chromium loads. The api can't do the probe itself:
+        the published port binds the HOST's loopback, unreachable when
+        the api runs in a container (compose). A runner that already
+        exited IS reported early (waiting won't help).
         """
-        if plan.type == "desktop":
-            probe = "/vnc.html"
-        elif plan.type == "python-server":
-            probe = "/"
-        else:
-            probe = _entry_url_path(plan.entry)
         deadline = self._clock() + self.ready_seconds
         while self._clock() < deadline:
             pv = self._previews.get(preview_id)
-            if pv is not None and pv.status in _DEAD_STATUSES:
-                raise ThumbnailError(
-                    f"{plan.type} preview exited before serving — the "
-                    "artifact likely crashed on startup"
-                )
-            if pv is not None and pv.port is not None:
-                url = f"http://127.0.0.1:{pv.port}{probe}"
-                try:
-                    with urllib.request.urlopen(url, timeout=2.0):
-                        return pv
-                except urllib.error.HTTPError:
-                    return pv  # any HTTP response = the chain is serving
-                except OSError:
-                    pass  # listener not up yet / forwarded conn refused
+            if pv is not None:
+                if pv.status in _DEAD_STATUSES:
+                    raise ThumbnailError(
+                        f"{plan.type} preview exited before serving — the "
+                        "artifact likely crashed on startup"
+                    )
+                return pv
             self._sleep(0.25)
         raise ThumbnailError(
-            f"{plan.type} preview did not serve within "
+            f"{plan.type} preview stack did not come up within "
             f"{self.ready_seconds:.0f}s"
         )
 
@@ -295,8 +289,9 @@ class Thumbnailer:
         """One-shot ``docker run --rm`` of the headless-chromium image.
 
         Foreground (blocking) — the api already runs us in a thread; the
-        subprocess timeout is the outer bound, the image entrypoint wraps
-        chromium in ``timeout`` as the inner one. On timeout the CLI is
+        subprocess timeout is the outer bound (covering the entrypoint's
+        in-container ready wait plus the chromium run), the entrypoint's
+        own ``timeout`` wrap is the inner one. On timeout the CLI is
         killed but the container may still run → ``rm -f`` by name.
         """
         url = self._capture_url(preview, plan)
@@ -332,6 +327,8 @@ class Thumbnailer:
             "-e",
             f"THUMB_BUDGET_MS={budget}",
             "-e",
+            f"THUMB_READY_SECONDS={int(self.ready_seconds)}",
+            "-e",
             f"THUMB_TIMEOUT_SECONDS={int(self.capture_seconds)}",
             "-e",
             "HOME=/tmp",
@@ -349,7 +346,9 @@ class Thumbnailer:
         ]
         try:
             proc = self._previews._docker(
-                args, check=False, timeout=self.capture_seconds + 30
+                args,
+                check=False,
+                timeout=self.ready_seconds + self.capture_seconds + 30,
             )
         except subprocess.TimeoutExpired as exc:
             self._previews._docker(["rm", "-f", name], check=False)
@@ -368,14 +367,15 @@ class Thumbnailer:
     ) -> ThumbResult:
         """Validate the shot → ``thumbnail.png`` + ``thumbnail.json``.
 
-        A non-PNG/empty/oversized file is rejected — a poisoned artifact
-        dir gets no thumbnail rather than a garbage one. The PNG is moved
-        into place atomically (same filesystem); the meta sidecar is
-        written by the api (never the container).
+        A non-PNG file is rejected — a poisoned artifact dir gets no
+        thumbnail rather than a garbage one. The PNG is moved into place
+        atomically (same filesystem); the meta sidecar is written by the
+        api (never the container).
         """
         shot = scratch / _OUT_FILENAME
         try:
-            head = shot.read_bytes()[: len(PNG_MAGIC)]
+            with shot.open("rb") as fh:
+                head = fh.read(len(PNG_MAGIC))
             size = shot.stat().st_size
         except OSError as exc:
             raise ThumbnailError(f"capture produced no screenshot: {exc}") from exc
@@ -386,11 +386,17 @@ class Thumbnailer:
         dest = artifact_dir / THUMB_FILENAME
         try:
             os.replace(shot, dest)
-            os.chmod(dest, 0o644)
         except OSError as exc:
             raise ThumbnailError(
                 f"cannot store thumbnail under {artifact_dir}: {exc}"
             ) from exc
+        try:
+            os.chmod(dest, 0o644)
+        except OSError:
+            # The file is nobody-owned (container uid) — a non-owner api
+            # can't chmod it; the container umask already yields a
+            # readable file.
+            pass
         captured = datetime.now(UTC)
         meta: dict[str, Any] = {
             "version": THUMB_META_VERSION,

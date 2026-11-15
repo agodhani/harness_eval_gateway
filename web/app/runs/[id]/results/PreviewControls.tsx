@@ -107,9 +107,18 @@ export default function PreviewControls({
   const [preview, setPreview] = useState<PreviewOut | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pick, setPick] = useState<string>(options[0]?.key ?? "");
-  const [thumbOverride, setThumbOverride] = useState<ThumbRef | null>();
+  const [thumbOverride, setThumbOverride] = useState<{
+    superseded: ThumbRef | null;
+    ref: ThumbRef;
+  } | null>(null);
   const [capturing, setCapturing] = useState(false);
-  const thumb = thumbOverride !== undefined ? thumbOverride : thumbnail;
+  // The capture response shadows the `thumbnail` prop it superseded only —
+  // a results refresh delivering a different ref (newer capture, or none
+  // after a delete) wins over the stale local override.
+  const thumb =
+    thumbOverride !== null && thumbnail === thumbOverride.superseded
+      ? thumbOverride.ref
+      : thumbnail;
 
   useEffect(() => {
     let cancelled = false;
@@ -170,7 +179,7 @@ export default function PreviewControls({
     setError(null);
     try {
       const t = await captureThumbnail(runId, sandboxId);
-      setThumbOverride(t);
+      setThumbOverride({ superseded: thumbnail, ref: t });
     } catch (e) {
       setError(
         e instanceof ApiError ? e.detail : "thumbnail capture failed",

@@ -698,8 +698,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
      preview stack, same isolation/topology (static → hardened
      http.server; desktop/python-server → runner+socat on the zero-egress
      `heg-desktop` net), short TTL (`THUMB_PREVIEW_TTL_SECONDS`, 300s).
-  2. `_wait_ready` polls the published localhost port until ANY HTTP
-     response (≤ `THUMB_READY_SECONDS`, 30s); a dead runner fails fast.
+  2. `_wait_ready` confirms the stack came up — a dead runner fails
+     fast. Serving readiness is polled inside the capture container
+     (≤ `THUMB_READY_SECONDS`, 30s): it shares `heg-preview`, and the
+     published port binds the HOST's loopback, unreachable from a
+     containerized api (compose).
   3. Type-scaled settle (`THUMB_SETTLE_SECONDS` 0.5s;
      `THUMB_DESKTOP_SETTLE_SECONDS` 8s — Xvnc is loopback-only inside the
      runner, so the noVNC page is the only window onto the framebuffer).
@@ -710,8 +713,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
      container name (`<runner>:8000` for static,
      `<runner>-proxy:{8000|6080}` for the executed types). nobody +
      read-only rootfs + cap-drop ALL + no-new-privileges + tmpfs /tmp;
-     `timeout` inside, subprocess timeout (`THUMB_CAPTURE_SECONDS`, 45s)
-     outside.
+     `timeout` inside, subprocess timeout (ready wait +
+     `THUMB_CAPTURE_SECONDS`, 45s, + slack) outside.
   5. PNG-magic validation → atomic `os.replace` to `thumbnail.png` +
      `thumbnail.json` (`{version,captured_at,type,entry,generator,
      width,height,bytes}`). Scratch `.thumb-*` dir + stack always cleaned.

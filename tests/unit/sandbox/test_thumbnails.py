@@ -5,17 +5,19 @@ container → PNG validation → ``thumbnail.png`` + ``thumbnail.json`` under th
 artifact dir) runs hermetically: ``FakeRuntime``/``_inspect_row`` from the
 preview tests emulate the preview stack; a subclass emulates the capture
 container by writing bytes into the ``-v <scratch>:/out`` dir it sees in the
-``docker run`` args. ``urllib.request.urlopen`` is monkeypatched for the
-host-side ready probe and ``sleep`` is injected — no docker, no network, no
-real waiting. The real docker path is covered by
-``tests/integration/test_thumbnail.py`` (``@pytest.mark.docker``).
+``docker run`` args. ``urllib.request.urlopen`` is monkeypatched so any
+host-side ready probe would be recorded (there must be none — serving
+readiness is the capture container's job; the published port binds the
+HOST's loopback, unreachable from a containerized api). ``sleep`` is
+injected — no docker, no network, no real waiting. The real docker path
+is covered by ``tests/integration/test_thumbnail.py``
+(``@pytest.mark.docker``).
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -101,7 +103,9 @@ def _no_sleep(record: list[float]):
 
 @pytest.fixture()
 def urlopen_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Stub the host-side ready probe — every URL 'serves' immediately."""
+    """Record any host-side HTTP probe — the api must never make one
+    (the published port is host-loopback; the capture container does the
+    serving-readiness wait on the preview network)."""
     calls: list[str] = []
 
     class _Resp:
@@ -246,14 +250,15 @@ def test_capture_static_full_flow(
     label_args = [spawn_run[i + 1] for i, v in enumerate(spawn_run) if v == "--label"]
     assert "heg.preview_purpose=thumb" in label_args
 
-    # Ready probe hit the published localhost port.
-    assert urlopen_calls == ["http://127.0.0.1:49152/"]
+    # No host-side ready probe — readiness waits inside the container.
+    assert urlopen_calls == []
 
     # Capture container: in-network URL, hardened, on heg-preview.
     run = _thumb_run(fake)
     assert run[run.index("--network") + 1] == PREVIEW_NETWORK
     assert _env(run, "CAPTURE_URL") == f"http://heg-prev-abc:{CONTAINER_PORT}/"
     assert _env(run, "THUMB_BUDGET_MS") == "10000"
+    assert _env(run, "THUMB_READY_SECONDS") == "30"
     assert run[run.index("--user") + 1] == "65534:65534"
     assert "--rm" in run and "--read-only" in run and "--cap-drop" in run
     labels = [run[i + 1] for i, v in enumerate(run) if v == "--label"]
@@ -328,9 +333,7 @@ def test_capture_desktop_proxied_url(
         plan=PreviewPlan(type="desktop", entry="main.py"),
     )
     assert result.type == "desktop"
-
-    # Ready probe traversed socat → websockify on the published port.
-    assert urlopen_calls == ["http://127.0.0.1:49160/vnc.html"]
+    assert urlopen_calls == []
 
     run = _thumb_run(fake)
     assert _env(run, "CAPTURE_URL") == (
@@ -360,7 +363,7 @@ def test_capture_python_server_proxied_url(
         plan=PreviewPlan(type="python-server", entry="app.py"),
     )
     assert result.type == "python-server"
-    assert urlopen_calls == ["http://127.0.0.1:49160/"]
+    assert urlopen_calls == []
     run = _thumb_run(fake)
     assert _env(run, "CAPTURE_URL") == (
         f"http://heg-prev-abc-proxy:{SERVER_CONTAINER_PORT}/"
@@ -476,20 +479,13 @@ def test_wait_ready_dead_preview(
 
 
 def test_wait_ready_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sleeps: list[float]
+    tmp_path: Path, sleeps: list[float]
 ) -> None:
-    """Never-serving stack → ThumbnailError after ready_seconds."""
+    """Stack that never appears → ThumbnailError after ready_seconds."""
     ws, artifact_dir = _ws(tmp_path, {"index.html": "x"})
-    fake = ThumbFakeRuntime()
-
-    def refuse(url, timeout=None):
-        raise urllib.error.URLError("conn refused")
-
-    monkeypatch.setattr(urllib.request, "urlopen", refuse)
-    fake.ps_ids = ["cid123"]
-    fake.inspect_rows = [_inspect_row(labels=_labels())]
+    fake = ThumbFakeRuntime()  # ps_ids empty — get() finds nothing
     mgr = PreviewManager(runtime=fake)  # type: ignore[arg-type]
-    with pytest.raises(ThumbnailError, match="did not serve"):
+    with pytest.raises(ThumbnailError, match="did not come up"):
         _thumbnailer(mgr, sleeps, ready_seconds=0.5).capture(
             run_id="run1",
             sandbox_id="sb1",
@@ -500,19 +496,18 @@ def test_wait_ready_timeout(
     assert not (artifact_dir / THUMB_FILENAME).exists()
 
 
-def test_wait_ready_http_error_still_ready(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sleeps: list[float]
+def test_capture_without_published_port(
+    tmp_path: Path, urlopen_calls: list[str], sleeps: list[float]
 ) -> None:
-    """An HTTP error page still proves the chain serves (the screenshot
-    shows whatever the app returns)."""
+    """The api never probes the published port — it binds the HOST's
+    loopback, unreachable from a containerized api (compose). Readiness
+    is the capture container's job (in-network CAPTURE_URL)."""
     ws, artifact_dir = _ws(tmp_path, {"index.html": "x"})
-    fake = ThumbFakeRuntime()
-
-    def http500(url, timeout=None):
-        raise urllib.error.HTTPError(url, 500, "err", None, None)
-
-    monkeypatch.setattr(urllib.request, "urlopen", http500)
-    mgr = _static_manager(fake)
+    fake = ThumbFakeRuntime(
+        inspect_rows=[_inspect_row(labels=_labels(), port=None)]
+    )
+    fake.ps_ids = ["cid123"]
+    mgr = PreviewManager(runtime=fake)  # type: ignore[arg-type]
     result = _thumbnailer(mgr, sleeps).capture(
         run_id="run1",
         sandbox_id="sb1",
@@ -521,6 +516,7 @@ def test_wait_ready_http_error_still_ready(
         plan=PreviewPlan(type="static", entry="index.html"),
     )
     assert result.path.exists()
+    assert urlopen_calls == []
 
 
 # ---------------------------------------------------------------------------

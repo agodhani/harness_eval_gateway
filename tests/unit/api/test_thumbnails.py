@@ -220,6 +220,54 @@ def test_capture_thumbnail_404s(
     assert fake_thumbnailer.calls == []
 
 
+def test_capture_thumbnail_workspace_outside_artifact_dir(
+    client: TestClient, run, session_factory, artifact_root, fake_thumbnailer
+) -> None:
+    """A workspace symlinked into a sibling artifact dir → 404, no
+    capture — writing to workspace.parent would clobber the sibling's
+    thumbnail while this sandbox's GET still 404s."""
+    sib_ws = _workspace(
+        artifact_root, run["run_id"], run["sb2"], {"index.html": "x"}
+    )
+    artifact_dir = artifact_root / str(run["run_id"]) / str(run["sb1"])
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "workspace").symlink_to(
+        sib_ws, target_is_directory=True
+    )
+    s = session_factory()
+    try:
+        sb = s.get(Sandbox, run["sb1"])
+        sb.artifact_path = str(artifact_dir)
+        s.commit()
+    finally:
+        s.close()
+    resp = client.post(_thumb_path(run["run_id"], run["sb1"]))
+    assert resp.status_code == 404
+    assert fake_thumbnailer.calls == []
+    assert not (sib_ws.parent / THUMB_FILENAME).exists()
+
+
+def test_capture_thumbnail_artifact_dir_workspace_mismatch(
+    client: TestClient, run, session_factory, artifact_root, fake_thumbnailer
+) -> None:
+    """artifact_path exists but has no workspace → workspace resolution
+    falls back to the jail layout while GET probes artifact_path — the
+    write target would never be served, so the POST refuses."""
+    stray = artifact_root / str(run["run_id"]) / "stray-artifact"
+    stray.mkdir(parents=True)  # a dir with no workspace/ inside
+    _workspace(artifact_root, run["run_id"], run["sb1"], {"index.html": "x"})
+    s = session_factory()
+    try:
+        sb = s.get(Sandbox, run["sb1"])
+        sb.artifact_path = str(stray)
+        s.commit()
+    finally:
+        s.close()
+    resp = client.post(_thumb_path(run["run_id"], run["sb1"]))
+    assert resp.status_code == 404
+    assert fake_thumbnailer.calls == []
+
+
 def test_capture_thumbnail_emits_checkpoint(
     client: TestClient, run, session_factory, artifact_root, fake_thumbnailer
 ) -> None:
@@ -346,6 +394,26 @@ def test_results_thumbnail_without_meta(
     }[str(run["sb1"])]["thumbnail"]
     assert thumb is not None
     assert thumb["url"].endswith("/thumbnail")
+    assert thumb["type"] is None and thumb["captured_at"] is None
+
+
+def test_results_thumbnail_meta_symlink_ignored(
+    client: TestClient, run, artifact_root, tmp_path_factory
+) -> None:
+    """A thumbnail.json symlink escaping the jail is not read — the
+    out-of-jail JSON must not leak into the results payload."""
+    ws = _workspace(artifact_root, run["run_id"], run["sb1"], {"index.html": "x"})
+    (ws.parent / THUMB_FILENAME).write_bytes(PNG_BYTES)
+    outside = tmp_path_factory.mktemp("outside") / "leak.json"
+    outside.write_text(
+        json.dumps({"captured_at": "2030-01-01T00:00:00+00:00", "type": "leak"})
+    )
+    (ws.parent / THUMB_META_FILENAME).symlink_to(outside)
+    resp = client.get(f"/api/runs/{run['run_id']}/results")
+    thumb = {
+        s["sandbox_id"]: s for s in resp.json()["sandboxes"]
+    }[str(run["sb1"])]["thumbnail"]
+    assert thumb is not None
     assert thumb["type"] is None and thumb["captured_at"] is None
 
 

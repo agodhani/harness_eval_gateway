@@ -18,7 +18,8 @@
 #   THUMB_BUDGET_MS        chromium --virtual-time-budget (post-load run
 #                          time before the shot), default 10000
 #   THUMB_TIMEOUT_SECONDS  hard kill bound on chromium, default 45
-#   THUMB_LOAD_MS          chromium --timeout (page-load bound), default 30000
+#   THUMB_READY_SECONDS    in-container wait for CAPTURE_URL to serve,
+#                          default 30
 #   THUMB_OUT              output path, default /out/capture.png
 #
 # python:3.12-slim base — same as the api + other preview images (typically
