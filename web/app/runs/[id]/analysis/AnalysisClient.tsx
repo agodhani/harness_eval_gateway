@@ -240,8 +240,6 @@ export default function AnalysisClient({ runId }: { runId: string }) {
   // Cost recompute — mirrors the server: an explicit pick reprices every
   // sandbox uniformly; auto ("") costs each sandbox at its OWN model's
   // rate (PR14 — SandboxAnalytics.price_model is the server-resolved key).
-  // Evaluator traffic prices at the evaluator model's rate when listed,
-  // else the participant's resolved rate.
   const priceFor = useCallback(
     (sb: { price_model?: string }) =>
       data.analytics?.price_table?.[priceModel ?? sb.price_model ?? ""],
@@ -249,11 +247,17 @@ export default function AnalysisClient({ runId }: { runId: string }) {
   );
   const evaluatorModel =
     data.results?.evaluator_model ?? data.run?.config?.evaluator_model ?? null;
-  const evalPriceFor = useCallback(
-    (sb: { price_model?: string }) =>
-      data.analytics?.price_table?.[evaluatorModel ?? ""] ?? priceFor(sb),
-    [data.analytics, evaluatorModel, priceFor],
-  );
+  // Judge price mirrors the server: the evaluator model's own rate when
+  // listed, else the explicit pick, else the RUN's resolved rate (its
+  // model when listed, else the first table entry) — NOT each sandbox's.
+  const evalPrice = useMemo(() => {
+    const table = data.analytics?.price_table;
+    if (!table) return undefined;
+    if (evaluatorModel && table[evaluatorModel]) return table[evaluatorModel];
+    const runModel = data.analytics?.model_name ?? "";
+    const key = priceModel ?? (table[runModel] ? runModel : Object.keys(table)[0]);
+    return key ? table[key] : undefined;
+  }, [data.analytics, evaluatorModel, priceModel]);
 
   const costRows: Row[] = useMemo(
     () =>
@@ -272,15 +276,16 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     () =>
       sbs.map((sb) => {
         const p = priceFor(sb);
-        const ep = evalPriceFor(sb);
         return {
           name: shortId(sb.sandbox_id),
           participant: p ? estimateCostUsd(p, sb.tokens) : 0,
           evaluator:
-            sb.evaluator && ep ? estimateCostUsd(ep, sb.evaluator.tokens) : 0,
+            sb.evaluator && evalPrice
+              ? estimateCostUsd(evalPrice, sb.evaluator.tokens)
+              : 0,
         };
       }),
-    [sbs, priceFor, evalPriceFor],
+    [sbs, priceFor, evalPrice],
   );
 
   /** Tool-call mix: top-N tool names across sandboxes + "other". */
@@ -543,7 +548,7 @@ export default function AnalysisClient({ runId }: { runId: string }) {
                 fmt={formatUsd}
               />
               <p className="chart-legend">
-                judge priced at {evaluatorModel ?? "participant rate"} when listed ·
+                judge priced at {evaluatorModel ?? "the run's rate"} when listed ·
                 participant at {priceModel ?? "each model's own rate"}
               </p>
             </>

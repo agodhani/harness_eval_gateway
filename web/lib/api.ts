@@ -174,16 +174,23 @@ export function harnessConfigLabel(
 }
 
 /** Effective participant-model set for a run — [model_name] + config extras
- * (PR14). Falls back to [modelName] for runs that predate config.models. */
+ * + any per-config ``model`` pins (PR14 — a pin counts as a participant even
+ * outside the run's model list). Falls back to [modelName] for runs that
+ * predate config.models. */
 export function runModels(
   modelName: string,
   configModels: unknown,
+  harnessConfigs?: { model?: unknown }[],
 ): string[] {
   const list = Array.isArray(configModels)
     ? (configModels as unknown[]).map(String).filter(Boolean)
     : [];
   const out = [modelName];
   for (const m of list) {
+    if (m && !out.includes(m)) out.push(m);
+  }
+  for (const hc of harnessConfigs ?? []) {
+    const m = String(hc?.model ?? "").trim();
     if (m && !out.includes(m)) out.push(m);
   }
   return out;
@@ -195,6 +202,9 @@ export interface HarnessConfig {
   system_prompt_extra?: string | null;
   /** Optional label persisted onto the sandbox row (PR1 named configs). */
   name?: string | null;
+  /** PR14: pin this config to a single participant model, overriding the
+   * run's model list for this config (one cell at the pinned model). */
+  model?: string | null;
 }
 
 export interface Budgets {
@@ -732,8 +742,10 @@ export interface RunTrendPoint {
   evaluator_llm_turns: number;
   evaluator_tokens: TokenUsage;
   evaluator_errors: number;
-  /** Price-table key `estimated_cost_usd` was computed at. */
-  price_model: string;
+  /** Price-table key `estimated_cost_usd` was computed at — the explicit
+   * param or the run's resolved rate; null when auto mode mixed per-model
+   * rates (no single honest key). */
+  price_model: string | null;
   estimated_cost_usd: number;
   /** Judge tokens priced at the evaluator model's rate when listed. */
   evaluator_cost_usd: number;

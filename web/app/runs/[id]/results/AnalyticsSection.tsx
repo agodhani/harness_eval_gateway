@@ -110,6 +110,9 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
   const rows: Row[] = [
     {
       label: "wall clock",
+      // By-model rollups sum member cells' event spans — parallel cells
+      // exceed any real elapsed time, so say so rather than imply it.
+      hint: byModel ? "sum of per-cell event spans" : undefined,
       cell: (sb) => formatDuration(sb.wall_clock_seconds * 1000) || "—",
     },
     { label: "LLM turns", cell: (sb) => formatNum(sb.llm_turns) },

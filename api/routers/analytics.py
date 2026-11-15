@@ -23,7 +23,8 @@ F13 cross-run trends: ``GET /api/analytics/runs`` rolls the same participant/
 evaluator split up to per-run points (tokens, turns, errors, mean overall
 score, cost) for the most recent runs — powers the analysis page's trend
 chart. ``?price_model=`` reprices every point uniformly; omitted, each point
-is costed at its own run's resolved price model.
+is costed at its run's per-cell model rates (a cell's own listed model,
+falling back to the run's resolved rate for unlisted models).
 """
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ from api.schemas import (
 )
 from db.models import Event, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
-from orchestrator.matrix import participant_models, sandbox_model
+from orchestrator.matrix import run_models, sandbox_model
 
 router = APIRouter(tags=["analytics"])
 
@@ -371,7 +372,7 @@ def get_run_analytics(
         m = sb_model[sb.id]
         if m not in seen_models:
             seen_models.append(m)
-    participant_set = participant_models(run.model_name, cfg.get("models"))
+    participant_set = run_models(cfg, run.model_name)
     ordered_models = [m for m in participant_set if m in seen_models]
     ordered_models += [m for m in seen_models if m not in ordered_models]
 
@@ -430,8 +431,10 @@ def get_run_trends(
     Newest-first: the ``limit`` most recent runs, each rolled up to
     participant + evaluator token/turn/error totals, the mean of its
     sandboxes' ``overall`` score rows, and cost. With ``price_model`` every
-    point is repriced uniformly; without it each point is costed at its own
-    run's resolved price (run's model when listed, else the table fallback).
+    point is repriced uniformly; without it each point's participant cells
+    are costed at their own model's listed rate (unlisted models fall back
+    to the run's resolved price — its model when listed, else the table
+    fallback).
     """
     if price_model is not None and price_model not in PRICE_TABLE:
         raise HTTPException(
@@ -467,12 +470,22 @@ def get_run_trends(
         else []
     )
 
+    run_by_id = {r.id: r for r in runs}
     sb_run: dict[UUID, UUID] = {sb.id: sb.run_id for sb in sandboxes}
+    # PR14: each sandbox's participant model — participant cost is bucketed
+    # by it so multi-model runs price each cell at its own rate.
+    sb_model = {
+        sb.id: sandbox_model(
+            sb.harness_config or {}, run_by_id[sb.run_id].model_name
+        )
+        for sb in sandboxes
+    }
     sb_count: dict[UUID, int] = {}
     for sb in sandboxes:
         sb_count[sb.run_id] = sb_count.get(sb.run_id, 0) + 1
     eval_start = _eval_boundaries(events)
     participant: dict[UUID, _Agg] = {r.id: _Agg() for r in runs}
+    participant_by_model: dict[UUID, dict[str, _Agg]] = {}
     evaluator: dict[UUID, _Agg] = {}
     for ev in events:
         if ev.sandbox_id is None:
@@ -484,6 +497,9 @@ def get_run_trends(
             evaluator.setdefault(rid, _Agg()).add(ev)
         else:
             participant[rid].add(ev)
+            participant_by_model.setdefault(rid, {}).setdefault(
+                sb_model[ev.sandbox_id], _Agg()
+            ).add(ev)
 
     # Latest overall score per sandbox → mean per run (mirrors the results
     # endpoint's "rows ordered asc → newest wins" rule before averaging).
@@ -520,12 +536,34 @@ def get_run_trends(
             else resolve_price_model(None, run.model_name)
         )
         assert selected is not None  # resolve_price_model only Nones on bad param
-        price = PRICE_TABLE[selected]
-        eval_price = PRICE_TABLE.get(evaluator_model, price)
+        eval_price = PRICE_TABLE.get(evaluator_model, PRICE_TABLE[selected])
 
         agg = participant[run.id]
         eval_agg = evaluator.get(run.id)
         overalls = overall_by_run.get(run.id, [])
+        # PR14 per-model pricing: auto mode costs each participant-model
+        # bucket at its own listed rate (unlisted → the run's resolved
+        # fallback); an explicit ?price_model= reprices every bucket at the
+        # one key. price_model is None when auto pricing mixed rates — no
+        # single key honestly describes the estimate.
+        cost = 0.0
+        used_keys: set[str] = set()
+        for model, mb in participant_by_model.get(run.id, {}).items():
+            key = price_model or (model if model in PRICE_TABLE else selected)
+            used_keys.add(key)
+            cost += estimate_cost_usd(
+                PRICE_TABLE[key],
+                input_tokens=mb.tokens.input,
+                output_tokens=mb.tokens.output,
+            )
+        if price_model is not None:
+            point_price_model = price_model
+        elif len(used_keys) == 1:
+            point_price_model = next(iter(used_keys))
+        elif not used_keys:
+            point_price_model = selected  # no participant traffic — $0 anyway
+        else:
+            point_price_model = None
         points.append(
             RunTrendPoint(
                 run_id=run.id,
@@ -544,15 +582,8 @@ def get_run_trends(
                     eval_agg.tokens if eval_agg is not None else TokenUsage()
                 ),
                 evaluator_errors=eval_agg.errors if eval_agg else 0,
-                price_model=selected,
-                estimated_cost_usd=round(
-                    estimate_cost_usd(
-                        price,
-                        input_tokens=agg.tokens.input,
-                        output_tokens=agg.tokens.output,
-                    ),
-                    6,
-                ),
+                price_model=point_price_model,
+                estimated_cost_usd=round(cost, 6),
                 evaluator_cost_usd=round(
                     estimate_cost_usd(
                         eval_price,

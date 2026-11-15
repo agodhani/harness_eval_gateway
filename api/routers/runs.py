@@ -32,7 +32,7 @@ from db.models import Rubric, Run, Sandbox
 from orchestrator import adapters as orch_adapters
 from orchestrator import events as orch_events
 from orchestrator import provision, runner, state_machine
-from orchestrator.matrix import participant_models
+from orchestrator.matrix import participant_models, run_models
 from orchestrator.rubric import RubricContent
 from skillpack_import.store import imported_root
 
@@ -75,10 +75,10 @@ def _run_sandboxes(session: Session, run_id: uuid.UUID) -> list[Sandbox]:
 
 def _same_model_eval(run: Run) -> bool:
     """True when the judge model equals ANY participant model — non-independent
-    judging for that cell (PR14: participants are a set, not just model_name)."""
-    cfg = run.config or {}
-    evaluator = cfg.get("evaluator_model") or run.model_name
-    return evaluator in set(participant_models(run.model_name, cfg.get("models")))
+    judging for that cell (PR14: participants are a set, not just model_name;
+    per-config ``model`` pins count too — ``run_models``)."""
+    evaluator = (run.config or {}).get("evaluator_model") or run.model_name
+    return evaluator in set(run_models(run.config, run.model_name))
 
 
 def _run_out(session: Session, run: Run) -> RunOut:
@@ -151,17 +151,29 @@ async def create_run(body: RunCreate, session: DbSession) -> RunOut:
     _validate_harness_configs(body)
 
     evaluator_model = body.evaluator_model or body.model_name
-    # PR14: persist the effective participant-model set ([model_name] +
-    # deduped extras) so lifecycle/results/analytics can expand the matrix
-    # without re-parsing the raw request.
+    # PR14: persist the run's model list ([model_name] + deduped extras) so
+    # lifecycle/results/analytics can expand the matrix without re-parsing
+    # the raw request. Per-config ``model`` pins stay inside each config
+    # dict (null pins omitted — unexpanded configs carry no ``model`` key).
     models = participant_models(body.model_name, body.models)
     config = {
-        "harness_configs": [hc.model_dump() for hc in body.harness_configs],
+        "harness_configs": [
+            {
+                k: v
+                for k, v in hc.model_dump().items()
+                if k != "model" or v is not None
+            }
+            for hc in body.harness_configs
+        ],
         "models": models,
         "evaluator_model": evaluator_model,
         "budgets": body.budgets.model_dump(),
-        "same_model_eval": evaluator_model in set(models),
     }
+    # Judge == any participant model flags non-independent scoring; pins
+    # count as participants even when outside the run's model list.
+    config["same_model_eval"] = evaluator_model in set(
+        run_models(config, body.model_name)
+    )
     run = Run(
         status="submitted",
         task_prompt=body.task_prompt,
@@ -205,7 +217,7 @@ async def list_runs(
             status=r.status,
             task_prompt=r.task_prompt[:200],
             model_name=r.model_name,
-            models=participant_models(r.model_name, (r.config or {}).get("models")),
+            models=run_models(r.config, r.model_name),
             created_at=r.created_at,
             finished_at=r.finished_at,
             sandbox_count=counts.get(r.id, 0),

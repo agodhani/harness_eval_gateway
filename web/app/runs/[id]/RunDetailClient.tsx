@@ -71,6 +71,11 @@ function ConfigSummary({ configs }: { configs: HarnessConfig[] }) {
               {c.name}
             </Badge>
           ) : null}
+          {c.model ? (
+            <Badge tone="amber" title="pinned model — overrides the run's model list for this config">
+              {c.model}
+            </Badge>
+          ) : null}
           {c.skill_packs.length === 0 ? (
             <span className="faint" style={{ fontSize: "0.8rem" }}>no skill packs</span>
           ) : (
@@ -428,7 +433,11 @@ export default function RunDetailClient({ runId }: { runId: string }) {
   const budgets = run.config?.budgets;
   const evaluatorModel = run.config?.evaluator_model ?? null;
   // PR14: effective participant-model set ([model_name] + config extras).
-  const participantModels = runModels(run.model_name, run.config?.models);
+  const participantModels = runModels(
+    run.model_name,
+    run.config?.models,
+    run.config?.harness_configs,
+  );
 
   return (
     <main className="container">

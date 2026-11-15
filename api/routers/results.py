@@ -34,7 +34,7 @@ from api.deps import get_db
 from api.schemas import AnalysisReport
 from db.models import Artifact, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
-from orchestrator.matrix import participant_models, sandbox_model
+from orchestrator.matrix import run_models, sandbox_model
 from sandbox.preview import ScanCache
 from scoring.render import ANALYSIS_JSON_FILENAME
 
@@ -114,8 +114,9 @@ class RunResults(BaseModel):
     run_id: UUID
     status: str
     model_name: str
-    # PR14: the run's full participant-model set — [model_name] + extras —
-    # so the UI can render multi-model runs without re-deriving the matrix.
+    # PR14: the run's full participant-model set — [model_name] + extras +
+    # per-config pins — so the UI can render multi-model runs without
+    # re-deriving the matrix.
     models: list[str] = Field(default_factory=list)
     evaluator_model: str | None = None
     same_model_eval: bool | None = None
@@ -273,7 +274,7 @@ def get_run_results(run_id: UUID, session: DbSession) -> RunResults:
         run_id=run.id,
         status=run.status,
         model_name=run.model_name,
-        models=participant_models(run.model_name, cfg.get("models")),
+        models=run_models(cfg, run.model_name),
         evaluator_model=cfg.get("evaluator_model"),
         same_model_eval=cfg.get("same_model_eval"),
         sandboxes=results,

@@ -87,7 +87,11 @@ async function fetchResultsViaScores(run: RunOut): Promise<RunResults> {
     run_id: run.id,
     status: run.status,
     model_name: run.model_name,
-    models: runModels(run.model_name, run.config?.models),
+    models: runModels(
+      run.model_name,
+      run.config?.models,
+      run.config?.harness_configs,
+    ),
     evaluator_model: run.config?.evaluator_model ?? null,
     same_model_eval: run.same_model_eval ?? null,
     sandboxes,
@@ -328,7 +332,7 @@ export default function ResultsClient({ runId }: { runId: string }) {
   // PR14: full participant-model set for the header note.
   const participantModels =
     currentResults?.models ??
-    runModels(modelName, run?.config?.models);
+    runModels(modelName, run?.config?.models, run?.config?.harness_configs);
 
   return (
     <main className="container">

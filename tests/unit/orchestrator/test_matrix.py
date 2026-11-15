@@ -10,6 +10,7 @@ from __future__ import annotations
 from orchestrator.matrix import (
     expanded_configs,
     participant_models,
+    run_models,
     sandbox_model,
 )
 
@@ -33,6 +34,31 @@ def test_participant_models_appends_deduped_extras() -> None:
 
 def test_participant_models_strips_whitespace() -> None:
     assert participant_models(" a ", [" b "]) == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# run_models — stored-config participant set (run list ∪ per-config pins)
+# ---------------------------------------------------------------------------
+
+
+def test_run_models_list_only() -> None:
+    cfg = {"models": ["m1", "m2"], "harness_configs": [{"adapter": "a"}]}
+    assert run_models(cfg, "m1") == ["m1", "m2"]
+
+
+def test_run_models_includes_pins_outside_the_list() -> None:
+    cfg = {
+        "models": ["m1", "m2"],
+        "harness_configs": [{"adapter": "a", "model": "m9"}, {"adapter": "a"}],
+    }
+    assert run_models(cfg, "m1") == ["m1", "m2", "m9"]
+
+
+def test_run_models_tolerates_missing_and_blank() -> None:
+    assert run_models(None, "m1") == ["m1"]
+    assert run_models({"harness_configs": [{"model": "m1"}]}, "m1") == ["m1"]
+    cfg = {"harness_configs": [{"model": "  "}, "not-a-dict", {"model": " m2 "}]}
+    assert run_models(cfg, "m1") == ["m1", "m2"]
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +102,51 @@ def test_expanded_configs_dedupes_models() -> None:
 
 def test_expanded_configs_empty_configs() -> None:
     assert expanded_configs([], ["m2"], "m1") == []
+
+
+# per-config model pins
+
+
+def test_expanded_configs_pin_overrides_run_list() -> None:
+    """A pinned config emits exactly one cell at its pin — it does not
+    fan out across the run's model list like unpinned configs."""
+    hcs = [{"adapter": "a", "model": "m9"}, {"adapter": "b"}]
+    out = expanded_configs(hcs, ["m2"], "m1")
+    # unpinned config × [m1, m2] first (model-major); the pin on an
+    # unlisted model appends in config order after the matrix cells.
+    assert out == [
+        {"adapter": "b", "model": "m1"},
+        {"adapter": "b", "model": "m2"},
+        {"adapter": "a", "model": "m9"},
+    ]
+
+
+def test_expanded_configs_pin_on_listed_model_stays_in_group() -> None:
+    """A pin naming a listed model emits inside that model's group."""
+    hcs = [{"adapter": "a", "model": "m2"}, {"adapter": "b"}]
+    out = expanded_configs(hcs, ["m2"], "m1")
+    assert out == [
+        {"adapter": "b", "model": "m1"},
+        {"adapter": "a", "model": "m2"},
+        {"adapter": "b", "model": "m2"},
+    ]
+
+
+def test_expanded_configs_dedupes_identical_cells() -> None:
+    """A pin onto a model the same config reaches via expansion anyway
+    collapses to one cell — no duplicate sandboxes."""
+    hcs = [{"adapter": "a", "model": "m1"}, {"adapter": "a"}]
+    out = expanded_configs(hcs, ["m2"], "m1")
+    assert out == [{"adapter": "a", "model": "m1"}, {"adapter": "a", "model": "m2"}]
+
+
+def test_expanded_configs_single_model_pin_verbatim() -> None:
+    """Single-model runs return configs verbatim — a submitted pin rides
+    through as the cell's ``model`` (sandbox_model resolves it)."""
+    hcs = [{"adapter": "a", "model": "m9"}]
+    out = expanded_configs(hcs, None, "m1")
+    assert out == [{"adapter": "a", "model": "m9"}]
+    assert sandbox_model(out[0], "m1") == "m9"
 
 
 # ---------------------------------------------------------------------------

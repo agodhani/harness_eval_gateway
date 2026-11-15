@@ -333,10 +333,42 @@ def test_create_run_models_field_bounds(api) -> None:
         "/api/runs", json=_valid_body(models=[f"m{i}" for i in range(9)])
     )
     assert resp.status_code == 422
-    # entries longer than 255 chars are dropped by normalization (blank/
-    # over-long collapse) — an all-dropped list degrades to single-model
-    data = _post_run(client, _valid_body(models=["x" * 300]))
-    assert data["config"]["models"] == ["qwen3:8b"]
+    # entries longer than 255 chars 422 like model_name/evaluator_model —
+    # a malformed entry must not silently shrink the participant set
+    resp = client.post("/api/runs", json=_valid_body(models=["x" * 300]))
+    assert resp.status_code == 422
+
+
+def test_create_run_per_config_model_pin(api) -> None:
+    """PR14: harness_configs[i].model pins that config to one model —
+    persisted in run.config, counted in the participant set."""
+    body = _valid_body(
+        models=["gpt-4o"],
+        harness_configs=[
+            {"adapter": "miniloop", "model": " claude-opus-4.1 "},
+            {"adapter": "miniloop"},
+        ],
+        evaluator_model="claude-opus-4.1",
+    )
+    data = _post_run(api.client, body)
+    cfg = data["config"]
+    # pin survives (whitespace-normalized); the unpinned config stays bare
+    assert cfg["harness_configs"][0]["model"] == "claude-opus-4.1"
+    assert "model" not in cfg["harness_configs"][1]
+    # config.models is the run's model list — pins join the participant
+    # set via run_models instead (a pin may sit outside the list)
+    assert cfg["models"] == ["qwen3:8b", "gpt-4o"]
+    # judge == the pinned participant model → same-model flag fires
+    assert cfg["same_model_eval"] is True
+    assert data["same_model_eval"] is True
+    rows = api.client.get("/api/runs").json()
+    row = next(r for r in rows if r["id"] == data["id"])
+    assert row["models"] == ["qwen3:8b", "gpt-4o", "claude-opus-4.1"]
+
+    # blank pin normalizes away — the config is unpinned (no model key)
+    body = _valid_body(harness_configs=[{"adapter": "miniloop", "model": "  "}])
+    data = _post_run(api.client, body)
+    assert "model" not in data["config"]["harness_configs"][0]
 
 
 def test_create_run_validation(api) -> None:

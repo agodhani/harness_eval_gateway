@@ -697,3 +697,69 @@ def test_trends_run_without_scores_has_null_mean(
     pt = _trend_point(body, analytics_run["run_id"])
     assert pt["mean_overall_score"] is None
     assert pt["sandbox_count"] == 2
+
+
+def test_trends_multimodel_prices_each_cell_at_its_own_rate(
+    client: TestClient, session_factory: sessionmaker[Session]
+) -> None:
+    """PR14: auto pricing buckets participant tokens per cell model — a
+    multi-model run must not be single-rated at model_name's price."""
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="multi-model",
+            model_name="qwen3:8b",  # local — $0 if used as the run's single rate
+            config={"models": ["qwen3:8b", "gpt-4o"]},
+            status="done",
+        )
+        s.add(run)
+        s.flush()
+        sbs = [
+            Sandbox(
+                run_id=run.id,
+                harness_config={"adapter": "miniloop", "model": model},
+                status="done",
+            )
+            for model in ("qwen3:8b", "gpt-4o")
+        ]
+        s.add_all(sbs)
+        s.flush()
+        for sb in sbs:
+            s.add(
+                _ev(
+                    run.id,
+                    sandbox_id=sb.id,
+                    type_="llm_response",
+                    ts=T0,
+                    payload={
+                        "usage": {
+                            "prompt_tokens": 100,
+                            "completion_tokens": 50,
+                            "total_tokens": 150,
+                        },
+                        "latency_ms": 10,
+                    },
+                )
+            )
+        s.commit()
+        run_id = run.id
+    finally:
+        s.close()
+
+    body = client.get("/api/analytics/runs", params={"limit": 100}).json()
+    pt = _trend_point(body, run_id)
+    # only the gpt-4o cell bills: (100*2.5 + 50*10)/1e6 = 0.00075 — the
+    # qwen3:8b (local) and gpt-4o cells are NOT averaged at one rate
+    assert pt["estimated_cost_usd"] == pytest.approx(0.00075)
+    # mixed per-model rates → no single price key honestly applies
+    assert pt["price_model"] is None
+
+    # explicit ?price_model= still reprices every cell uniformly
+    body = client.get(
+        "/api/analytics/runs",
+        params={"limit": 100, "price_model": "gpt-4o-mini"},
+    ).json()
+    pt = _trend_point(body, run_id)
+    assert pt["price_model"] == "gpt-4o-mini"
+    # 2 cells × (100*0.15 + 50*0.6)/1e6 = 0.00009
+    assert pt["estimated_cost_usd"] == pytest.approx(0.00009)

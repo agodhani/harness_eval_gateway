@@ -304,7 +304,11 @@ export default function RunConsoleLive({ run }: { run: RunOut }) {
           <span className="evc__meta">task — “{truncate(run.task_prompt, 48)}”</span>
           <span className="evc__meta">
             model —{" "}
-            {runModels(run.model_name, run.config?.models).join(", ")}
+            {runModels(
+              run.model_name,
+              run.config?.models,
+              run.config?.harness_configs,
+            ).join(", ")}
           </span>
           <span className="evc__right">
             <span>{events.length} events</span>
