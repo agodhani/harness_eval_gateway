@@ -239,12 +239,12 @@ def test_create_run_multi_adapter(api) -> None:
     body = _valid_body(
         harness_configs=[
             {"adapter": a}
-            for a in ("miniloop", "claude_code", "codex", "deepseek", "pi")
+            for a in ("miniloop", "claude_code", "codex", "deepseek", "pi", "aider")
         ]
     )
     data = _post_run(api.client, body)
     adapters = [hc["adapter"] for hc in data["config"]["harness_configs"]]
-    assert adapters == ["miniloop", "claude_code", "codex", "deepseek", "pi"]
+    assert adapters == ["miniloop", "claude_code", "codex", "deepseek", "pi", "aider"]
 
 
 def test_create_run_validation(api) -> None:
