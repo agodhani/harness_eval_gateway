@@ -216,10 +216,12 @@ Event mapping conventions across CLI harnesses:
   openai/<model>` (the `openai/` prefix is aider's litellm route to
   OpenAI-compatible endpoints; weak-model covers commit messages +
   history summarization — pinning it to the run model keeps the
-  comparison axis clean), `yes-always`, `auto-commits`, `detect-urls:
-  false`, `check-update: false`, `analytics-disable: true`, `pretty:
-  false`, `stream: false`, `fancy-input: false`, and history-file
-  relocation into `$HOME`. Cred stays in env (`OPENAI_API_KEY`), never on
+  comparison axis clean), `yes-always`, `auto-commits`, `dirty-commits`,
+  `suggest-shell-commands` (how `done` gets invoked), `detect-urls:
+  false`, `check-update: false`, `show-release-notes: false`,
+  `analytics-disable: true`, `pretty: false`, `stream: false`,
+  `fancy-input: false`, and history-file relocation into `$HOME`.
+  Cred stays in env (`OPENAI_API_KEY`), never on
   disk; `OPENAI_API_BASE` + `OPENAI_BASE_URL` both set (litellm ≥1.68
   renamed the canonical var and briefly broke `openai-api-base`).
 - **No JSONL mode** — aider prints a human transcript only. The shim
