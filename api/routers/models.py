@@ -6,6 +6,13 @@ to the upstream) and normalizes the OpenAI-shaped ``data[]`` list into
 the response ``x-heg-provider`` so the UI only offers install when the
 upstream can actually pull (``provider == "ollama"``).
 
+``GET /api/models?provider=<name>`` forwards the name as the gateway's
+``x-heg-provider`` request override — the minted cred is run-scoped
+(``sandbox_id=None``, i.e. a service cred), which is exactly the cred class
+the override gate exists for, so each submit-form row can browse the catalog
+of the upstream its provider select names. The reported ``provider`` is the
+gateway's RESOLVED provider (response header), not the request param.
+
 ``POST /api/models/pull`` streams ``ollama pull`` progress: api → gateway
 ``POST /v1/models/pull`` → upstream ``/api/pull``, NDJSON lines passed
 through verbatim so the UI renders live progress. Non-ollama providers 501
@@ -23,11 +30,12 @@ from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.config import get_settings
+from gateway.config import require_provider
 from gateway.creds import mint_cred
 
 router = APIRouter(tags=["models"])
@@ -108,16 +116,31 @@ async def _error_message(resp: httpx.Response) -> str:
 
 
 @router.get("/api/models", response_model=ModelsOut)
-async def list_models(client: GatewayClient) -> ModelsOut:
-    """Live model catalog — gateway ``/v1/models`` normalized for the UI."""
+async def list_models(
+    client: GatewayClient,
+    provider: Annotated[str | None, Query()] = None,
+) -> ModelsOut:
+    """Live model catalog — gateway ``/v1/models`` normalized for the UI.
+
+    ``?provider=`` names the upstream whose catalog to fetch; it rides to the
+    gateway as the ``x-heg-provider`` service-cred override (validated the
+    same way — unknown names 400 here rather than round-tripping). The
+    gateway still resolves+stamps the provider it actually queried, so an
+    unkeyed-but-valid name 400s there and forwards like any gateway error.
+    """
     settings = get_settings()
+    headers = {
+        "Authorization": f"Bearer {_service_cred(settings.GATEWAY_CRED_SECRET)}"
+    }
+    if provider is not None:
+        try:
+            headers["x-heg-provider"] = require_provider(provider)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            ) from exc
     try:
-        resp = await client.get(
-            "/v1/models",
-            headers={
-                "Authorization": f"Bearer {_service_cred(settings.GATEWAY_CRED_SECRET)}"
-            },
-        )
+        resp = await client.get("/v1/models", headers=headers)
     except httpx.HTTPError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

@@ -46,6 +46,7 @@ def gw() -> Any:
                 "url": str(request.url),
                 "json": body,
                 "authorization": request.headers.get("authorization"),
+                "x_heg_provider": request.headers.get("x-heg-provider"),
             }
         )
         return state["handler"](request)
@@ -156,6 +157,93 @@ def test_list_models_non_list_data_body(client: TestClient, gw: Any) -> None:
     resp = client.get("/api/models")
     assert resp.status_code == 200
     assert resp.json()["models"] == []
+
+
+# ---------------------------------------------------------------------------
+# GET /api/models?provider= — submit picker's per-upstream catalogs
+# ---------------------------------------------------------------------------
+
+
+def test_list_models_provider_param_forwarded_as_override(
+    client: TestClient, gw: Any
+) -> None:
+    """``?provider=`` rides to the gateway as ``x-heg-provider`` — the
+    service-cred override the submit picker uses to browse one upstream's
+    catalog per row. The reported provider is the RESOLVED one (response
+    header), not the request param."""
+    gw["handler"] = lambda _r: httpx.Response(
+        200,
+        json={"data": [{"id": "particle-ai/particle-1:free"}]},
+        headers={"x-heg-provider": "openrouter"},
+    )
+    resp = client.get("/api/models", params={"provider": "openrouter"})
+    assert resp.status_code == 200
+    assert gw["seen"][0]["x_heg_provider"] == "openrouter"
+    body = resp.json()
+    assert body["provider"] == "openrouter"
+    assert body["pull_supported"] is False
+
+
+def test_list_models_provider_param_normalized(
+    client: TestClient, gw: Any
+) -> None:
+    """Case/space tolerance matches the gateway's own override validation."""
+    resp = client.get("/api/models", params={"provider": " OpenRouter "})
+    assert resp.status_code == 200
+    assert gw["seen"][0]["x_heg_provider"] == "openrouter"
+
+
+def test_list_models_no_provider_sends_no_override(
+    client: TestClient, gw: Any
+) -> None:
+    resp = client.get("/api/models")
+    assert resp.status_code == 200
+    assert gw["seen"][0]["x_heg_provider"] is None
+
+
+def test_list_models_unknown_provider_400s_before_gateway(
+    client: TestClient, gw: Any
+) -> None:
+    resp = client.get("/api/models", params={"provider": "bogus"})
+    assert resp.status_code == 400
+    assert "bogus" in resp.json()["detail"]
+    assert gw["seen"] == []
+
+
+def test_list_models_unkeyed_provider_error_forwarded(
+    client: TestClient, gw: Any
+) -> None:
+    """A VALID but unkeyed provider (no API key configured) 400s at the
+    gateway — the api forwards the detail like any gateway error."""
+    gw["handler"] = lambda _r: httpx.Response(
+        400,
+        json={
+            "error": {
+                "message": (
+                    "x-heg-provider 'openai' is not configured on this "
+                    "gateway (no API key set)"
+                )
+            }
+        },
+    )
+    resp = client.get("/api/models", params={"provider": "openai"})
+    assert resp.status_code == 400
+    assert "not configured" in resp.json()["detail"]
+
+
+def test_list_models_resolved_provider_not_request_param(
+    client: TestClient, gw: Any
+) -> None:
+    """``provider`` in the body echoes the gateway's stamp — an older
+    gateway that ignored the override reports its own resolved provider."""
+    gw["handler"] = lambda _r: httpx.Response(
+        200,
+        json={"data": [{"id": "m"}]},
+        headers={"x-heg-provider": "ollama"},
+    )
+    body = client.get("/api/models", params={"provider": "openai"}).json()
+    assert body["provider"] == "ollama"
+    assert body["pull_supported"] is True
 
 
 # ---------------------------------------------------------------------------

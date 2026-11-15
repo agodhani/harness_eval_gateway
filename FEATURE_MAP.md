@@ -825,9 +825,14 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     `GATEWAY_CRED_SECRET`), normalizes `{object:"list",data:[...]}` →
     `{models:[{id,...}], provider, pull_supported}`. The gateway stamps
     `X-HEG-Provider` on the response so `pull_supported` is true only for
-    the `ollama` upstream. Submit page replaces the offline
+    the `ollama` upstream. `GET /api/models?provider=<name>` forwards the
+    name as the gateway's `x-heg-provider` service-cred override (unknown
+    names 400 at the api via `require_provider`; valid-but-unkeyed 400s at
+    the gateway) so each submit-form row can browse the upstream its
+    provider select names — the reported `provider` is always the
+    gateway's RESOLVED one. Submit page replaces the offline
     `MODEL_SUGGESTIONS` fallback with the live ids once the catalog is
-    non-empty, for the two model ComboInputs.
+    non-empty, for the model ComboInputs.
   - **Model install** — `POST /api/models/pull` → gateway
     `POST /v1/models/pull` → upstream `POST /api/pull` (ollama-only —
     `501` for other providers), NDJSON progress streamed end-to-end
@@ -855,14 +860,17 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `db/models.py` + `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`,
   `orchestrator/provision.py` (`_sandbox_name` default),
   `api/routers/results.py` + `analytics.py` (`name` fields),
-  `web/lib/api.ts` (`listModels`, `pullModel` streaming),
+  `web/lib/api.ts` (`getModels(provider?)`, `PROVIDERS`, `pullModel`
+  streaming), `web/lib/modelRows.ts` (+ `.test.ts` — row→payload mapping),
   `web/app/submit/page.tsx`, `web/app/runs/[id]/` (`RunDetailClient`,
   `timeline/TimelineClient`, `results/ResultsClient`,
   `results/AnalyticsSection`, `analysis/AnalysisClient`),
   `web/components/RunConsoleLive.tsx`
 - **Verify:**
   - Unit: `tests/unit/api/test_models.py` (normalize, provider flag,
-    gateway error/unreachable, pull streaming + validation),
+    `?provider=` forwarding + validation, gateway error/unreachable, pull
+    streaming + validation), `web/lib/modelRows.test.ts` (rows→
+    `model_name`/`models` mapping, dedupe),
     `tests/unit/gateway/test_proxy.py` (pull passthrough/stream-forced/
     501 non-ollama/auth), `tests/unit/db/test_migrations.py`
     (upgrade/downgrade on sqlite, single head, type match),
@@ -901,8 +909,15 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     (`price_model` param still forces a uniform reprice, now optional) and
     adds a `models` rollup (`ModelAnalytics`: tokens/cost aggregates
     per participant model).
-  - **UI** — submit form gains a multi-model picker (chips + live catalog,
-    Ollama pull preserved); run detail/list show the model set; results
+  - **UI** — submit form picks participants as a row list: each row is a
+    provider select + model ComboInput (`?provider=` catalog per row),
+    row 1 is the primary (`model_name`), "+ Add Another Model" appends
+    (capped by `models` max 8 + the matrix cap); provider is picker
+    metadata only — `RunCreate` carries no per-model provider, routing
+    resolves per model name via PROVIDER_ROUTES. Evaluator model gets the
+    same single-row picker; Ollama pull preserved (shown while any row is
+    on ollama and the upstream reports pull support). Run detail/list show
+    the model set; results
     matrix + timeline + live console label each cell with its model;
     AnalyticsSection gains a sandbox/model segmented view with per-model
     aggregation and per-model cost; the analysis page prices each sandbox at
@@ -911,7 +926,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `orchestrator/provision.py`, `api/schemas.py` (`RunCreate.models`,
   `HarnessConfigIn.model`, `MAX_MATRIX_CELLS`, `models` on run/results/
   analytics schemas), `api/routers/runs.py`, `api/routers/results.py`,
-  `api/routers/analytics.py`, `web/lib/api.ts`, `web/app/submit/page.tsx`,
+  `api/routers/analytics.py`, `web/lib/api.ts`, `web/lib/modelRows.ts`
+  (participant-row → `model_name`/`models` payload mapping),
+  `web/app/submit/page.tsx`,
   `web/app/runs/page.tsx`, `web/app/runs/[id]/RunDetailClient.tsx`,
   `web/app/runs/[id]/results/{ResultsClient,AnalyticsSection}.tsx`,
   `web/app/runs/[id]/analysis/AnalysisClient.tsx`,
@@ -924,7 +941,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     `test_provision.py` (model persisted in harness_config + env),
     `tests/unit/api/test_runs.py` (validation, normalization, same-model
     eval across the set), `test_results.py` (`model`/`models` fields),
-    `test_analytics.py` (per-model pricing + rollup)
+    `test_analytics.py` (per-model pricing + rollup),
+    `web/lib/modelRows.test.ts` (participant-row payload mapping)
   - Manual: submit with 2 configs × 2 models → 4 sandboxes named/labeled
     per cell; results matrix + analytics "model" view group by model; cost
     auto-mode prices each cell at its own model.

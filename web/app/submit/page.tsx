@@ -1,22 +1,31 @@
 "use client";
 
 /**
- * F1 — submission form: task prompt + model + harness config matrix +
- * evaluator model + budgets → POST /api/runs → redirect to run detail.
+ * F1 — submission form: task prompt + participant-model rows + harness
+ * config matrix + evaluator model + budgets → POST /api/runs → redirect to
+ * run detail.
+ *
+ * Participant models are a row list: each row is a provider select (which
+ * upstream catalog its picker browses — informational only; the run's
+ * actual provider routing resolves per model name gateway-side via
+ * PROVIDER_ROUTES) plus a model ComboInput. Row 1 is the primary model
+ * (→ `model_name`); "+ Add Another Model" appends participant rows
+ * (→ `models`). The evaluator gets the same single-row treatment.
  *
  * Client-side validation mirrors the API contract (plan §1): task_prompt and
  * model_name required, ≥1 harness config, known adapter/skill-pack names.
  */
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   ADAPTERS,
   ApiError,
   createRun,
   DEFAULT_BUDGETS,
+  getModels,
   listHarnesses,
-  listModels,
   listSkillPacks,
+  PROVIDERS,
   pullModel,
   SKILL_PACKS,
   type Budgets,
@@ -25,6 +34,7 @@ import {
   type SkillPack,
   type SkillpackImportResult,
 } from "@/lib/api";
+import { modelsPayload, participantModels } from "@/lib/modelRows";
 import { ComboInput } from "@/components/ComboInput";
 import { Badge, Card, ErrorNote, InfoNote } from "@/components/ui";
 import { ImportSkillPackDialog } from "./ImportSkillPackDialog";
@@ -35,6 +45,8 @@ const MODEL_SUGGESTIONS = ["qwen3:8b", "qwen2.5-coder:3b", "qwen2.5-coder:7b"];
 const MAX_CONFIGS = 8;
 // Mirrors api/schemas.py MAX_MATRIX_CELLS — configs × models sandbox cap.
 const MAX_MATRIX_CELLS = 32;
+// RunCreate.models caps at 8 extras → at most 1 primary + 8 extra rows.
+const MAX_MODEL_ROWS = 9;
 
 interface ConfigRow {
   key: number;
@@ -42,6 +54,22 @@ interface ConfigRow {
   adapter: string;
   skill_packs: string[];
   system_prompt_extra: string;
+}
+
+interface ModelRow {
+  key: number;
+  provider: string;
+  model: string;
+  /** User explicitly picked this row's provider — the mount-time catalog
+   * fetch (which resolves the gateway's DEFAULT upstream) must not re-align
+   * a picked row to that default. */
+  picked?: boolean;
+}
+
+/** One upstream's cached catalog from GET /api/models?provider=. */
+interface Catalog {
+  models: string[];
+  pullSupported: boolean;
 }
 
 let nextKey = 1;
@@ -55,15 +83,30 @@ function blankConfig(): ConfigRow {
   };
 }
 
+function blankModelRow(provider: string): ModelRow {
+  return { key: nextKey++, provider, model: "" };
+}
+
 export default function SubmitPage() {
   const router = useRouter();
 
   const [taskPrompt, setTaskPrompt] = useState("");
-  const [modelName, setModelName] = useState("qwen3:8b");
-  // PR14: ADDITIONAL participant models — the run matrix expands to
-  // harness_configs × ([modelName] + extraModels). Empty = single-model.
-  const [extraModels, setExtraModels] = useState<string[]>([]);
-  const [evaluatorModel, setEvaluatorModel] = useState("");
+  // Participant-model rows — row 1 is the required primary (→ model_name);
+  // extra rows are the PR14 additional models (→ models, deduped).
+  const [modelRows, setModelRows] = useState<ModelRow[]>(() => [
+    { key: nextKey++, provider: "ollama", model: "qwen3:8b" },
+  ]);
+  const [evalRow, setEvalRow] = useState<ModelRow>(() =>
+    blankModelRow("ollama"),
+  );
+  // Gateway's resolved default provider — learned from the no-param mount
+  // fetch; new rows + unpicked selects track it.
+  const [defaultProvider, setDefaultProvider] = useState("ollama");
+  // Live model catalogs keyed by provider — GET /api/models?provider=
+  // (gateway → that upstream). A missing entry (never fetched / failed)
+  // → MODEL_SUGGESTIONS fallback.
+  const [catalogs, setCatalogs] = useState<Record<string, Catalog>>({});
+  const catalogsInflight = useRef(new Set<string>());
   const [configs, setConfigs] = useState<ConfigRow[]>(() => [blankConfig()]);
   const [budgets, setBudgets] = useState<Budgets>({ ...DEFAULT_BUDGETS });
   const [submitting, setSubmitting] = useState(false);
@@ -72,51 +115,89 @@ export default function SubmitPage() {
   // Harness registry from GET /api/harnesses; static ADAPTERS is the fallback
   // when the API isn't running (page convention: degrade gracefully).
   const [harnesses, setHarnesses] = useState<HarnessManifest[]>([]);
-  // Live model catalog from GET /api/models (gateway → upstream). Empty +
-  // pullSupported=false while offline → MODEL_SUGGESTIONS fallback.
-  const [models, setModels] = useState<string[]>([]);
-  const [pullSupported, setPullSupported] = useState(false);
   // ollama pull ("install model") state — pullMsg doubles as progress text.
   const [pullName, setPullName] = useState("");
   const [pulling, setPulling] = useState(false);
   const [pullMsg, setPullMsg] = useState<string | null>(null);
   const [pullFailed, setPullFailed] = useState(false);
 
-  const modelSuggestions = useMemo(
-    () => (models.length > 0 ? models : [...MODEL_SUGGESTIONS]),
-    [models],
-  );
+  /** Model ids one row's picker suggests — live catalog for its provider,
+   * MODEL_SUGGESTIONS when that catalog is missing/empty. */
+  const suggestionsFor = (provider: string): string[] => {
+    const cat = catalogs[provider];
+    return cat && cat.models.length ? cat.models : [...MODEL_SUGGESTIONS];
+  };
 
-  // Effective participant-model set: primary first, extras deduped against
-  // it and each other (mirrors orchestrator.matrix.participant_models).
-  const participantModels = useMemo(() => {
-    const out: string[] = [];
-    for (const raw of [modelName, ...extraModels]) {
-      const m = raw.trim();
-      if (m && !out.includes(m)) out.push(m);
-    }
-    return out;
-  }, [modelName, extraModels]);
-  const modelCount = participantModels.length;
-  const sandboxCount = configs.length * Math.max(modelCount, 1);
-  // Catalog models eligible as extras — the primary is already a participant.
-  const extraModelOptions = useMemo(
-    () => modelSuggestions.filter((m) => m !== modelName.trim()),
-    [modelSuggestions, modelName],
-  );
-
-  function setPrimaryModel(v: string) {
-    setModelName(v);
-    // A model promoted to primary leaves the extras set (dedupe anyway,
-    // but keeping state clean avoids a stale checked box reappearing).
-    const p = v.trim();
-    if (p) setExtraModels((prev) => prev.filter((m) => m !== p));
+  /** Fetch + cache one provider's catalog (in-flight deduped). */
+  function ensureCatalog(provider: string) {
+    if (catalogs[provider] !== undefined) return;
+    if (catalogsInflight.current.has(provider)) return;
+    catalogsInflight.current.add(provider);
+    getModels(provider)
+      .then((r) => {
+        const resolved = r.provider ?? provider;
+        setCatalogs((c) => ({
+          ...c,
+          [resolved]: {
+            models: r.models.map((m) => m.id),
+            pullSupported: r.pull_supported,
+          },
+        }));
+      })
+      .catch(() => {
+        /* provider unreachable/unkeyed — MODEL_SUGGESTIONS fallback stays */
+      })
+      .finally(() => {
+        catalogsInflight.current.delete(provider);
+      });
   }
 
-  function toggleExtraModel(m: string) {
-    setExtraModels((prev) =>
-      prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m],
-    );
+  // Mount: fetch the gateway's DEFAULT provider catalog (no param → the
+  // resolved upstream stamps x-heg-provider on the response) and align every
+  // row whose provider the user hasn't explicitly picked to that default, so
+  // the select names the upstream actually serving its suggestions.
+  useEffect(() => {
+    let cancelled = false;
+    getModels()
+      .then((r) => {
+        if (cancelled) return;
+        const provider = r.provider ?? "ollama";
+        setCatalogs((c) => ({
+          ...c,
+          [provider]: {
+            models: r.models.map((m) => m.id),
+            pullSupported: r.pull_supported,
+          },
+        }));
+        setDefaultProvider(provider);
+        setModelRows((rs) =>
+          rs.map((row) => (row.picked ? row : { ...row, provider })),
+        );
+        setEvalRow((e) => (e.picked ? e : { ...e, provider }));
+      })
+      .catch(() => {
+        /* offline fallback: static MODEL_SUGGESTIONS */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** Refetch the ollama catalog — called after a successful pull. */
+  async function refreshModels() {
+    try {
+      const r = await getModels("ollama");
+      const resolved = r.provider ?? "ollama";
+      setCatalogs((c) => ({
+        ...c,
+        [resolved]: {
+          models: r.models.map((m) => m.id),
+          pullSupported: r.pull_supported,
+        },
+      }));
+    } catch {
+      /* gateway/api down — existing catalog (or fallback) stays */
+    }
   }
 
   useEffect(() => {
@@ -127,33 +208,6 @@ export default function SubmitPage() {
       })
       .catch(() => {
         /* offline fallback: static ADAPTERS list */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  /** Refetch the live catalog — called after a successful pull too. */
-  async function refreshModels() {
-    try {
-      const r = await listModels();
-      if (r.models.length) setModels(r.models.map((m) => m.id));
-      setPullSupported(r.pull_supported);
-    } catch {
-      /* gateway/api down — MODEL_SUGGESTIONS fallback stays */
-    }
-  }
-
-  useEffect(() => {
-    let cancelled = false;
-    listModels()
-      .then((r) => {
-        if (cancelled) return;
-        if (r.models.length) setModels(r.models.map((m) => m.id));
-        setPullSupported(r.pull_supported);
-      })
-      .catch(() => {
-        /* offline fallback: static MODEL_SUGGESTIONS */
       });
     return () => {
       cancelled = true;
@@ -231,18 +285,42 @@ export default function SubmitPage() {
     setImportFor(null);
   }
 
-  const effectiveEvaluator = evaluatorModel.trim() || modelName.trim();
+  // Effective participant-model set: primary first, extras deduped against
+  // it and each other (mirrors orchestrator.matrix.participant_models).
+  const participants = useMemo(() => participantModels(modelRows), [modelRows]);
+  const primaryModel = modelRows[0]?.model.trim() ?? "";
+  const modelCount = participants.length;
+  const sandboxCount = configs.length * Math.max(modelCount, 1);
+
+  const effectiveEvaluator = evalRow.model.trim() || primaryModel;
   // PR14: flagged when the judge equals ANY participant model —
   // non-independent judging for that matrix cell.
   const sameModelEval =
-    effectiveEvaluator !== "" && participantModels.includes(effectiveEvaluator);
+    effectiveEvaluator !== "" && participants.includes(effectiveEvaluator);
 
   const canAddConfig = configs.length < MAX_CONFIGS;
+  // Row cap: 8 extras max (RunCreate.models bound) AND adding one more
+  // model must not blow the configs × models matrix cap.
+  const canAddModel =
+    modelRows.length < MAX_MODEL_ROWS &&
+    configs.length * (modelCount + 1) <= MAX_MATRIX_CELLS;
+  const canAddModelHint =
+    modelRows.length >= MAX_MODEL_ROWS
+      ? `max ${MAX_MODEL_ROWS} participant models`
+      : `matrix cap — ${MAX_MATRIX_CELLS} sandboxes max`;
+
+  // The ollama install control only makes sense while a row actually picks
+  // from ollama AND that upstream reported pull support — a non-ollama row
+  // (or an unkeyed/unreachable ollama) hides it.
+  const ollamaInUse =
+    modelRows.some((r) => r.provider === "ollama") ||
+    evalRow.provider === "ollama";
+  const pullVisible = ollamaInUse && (catalogs.ollama?.pullSupported ?? false);
 
   const validation = useMemo(() => {
     const errs: Record<string, string> = {};
     if (!taskPrompt.trim()) errs.task_prompt = "Task prompt is required.";
-    if (!modelName.trim()) errs.model_name = "Model name is required.";
+    if (!primaryModel) errs.model_name = "Model name is required.";
     if (configs.length === 0) errs.configs = "At least one harness config is required.";
     configs.forEach((c, i) => {
       if (!adapterNames.includes(c.adapter)) {
@@ -263,12 +341,37 @@ export default function SubmitPage() {
         `Matrix too large: ${configs.length} configs × ${modelCount} models ` +
         `= ${sandboxCount} sandboxes (max ${MAX_MATRIX_CELLS}).`;
     return errs;
-  }, [taskPrompt, modelName, configs, budgets, adapterNames, packNames, sandboxCount, modelCount]);
+  }, [taskPrompt, primaryModel, configs, budgets, adapterNames, packNames, sandboxCount, modelCount]);
 
   const isValid = Object.keys(validation).length === 0;
 
   function updateConfig(key: number, patch: Partial<ConfigRow>) {
     setConfigs((cs) => cs.map((c) => (c.key === key ? { ...c, ...patch } : c)));
+  }
+
+  function updateModelRow(key: number, patch: Partial<ModelRow>) {
+    setModelRows((rs) =>
+      rs.map((r) => (r.key === key ? { ...r, ...patch } : r)),
+    );
+  }
+
+  function pickProvider(key: number, provider: string) {
+    updateModelRow(key, { provider, picked: true });
+    ensureCatalog(provider);
+  }
+
+  function pickEvalProvider(provider: string) {
+    setEvalRow((e) => ({ ...e, provider, picked: true }));
+    ensureCatalog(provider);
+  }
+
+  function addModelRow() {
+    if (!canAddModel) return;
+    setModelRows((rs) => [...rs, blankModelRow(defaultProvider)]);
+  }
+
+  function removeModelRow(key: number) {
+    setModelRows((rs) => (rs.length > 1 ? rs.filter((r) => r.key !== key) : rs));
   }
 
   function togglePack(cfg: ConfigRow, pack: string) {
@@ -334,16 +437,19 @@ export default function SubmitPage() {
       system_prompt_extra: c.system_prompt_extra.trim() || null,
       name: c.name.trim() || null,
     }));
+    // Row 1 → model_name; remaining deduped rows → models (null when
+    // single-model). Providers stay client-side — RunCreate has no
+    // per-model provider field; routing resolves gateway-side.
+    const { model_name, models } = modelsPayload(modelRows);
 
     setSubmitting(true);
     try {
       const run = await createRun({
         task_prompt: taskPrompt.trim(),
-        model_name: modelName.trim(),
-        // PR14: extra participant models — empty list → single-model run.
-        models: extraModels.length ? extraModels : null,
+        model_name,
+        models,
         harness_configs,
-        evaluator_model: evaluatorModel.trim() || null,
+        evaluator_model: evalRow.model.trim() || null,
         budgets,
       });
       router.push(`/runs/${run.id}`);
@@ -396,80 +502,78 @@ export default function SubmitPage() {
           </div>
         </Card>
 
-        <Card title="Model">
-          <div className="input-row">
-            <div className="field">
-              <label className="field__label" htmlFor="model_name">
-                Participant model <span className="faint">(required)</span>
-              </label>
-              <ComboInput
-                id="model_name"
-                value={modelName}
-                onChange={setPrimaryModel}
-                suggestions={modelSuggestions}
-                placeholder="qwen3:8b"
-                disabled={submitting}
-                mono
-              />
-              {fieldErrors.model_name ? (
-                <span className="field__error">{fieldErrors.model_name}</span>
-              ) : (
-                <span className="field__hint">
-                  {models.length > 0
-                    ? `${models.length} models from the gateway upstream — the primary model every config runs on.`
-                    : "Primary participant model — runs in every sandbox unless extended below."}
-                </span>
-              )}
-            </div>
-            <div className="field">
-              <label className="field__label" htmlFor="evaluator_model">
-                Evaluator model
-              </label>
-              <ComboInput
-                id="evaluator_model"
-                value={evaluatorModel}
-                onChange={setEvaluatorModel}
-                suggestions={modelSuggestions}
-                placeholder={modelName.trim() || "same as participant"}
-                disabled={submitting}
-                mono
-              />
-              {sameModelEval ? (
-                <InfoNote>
-                  Evaluator uses the <strong>same model</strong> as the participants
-                  {modelName.trim() ? <> (<code>{modelName.trim()}</code>)</> : null} —
-                  scores may not be fully independent. This is allowed; the results page flags it.
-                </InfoNote>
-              ) : (
-                <span className="field__hint">
-                  Leave empty to reuse the primary participant model.
-                </span>
-              )}
-            </div>
-          </div>
-          <div className="field" style={{ marginTop: "0.9rem" }}>
-            <label className="field__label" htmlFor="extra_models">
-              Additional models{" "}
-              <span className="faint">(optional — model-vs-model)</span>
+        <Card title="Models">
+          <div className="field">
+            <label className="field__label">
+              Participant models{" "}
+              <span className="faint">(participant 1 is the primary — required)</span>
             </label>
             <div
-              id="extra_models"
-              className="check-list check-list--scroll"
+              className="model-rows"
               role="group"
-              aria-label="Additional participant models"
+              aria-label="Participant models"
             >
-              {extraModelOptions.map((m) => (
-                <label key={m} className="check-item">
-                  <input
-                    type="checkbox"
-                    checked={extraModels.includes(m)}
-                    onChange={() => toggleExtraModel(m)}
+              {modelRows.map((row, i) => (
+                <div className="model-row" key={row.key}>
+                  <span className="model-row__label">participant {i + 1}</span>
+                  <select
+                    className="select"
+                    aria-label={`participant ${i + 1} provider`}
+                    title="Which upstream's catalog to browse — informational only"
+                    value={row.provider}
+                    onChange={(e) => pickProvider(row.key, e.target.value)}
                     disabled={submitting}
+                  >
+                    {PROVIDERS.map((p) => (
+                      <option key={p} value={p}>
+                        {p}
+                      </option>
+                    ))}
+                  </select>
+                  <ComboInput
+                    id={i === 0 ? "model_name" : `model_${i + 1}`}
+                    value={row.model}
+                    onChange={(v) => updateModelRow(row.key, { model: v })}
+                    suggestions={suggestionsFor(row.provider)}
+                    placeholder={i === 0 ? "qwen3:8b" : "model id…"}
+                    disabled={submitting}
+                    mono
                   />
-                  <code>{m}</code>
-                </label>
+                  <button
+                    type="button"
+                    className="btn btn--sm btn--ghost"
+                    onClick={() => removeModelRow(row.key)}
+                    // Row 1 keeps the slot (alignment) but can't be removed —
+                    // the primary model is required.
+                    disabled={submitting || i === 0}
+                    style={i === 0 ? { visibility: "hidden" } : undefined}
+                    tabIndex={i === 0 ? -1 : undefined}
+                    aria-hidden={i === 0 || undefined}
+                  >
+                    remove
+                  </button>
+                </div>
               ))}
             </div>
+            <div className="row">
+              <button
+                type="button"
+                className="btn btn--sm"
+                onClick={addModelRow}
+                disabled={submitting || !canAddModel}
+              >
+                + Add Another Model
+              </button>
+              {!canAddModel ? (
+                <span className="field__hint">{canAddModelHint}</span>
+              ) : null}
+            </div>
+            {fieldErrors.model_name ? (
+              <span className="field__error">{fieldErrors.model_name}</span>
+            ) : null}
+            {fieldErrors.models ? (
+              <span className="field__error">{fieldErrors.models}</span>
+            ) : null}
             <span className="field__hint">
               {modelCount > 1 ? (
                 <>
@@ -477,17 +581,67 @@ export default function SubmitPage() {
                     {modelCount} models × {configs.length} configs = {sandboxCount}{" "}
                     sandboxes
                   </strong>{" "}
-                  — every config runs once per model.
+                  — every config runs once per model.{" "}
                 </>
               ) : (
-                "Check extra models to compare harness AND model in one run — each config runs once per model."
+                "Add another model to compare harness AND model in one run — each config runs once per model. "
               )}
+              A row&apos;s provider only picks which upstream catalog to browse —
+              the payload sends just the model name; actual routing resolves per
+              model via the gateway&apos;s PROVIDER_ROUTES.
             </span>
-            {fieldErrors.models ? (
-              <span className="field__error">{fieldErrors.models}</span>
-            ) : null}
           </div>
-          {pullSupported ? (
+
+          <div className="field" style={{ marginTop: "0.9rem" }}>
+            <label className="field__label" htmlFor="evaluator_model">
+              Evaluator model
+            </label>
+            <div className="model-row">
+              <span className="model-row__label">evaluator</span>
+              <select
+                className="select"
+                aria-label="evaluator provider"
+                title="Which upstream's catalog to browse — informational only"
+                value={evalRow.provider}
+                onChange={(e) => pickEvalProvider(e.target.value)}
+                disabled={submitting}
+              >
+                {PROVIDERS.map((p) => (
+                  <option key={p} value={p}>
+                    {p}
+                  </option>
+                ))}
+              </select>
+              <ComboInput
+                id="evaluator_model"
+                value={evalRow.model}
+                onChange={(v) => setEvalRow((e) => ({ ...e, model: v }))}
+                suggestions={suggestionsFor(evalRow.provider)}
+                placeholder={primaryModel || "same as participant"}
+                disabled={submitting}
+                mono
+              />
+            </div>
+            {sameModelEval ? (
+              <InfoNote>
+                Evaluator uses the <strong>same model</strong> as a participant
+                {effectiveEvaluator ? (
+                  <>
+                    {" "}
+                    (<code>{effectiveEvaluator}</code>)
+                  </>
+                ) : null}{" "}
+                — scores may not be fully independent. This is allowed; the
+                results page flags it.
+              </InfoNote>
+            ) : (
+              <span className="field__hint">
+                Leave empty to reuse the primary participant model.
+              </span>
+            )}
+          </div>
+
+          {pullVisible ? (
             <div className="field" style={{ marginTop: "0.9rem" }}>
               <label className="field__label" htmlFor="pull_model">
                 Install model <span className="faint">(ollama pull)</span>
