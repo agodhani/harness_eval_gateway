@@ -96,8 +96,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 ### F3 — AI gateway ✅
 
-- **What:** OpenAI-compatible `/v1/chat/completions` endpoint → Ollama
-  upstream — non-streaming by default, metered SSE pass-through when the
+- **What:** OpenAI-compatible `/v1/chat/completions` endpoint → configurable
+  upstream (Ollama default) — non-streaming by default, metered SSE pass-through when the
   caller sets `stream: true` (pi and other OpenAI-compatible CLIs stream
   unconditionally); Anthropic Messages `/v1/messages` +
   `/v1/messages/count_tokens` (Claude Code, dsh) and OpenAI Responses
@@ -105,13 +105,30 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   tee; `GET /v1/models` for CLI probes; per-run/sandbox HMAC credentials
   (`heg.<b64>.<sig>`); records tokens in/out, latency, failures; token
   budgets (429 + `error` event); emits `llm_request`/`llm_response`/`error`
-  events. `/internal/events` (harness-event proxy, cred or ingest-token
-  auth) + `/internal/done` (done_signal) for sandbox egress.
+  events carrying the resolved upstream provider. `/internal/events`
+  (harness-event proxy, cred or ingest-token auth) + `/internal/done`
+  (done_signal) for sandbox egress.
+- **Upstreams:** `UPSTREAM_PROVIDER` picks the default provider —
+  `ollama` (default), `openrouter`, `openai`, `anthropic` — and
+  `PROVIDER_ROUTES` (JSON `{"model-glob": provider}`) overrides it per
+  request model (first match wins, case-insensitive); an `x-heg-provider`
+  request header forces the provider outright on service creds
+  (`sandbox_id=None`; unknown/unkeyed values 400, ignored on
+  sandbox-scoped creds). Each
+  provider gets its own key/base-URL/headers (Anthropic sends `x-api-key` +
+  `anthropic-version`; caller `anthropic-beta`/`anthropic-version` headers
+  forward to the anthropic provider); endpoints a provider doesn't
+  implement return its native 404; Ollama-only body params are stripped
+  for hosted providers.
 - **Where:** `gateway/` (`main.py`, `creds.py`, `metering.py`, `deps.py`,
   `config.py`, `mint_cred.py` CLI), compose service `gateway` (:8081→8080)
 - **Verify:**
   - Unit: `tests/unit/gateway/` (creds, metering, proxy — hermetic; protocol
-    pass-throughs + SSE usage normalization covered)
+    pass-throughs + SSE usage normalization covered),
+    `test_upstream_provider.py` (provider selection, key validation,
+    PROVIDER_ROUTES resolution, `x-heg-provider` override, per-provider
+    client base/headers, ollama-param stripping, anthropic protocol-header
+    forwarding, provider attribution on emitted events)
   - Manual: mint cred (`uv run python -m gateway.mint_cred`) →
     `curl localhost:8081/v1/chat/completions` → completion + event rows
   - M2 e2e proven: sandbox→gateway→Ollama→events (see run
@@ -160,7 +177,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   timestamps. API side (`api/routers/events.py`: ingest batch/single,
   query w/ filters+pagination, SSE tail) + timeline UI both landed.
 - **Where:** `api/routers/events.py`, `api/schemas.py` (EventSource/EventType
-  enums), db `events`, `web/app/runs/[id]/timeline/`
+  enums), db `events`, `web/app/runs/[id]/timeline/` (`TimelineClient.tsx` +
+  `SandboxMetricsBar.tsx` — the PR9 metrics strip lives here; see F9)
 - **Run-detail console:** `web/components/RunConsoleLive.tsx` — per-sandbox
   event lanes on the run detail page (backlog + SSE + `after_id` poll, same
   merge as the timeline; evaluator/orchestrator traffic routed to a bottom
@@ -247,14 +265,28 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   and reported under `evaluator` rather than polluting participant numbers.
   Results page gains an "Analytics" section — side-by-side comparison table +
   price-model dropdown that recomputes cost client-side (no refetch).
+  Timeline page (PR9) hosts the same numbers in-context: a per-sandbox
+  metrics strip between the filter toolbar and the event stream — compact
+  chips (turns · tokens in→out · avg latency · est. cost · errors, plus a
+  judge-traffic line once the evaluator runs). Chips double as
+  sandbox-filter selectors (same state as the toolbar dropdown, whose
+  options gain adapter labels), and the strip refreshes every 15s while the
+  run is non-terminal.
 - **Where:** `api/pricing.py`, `api/routers/analytics.py`, response schemas
   in `api/schemas.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx`,
-  `web/lib/api.ts` (`getRunAnalytics`, `estimateCostUsd`)
+  `web/lib/api.ts` (`getRunAnalytics`, `estimateCostUsd`),
+  `web/lib/timelineAnalytics.ts` (`sandboxStrips` transform) +
+  `timelineAnalytics.test.ts`, `web/lib/format.ts` (`formatNum`/`formatUsd`),
+  `web/app/runs/[id]/timeline/SandboxMetricsBar.tsx` + `.tl-metric*` in
+  `web/app/globals.css`
 - **Verify:**
   - Unit: `tests/unit/api/test_analytics.py` (aggregation math, eval-phase
-    split, cost at known price model, defaults, 404/422, zero-event run)
+    split, cost at known price model, defaults, 404/422, zero-event run);
+    `cd web && npm test` (node --test — `sandboxStrips` chip transform)
   - API: `curl localhost:8001/api/runs/<id>/analytics?price_model=gpt-4o`
-  - UI: results page → "Analytics" card → switch price model → cost updates
+  - UI: results page → "Analytics" card → switch price model → cost updates;
+    timeline page → strip shows per-sandbox stats live → click a chip →
+    stream filters to that sandbox
 - **Depends on:** F6 (events), F8 (results page)
 
 ### F10 — Multi-harness adapters ✅

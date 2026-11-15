@@ -27,8 +27,7 @@ MANIFEST = {
     "display_name": "Claude Code CLI",
     "description": (
         "claude -p --output-format stream-json in a Node sandbox; model "
-        "traffic is the Anthropic Messages API proxied by the AI gateway "
-        "to Ollama"
+        "traffic is the Anthropic Messages API proxied by the AI gateway"
     ),
     "llm_protocol": "anthropic-messages",
     "cli": "claude",
