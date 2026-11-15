@@ -23,8 +23,18 @@ os.environ.setdefault("GATEWAY_URL", "http://localhost:8081")
 # Same for PROVIDER_ROUTES — model-glob overrides must not reroute tests.
 os.environ.setdefault("UPSTREAM_PROVIDER", "ollama")
 os.environ.setdefault("PROVIDER_ROUTES", "")
+# Same for the PR18 replay cache — a dev's GATEWAY_CACHE_ENABLED=true must
+# not make tests silently replay stored responses.
+os.environ["GATEWAY_CACHE_ENABLED"] = "false"
 os.environ.setdefault("ARTIFACT_ROOT", str(ROOT / "data" / "artifacts"))
 os.environ.setdefault("LOG_LEVEL", "WARNING")
+# PR7: the exec signal collector lives in the default COLLECTORS registry —
+# pin it off for the suite so a stray collect_signals() can't spawn docker
+# containers on a dev machine. Docker-marked tests enable it explicitly.
+os.environ.setdefault("SCORING_EXEC", "0")
+# PR8: same for LLM test-suite generation — the evaluator's testgen step is
+# pinned off so unit tests never call a model or spawn exec containers.
+os.environ.setdefault("SCORING_TESTGEN", "0")
 
 from fastapi.testclient import TestClient
 

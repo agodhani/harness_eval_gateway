@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from api.deps import get_session_factory
 from api.routers import results as results_router
-from db.models import Artifact, Base, Rubric, Run, Sandbox, Score
+from db.models import Artifact, Base, Event, Rubric, Run, Sandbox, Score
 from orchestrator import lifecycle as lifecycle_mod
 from orchestrator import runner
 
@@ -59,6 +59,7 @@ def scored_run(session_factory: sessionmaker[Session]):
         s.flush()
         sb1 = Sandbox(
             run_id=run.id,
+            name="with-superpowers",
             harness_config={"adapter": "miniloop", "skill_packs": ["superpowers"]},
             status="done",
             terminal_reason="agent_done",
@@ -114,6 +115,8 @@ def test_run_results_shape(client: TestClient, scored_run) -> None:
     assert body["run_id"] == str(scored_run["run_id"])
     assert body["status"] == "done"
     assert body["model_name"] == "qwen3:8b"
+    # PR14: effective participant set + per-sandbox model resolution
+    assert body["models"] == ["qwen3:8b"]
     assert body["evaluator_model"] == "qwen3:8b"
     assert body["same_model_eval"] is True
     assert len(body["sandboxes"]) == 2
@@ -121,6 +124,8 @@ def test_run_results_shape(client: TestClient, scored_run) -> None:
     sb1 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"]))
     assert sb1["status"] == "done"
     assert sb1["terminal_reason"] == "agent_done"
+    assert sb1["name"] == "with-superpowers"  # PR1: persisted sandbox name
+    assert sb1["model"] == "qwen3:8b"  # PR14: no config model → run default
     assert sb1["harness_config"]["skill_packs"] == ["superpowers"]
     assert sb1["rubric_id"] == str(scored_run["rubric_id"])
     assert sb1["dimensions"]["functional_requirements"] == {
@@ -135,6 +140,120 @@ def test_run_results_shape(client: TestClient, scored_run) -> None:
     assert sb2["dimensions"] == {}
     assert sb2["overall"] is None
     assert sb2["terminal_reason"] == "timeout"
+    assert sb2["name"] is None  # unnamed sandbox serializes null
+    # no eval-failure events seeded -> eval_error absent (not "judge failed")
+    assert sb2["eval_error"] is None
+
+
+def _error_event(session_factory, run_id, sandbox_id, payload, source="evaluator"):
+    s = session_factory()
+    try:
+        s.add(
+            Event(
+                run_id=run_id,
+                sandbox_id=sandbox_id,
+                source=source,
+                type="error",
+                payload=payload,
+            )
+        )
+        s.commit()
+    finally:
+        s.close()
+
+
+def test_run_results_surfaces_eval_failure(
+    client: TestClient, scored_run, session_factory
+) -> None:
+    """A scoreless sandbox whose judge failed reports eval_error — the UI
+    distinguishes 'judge failed' from 'no rubric scores'."""
+    _error_event(
+        session_factory,
+        scored_run["run_id"],
+        scored_run["sb2"],
+        {
+            "phase": "eval_scores_failed",
+            "reason": "scores_invalid",
+            "detail": "scores.json is not valid JSON",
+        },
+    )
+
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    body = resp.json()
+    sb2 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"]))
+    assert sb2["eval_error"] is not None
+    assert "scores_invalid" in sb2["eval_error"]
+    assert "not valid JSON" in sb2["eval_error"]
+    # scored sandbox unaffected
+    sb1 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"]))
+    assert sb1["eval_error"] is None
+
+
+def test_run_results_eval_error_cleared_when_scored(
+    client: TestClient, scored_run, session_factory
+) -> None:
+    """A failed attempt that a later retry recovered must not leave
+    eval_error on a sandbox WITH scores."""
+    _error_event(
+        session_factory,
+        scored_run["run_id"],
+        scored_run["sb1"],
+        {"phase": "eval_scores_failed", "reason": "scores_missing"},
+    )
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb1 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"])
+    )
+    assert sb1["eval_error"] is None
+
+
+def test_run_results_eval_orchestrator_failure(
+    client: TestClient, scored_run, session_factory
+) -> None:
+    """Orchestrator-emitted stage=evaluation errors (evaluate_sandbox
+    exceptions, final eval_failed marker) also surface."""
+    _error_event(
+        session_factory,
+        scored_run["run_id"],
+        scored_run["sb2"],
+        {"stage": "evaluation", "message": "RuntimeError: spawn exploded"},
+        source="orchestrator",
+    )
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb2 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"])
+    )
+    assert sb2["eval_error"] is not None
+    assert "spawn exploded" in sb2["eval_error"]
+
+
+def test_run_results_non_eval_errors_ignored(
+    client: TestClient, scored_run, session_factory
+) -> None:
+    """Budget/gateway/harness error events are NOT eval failures."""
+    _error_event(
+        session_factory,
+        scored_run["run_id"],
+        scored_run["sb2"],
+        {"stage": "budget", "reason": "budget_exceeded", "http_status": 429},
+        source="gateway",
+    )
+    _error_event(
+        session_factory,
+        scored_run["run_id"],
+        scored_run["sb2"],
+        {"stage": "spawn", "message": "docker gone"},
+        source="orchestrator",
+    )
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb2 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"])
+    )
+    assert sb2["eval_error"] is None
 
 
 def test_run_results_includes_artifacts(
@@ -170,6 +289,47 @@ def test_run_results_includes_artifacts(
 def test_run_results_404(client: TestClient) -> None:
     resp = client.get(f"/api/runs/{uuid.uuid4()}/results")
     assert resp.status_code == 404
+
+
+def test_run_results_multi_model(client: TestClient, session_factory) -> None:
+    """PR14: per-sandbox model + run-level models list on a model matrix."""
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="x",
+            model_name="qwen3:8b",
+            config={"models": ["qwen3:8b", "gpt-4o"]},
+            status="done",
+        )
+        s.add(run)
+        s.flush()
+        s.add_all(
+            [
+                Sandbox(
+                    run_id=run.id,
+                    name="baseline · qwen3:8b",
+                    harness_config={"adapter": "miniloop", "model": "qwen3:8b"},
+                    status="done",
+                ),
+                Sandbox(
+                    run_id=run.id,
+                    name="baseline · gpt-4o",
+                    harness_config={"adapter": "miniloop", "model": "gpt-4o"},
+                    status="done",
+                ),
+            ]
+        )
+        s.commit()
+        run_id = run.id
+    finally:
+        s.close()
+
+    body = client.get(f"/api/runs/{run_id}/results").json()
+    assert body["models"] == ["qwen3:8b", "gpt-4o"]
+    by_model = {sb["model"]: sb for sb in body["sandboxes"]}
+    assert set(by_model) == {"qwen3:8b", "gpt-4o"}
+    assert by_model["gpt-4o"]["name"] == "baseline · gpt-4o"
+    assert by_model["gpt-4o"]["harness_config"]["model"] == "gpt-4o"
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +411,163 @@ def test_run_results_includes_analysis(
     # sb2 has no artifact_path -> analysis absent
     sb2 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"]))
     assert sb2["analysis"] is None
+
+
+def test_run_results_exec_summary(
+    client: TestClient, scored_run, session_factory, artifact_root
+) -> None:
+    """PR7: the flat `exec` field is derived from the analysis exec signal."""
+    payload = json.loads(json.dumps(ANALYSIS_JSON))
+    payload["signals"].append(
+        {
+            "name": "exec",
+            "status": "ok",
+            "metrics": {
+                "build_ok": True,
+                "tests_detected": True,
+                "tests_ok": True,
+                "tests_collected": 5,
+                "tests_passed": 5,
+                "tests_failed": 0,
+                "tests_errors": 0,
+                "tests_skipped": 1,
+                "coverage_percent": 82.5,
+                "timed_out": False,
+                "duration_seconds": 9.4,
+            },
+            "warnings": [],
+            "error": None,
+        }
+    )
+    art_dir = artifact_root / "x" / "y"
+    art_dir.mkdir(parents=True)
+    (art_dir / "analysis.json").write_text(json.dumps(payload))
+    _set_artifact_path(session_factory, scored_run["sb1"], str(art_dir))
+
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb1 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"])
+    )
+    ex = sb1["exec"]
+    assert ex["status"] == "ok"
+    assert ex["build_ok"] is True
+    assert ex["tests_detected"] is True
+    assert ex["tests_passed"] == 5
+    assert ex["tests_skipped"] == 1
+    assert ex["coverage_percent"] == 82.5
+    assert ex["timed_out"] is False
+    # no artifact -> no analysis -> no exec summary
+    sb2 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"])
+    )
+    assert sb2["exec"] is None
+
+
+def test_run_results_exec_summary_skipped(
+    client: TestClient, scored_run, session_factory, artifact_root
+) -> None:
+    """A skipped exec signal surfaces its status + reason, not zeros."""
+    payload = json.loads(json.dumps(ANALYSIS_JSON))
+    payload["signals"].append(
+        {
+            "name": "exec",
+            "status": "skipped",
+            "metrics": {},
+            "warnings": ["exec scoring disabled (SCORING_EXEC=0)"],
+            "error": None,
+        }
+    )
+    art_dir = artifact_root / "x" / "y"
+    art_dir.mkdir(parents=True)
+    (art_dir / "analysis.json").write_text(json.dumps(payload))
+    _set_artifact_path(session_factory, scored_run["sb1"], str(art_dir))
+
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb1 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"])
+    )
+    assert sb1["exec"]["status"] == "skipped"
+    assert "SCORING_EXEC" in (sb1["exec"]["detail"] or "")
+
+
+def test_run_results_generated_tests_summary(
+    client: TestClient, scored_run, session_factory, artifact_root
+) -> None:
+    """PR8: the flat `generated_tests` field is derived from the signal."""
+    payload = json.loads(json.dumps(ANALYSIS_JSON))
+    payload["signals"].append(
+        {
+            "name": "generated_tests",
+            "status": "ok",
+            "metrics": {
+                "model": "eval-model",
+                "files_written": 2,
+                "files_rejected": 1,
+                "tests_detected": True,
+                "tests_collected": 10,
+                "tests_passed": 7,
+                "tests_failed": 2,
+                "tests_errors": 1,
+                "pass_rate": 0.7,
+                "coverage_percent": 66.0,
+                "timed_out": False,
+            },
+            "warnings": [],
+            "error": None,
+        }
+    )
+    art_dir = artifact_root / "x" / "y"
+    art_dir.mkdir(parents=True)
+    (art_dir / "analysis.json").write_text(json.dumps(payload))
+    _set_artifact_path(session_factory, scored_run["sb1"], str(art_dir))
+
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb1 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"])
+    )
+    gt = sb1["generated_tests"]
+    assert gt["status"] == "ok"
+    assert gt["model"] == "eval-model"
+    assert gt["files_written"] == 2
+    assert gt["tests_passed"] == 7
+    assert gt["tests_failed"] == 2
+    assert gt["pass_rate"] == 0.7
+    assert gt["coverage_percent"] == 66.0
+    sb2 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"])
+    )
+    assert sb2["generated_tests"] is None
+
+
+def test_run_results_generated_tests_skipped(
+    client: TestClient, scored_run, session_factory, artifact_root
+) -> None:
+    """A skipped generated_tests signal surfaces its status + reason."""
+    payload = json.loads(json.dumps(ANALYSIS_JSON))
+    payload["signals"].append(
+        {
+            "name": "generated_tests",
+            "status": "skipped",
+            "metrics": {},
+            "warnings": ["test-suite generation disabled (SCORING_TESTGEN=0)"],
+            "error": None,
+        }
+    )
+    art_dir = artifact_root / "x" / "y"
+    art_dir.mkdir(parents=True)
+    (art_dir / "analysis.json").write_text(json.dumps(payload))
+    _set_artifact_path(session_factory, scored_run["sb1"], str(art_dir))
+
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    sb1 = next(
+        s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"])
+    )
+    assert sb1["generated_tests"]["status"] == "skipped"
+    assert "SCORING_TESTGEN" in (sb1["generated_tests"]["detail"] or "")
 
 
 def test_run_results_invalid_analysis_is_null(

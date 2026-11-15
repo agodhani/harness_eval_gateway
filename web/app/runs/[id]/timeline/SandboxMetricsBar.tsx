@@ -6,10 +6,12 @@
  * `sandboxStrips` (lib/timelineAnalytics.ts) from the F9 analytics response —
  * this component is presentational only.
  *
- * Clicking a chip toggles the timeline's sandbox filter (same state the
- * toolbar dropdown drives), so the strip doubles as a per-sandbox selector.
- * The strip is a single horizontal row — future split-view trace work
- * (PR10) keeps it untouched above the stream area.
+ * Clicking a chip toggles selection: in merged mode that is the timeline's
+ * sandbox filter (same state the toolbar dropdown drives); in split mode
+ * (PR10) TimelineClient routes the click to lane assignment instead — the
+ * strip keeps working as the sandbox picker for both views. The strip is a
+ * single horizontal row — PR10's split view keeps it untouched above the
+ * stream area.
  */
 import { shortId } from "@/lib/format";
 import { Badge, statusTone } from "@/components/ui";
@@ -17,19 +19,19 @@ import type { SandboxStrip } from "@/lib/timelineAnalytics";
 
 export default function SandboxMetricsBar({
   strips,
-  selected,
+  selectedIds,
   onSelect,
 }: {
   strips: SandboxStrip[];
-  /** Current sandbox filter value: "" = all, "__none__" = run-level, else id. */
-  selected: string;
+  /** Chips rendered active — merged: the one filtered sandbox; split: both lanes. */
+  selectedIds: ReadonlySet<string>;
   onSelect: (sandboxId: string) => void;
 }) {
   if (strips.length === 0) return null;
   return (
     <div className="tl-metrics" role="group" aria-label="Per-sandbox metrics">
       {strips.map((s) => {
-        const active = selected === s.sandboxId;
+        const active = selectedIds.has(s.sandboxId);
         const shown = s.terminalReason ?? s.status;
         return (
           <button
@@ -37,7 +39,7 @@ export default function SandboxMetricsBar({
             key={s.sandboxId}
             className={`tl-metric${active ? " is-active" : ""}`}
             onClick={() => onSelect(s.sandboxId)}
-            title={`${s.sandboxId}${s.label ? ` · ${s.label}` : ""} — ${active ? "clear filter" : "filter timeline to this sandbox"}`}
+            title={`${s.sandboxId}${s.label ? ` · ${s.label}` : ""} — ${active ? "deselect" : "select"} (merged: filter · split: assign to a lane)`}
             aria-pressed={active}
           >
             <span className="tl-metric__head">

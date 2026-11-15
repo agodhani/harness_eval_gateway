@@ -9,6 +9,7 @@ is touched.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -23,7 +24,7 @@ from sqlalchemy import select
 from api.deps import get_db
 from api.main import app
 from api.routers import runs as runs_router
-from db.models import Base, Rubric, Run
+from db.models import Base, Event, Rubric, Run
 from db.session import make_engine, make_session_factory
 from orchestrator import lifecycle as lifecycle_mod
 from orchestrator import rubric as rubric_mod
@@ -247,6 +248,130 @@ def test_create_run_multi_adapter(api) -> None:
     assert adapters == ["miniloop", "claude_code", "codex", "deepseek", "pi", "aider"]
 
 
+def test_create_run_harness_config_names(api) -> None:
+    """PR1: optional per-config name survives submit -> run.config round-trip."""
+    body = _valid_body(
+        harness_configs=[
+            {"adapter": "miniloop", "name": "baseline-loop"},
+            {"adapter": "miniloop"},  # no name -> null, provision defaults it
+        ]
+    )
+    data = _post_run(api.client, body)
+    hcs = data["config"]["harness_configs"]
+    assert hcs[0]["name"] == "baseline-loop"
+    assert hcs[1]["name"] is None
+
+
+def test_create_run_multi_model_matrix(api) -> None:
+    """PR14: models[] expands the matrix — config.models persists the
+    effective participant set ([model_name] + deduped extras)."""
+    body = _valid_body(models=["gpt-4o", "claude-opus-4.1", "gpt-4o", "qwen3:8b"])
+    data = _post_run(api.client, body)
+    cfg = data["config"]
+    # model_name leads; extras deduped against it and each other
+    assert cfg["models"] == ["qwen3:8b", "gpt-4o", "claude-opus-4.1"]
+    # harness_configs stay unexpanded at submit — expansion happens at
+    # provisioning (orchestrator.matrix.expanded_configs).
+    assert len(cfg["harness_configs"]) == 2
+    assert all("model" not in hc for hc in cfg["harness_configs"])
+    # evaluator_model "eval-model" isn't a participant → flag stays False
+    assert cfg["same_model_eval"] is False
+    assert data["same_model_eval"] is False
+
+
+def test_create_run_models_default_single_model(api) -> None:
+    """Omitted/empty models → single-model run; config.models still records
+    the effective set ([model_name]) for downstream consumers."""
+    for models in (None, []):
+        body = _valid_body()
+        if models is not None:
+            body["models"] = models
+        data = _post_run(api.client, body)
+        assert data["config"]["models"] == ["qwen3:8b"]
+
+
+def test_create_run_same_model_eval_against_any_participant(api) -> None:
+    """PR14: the same-model flag fires when the judge equals ANY participant
+    model — non-independent judging for that matrix cell."""
+    # evaluator == an EXTRA participant model → flagged
+    body = _valid_body(models=["gpt-4o"], evaluator_model="gpt-4o")
+    data = _post_run(api.client, body)
+    assert data["config"]["same_model_eval"] is True
+    assert data["same_model_eval"] is True
+    # evaluator == primary participant → flagged (pre-PR14 behavior);
+    # drop the explicit evaluator_model so it defaults to model_name
+    body = _valid_body(models=["gpt-4o"])
+    del body["evaluator_model"]
+    data = _post_run(api.client, body)
+    assert data["config"]["evaluator_model"] == "qwen3:8b"
+    assert data["same_model_eval"] is True
+    # evaluator distinct from all participants → not flagged
+    body = _valid_body(models=["gpt-4o"], evaluator_model="eval-model")
+    data = _post_run(api.client, body)
+    assert data["same_model_eval"] is False
+
+
+def test_create_run_matrix_size_cap(api) -> None:
+    """PR14: configs × models is capped — each cell is a real sandbox."""
+    # 8 configs × (1 + 4 models) = 40 cells > MAX_MATRIX_CELLS (32)
+    body = _valid_body(
+        harness_configs=[{}] * 8,
+        models=["m2", "m3", "m4", "m5"],
+    )
+    resp = api.client.post("/api/runs", json=body)
+    assert resp.status_code == 422
+    assert "matrix" in resp.text.lower() or "sandboxes" in resp.text.lower()
+    # exactly at the cap → accepted
+    body = _valid_body(harness_configs=[{}] * 8, models=["m2", "m3"])
+    data = _post_run(api.client, body)  # 8 × 3 = 24 ≤ 32
+    assert len(data["config"]["models"]) == 3
+
+
+def test_create_run_models_field_bounds(api) -> None:
+    client = api.client
+    # >8 extra models rejected by the field bound
+    resp = client.post(
+        "/api/runs", json=_valid_body(models=[f"m{i}" for i in range(9)])
+    )
+    assert resp.status_code == 422
+    # entries longer than 255 chars 422 like model_name/evaluator_model —
+    # a malformed entry must not silently shrink the participant set
+    resp = client.post("/api/runs", json=_valid_body(models=["x" * 300]))
+    assert resp.status_code == 422
+
+
+def test_create_run_per_config_model_pin(api) -> None:
+    """PR14: harness_configs[i].model pins that config to one model —
+    persisted in run.config, counted in the participant set."""
+    body = _valid_body(
+        models=["gpt-4o"],
+        harness_configs=[
+            {"adapter": "miniloop", "model": " claude-opus-4.1 "},
+            {"adapter": "miniloop"},
+        ],
+        evaluator_model="claude-opus-4.1",
+    )
+    data = _post_run(api.client, body)
+    cfg = data["config"]
+    # pin survives (whitespace-normalized); the unpinned config stays bare
+    assert cfg["harness_configs"][0]["model"] == "claude-opus-4.1"
+    assert "model" not in cfg["harness_configs"][1]
+    # config.models is the run's model list — pins join the participant
+    # set via run_models instead (a pin may sit outside the list)
+    assert cfg["models"] == ["qwen3:8b", "gpt-4o"]
+    # judge == the pinned participant model → same-model flag fires
+    assert cfg["same_model_eval"] is True
+    assert data["same_model_eval"] is True
+    rows = api.client.get("/api/runs").json()
+    row = next(r for r in rows if r["id"] == data["id"])
+    assert row["models"] == ["qwen3:8b", "gpt-4o", "claude-opus-4.1"]
+
+    # blank pin normalizes away — the config is unpinned (no model key)
+    body = _valid_body(harness_configs=[{"adapter": "miniloop", "model": "  "}])
+    data = _post_run(api.client, body)
+    assert "model" not in data["config"]["harness_configs"][0]
+
+
 def test_create_run_validation(api) -> None:
     client = api.client
     cases = [
@@ -261,6 +386,10 @@ def test_create_run_validation(api) -> None:
         {
             **_valid_body(),
             "harness_configs": [{"system_prompt_extra": "x" * 8001}],
+        },
+        {
+            **_valid_body(),
+            "harness_configs": [{"name": "x" * 65}],
         },
         {**_valid_body(), "budgets": {"max_iters": 0}},
         # submit-time semantic validation
@@ -385,6 +514,92 @@ def test_approve_freezes_rubric_and_starts_lifecycle(api) -> None:
         rubric = s.get(Rubric, rubric_id)
         assert rubric.status == "approved"
         assert rubric.version == 1
+
+
+def test_approve_queues_behind_active_run(api, monkeypatch) -> None:
+    """PR15 pacing: approvals serialize — a second run parks in `queued` and
+    promotes FIFO (by approval) when the active run frees the slot.
+
+    Note on mechanics: starlette's TestClient builds a fresh blocking
+    portal per request, so background tasks spawned mid-request are
+    cancelled when it completes — a test can't hold a "still running"
+    lifecycle across requests. Instead the fake marks done only runs the
+    test releases, A's task exits while A stays `provisioning` (promote
+    correctly no-ops: slot still held), and A's end is driven by calling
+    ``promote_next_queued`` on a throwaway loop. B's own task-finally
+    promotes C, so the real chain still runs.
+    """
+    client = api.client
+    calls: list[uuid.UUID] = []
+    finishable: set[uuid.UUID] = set()
+
+    async def finishable_lifecycle(run_id, **kwargs):
+        calls.append(run_id)
+        if run_id in finishable:
+            with api.session_factory() as s:
+                r = s.get(Run, run_id)
+                if r is not None:
+                    r.status = "done"
+                    s.commit()
+
+    monkeypatch.setattr(lifecycle_mod, "run_lifecycle", finishable_lifecycle)
+
+    run_a, _ = _run_with_draft_rubric(api)
+    resp = client.post(f"/api/runs/{run_a}/approve")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "provisioning"
+
+    # A's lifecycle ran but A still holds the slot (fake left it active)
+    deadline = time.monotonic() + 5.0
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert calls == [uuid.UUID(run_a)]
+
+    run_b, _ = _run_with_draft_rubric(api)
+    run_c, _ = _run_with_draft_rubric(api)
+    resp = client.post(f"/api/runs/{run_b}/approve")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "queued"
+    resp = client.post(f"/api/runs/{run_c}/approve")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "queued"
+    # parked: no lifecycle started for B or C while A holds the slot
+    assert calls == [uuid.UUID(run_a)]
+
+    # A finishes -> the queue drains FIFO through real promote calls.
+    finishable.update({uuid.UUID(run_a), uuid.UUID(run_b), uuid.UUID(run_c)})
+    with api.session_factory() as s:
+        s.get(Run, uuid.UUID(run_a)).status = "done"
+        s.commit()
+
+    async def _drain():
+        await runner.promote_next_queued(
+            session_factory=api.session_factory,
+            settings=api.settings,
+            runtime=None,  # unused by the fake
+        )
+        for _ in range(200):
+            if len(calls) >= 3:
+                return
+            await asyncio.sleep(0.01)
+
+    asyncio.run(_drain())
+
+    # FIFO by approval time: B promotes before C
+    assert calls == [uuid.UUID(run_a), uuid.UUID(run_b), uuid.UUID(run_c)]
+
+    for rid in (run_b, run_c):
+        _wait_run(client, rid, status="done")
+        with api.session_factory() as s:
+            stages = [
+                e.payload.get("stage")
+                for e in s.execute(
+                    select(Event).where(Event.run_id == uuid.UUID(rid))
+                ).scalars()
+                if e.type == "checkpoint"
+            ]
+        assert "run_queued" in stages
+        assert "run_dequeued" in stages
 
 
 def test_rubric_endpoints_404_and_409(api) -> None:

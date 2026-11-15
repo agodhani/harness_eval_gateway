@@ -30,6 +30,14 @@ append-mostly; rebase on main before merge.
   judge line; chips double as sandbox-filter selectors; `sandboxStrips`
   transform in `web/lib/timelineAnalytics.ts` + `node --test` unit tests).
   Leftover idea: on-event-hover cumulative stats.
+- **PR10 split-view trace comparison**: `merged | split` toggle on the
+  timeline page — two sandbox lanes on ONE merged `(ts,id)` ordering inside
+  a single scroll container (synchronized scroll + time alignment by
+  construction, no scroll mirroring); sticky lane pickers with
+  swap-on-collision, run-level/other-sandbox events as full-width shared
+  rows, metrics chips assign lanes in split mode; transform + tests in
+  `web/lib/splitTimeline.ts(.test.ts)`, shared row markup in
+  `timeline/EventRow.tsx`.
 - **OpenRouter provider** (commit 8014338): `UPSTREAM_PROVIDER=ollama|openrouter`
   in `gateway/config.py`; client base normalizes to `/api/` (httpx
   concatenates base+request paths); Ollama-only body params
@@ -42,6 +50,15 @@ append-mostly; rebase on main before merge.
   `dots-studio/dots-3-note-preview:free`. Mandatory-reasoning models (ernie,
   lfm) 400 on miniloop's `reasoning_effort:"none"`.
 - **PR6 — static-analysis signals** (`scoring/` package, see below).
+- **PR7 — exec + coverage signals** (`exec` collector in `scoring/` +
+  `sandbox/exec.py` ExecRunner + `heg-exec` image, see below).
+- **PR8 — Automated test-suite generation**: `evaluator/testgen.py` writes
+  a pytest suite via the gateway (eval cred, metered), persists it to
+  `<artifact>/generated_tests/`, runs it via `ExecRunner` `test_target`
+  (`EXEC_TEST_TARGET` env → `/srv/test_target` ro mount in `heg-exec`),
+  and folds pass rate into the `generated_tests` `SignalReport` →
+  `ANALYSIS.md`/judge brief/results API flat summary. `SCORING_TESTGEN=0`
+  opts out; `TESTGEN_*` knobs bound prompt budget, files, tokens, timeout.
 - **PR11 — Graphical analysis + cross-run dashboards** (F13): recharts,
   `GET /api/analytics/runs`, results-matrix totals row.
 - **OpenAI + Anthropic providers + per-model routing** (PR12):
@@ -58,15 +75,43 @@ append-mostly; rebase on main before merge.
   onto paid upstreams; caller `anthropic-beta`/`anthropic-version` headers
   forward to the anthropic upstream. Emitted `llm_*`/`error` events record
   the resolved provider.
+- **Gateway response cache / deterministic replay** (PR18): opt-in
+  `GATEWAY_CACHE_ENABLED` (off by default); sqlite store
+  (`gateway/cache.py`, `GATEWAY_CACHE_PATH`) keyed on
+  `namespace+path+provider+outgoing-body` — hits replay byte-verbatim with
+  `x-heg-cache: hit`, emit `llm_*` events marked `payload.cached: true`,
+  and still count toward the run budget (gate runs before lookup). Only
+  complete 2xx bodies stored; `count_tokens`/`/v1/models` bypass;
+  `GATEWAY_CACHE_NAMESPACE` bump invalidates; `GATEWAY_CACHE_MAX_ENTRIES`
+  LRU bound.
 - **PR5 — Eval iteration** (F14): re-score on stored artifacts
   (`POST /api/runs/{id}/rescore` → `lifecycle.rescore_run`), versioned
   post-run rubric edits (`parent_id` chain, `Score.rubric_version`/`seq`
   provenance, `?rubric_version=` results filter). See FEATURE_MAP.md F14.
-- **PR4 — Artifact thumbnails** (F15): explicit `POST .../thumbnail` →
+- **PR1 — Submit-form UX** (F15): live model picker via `GET /api/models`
+  (gateway `/v1/models` proxied, `pull_supported` flag from the
+  `x-heg-provider` stamp), `POST /api/models/pull` → `ollama pull` with
+  NDJSON progress (control-plane creds only), named harness configs
+  (`sandboxes.name`, default `<adapter>-<shortid>`). Details:
+  `FEATURE_MAP.md` F15.
+- **PR17 — hook/plugin telemetry lane**: shared receiver
+  `adapters/common/hooks.py` (`python3 -m adapters.common.hooks <adapter>`)
+  wired to claude_code `settings.json` hooks (stdin), codex `notify`
+  (argv), and pi's generated `heg-events.ts` extension (stdin); per-adapter
+  `translate_hook` normalizes payloads stamped `via: "hook"`; new
+  `tool_result` EventType carries tool outcomes. Details: FEATURE_MAP.md
+  F10 + docs/p25-harness-adapters.md §PR17.
+- **PR15 — Run pacing** (`queued` run status + `orchestrator/pacing.py`):
+  `place_run`/`claim_next_queued` FIFO promotion via
+  `runner._lifecycle_then_promote` + `startup_sweep` re-kick; `spawn_one`
+  waits on `SPAWN_MIN_FREE_MEM_MB` headroom capped by
+  `SPAWN_MEM_WAIT_SECONDS` (timeout fails that sandbox, siblings fail
+  fast). Details: `FEATURE_MAP.md` F2.
+- **PR4 — Artifact thumbnails** (F17): explicit `POST .../thumbnail` →
   bounded headless-chromium screenshot through the artifact's own
   thumb-purpose preview stack; `<artifact>/thumbnail.png` +
   `thumbnail.json` embedded on `SandboxResult.thumbnail`; click-through
-  to full live preview. Details: `FEATURE_MAP.md` F15.
+  to full live preview. Details: `FEATURE_MAP.md` F17.
 
 ## Dependency DAG
 
@@ -89,15 +134,12 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR10, PR15, PR18,
-  PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
-  PR17 (soft ←13 satisfied — PR13 landed).
-- **Depth 1:** PR8 (←7), PR14 (←1, +12 soft), PR16 (←15).
+- **Depth 0 (start immediately):** PR16 (hard dep PR15 landed), PR19.
 - **Floating:** PR20 (soft ←15).
 
-Critical path depth = 1 remaining (`7→8`; `3→4` closed when PR4 landed —
-was 3 via `6→7→8` before PR2 and PR6 landed). Max safe concurrency ≈ 9
-lanes.
+Critical path depth = 0 — every hard edge has landed (`3→4` closed when
+PR4 landed; `6→7→8`, `1→14`, `9→10`, `12→18`, `15→16`'s blocker all
+landed). Max safe concurrency ≈ 3 lanes.
 
 ## Shared-file hotspots (merge-conflict risk)
 
@@ -111,7 +153,7 @@ lanes.
 
 ## PR cards
 
-### PR1 — Submit-form UX
+### PR1 — Submit-form UX ✅ landed (F15)
 - **Scope:** dynamic model picker (replace hardcoded `MODEL_SUGGESTIONS`
   with live list from gateway `/v1/models` — pass-through exists; add an
   api proxy route e.g. `GET /api/models` → `GATEWAY_URL`); model install
@@ -162,7 +204,7 @@ landed" and `FEATURE_MAP.md` F12.
   trigger: `POST/GET/DELETE .../thumbnail` (502 on failure — never breaks
   results; results GET embeds `SandboxResult.thumbnail` as a cheap jailed
   FS probe, no spawning). UI: `📷 snapshot`/`↻ recapture` + clickable
-  shot that opens the full live preview. Details: `FEATURE_MAP.md` F15.
+  shot that opens the full live preview. Details: `FEATURE_MAP.md` F17.
 
 ### PR5 — Eval iteration: re-score + rubric edits — ✅ landed
 Landed as F14: `POST /api/runs/{id}/rubrics` appends immutable rubric
@@ -179,20 +221,19 @@ evaluator stages `ANALYSIS.md`/`analysis.json` judge evidence, persists
 `<artifact>/analysis.json`, emits an `eval_analysis` checkpoint, and the
 results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 
-### PR7 — Objective scoring II: exec + coverage
-- **Scope:** execute candidate code in a locked sandbox — build success,
-  test pass, coverage as score dimensions. Reuse sandbox-runtime isolation
-  patterns (egress lockdown, resource bounds).
-- **Touch:** `evaluator/` (exec staging), `sandbox/runtime.py` or a new
-  exec sandbox spec, `api/routers/results.py`.
-- **Depends on:** PR6 (signal plumbing), PR5 (evaluator wiring) — both landed.
-- **Verify:** integration test executing a trivial artifact.
+### PR7 — Objective scoring II: exec + coverage — ✅ landed
+Landed as the `exec` signal collector: candidate build/tests/coverage run
+inside a locked `heg-exec` container (`--network none`, uid-split demotion
+of candidate phases to nobody, resource + tmpfs bounds, sentinel-first
+result channel). `analysis.json` gains the exec signal, `ANALYSIS.md` an
+"Executed checks" block, a `test_execution` event is emitted when tests
+ran, and `GET /api/runs/{id}/results` exposes a flat `exec` ExecSummary.
+`SCORING_EXEC=0` disables. Paths + tests: FEATURE_MAP F7.
 
-### PR8 — Automated test-suite generation
-- **Scope:** LLM-generated tests as the eval target — generate suite via
-  gateway, run via PR7 exec infra, fold pass-rate into scoring.
-- **Touch:** `evaluator/` (gen + exec orchestration), prompts.
-- **Depends on:** PR7.
+### PR8 — Automated test-suite generation — ✅ landed
+See "Already landed" — `evaluator/testgen.py` + `ExecRunner` `test_target`
+(`EXEC_TEST_TARGET`), `generated_tests` SignalReport → judge brief,
+`SCORING_TESTGEN`/`TESTGEN_*` flags.
 
 ### PR9 — Timeline-side analytics — ✅ landed
 - **Scope:** per-sandbox metrics (cost/tokens/latency) rendered alongside
@@ -204,13 +245,27 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 - **Landed:** metrics strip between toolbar and stream (`SandboxMetricsBar`
   + `sandboxStrips`); see "Already landed" + `FEATURE_MAP.md` F9.
 
-### PR10 — Split-view trace comparison
+### PR10 — Split-view trace comparison — ✅ landed
 - **Scope:** side-by-side, time-aligned event streams for two sandboxes on
   the timeline page (today: one merged stream + a single-sandbox filter
   dropdown); scrolling/diff-alignment UX TBD.
 - **Touch:** `web/app/runs/[id]/timeline/` (new split component),
   `web/lib/api.ts` if new query params needed.
 - **Depends on:** PR9 (same page — land it first).
+- **Landed:** `merged | split` toolbar toggle (`?view=split&left=&right=`
+  seeds lanes, auto-defaults to first two sandboxes until touched). Design
+  picked over scroll-mirroring: ONE scroll container renders a merged
+  `(ts,id)` ordering as two-column rows — each event fills only its lane's
+  cell, so sync scroll + time alignment are structural and a quiet lane
+  reads as gaps (diff-tool idiom). `buildSplitRows`/`pickLane`/`toggleLane`/
+  `laneEventCounts` in `web/lib/splitTimeline.ts` (+
+  node:test); `SplitTimeline.tsx` sticky lane heads (picker swap on
+  collision, status badge, per-lane counts); `EventRow.tsx` extraction
+  shares row markup/summaries/colors across both views; run-level +
+  non-lane-sandbox events span both columns; PR9 metrics chips assign lanes
+  in split mode (`selectedIds` prop); sandbox filter dropdown is
+  merged-only. `ts` ordering uses `Date.parse` (mixed fractional-seconds
+  ISO strings don't sort lexicographically).
 
 ### PR11 — Graphical analysis page + cross-run dashboards — ✅ landed
 - **Scope:** charts over F9 analytics + scores: per-dimension score
@@ -250,23 +305,26 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 - **Verify:** `tests/unit/adapters/test_adapter_contract.py` covers it
   automatically + per-adapter tests; `test_adapter_images.py` docker test.
 
-### PR14 — Model-vs-model comparisons
-- **Scope:** multi-model matrices — vary model as well as harness config
-  (matrix expansion is `configs × model` already; needs spec/UI support +
-  compare-by-model analytics). Reverses the early "harnesses not models"
-  decision — flag in docs.
+### PR14 — Model-vs-model comparisons — ✅ implemented (F16)
+- **Scope:** multi-model matrices — vary model as well as harness config.
+  Reverses the early "harnesses not models" decision — flagged in
+  `AGENTS.md` decisions log + `FEATURE_MAP.md` F16.
+- **Landed:** `RunCreate.models` + per-config `model` override
+  (`api/schemas.py`), `orchestrator/matrix.py` expansion
+  (`configs × models`, deduped, `MAX_MATRIX_CELLS` cap), per-sandbox model
+  persisted in `harness_config.model` + passed to adapters as `MODEL_NAME`,
+  `same_model_eval` across all participant models, per-model pricing +
+  `ModelAnalytics` rollup in analytics, model labels across submit/results/
+  analytics/analysis/run-detail/run-list/console UI.
 - **Touch:** `api/schemas.py` run spec, `orchestrator/` matrix expansion,
   submit form, results/analytics UI.
 - **Depends on:** PR1 (HarnessConfigIn schema churn settles); best after
-  PR12 (needs >1 usable provider to be interesting).
+  PR12 (needs >1 usable provider to be interesting). **Stacked on
+  `feat/pr1-submit-ux` @ `4d1e12d`.**
 
-### PR15 — Run pacing: submission queue + memory-aware scheduling
-- **Scope:** serialize runs so a new submission queues behind the active
-  one; gate `spawn_one` on host memory pressure (docker info/cgroup stats)
-  and queue pending sandboxes until headroom exists (matters at 8x).
-- **Touch:** `orchestrator/runner.py`, `orchestrator/provision.py`,
-  `orchestrator/monitor.py`, run state machine (queued state?).
-- **Verify:** unit tests with stubbed memory readings + queue ordering.
+### PR15 — Run pacing: submission queue + memory-aware scheduling — ✅ landed
+`queued` run status + `orchestrator/pacing.py` — see "Already landed" and
+`FEATURE_MAP.md` F2.
 
 ### PR16 — "Add next prompt" (multi-turn runs)
 - **Scope:** continue a finished sandbox with a follow-up prompt on the
@@ -276,15 +334,30 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
   sandbox runtime (resume semantics), run detail UI.
 - **Depends on:** PR15 (same files; pacing settles first).
 
-### PR17 — Higher-fidelity instrumentation via hooks/plugins
-- **Scope:** richer agent-level events via harness hooks/plugins where the
-  CLIs support them (beyond adapter-translated output).
-- **Touch:** `adapters/common/` shim, `api/schemas.py` EventType (maybe new
-  types — contract test AST-scans emitters), adapter translate fns.
+### PR17 — Higher-fidelity instrumentation via hooks/plugins — ✅ landed
+Landed as the hook/plugin telemetry lane: `adapters/common/hooks.py` shared
+receiver (right-to-left argv dict-JSON scan → select-gated bounded stdin,
+always exit 0, JSONL mirror to stderr only) + per-adapter `translate_hook`
+paired with `MANIFEST["hooks"]` (contract-tested). claude_code
+`settings.json` hooks (`PostToolUse` → `tool_result`; lifecycle /
+notification → `checkpoint`), codex `notify` (`agent-turn-complete` →
+`checkpoint` + `last-assistant-message`), pi generated
+`extensions/heg-events.ts` (`tool_execution_end` → `tool_result`);
+deepseek/miniloop stay translated-only. New `tool_result` EventType carries
+tool outcomes; `via: "hook"` stamped on every hook payload. Details:
+FEATURE_MAP F10, docs/p25-harness-adapters.md §PR17.
 
-### PR18 — Gateway response caching / deterministic replay
+### PR18 — Gateway response caching / deterministic replay ✅ landed
 - **Scope:** cache upstream responses keyed on request for deterministic
   replay (dev/CI aid — cheap reruns).
+- **Landed:** `gateway/cache.py` sqlite store keyed on
+  `namespace + path + provider + outgoing-body`; opt-in
+  `GATEWAY_CACHE_*` flags (off by default); hits replay byte-verbatim
+  (`x-heg-cache: hit`), still emit `llm_*` events with `payload.cached:
+  true`, re-meter stored usage against the run budget, and the budget gate
+  runs before lookup — replays accrue + 429 identically to live runs. Only
+  complete 2xx bodies stored; unmetered probes bypass; failures degrade to
+  miss. Details: `FEATURE_MAP.md` F3.
 - **Touch:** `gateway/` (cache layer in proxy path, config flags).
 - **Depends on:** PR12 (gateway churn settles).
 

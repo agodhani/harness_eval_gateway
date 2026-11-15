@@ -18,7 +18,11 @@ from db.models import Event, Run
 from gateway import metering
 from gateway.config import get_settings
 from gateway.creds import DEV_CRED_TOKEN, mint_cred
-from gateway.deps import get_session_factory, get_upstream_client
+from gateway.deps import (
+    get_ollama_client,
+    get_session_factory,
+    get_upstream_client,
+)
 from gateway.main import app
 
 SECRET = "dev-secret-change-me"  # gateway.config default in tests
@@ -87,8 +91,12 @@ def upstream() -> Any:
             yield client
 
     app.dependency_overrides[get_upstream_client] = _dep
+    # /v1/models/pull uses the ollama-pinned dep, not the routed one —
+    # same mock transport so pull traffic lands in ``seen`` too.
+    app.dependency_overrides[get_ollama_client] = _dep
     yield state
     app.dependency_overrides.pop(get_upstream_client, None)
+    app.dependency_overrides.pop(get_ollama_client, None)
 
 
 @pytest.fixture()
@@ -764,6 +772,144 @@ def test_list_models_passthrough(
     assert resp.json()["data"][0]["id"] == "m1"
     assert upstream["seen"][0]["url"].endswith("/v1/models")
     assert emitted == []  # probes are not metered
+    # PR1: the api's pull_supported flag reads the active provider here.
+    assert resp.headers["x-heg-provider"] == "ollama"
+
+
+# ---------------------------------------------------------------------------
+# PR1 — POST /v1/models/pull (ollama-only model install, streamed passthrough)
+#
+# Pull is control-plane only: creds carrying a sandbox_id get 403 — the api
+# mints run-scoped service creds (sandbox_id=None) for /api/models/*, so
+# tests mint the same shape via _cred(sandbox_id=None).
+# ---------------------------------------------------------------------------
+
+_PULL_NDJSON = b'{"status":"pulling manifest"}\n{"status":"success"}\n'
+
+
+def _service_cred(**kwargs: Any) -> str:
+    """Run-scoped service cred (sandbox_id=None) — what the api mints for
+    /v1/models and /v1/models/pull."""
+    return _cred(sandbox_id=None, **kwargs)
+
+
+def test_pull_models_streams_passthrough(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    upstream["handler"] = lambda _req: httpx.Response(
+        200,
+        content=_PULL_NDJSON,
+        headers={"content-type": "application/x-ndjson"},
+    )
+    resp = gw_client.post(
+        "/v1/models/pull",
+        json={"name": "qwen3:8b"},
+        headers=_auth(_service_cred()),
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/x-ndjson")
+    assert resp.content == _PULL_NDJSON
+
+    sent = upstream["seen"][0]
+    assert sent["url"].endswith("/api/pull")
+    assert sent["json"] == {"name": "qwen3:8b", "stream": True}
+    assert emitted == []  # not a generation call — unmetered
+
+
+def test_pull_models_requires_bearer(gw_client: TestClient) -> None:
+    assert gw_client.post("/v1/models/pull", json={"name": "m"}).status_code == 401
+
+
+def test_pull_models_sandbox_cred_forbidden(
+    gw_client: TestClient, upstream: Any
+) -> None:
+    """Sandbox participant creds (sandbox_id set) may not pull — a pull is a
+    host-capability escalation (disk/bandwidth, arbitrary registries)."""
+    resp = gw_client.post(
+        "/v1/models/pull", json={"name": "m"}, headers=_auth(_cred())
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["type"] == "forbidden"
+    assert upstream["seen"] == []
+
+
+def test_pull_models_dev_cred_forbidden(
+    gw_client: TestClient, upstream: Any
+) -> None:
+    """``heg-dev`` maps to a dev sandbox id — refused like any
+    sandbox-shaped cred (the token is a public repo constant)."""
+    resp = gw_client.post(
+        "/v1/models/pull", json={"name": "m"}, headers=_auth(DEV_CRED_TOKEN)
+    )
+    assert resp.status_code == 403
+    assert upstream["seen"] == []
+
+
+def test_pull_models_strips_body_to_allowlist(
+    gw_client: TestClient, upstream: Any
+) -> None:
+    """Only ollama's pull selectors (name/model) forward; ``stream`` is
+    forced true and ``insecure``/unknown fields are dropped — caller-set
+    ``insecure`` would enable plaintext-HTTP registry pulls."""
+    upstream["handler"] = lambda _req: httpx.Response(
+        200, content=_PULL_NDJSON, headers={"content-type": "application/x-ndjson"}
+    )
+    resp = gw_client.post(
+        "/v1/models/pull",
+        json={
+            "name": "qwen3:8b",
+            "stream": False,
+            "insecure": True,
+            "extra": "dropped",
+        },
+        headers=_auth(_service_cred()),
+    )
+    assert resp.status_code == 200
+    assert upstream["seen"][0]["json"] == {"name": "qwen3:8b", "stream": True}
+
+    # ``model`` is the newer-server alias for ``name`` — also allowlisted.
+    resp = gw_client.post(
+        "/v1/models/pull", json={"model": "qwen3:8b"}, headers=_auth(_service_cred())
+    )
+    assert resp.status_code == 200
+    assert upstream["seen"][1]["json"] == {"model": "qwen3:8b", "stream": True}
+
+
+def test_pull_models_upstream_error_status_forwarded(
+    gw_client: TestClient, upstream: Any
+) -> None:
+    upstream["handler"] = lambda _req: httpx.Response(
+        404, json={"error": "model not found"}
+    )
+    resp = gw_client.post(
+        "/v1/models/pull",
+        json={"name": "nope:1b"},
+        headers=_auth(_service_cred()),
+    )
+    assert resp.status_code == 404
+
+
+def test_pull_models_openrouter_provider_501(
+    gw_client: TestClient, upstream: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gateway import main as gw_main
+    from gateway.config import GatewaySettings
+
+    monkeypatch.setattr(
+        gw_main,
+        "get_settings",
+        lambda: GatewaySettings(
+            _env_file=None,
+            UPSTREAM_PROVIDER="openrouter",
+            OPENROUTER_API_KEY="sk-or-k",
+        ),
+    )
+    resp = gw_client.post(
+        "/v1/models/pull", json={"name": "m"}, headers=_auth(_service_cred())
+    )
+    assert resp.status_code == 501
+    assert "ollama" in resp.json()["error"]["message"]
+    assert upstream["seen"] == []  # nothing forwarded upstream
 
 
 def test_passthrough_upstream_error_emits(

@@ -38,20 +38,22 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from api.config import get_settings
 from api.deps import get_db
 from api.schemas import AnalysisReport, RubricOut
-from db.models import Artifact, Rubric, Run, Sandbox, Score
+from db.models import Artifact, Event, Rubric, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
 from orchestrator import events as orch_events
 from orchestrator import runner, state_machine
+from orchestrator.matrix import run_models, sandbox_model
 from orchestrator.rubric import RubricContent, create_rubric_version
 from sandbox.preview import ScanCache, resolve_artifact_dir
 from sandbox.thumbnails import THUMB_FILENAME, THUMB_META_FILENAME
+from scoring.exec import exec_summary_dict
 from scoring.render import ANALYSIS_JSON_FILENAME
 
 router = APIRouter(tags=["results"])
@@ -77,6 +79,49 @@ def reset_scan_cache() -> None:
 class DimensionScore(BaseModel):
     score: float
     rationale: str = ""
+
+
+class ExecSummary(BaseModel):
+    """Flat exec-signal headline (PR7) — the measured build/test/coverage
+    outcome, derived from ``analysis.json``'s ``exec`` signal so UI
+    consumers don't re-derive it from nested metrics. ``status`` mirrors
+    the SignalReport status: ``ok`` = measured (build/tests may still be
+    red), ``skipped``/``error`` = not measured."""
+
+    status: str = "ok"
+    build_ok: bool | None = None
+    tests_detected: bool = False
+    tests_ok: bool | None = None
+    tests_collected: int = 0
+    tests_passed: int = 0
+    tests_failed: int = 0
+    tests_errors: int = 0
+    tests_skipped: int = 0
+    coverage_percent: float | None = None
+    timed_out: bool = False
+    duration_seconds: float | None = None
+    detail: str | None = None  # skip reason / error message
+
+
+class GeneratedTestsSummary(BaseModel):
+    """Flat generated-tests headline (PR8) — the evaluator-authored pytest
+    suite's outcome, derived from ``analysis.json``'s ``generated_tests``
+    signal. ``status`` mirrors the SignalReport status: ``ok`` = measured
+    (the suite may still be red), ``skipped``/``error`` = not measured."""
+
+    status: str = "ok"
+    model: str | None = None
+    files_written: int = 0
+    files_rejected: int = 0
+    tests_detected: bool = False
+    tests_collected: int = 0
+    tests_passed: int = 0
+    tests_failed: int = 0
+    tests_errors: int = 0
+    pass_rate: float | None = None
+    coverage_percent: float | None = None
+    timed_out: bool = False
+    detail: str | None = None  # skip reason / error message
 
 
 class ArtifactRef(BaseModel):
@@ -108,6 +153,12 @@ class SandboxResult(BaseModel):
 
     sandbox_id: UUID
     harness_config: dict[str, Any] = Field(default_factory=dict)
+    # Config label from the sandbox row (PR1 named harness configs); NULL
+    # on sandboxes that predate the column.
+    name: str | None = None
+    # PR14: the participant model this sandbox ran — the harness_config
+    # ``model`` cell on multi-model runs, else the run's ``model_name``.
+    model: str = ""
     status: str
     terminal_reason: str | None = None
     artifact_path: str | None = None
@@ -117,6 +168,10 @@ class SandboxResult(BaseModel):
     rubric_version: int | None = None
     dimensions: dict[str, DimensionScore] = Field(default_factory=dict)
     overall: DimensionScore | None = None
+    # Judge/eval pipeline failure detail — set only when the eval failed and
+    # the sandbox has no Score rows, so the UI can distinguish "judge failed"
+    # from "no rubric scores" (pending / never evaluated). Null otherwise.
+    eval_error: str | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     # F12: whether the snapshot workspace has a previewable entry —
     # drives the results-page Preview button. preview_candidates lists
@@ -135,6 +190,12 @@ class SandboxResult(BaseModel):
     # (``<artifact>/analysis.json``). None when the evaluator ran without
     # signal collection or the report is unreadable.
     analysis: AnalysisReport | None = None
+    # PR7: flat view of the ``exec`` signal (build/test/coverage measured
+    # in the locked heg-exec container) — None when no analysis exists.
+    exec: ExecSummary | None = None
+    # PR8: flat view of the ``generated_tests`` signal (LLM-written suite
+    # executed against the submission) — None when no analysis exists.
+    generated_tests: GeneratedTestsSummary | None = None
 
 
 class RubricVersionOut(BaseModel):
@@ -195,6 +256,10 @@ class RunResults(BaseModel):
     run_id: UUID
     status: str
     model_name: str
+    # PR14: the run's full participant-model set — [model_name] + extras +
+    # per-config pins — so the UI can render multi-model runs without
+    # re-deriving the matrix.
+    models: list[str] = Field(default_factory=list)
     evaluator_model: str | None = None
     same_model_eval: bool | None = None
     # PR5: the ?rubric_version= filter echoed back (None = newest-wins view).
@@ -291,6 +356,91 @@ def _load_thumbnail(jail: Path, sandbox: Sandbox) -> ThumbnailRef | None:
         type=meta.get("type") if isinstance(meta.get("type"), str) else None,
         entry=meta.get("entry") if isinstance(meta.get("entry"), str) else None,
     )
+
+
+def _exec_summary(analysis: AnalysisReport | None) -> ExecSummary | None:
+    """Flatten ``analysis``'s exec signal into a :class:`ExecSummary`.
+
+    None when there's no analysis or no exec signal at all; skipped/error
+    signals surface their status + a short detail (skip reason or error).
+    Malformed metric values degrade to the bare status — analysis.json is
+    persisted candidate-adjacent data, so summary coercion never 500s.
+    """
+    if analysis is None:
+        return None
+    sig = analysis.signal("exec")
+    if sig is None:
+        return None
+    detail = sig.error or (sig.warnings[0] if sig.warnings else None)
+    try:
+        return ExecSummary.model_validate(
+            {"status": sig.status, "detail": detail}
+            | exec_summary_dict(sig.metrics)
+        )
+    except ValidationError:
+        return ExecSummary(
+            status=sig.status, detail=detail or "malformed exec metrics"
+        )
+
+
+def _generated_tests_summary(
+    analysis: AnalysisReport | None,
+) -> GeneratedTestsSummary | None:
+    """Flatten ``analysis``'s ``generated_tests`` signal (PR8) — same
+    contract as :func:`_exec_summary`."""
+    if analysis is None:
+        return None
+    sig = analysis.signal("generated_tests")
+    if sig is None:
+        return None
+    m = sig.metrics
+    detail = sig.error or (sig.warnings[0] if sig.warnings else None)
+    try:
+        return GeneratedTestsSummary(
+            status=sig.status,
+            model=m.get("model"),
+            files_written=int(m.get("files_written") or 0),
+            files_rejected=int(m.get("files_rejected") or 0),
+            tests_detected=bool(m.get("tests_detected")),
+            tests_collected=int(m.get("tests_collected") or 0),
+            tests_passed=int(m.get("tests_passed") or 0),
+            tests_failed=int(m.get("tests_failed") or 0),
+            tests_errors=int(m.get("tests_errors") or 0),
+            pass_rate=m.get("pass_rate"),
+            coverage_percent=m.get("coverage_percent"),
+            timed_out=bool(m.get("timed_out")),
+            detail=detail,
+        )
+    except (ValidationError, TypeError, ValueError):
+        return GeneratedTestsSummary(
+            status=sig.status,
+            detail=detail or "malformed generated_tests metrics",
+        )
+
+
+# ---------------------------------------------------------------------------
+# eval-failure surfacing
+# ---------------------------------------------------------------------------
+
+#: ``error``-event payload markers that mean "the eval pipeline failed this
+#: sandbox": evaluator-emitted phases (spawn died, scores.json missing/
+#: invalid, final eval_failed marker) plus the orchestrator's
+#: ``stage="evaluation"`` catch-all (evaluate_sandbox exceptions).
+_EVAL_FAIL_PHASES = frozenset(
+    {"eval_scores_failed", "eval_spawn_failed", "eval_failed"}
+)
+
+
+def _eval_error_label(payload: dict[str, Any]) -> str | None:
+    """Short eval-failure label for a sandbox ``error`` event, else None."""
+    phase = payload.get("phase")
+    if phase not in _EVAL_FAIL_PHASES and payload.get("stage") != "evaluation":
+        return None
+    code = payload.get("reason") or phase or "evaluation"
+    detail = payload.get("detail") or payload.get("message")
+    if isinstance(detail, str) and detail.strip():
+        return f"{code}: {detail.strip()[:160]}"
+    return str(code)
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +589,27 @@ def get_run_results(
     for art in artifacts:
         artifacts_by_sandbox.setdefault(art.sandbox_id, []).append(art)
 
+    # Eval-failure events — latest label per sandbox. Only surfaced on
+    # sandboxes with NO Score rows: a retry that eventually produced scores
+    # supersedes its earlier failed attempts.
+    eval_failures: dict[UUID, str] = {}
+    if sandbox_ids:
+        err_rows = session.execute(
+            select(Event.sandbox_id, Event.payload)
+            .where(
+                Event.run_id == run_id,
+                Event.sandbox_id.in_(sandbox_ids),
+                Event.type == "error",
+            )
+            .order_by(Event.id)
+        ).all()
+        for sid, payload in err_rows:
+            if sid is None or not isinstance(payload, dict):
+                continue
+            label = _eval_error_label(payload)
+            if label is not None:
+                eval_failures[sid] = label
+
     jail = _artifact_jail()
     scan_ttl = get_settings().PREVIEW_SCAN_TTL_SECONDS
     results: list[SandboxResult] = []
@@ -454,6 +625,7 @@ def get_run_results(
             ttl_seconds=scan_ttl,
         )
         plan = scan.plan if scan is not None else None
+        analysis = _load_analysis(jail, sb)
         dimensions: dict[str, DimensionScore] = {}
         overall: DimensionScore | None = None
         rubric_id: UUID | None = None
@@ -475,6 +647,8 @@ def get_run_results(
             SandboxResult(
                 sandbox_id=sb.id,
                 harness_config=sb.harness_config or {},
+                name=sb.name,
+                model=sandbox_model(sb.harness_config or {}, run.model_name),
                 status=sb.status,
                 terminal_reason=sb.terminal_reason,
                 artifact_path=sb.artifact_path,
@@ -482,6 +656,9 @@ def get_run_results(
                 rubric_version=sb_rubric_version,
                 dimensions=dimensions,
                 overall=overall,
+                eval_error=(
+                    None if by_sandbox.get(sb.id) else eval_failures.get(sb.id)
+                ),
                 artifacts=[
                     ArtifactRef(id=a.id, kind=a.kind, path=a.path)
                     for a in artifacts_by_sandbox.get(sb.id, [])
@@ -497,7 +674,9 @@ def get_run_results(
                     else []
                 ),
                 thumbnail=_load_thumbnail(jail, sb),
-                analysis=_load_analysis(jail, sb),
+                analysis=analysis,
+                exec=_exec_summary(analysis),
+                generated_tests=_generated_tests_summary(analysis),
             )
         )
 
@@ -507,6 +686,7 @@ def get_run_results(
         run_id=run.id,
         status=run.status,
         model_name=run.model_name,
+        models=run_models(cfg, run.model_name),
         evaluator_model=cfg.get("evaluator_model"),
         same_model_eval=cfg.get("same_model_eval"),
         selected_rubric_version=rubric_version,

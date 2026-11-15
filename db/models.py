@@ -44,7 +44,8 @@ class Run(Base):
     __tablename__ = "runs"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    # submitted | rubric_review | provisioning | running | evaluating | done | failed
+    # submitted | rubric_review | queued (PR15 pacing: parked behind the
+    # active run) | provisioning | running | evaluating | done | failed
     status: Mapped[str] = mapped_column(String(32), default="submitted", index=True)
     task_prompt: Mapped[str] = mapped_column(Text)
     model_name: Mapped[str] = mapped_column(String(255))
@@ -70,6 +71,10 @@ class Sandbox(Base):
     run_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("runs.id"), index=True)
     # Per-sandbox harness config (which adapter, skill packs, prompt overrides).
     harness_config: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
+    # Optional user label for the harness config (PR1 named configs) —
+    # surfaced in timeline/results/analytics; provisioner defaults it to
+    # "<adapter>-<sandbox short id>" when the submit left it blank.
+    name: Mapped[str | None] = mapped_column(String(255))
     # provisioning | running | terminating | done | failed (terminal_reason set)
     status: Mapped[str] = mapped_column(String(32), default="provisioning", index=True)
     docker_container_id: Mapped[str | None] = mapped_column(String(128))
@@ -112,9 +117,9 @@ class Event(Base):
     seq: Mapped[int | None] = mapped_column(BigInteger)
     # gateway | harness | sandbox | evaluator | orchestrator
     source: Mapped[str] = mapped_column(String(32))
-    # llm_request | llm_response | tool_call | shell_command | file_op |
-    # test_execution | checkpoint | skill_invocation | done_signal | error |
-    # run_started | terminal_state | context_compacted | miniloop_result
+    # llm_request | llm_response | tool_call | tool_result | shell_command |
+    # file_op | test_execution | checkpoint | skill_invocation | done_signal |
+    # error | run_started | terminal_state | context_compacted | miniloop_result
     # (authoritative list: api/schemas.py EventType — keep in sync)
     type: Mapped[str] = mapped_column(String(64))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)

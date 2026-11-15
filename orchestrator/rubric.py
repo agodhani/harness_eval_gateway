@@ -286,6 +286,7 @@ async def _request_rubric(
     cred: str,
     model: str,
     task_prompt: str,
+    max_tokens: int,
 ) -> RubricContent:
     """One chat-completions call → RubricContent; one JSON-only retry."""
     messages: list[dict[str, Any]] = [
@@ -295,7 +296,9 @@ async def _request_rubric(
     body_base = {
         "model": model,
         "temperature": 0.2,
-        "max_tokens": 2048,
+        # Thinking models spend output tokens on <think> blocks before the
+        # JSON — a small cap truncates the document into unparseable JSON.
+        "max_tokens": max_tokens,
         "stream": False,
     }
     headers = {"Authorization": f"Bearer {cred}"}
@@ -458,6 +461,7 @@ async def draft_rubric(
             cred=cred,
             model=model,
             task_prompt=run.task_prompt,
+            max_tokens=int(settings.RUBRIC_MAX_TOKENS),
         )
         _persist_draft(session_factory, run_id, content, model=model)
         log.info("draft_rubric: run %s -> rubric_review", run_id)

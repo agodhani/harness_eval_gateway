@@ -27,7 +27,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F12 | Artifact preview (static html + desktop GUI via noVNC + python-server web apps, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `sandbox/images/server-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
 | F13 | Graphical analysis page + cross-run trends (recharts) | ✅ | `web/app/runs/[id]/analysis/`, `api/routers/analytics.py` (`GET /api/analytics/runs`), `web/app/runs/[id]/results/ResultsClient.tsx` (totals row) | `tests/unit/api/test_analytics.py` (trends section) |
 | F14 | Eval iteration (re-score + versioned rubrics) | ✅ | `api/routers/results.py`, `orchestrator/lifecycle.py` (`rescore_run`), `orchestrator/rubric.py` (`create_rubric_version`), `web/app/runs/[id]/results/RescoreControls.tsx` | `tests/unit/orchestrator/test_rescore.py`, `tests/unit/api/test_results.py`, `tests/unit/evaluator/test_evaluate.py` |
-| F15 | Artifact thumbnails (headless screenshots via the preview stack) | ✅ | `sandbox/thumbnails.py`, `sandbox/images/thumbnail-capture.{Dockerfile,sh}`, `api/routers/preview.py` (`.../thumbnail`), `api/routers/results.py` (`SandboxResult.thumbnail`), `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_thumbnails.py`, `tests/unit/api/test_thumbnails.py`, `tests/integration/test_thumbnail.py` |
+| F15 | Submit UX: live model picker + install, named harness configs | ✅ | `api/routers/models.py`, `gateway/main.py` (`/v1/models/pull`), `web/app/submit/page.tsx`, `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`, `orchestrator/provision.py` | `tests/unit/api/test_models.py`, `tests/unit/gateway/test_proxy.py` (pull), `tests/unit/db/test_migrations.py`, `tests/unit/orchestrator/test_provision.py` (name) |
+| F16 | Model-vs-model matrix (config × model) + per-model analytics | ✅ | `orchestrator/matrix.py`, `orchestrator/lifecycle.py`, `orchestrator/provision.py`, `api/schemas.py`, `api/routers/runs.py`, `results.py`, `analytics.py`, `web/app/submit/page.tsx`, `web/lib/api.ts`, `web/app/runs/[id]/` (detail, results, analysis) | `tests/unit/orchestrator/test_matrix.py`, `test_lifecycle.py`, `test_provision.py`, `tests/unit/api/test_runs.py`, `test_results.py`, `test_analytics.py` |
+| F17 | Artifact thumbnails (headless screenshots via the preview stack) | ✅ | `sandbox/thumbnails.py`, `sandbox/images/thumbnail-capture.{Dockerfile,sh}`, `api/routers/preview.py` (`.../thumbnail`), `api/routers/results.py` (`SandboxResult.thumbnail`), `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_thumbnails.py`, `tests/unit/api/test_thumbnails.py`, `tests/integration/test_thumbnail.py` |
 
 ## Feature details
 
@@ -80,19 +82,33 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 ### F2 — Orchestrator ✅
 
-- **What:** run state machine (`submitted → rubric_review → provisioning →
-  running → evaluating → done | failed`); matrix expansion (harness configs ×
-  model); rubric draft generated via gateway → frozen on user approval;
-  termination policy watcher (timeout, budget, stuck-loop, done signal).
+- **What:** run state machine (`submitted → rubric_review → [queued →]
+  provisioning → running → evaluating → done | failed`); matrix expansion
+  (harness configs × model); rubric draft generated via gateway → frozen on
+  user approval; termination policy watcher (timeout, budget, stuck-loop,
+  done signal).
+- **Pacing (PR15):** one active run at a time — approvals while a run
+  executes (or is queued) park in `queued` and promote FIFO by approval
+  (`pacing.place_run` / `claim_next_queued`; promotion is wired into
+  `runner._lifecycle_then_promote` + re-kicked by `startup_sweep`). Spawn
+  memory gate: `spawn_one` waits for `SPAWN_MIN_FREE_MEM_MB` host headroom
+  before `docker run` (probed via `/proc/meminfo` → `sysconf` → `docker
+  info`+`stats`), capped by `SPAWN_MEM_WAIT_SECONDS`, expiry fails that
+  sandbox — remaining configs then fail fast (one probe each) so pressure
+  can't hold the slot for N×cap. Pacing emits `checkpoint` events keyed by
+  `payload.stage`: `run_queued`/`run_dequeued` (run scope),
+  `spawn_mem_wait`/`spawn_mem_release`/`spawn_mem_timeout` (sandbox scope).
 - **Where:** `orchestrator/` (`state_machine.py`, `lifecycle.py`,
-  `provision.py`, `monitor.py`, `rubric.py`, `runner.py`, `events.py`,
-  `adapters.py`), db `runs`/`sandboxes`/`rubrics`
+  `provision.py`, `monitor.py`, `rubric.py`, `runner.py`, `pacing.py`,
+  `events.py`, `adapters.py`), db `runs`/`sandboxes`/`rubrics`
 - **Verify:**
   - Unit: `tests/unit/orchestrator/` (`test_state_machine.py`,
     `test_lifecycle.py`, `test_monitor.py`, `test_provision.py`,
-    `test_rubric.py`)
+    `test_rubric.py`, `test_pacing.py`), queue E2E in
+    `tests/unit/api/test_runs.py::test_approve_queues_behind_active_run`
   - Manual: submit → edit/approve rubric → sandboxes spawn → terminal states
-    recorded correctly
+    recorded correctly; approve a second run mid-flight → `queued` badge →
+    promotes when the first finishes
 - **Depends on:** F3, F4, F5
 
 ### F3 — AI gateway ✅
@@ -121,15 +137,36 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   forward to the anthropic provider); endpoints a provider doesn't
   implement return its native 404; Ollama-only body params are stripped
   for hosted providers.
-- **Where:** `gateway/` (`main.py`, `creds.py`, `metering.py`, `deps.py`,
-  `config.py`, `mint_cred.py` CLI), compose service `gateway` (:8081→8080)
+- **Response cache / deterministic replay (PR18):** opt-in via
+  `GATEWAY_CACHE_ENABLED` (OFF by default — real runs hit the live
+  upstream). Metered generation calls (`/v1/chat/completions` streamed +
+  buffered, `/v1/messages`, `/v1/responses`) replay from a sqlite store
+  (`GATEWAY_CACHE_PATH`, default `./data/gateway_cache.sqlite3`,
+  `GATEWAY_CACHE_MAX_ENTRIES` LRU bound) keyed on
+  `namespace + path + provider + outgoing-body` (post-transform — stream vs
+  buffered and per-provider routes can't collide; bump
+  `GATEWAY_CACHE_NAMESPACE` to invalidate). Hits skip the upstream, return
+  an `x-heg-cache: hit` header, and still emit `llm_request`/`llm_response`
+  with `payload.cached: true` + the stored body re-metered for usage —
+  cached spend counts toward the run budget and the budget gate runs before
+  the lookup, so a replay 429s at the same point the live run did. Only
+  complete 2xx responses are stored; `count_tokens`/`/v1/models` bypass the
+  cache; cache failures degrade to a miss (never a proxy 5xx).
+- **Where:** `gateway/` (`main.py`, `cache.py`, `creds.py`, `metering.py`,
+  `deps.py`, `config.py`, `mint_cred.py` CLI), compose service `gateway`
+  (:8081→8080)
 - **Verify:**
   - Unit: `tests/unit/gateway/` (creds, metering, proxy — hermetic; protocol
     pass-throughs + SSE usage normalization covered),
     `test_upstream_provider.py` (provider selection, key validation,
     PROVIDER_ROUTES resolution, `x-heg-provider` override, per-provider
     client base/headers, ollama-param stripping, anthropic protocol-header
-    forwarding, provider attribution on emitted events)
+    forwarding, provider attribution on emitted events),
+    `test_cache.py` (key stability/provider+body+path keying, LRU bound,
+    file persistence, namespace invalidation, miss→hit replay for buffered +
+    SSE + /v1/messages + /v1/responses, cached-event flagging + usage
+    metering, budget gate before lookup, non-2xx and unmetered bypass,
+    lookup/store failure degradation)
   - Manual: mint cred (`uv run python -m gateway.mint_cred`) →
     `curl localhost:8081/v1/chat/completions` → completion + event rows
   - M2 e2e proven: sandbox→gateway→Ollama→events (see run
@@ -177,18 +214,42 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   stream; UI timeline page — live during run, replayable after with
   timestamps. API side (`api/routers/events.py`: ingest batch/single,
   query w/ filters+pagination, SSE tail) + timeline UI both landed.
+  **Split view (PR10):** a `merged | split` toggle in the toolbar switches
+  the stream to two sandbox lanes — side-by-side, time-aligned event
+  streams for comparison. Design: ONE scroll container renders a merged
+  `(ts, id)` ordering of both lanes' events as two-column rows (an event
+  fills only its lane's cell; the other stays empty), so synchronized
+  scroll + time alignment are structural — no scroll mirroring. A sticky
+  lane header holds per-lane sandbox pickers (labels from analytics,
+  status badge, per-lane event count); picking the id already in the
+  other lane swaps them. Run-level (`sandbox_id` null) and non-lane
+  sandbox events render as full-width shared rows. Lanes seed from
+  `?view=split&left=&right=` URL params, else auto-default to the first
+  two discovered sandboxes (never overwriting an explicit pick); the
+  sandbox filter dropdown is merged-only — in split mode the PR9 metrics
+  chips assign lanes instead (occupant clears, new id fills first empty
+  lane else replaces right). Row rendering is shared via `EventRow.tsx`
+  (same `.tl-*` markup + per-type colors as merged).
 - **Where:** `api/routers/events.py`, `api/schemas.py` (EventSource/EventType
-  enums), db `events`, `web/app/runs/[id]/timeline/` (`TimelineClient.tsx` +
-  `SandboxMetricsBar.tsx` — the PR9 metrics strip lives here; see F9)
+  enums), db `events`, `web/app/runs/[id]/timeline/` (`TimelineClient.tsx`,
+  `SandboxMetricsBar.tsx` — PR9 strip, `SplitTimeline.tsx` + `EventRow.tsx`
+  — PR10 split view, see F9), `web/lib/splitTimeline.ts` (`buildSplitRows`
+  merged-ordering transform, `pickLane`/`toggleLane`/`laneEventCounts`)
+  + `splitTimeline.test.ts`
 - **Run-detail console:** `web/components/RunConsoleLive.tsx` — per-sandbox
   event lanes on the run detail page (backlog + SSE + `after_id` poll, same
   merge as the timeline; evaluator/orchestrator traffic routed to a bottom
   lane). Shares the `evc-*` stylesheet in `globals.css` with the landing
   replay console.
 - **Verify:**
-  - Unit: `tests/unit/api/test_events.py` + `test_event_types.py` (13+ tests)
+  - Unit: `tests/unit/api/test_events.py` + `test_event_types.py` (13+ tests);
+    `cd web && npm test` — `splitTimeline.test.ts` covers the merged
+    `(ts,id)` ordering (incl. the mixed fractional-seconds ts edge),
+    day markers, shared rows, lane counts, and all lane-selection rules
   - Live: SSE verified via curl; M2 events persisted
-  - UI: run → timeline page shows live events; run detail shows live lanes
+  - UI: run → timeline page shows live events; `split` toggle → two lanes
+    scroll in lockstep on one time axis, lane pickers swap on collision,
+    run-level rows span both columns; run detail shows live lanes
 - **Depends on:** F0 (ingestion slice unblocks F3)
 
 ### F7 — Evaluator sandbox ✅
@@ -203,48 +264,113 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   rows is re-spawned up to `EVAL_SCORE_RETRIES` times (default 1) with a fresh
   cred, emitting an `eval_retry` checkpoint — covers small-model flake modes
   (malformed JSON, stuck-loop wander); infra exceptions are not retried.
-  **Objective signals (PR6):** before staging, the candidate workspace is
-  measured by the `scoring` package's signal collectors — `static_analysis`
-  runs lizard (multi-language, parse-only, no code execution) for real
-  cyclomatic complexity, nloc, function counts, nesting depth, and language
-  mix. The report is staged into the eval workspace as `ANALYSIS.md`
-  (judge-facing brief; judge is told to score `cyclomatic_complexity` from
-  measured values) + `analysis.json`, persisted at
-  `<artifact>/analysis.json`, summarized in an `eval_analysis` checkpoint
-  event, and re-validated + embedded as `analysis` on
-  `GET /api/runs/{id}/results` sandboxes. Candidate-authored
-  `ANALYSIS.md`/`analysis.json` files are dropped at staging (reserved
-  names — fake measured evidence can't reach the judge). Collection never
-  blocks evaluation: collector failures degrade to `status="error"` signal
-  entries / `status="unavailable"` event. Collector registry
-  (`scoring/collectors.py::COLLECTORS`) is the extension point for PR7's
-  exec/coverage signals.
+  Exhausted attempts leave a final `error` event (`stage="evaluation"`,
+  `phase="eval_failed"`) which the results API surfaces as per-sandbox
+  `eval_error` — distinguishable from "not yet scored" (F8). Judge per-request
+  output cap is `EVAL_JUDGE_MAX_TOKENS` (default 8192; thinking judges).
+  **Objective signals (PR6+PR7):** before staging, the candidate workspace
+  is measured by the `scoring` package's signal collectors —
+  `static_analysis` runs lizard (multi-language, parse-only, no code
+  execution) for real cyclomatic complexity, nloc, function counts,
+  nesting depth, and language mix; `exec` runs the workspace's
+  build/tests/coverage inside a locked `heg-exec` container
+  (`--network none`, cap-drop ALL + cap-add SETUID/SETGID — the in-image
+  runner is uid 0 only to demote every candidate phase to nobody, keeping
+  the `/out` result channel and container stdout unforgeable —
+  no-new-privileges, cpu/memory/pids bounds, tmpfs-capped scratch,
+  artifact mounted read-only at `/srv/src` and copied to container-local
+  `/work` — the artifact is never written).
+  The report is staged into the eval workspace as `ANALYSIS.md`
+  (judge-facing brief incl. the executed-checks block; judge is told to
+  score `cyclomatic_complexity` from measured values and to treat
+  build/test/coverage as ground truth for functional/acceptance dims) +
+  `analysis.json`, persisted at `<artifact>/analysis.json`, summarized in
+  an `eval_analysis` checkpoint event (plus a `test_execution` event when
+  candidate tests ran), and re-validated + embedded as `analysis` + flat
+  `exec` ExecSummary on `GET /api/runs/{id}/results` sandboxes.
+  Candidate-authored `ANALYSIS.md`/`analysis.json` files are dropped at
+  staging (reserved names — fake measured evidence can't reach the judge).
+  Collection never blocks evaluation: collector failures degrade to
+  `status="error"`/`skipped` signal entries / `status="unavailable"`
+  event. Collector registry (`scoring/collectors.py::COLLECTORS`) is the
+  extension point for further signal types; `SCORING_EXEC=0` disables the
+  exec collector (conftest pins it for unit tests).
+  **Generated test suite (PR8):** a third `generated_tests` signal is
+  appended by the evaluator itself (`evaluator/testgen.py`, not a
+  registry collector — it needs gateway creds + the artifact dir).
+  Before staging, the evaluator calls the model through the gateway on
+  the per-eval cred (metered/budgeted like the judge; draws on the same
+  `EVAL_TOKEN_BUDGET` allowance) with the rubric + budget-capped source
+  listing (`build_testgen_prompt` in `prompts.py`) → parses output into
+  `test_*.py` files via `### FILE:` markers (deterministic containment:
+  every file must `compile()` AND define a `test_*`; rejected chunks are
+  reported, a fully unusable generation → `status="skipped"`) → persists
+  the suite + `_manifest.json` to `<artifact>/generated_tests/`
+  (provenance — never the candidate's `workspace/`) → runs it via
+  `ExecRunner.execute(workspace, test_target=…)` — PR8's
+  `EXEC_TEST_TARGET` contract: the dir mounts read-only at
+  `/srv/test_target`, exec_runner copies it to `/tmp/gen_tests`, pytest
+  runs there, coverage stays `--source=/work` and the build phase never
+  compiles generated files (a broken generated test can't be attributed
+  to the candidate's build). JUnit parsing now also captures failing
+  test names (`failed_tests`). The signal lands in the same envelope —
+  `ANALYSIS.md` "Generated test suite" section + `analysis.json` +
+  `eval_analysis` summary + `test_execution` `phase=eval_testgen` event
+  + flat `generated_tests` summary on the results API — and the suite is
+  staged into the eval workspace for the judge (a candidate-authored
+  `generated_tests/` is a reserved name, evicted at staging).
+  `SCORING_TESTGEN=0` disables (conftest pins it); knobs:
+  `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
+  `TESTGEN_MAX_FILES` (8), `TESTGEN_MAX_TOKENS` (4096),
+  `TESTGEN_TIMEOUT_SECONDS` (240).
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
-  `prompts.py`), `scoring/` (`models.py` — analysis.json/API pydantic
+  `prompts.py`, `testgen.py` — PR8 suite generation + exec orchestration),
+  `scoring/` (`models.py` — analysis.json/API pydantic
   contract, `collectors.py` — SignalCollector protocol + registry,
-  `static.py` — lizard collector, `render.py` — ANALYSIS.md), db `scores`,
-  `api/routers/results.py` (`SandboxResult.analysis`),
-  `api/schemas.py` (AnalysisReport re-export)
+  `static.py` — lizard collector, `exec.py` — exec collector,
+  `render.py` — ANALYSIS.md), `sandbox/exec.py` (ExecRunner — docker
+  lifecycle + result parsing + `test_target` mount) +
+  `sandbox/images/exec.Dockerfile` + `exec_runner.py` (in-image
+  build/test/coverage phases + `EXEC_TEST_TARGET` mode), db `scores`,
+  `api/routers/results.py` (`SandboxResult.analysis` + `.exec` +
+  `.generated_tests`), `api/schemas.py` (AnalysisReport re-export)
 - **Verify:**
   - Unit: `tests/unit/evaluator/` (`test_evaluate.py`, `test_scores.py`,
     `test_prompts.py`) — mocked runtime; staging, timeout salvage, malformed
-    scores covered; `tests/unit/scoring/` (`test_static.py`,
-    `test_collectors.py`, `test_render.py`) — workspaces with known CC
-    values, skip/cap/symlink rules, collector isolation, markdown render
+    scores covered; `tests/unit/evaluator/test_testgen.py` — fake gateway
+    client + fake exec runner: skip/error semantics, deterministic
+    containment of bad output (fences/markers/syntax/no-test rejection),
+    provenance layout, pass-rate metrics, cap knobs;
+    `tests/unit/scoring/` (`test_static.py`,
+    `test_collectors.py`, `test_render.py`, `test_exec.py`) — workspaces
+    with known CC values, skip/cap/symlink rules, collector isolation,
+    markdown render, exec metric mapping/status semantics;
+    `tests/unit/sandbox/test_exec.py` — exec run-argv isolation posture
+    (incl. `test_target` mount/env), result file/sentinel parsing,
+    timeout/missing-image paths; `tests/unit/sandbox/test_exec_runner.py`
+    — in-image helpers (junit failed names, target staging, discovery)
+  - Exec integration: `tests/integration/test_exec_scoring.py`
+    (`@pytest.mark.docker`) — real `heg-exec` container executes a trivial
+    artifact: build ok, 2/2 tests pass, coverage measured, container
+    force-removed, workspace untouched; PR8 cases run an external
+    `generated_tests` dir via `test_target` (pass + red suite w/ failing
+    names, mount stays byte-identical)
   - Results API: `tests/unit/api/test_results.py` — analysis embedded when
     `<artifact>/analysis.json` exists+valid, null otherwise
   - Manual: scores + rationale visible on results page; rationale for
-    cyclomatic_complexity cites measured CC values
+    cyclomatic_complexity cites measured CC values; build/test failures
+    visible in analysis + eval events
 - **Depends on:** F2, F4, artifacts from a completed run
 
 ### F8 — Results UI ✅
 
 - **What:** run list; per-run matrix (sandbox × rubric dimension); score +
   rationale view; link to timeline replay; artifact download; flag when
-  evaluator model == participant model. The run-detail rubric table also
+  evaluator model == any participant model. The run-detail rubric table also
   renders per-sandbox score columns + an `overall` row once results exist
   (`RunDetailClient.tsx` `RubricView` + `getRunResults` poll while
-  `evaluating`).
+  `evaluating`). Sandboxes whose eval failed surface an `eval failed` badge
+  (from `SandboxResult.eval_error`) instead of blank score cells.
 - **Where:** `web/app/runs/` (list, detail, `results/`), results components,
   `api/routers/results.py` (results + scores + artifact-download endpoints)
 - **Verify:**
@@ -269,10 +395,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   Timeline page (PR9) hosts the same numbers in-context: a per-sandbox
   metrics strip between the filter toolbar and the event stream — compact
   chips (turns · tokens in→out · avg latency · est. cost · errors, plus a
-  judge-traffic line once the evaluator runs). Chips double as
-  sandbox-filter selectors (same state as the toolbar dropdown, whose
-  options gain adapter labels), and the strip refreshes every 15s while the
-  run is non-terminal.
+  judge-traffic line once the evaluator runs). Chips double as sandbox
+  selectors: merged mode toggles the sandbox filter (same state as the
+  toolbar dropdown, whose options gain adapter labels); split mode (PR10)
+  assigns the sandbox to a comparison lane instead. The strip refreshes
+  every 15s while the run is non-terminal.
 - **Where:** `api/pricing.py`, `api/routers/analytics.py`, response schemas
   in `api/schemas.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx`,
   `web/lib/api.ts` (`getRunAnalytics`, `estimateCostUsd`),
@@ -287,7 +414,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - API: `curl localhost:8001/api/runs/<id>/analytics?price_model=gpt-4o`
   - UI: results page → "Analytics" card → switch price model → cost updates;
     timeline page → strip shows per-sandbox stats live → click a chip →
-    stream filters to that sandbox
+    stream filters to that sandbox (merged) / chip assigns a split lane
 - **Depends on:** F6 (events), F8 (results page)
 
 ### F10 — Multi-harness adapters ✅
@@ -308,7 +435,22 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `GET /api/harnesses` serves adapter manifests (display name, LLM protocol,
   CLI, image) for the submit form; `HarnessConfigIn.adapter` validates
   against the registry. Design doc: `docs/p25-harness-adapters.md`.
-- **Where:** `adapters/common/` (`runner.py`, `contract.py`),
+- **Hook/plugin telemetry (PR17):** harnesses with a documented native hook
+  surface report higher-fidelity events through the shared receiver
+  `adapters/common/hooks.py` (`python3 -m adapters.common.hooks <adapter>
+  [json]` — stdin payload for Claude Code hooks and pi's extension
+  forwarder, argv for Codex `notify`). Each hooked adapter ships `translate_hook`
+  beside `translate_obj` in `translate.py` + a `MANIFEST["hooks"]` line;
+  emitted payloads are stamped `via: "hook"`. Coverage: `claude_code`
+  settings.json hooks (`PostToolUse` → `tool_result` — outcome detail the
+  stream translation drops; `SessionStart/End`, `Stop`, `SubagentStop`,
+  `Notification`, `PreCompact` → `checkpoint`), `codex` `notify`
+  (`agent-turn-complete` → `checkpoint` with `last-assistant-message`), `pi`
+  generated `extensions/heg-events.ts` (`tool_execution_end` →
+  `tool_result`). `deepseek`/`aider`/`miniloop` stay translated-only. The
+  receiver always exits 0 and mirrors to stderr (stdout can feed back into
+  agent context for some claude hook events).
+- **Where:** `adapters/common/` (`runner.py`, `contract.py`, `hooks.py`),
   `adapters/{codex,claude_code,pi,deepseek,aider}/` (`adapter.py`, `config.py`,
   `translate.py`, `__main__.py`; aider also `launcher.py` — the patched
   entrypoint that lifts aider's explicit-yes gate on suggested shell
@@ -318,8 +460,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Verify:**
   - Unit: `tests/unit/adapters/test_adapter_contract.py` (contract across all
     adapters: manifest, image_spec, env, launch, translation → valid
-    `EventType`s, `HEG_RESULT` parsing) + per-adapter tests under
-    `tests/unit/adapters/<name>/`
+    `EventType`s, `HEG_RESULT` parsing, hook-manifest ↔ `translate_hook`
+    pairing) + per-adapter tests under `tests/unit/adapters/<name>/` +
+    `tests/unit/adapters/common/test_hooks.py` (receiver: payload parsing,
+    via-stamping, ingest POST, exit-0 guarantee)
   - API: `tests/unit/api/test_harnesses.py`, multi-adapter submit in
     `test_runs.py::test_create_run_multi_adapter`
   - Docker: `tests/integration/test_adapter_images.py` (`-m docker`) — CLI
@@ -578,8 +722,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `RunTrends{price_model|null, price_table, points[]}` — per-run roll-up of
   the same participant/evaluator event split (eval boundary per sandbox),
   latest-`overall`-score-per-sandbox mean, participant + judge tokens,
-  errors, cost. No `price_model` → each point costed at its own run's
-  resolved price ("auto", `price_model:null`); with it → uniform repricing.
+  errors, cost. No `price_model` → each point's participant cells costed
+  at their own model's listed rate (unlisted → the run's resolved rate;
+  `RunTrends.price_model:null` "auto" — a point's own `price_model` is the
+  single applied key, or null when cells priced at mixed rates); with it →
+  uniform repricing.
   Newest-first; `limit` 1–100 default 20.
 - **Where:** `api/routers/analytics.py` (`get_run_trends` +
   `_eval_boundaries`/`_is_eval_event` helpers, also used by the per-run
@@ -670,7 +817,121 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     scores; edit rubric → save & re-score → run returns to `evaluating`.
 - **Depends on:** F7 (evaluator), F8 (results page), F4 (artifact store)
 
-### F15 — Artifact thumbnails ✅
+### F15 — Submit UX: live model picker + install, named harness configs ✅
+
+- **What:** three submit-form upgrades shipped together.
+  - **Live model catalog** — `GET /api/models` proxies the gateway's
+    existing `GET /v1/models` (api mints a run-null `heg.*` cred with
+    `GATEWAY_CRED_SECRET`), normalizes `{object:"list",data:[...]}` →
+    `{models:[{id,...}], provider, pull_supported}`. The gateway stamps
+    `X-HEG-Provider` on the response so `pull_supported` is true only for
+    the `ollama` upstream. Submit page replaces the offline
+    `MODEL_SUGGESTIONS` fallback with the live ids once the catalog is
+    non-empty, for the two model ComboInputs.
+  - **Model install** — `POST /api/models/pull` → gateway
+    `POST /v1/models/pull` → upstream `POST /api/pull` (ollama-only —
+    `501` for other providers), NDJSON progress streamed end-to-end
+    (httpx `send(stream=True)` → `StreamingResponse`, pull body forced to
+    `{"name","stream":true}`). Submit page: a `name:tag` input + pull
+    button with a single status line — while streaming it shows the last
+    ollama status plus a `completed`/`total` percent, then the outcome
+    (errors styled as field errors); on success the model catalog
+    refreshes and the new id enters the suggestions. `pull_supported=false`
+    hides the control entirely.
+  - **Named harness configs** — optional `name` (≤64 chars) per
+    `HarnessConfigIn`; persisted on `sandboxes.name` (migration
+    `a2b3c4d5e6f7`), default `<adapter>-<sandbox-id[:8]>` assigned in
+    `spawn_one` after the UUID exists. Surfaced as `name` on
+    `SandboxOut`/`SandboxResult`/`SandboxAnalytics` and rendered —
+    with short-id fallback/tooltips — in the submit rows, run detail
+    (config summary + sandboxes table + rubric breakdown headers),
+    timeline sandbox filter + row labels, results matrix + artifacts
+    table, analytics column heads, analysis-page legend chips, and the
+    live run-console lane heads.
+- **Where:** `api/routers/models.py` (`ModelsOut`/`ModelPullIn`/
+  `ModelInfo`, + `api/main.py` include), `gateway/main.py` (`pull_model`,
+  provider header), `api/schemas.py` (`HarnessConfigIn.name`,
+  `SandboxOut.name`, `SandboxResult.name`, `SandboxAnalytics.name`),
+  `db/models.py` + `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`,
+  `orchestrator/provision.py` (`_sandbox_name` default),
+  `api/routers/results.py` + `analytics.py` (`name` fields),
+  `web/lib/api.ts` (`listModels`, `pullModel` streaming),
+  `web/app/submit/page.tsx`, `web/app/runs/[id]/` (`RunDetailClient`,
+  `timeline/TimelineClient`, `results/ResultsClient`,
+  `results/AnalyticsSection`, `analysis/AnalysisClient`),
+  `web/components/RunConsoleLive.tsx`
+- **Verify:**
+  - Unit: `tests/unit/api/test_models.py` (normalize, provider flag,
+    gateway error/unreachable, pull streaming + validation),
+    `tests/unit/gateway/test_proxy.py` (pull passthrough/stream-forced/
+    501 non-ollama/auth), `tests/unit/db/test_migrations.py`
+    (upgrade/downgrade on sqlite, single head, type match),
+    `tests/unit/orchestrator/test_provision.py` (custom name persisted,
+    default/whitespace → `adapter-shortid`),
+    `tests/unit/api/test_runs.py` (name round-trip, 64-char bound),
+    `test_results.py`/`test_analytics.py` (`name` in responses)
+  - Manual: `curl localhost:8001/api/models` → catalog + `pull_supported`;
+    `curl -N -X POST localhost:8001/api/models/pull -d '{"name":"qwen3:8b"}'`
+    → ndjson progress lines; submit form → model dropdown lists live ids,
+    install streams progress; run detail/timeline/results/analytics show
+    the configured names (or `adapter-shortid` defaults).
+- **Depends on:** F1 (submit form), F3 (gateway `/v1/models` + creds)
+
+### F16 — Model-vs-model matrix (config × model) + per-model analytics ✅
+
+- **What:** reverses the original "compare harnesses, not models" decision —
+  a run can now vary the participant model as well as the harness config.
+  - **Spec** — `RunCreate.models` (optional list, deduped/normalized against
+    `model_name`; omitted/empty/blank → `[model_name]`;
+    over-`MAX_MATRIX_CELLS` expanded cells rejected).
+    `HarnessConfigIn.model` optionally pins one config to a single
+    model, overriding the run list for that config. Normalized set persisted
+    as `run.config.models`; `RunSummary` exposes `models` (`RunOut` carries
+    it under `config`).
+  - **Expansion** — `orchestrator/matrix.py`: `participant_models`,
+    `expanded_configs` (config × models minus explicit overrides, deduped),
+    `sandbox_model` (per-sandbox resolution). `lifecycle.py` provisions one
+    sandbox per expanded cell; `provision.py` persists the resolved model in
+    `Sandbox.harness_config.model`, folds it into the sandbox name/label,
+    and passes it to the adapter env as `MODEL_NAME`. Per-cell spawn failures
+    stay isolated.
+  - **API** — `same_model_eval` now compares the evaluator model against
+    *every* participant model; results carry `SandboxResult.model` +
+    `RunResults.models`; analytics resolves pricing per sandbox's own model
+    (`price_model` param still forces a uniform reprice, now optional) and
+    adds a `models` rollup (`ModelAnalytics`: tokens/cost aggregates
+    per participant model).
+  - **UI** — submit form gains a multi-model picker (chips + live catalog,
+    Ollama pull preserved); run detail/list show the model set; results
+    matrix + timeline + live console label each cell with its model;
+    AnalyticsSection gains a sandbox/model segmented view with per-model
+    aggregation and per-model cost; the analysis page prices each sandbox at
+    its own model's rate in "auto" mode.
+- **Where:** `orchestrator/matrix.py` (new), `orchestrator/lifecycle.py`,
+  `orchestrator/provision.py`, `api/schemas.py` (`RunCreate.models`,
+  `HarnessConfigIn.model`, `MAX_MATRIX_CELLS`, `models` on run/results/
+  analytics schemas), `api/routers/runs.py`, `api/routers/results.py`,
+  `api/routers/analytics.py`, `web/lib/api.ts`, `web/app/submit/page.tsx`,
+  `web/app/runs/page.tsx`, `web/app/runs/[id]/RunDetailClient.tsx`,
+  `web/app/runs/[id]/results/{ResultsClient,AnalyticsSection}.tsx`,
+  `web/app/runs/[id]/analysis/AnalysisClient.tsx`,
+  `web/app/runs/[id]/timeline/TimelineClient.tsx`,
+  `web/lib/timelineAnalytics.ts` (per-sandbox price basis in strips),
+  `web/components/RunConsoleLive.tsx`, `web/app/globals.css`
+- **Verify:**
+  - Unit: `tests/unit/orchestrator/test_matrix.py` (defaults, overrides,
+    dedupe, limits), `test_lifecycle.py` (matrix expansion + spawn isolation),
+    `test_provision.py` (model persisted in harness_config + env),
+    `tests/unit/api/test_runs.py` (validation, normalization, same-model
+    eval across the set), `test_results.py` (`model`/`models` fields),
+    `test_analytics.py` (per-model pricing + rollup)
+  - Manual: submit with 2 configs × 2 models → 4 sandboxes named/labeled
+    per cell; results matrix + analytics "model" view group by model; cost
+    auto-mode prices each cell at its own model.
+- **Depends on:** F15 (PR1 — named configs + live model picker this stacks
+  on); best after multi-provider support so >1 model is usable.
+
+### F17 — Artifact thumbnails ✅
 
 - **What:** results-page `📷 snapshot` button → a synchronous, bounded
   headless screenshot of the artifact, served exactly as an interactive

@@ -29,9 +29,10 @@ from sandbox.runtime import SandboxRuntime
 from sandbox.spec import SandboxSpec
 from skillpack_import.store import imported_root
 
-from . import state_machine
+from . import pacing, state_machine
 from .adapters import adapter_image, get_adapter
 from .events import emit
+from .matrix import sandbox_model
 
 log = logging.getLogger(__name__)
 
@@ -175,7 +176,8 @@ def build_spec(
     adapter = get_adapter(str(harness_config.get("adapter") or "miniloop"))
     task = {
         "task_prompt": run.task_prompt,
-        "model": run.model_name,
+        # PR14: per-cell model — same model the env/gateway wiring uses.
+        "model": sandbox_model(harness_config, run.model_name),
         "gateway_url": GATEWAY_INTERNAL_URL,
         "cred": env.get("GATEWAY_CRED", ""),
         "events_ingest_url": GATEWAY_INGEST_URL,
@@ -204,6 +206,33 @@ def _load_run(session_factory: sessionmaker[Session], run_id: uuid.UUID) -> Run 
         return session.get(Run, run_id)
 
 
+def _sandbox_name(hc: dict[str, Any], sid: uuid.UUID) -> str:
+    """Display name for a sandbox row (PR1 named harness configs).
+
+    The submit form's optional config label wins; blank gets
+    ``<adapter>-<sandbox short id>`` so same-adapter siblings stay
+    distinguishable in the timeline filter, results matrix, and analytics.
+    PR14: on multi-model runs the cell's ``model`` is appended
+    (``<label> · <model>``) so same-config siblings on different models stay
+    distinguishable everywhere the name is shown.
+    """
+    label = str(hc.get("name") or "").strip()
+    if not label:
+        adapter = str(hc.get("adapter") or hc.get("harness") or "miniloop")
+        label = f"{adapter}-{str(sid)[:8]}"
+    model = str(hc.get("model") or "").strip()
+    if not model:
+        return label[:255]
+    # sandboxes.name is String(255): keep the model tail intact, truncate
+    # the label side if the pair overflows.
+    suffix = f" · {model}"
+    if len(suffix) >= 255:
+        return suffix[-255:]
+    if len(label) + len(suffix) > 255:
+        label = label[: 255 - len(suffix)]
+    return label + suffix
+
+
 def _insert_sandbox_row(
     session_factory: sessionmaker[Session], run_id: uuid.UUID, hc: dict[str, Any]
 ) -> uuid.UUID:
@@ -212,7 +241,13 @@ def _insert_sandbox_row(
     sid = uuid.uuid4()
     with session_factory() as session:
         session.add(
-            Sandbox(id=sid, run_id=run_id, harness_config=dict(hc), status="provisioning")
+            Sandbox(
+                id=sid,
+                run_id=run_id,
+                harness_config=dict(hc),
+                status="provisioning",
+                name=_sandbox_name(hc, sid),
+            )
         )
         session.commit()
     return sid
@@ -304,17 +339,43 @@ async def spawn_one(
             extra_roots=(imported_root(settings),),
         )
 
+        # PR15 pacing: gate `docker run` on host memory headroom — at 8
+        # configs, launching every sandbox at once can OOM the host/VM that
+        # also hosts the model. Bounded wait; a timeout fails THIS sandbox
+        # like any other spawn failure — and collapses siblings' waits to a
+        # single probe, so pressure can't hold the run for N×cap.
+        headroom = await pacing.wait_for_headroom(
+            session_factory=session_factory,
+            run_id=run_id,
+            sandbox_id=sid,
+            settings=settings,
+        )
+        if not headroom:
+            _mark_spawn_failed(
+                session_factory,
+                run_id=run_id,
+                sandbox_id=sid,
+                message=(
+                    "spawn deferred: host memory stayed below "
+                    "SPAWN_MIN_FREE_MEM_MB past SPAWN_MEM_WAIT_SECONDS"
+                ),
+            )
+            return None
+
         cred = mint_sandbox_cred(
             run_id=run_id,
             sandbox_id=sid,
             secret=settings.GATEWAY_CRED_SECRET,
             budgets=budgets,
         )
+        # PR14: the cell's model overrides run.model_name — the harness env
+        # (MODEL_NAME / adapter config) AND the launch task agree on it.
+        model = sandbox_model(harness_config, run.model_name)
         env = build_env(
             adapter,
             cred=cred,
             task_prompt=run.task_prompt,
-            model_name=run.model_name,
+            model_name=model,
             max_iters=budgets["max_iters"],
             system_prompt_extra=harness_config.get("system_prompt_extra"),
         )

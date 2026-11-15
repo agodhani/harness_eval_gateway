@@ -31,7 +31,8 @@ from api.schemas import (
 from db.models import Rubric, Run, Sandbox
 from orchestrator import adapters as orch_adapters
 from orchestrator import events as orch_events
-from orchestrator import provision, runner, state_machine
+from orchestrator import pacing, provision, runner
+from orchestrator.matrix import participant_models, run_models
 from orchestrator.rubric import RubricContent
 from skillpack_import.store import imported_root
 
@@ -73,9 +74,11 @@ def _run_sandboxes(session: Session, run_id: uuid.UUID) -> list[Sandbox]:
 
 
 def _same_model_eval(run: Run) -> bool:
-    cfg = run.config or {}
-    evaluator = cfg.get("evaluator_model") or run.model_name
-    return evaluator == run.model_name
+    """True when the judge model equals ANY participant model — non-independent
+    judging for that cell (PR14: participants are a set, not just model_name;
+    per-config ``model`` pins count too — ``run_models``)."""
+    evaluator = (run.config or {}).get("evaluator_model") or run.model_name
+    return evaluator in set(run_models(run.config, run.model_name))
 
 
 def _run_out(session: Session, run: Run) -> RunOut:
@@ -148,12 +151,29 @@ async def create_run(body: RunCreate, session: DbSession) -> RunOut:
     _validate_harness_configs(body)
 
     evaluator_model = body.evaluator_model or body.model_name
+    # PR14: persist the run's model list ([model_name] + deduped extras) so
+    # lifecycle/results/analytics can expand the matrix without re-parsing
+    # the raw request. Per-config ``model`` pins stay inside each config
+    # dict (null pins omitted — unexpanded configs carry no ``model`` key).
+    models = participant_models(body.model_name, body.models)
     config = {
-        "harness_configs": [hc.model_dump() for hc in body.harness_configs],
+        "harness_configs": [
+            {
+                k: v
+                for k, v in hc.model_dump().items()
+                if k != "model" or v is not None
+            }
+            for hc in body.harness_configs
+        ],
+        "models": models,
         "evaluator_model": evaluator_model,
         "budgets": body.budgets.model_dump(),
-        "same_model_eval": evaluator_model == body.model_name,
     }
+    # Judge == any participant model flags non-independent scoring; pins
+    # count as participants even when outside the run's model list.
+    config["same_model_eval"] = evaluator_model in set(
+        run_models(config, body.model_name)
+    )
     run = Run(
         status="submitted",
         task_prompt=body.task_prompt,
@@ -197,6 +217,7 @@ async def list_runs(
             status=r.status,
             task_prompt=r.task_prompt[:200],
             model_name=r.model_name,
+            models=run_models(r.config, r.model_name),
             created_at=r.created_at,
             finished_at=r.finished_at,
             sandbox_count=counts.get(r.id, 0),
@@ -255,11 +276,17 @@ async def update_rubric(
 
 @router.post("/{run_id}/approve")
 async def approve_run(run_id: uuid.UUID, session: DbSession) -> RunOut:
-    """Freeze the rubric and kick off provisioning/lifecycle."""
+    """Freeze the rubric and kick off provisioning/lifecycle.
+
+    PR15 pacing: when another run holds the execution slot (or is already
+    queued), the approved run parks in ``queued`` instead — promotion to
+    ``provisioning`` happens FIFO when the active run finishes
+    (``runner._lifecycle_then_promote``) or on the next startup sweep.
+    ``started_at`` = approval/queue-entry time, as before.
+    """
     run, rubric = _editable_rubric(session, run_id)
 
     rubric.status = "approved"
-    state_machine.transition(session, run, "provisioning")
     run.started_at = datetime.now(UTC)
     orch_events.emit(
         session,
@@ -271,7 +298,9 @@ async def approve_run(run_id: uuid.UUID, session: DbSession) -> RunOut:
             "version": rubric.version,
         },
     )
+    placed = pacing.place_run(session, run)
     session.commit()
 
-    runner.start_lifecycle_task(run.id)
+    if placed == "provisioning":
+        runner.start_lifecycle_task(run.id)
     return _run_out(session, run)

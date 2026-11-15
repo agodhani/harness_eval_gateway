@@ -2,7 +2,9 @@
 
 The sandbox runs the Python shim (``python3 -m adapters.pi``) which writes
 ``~/.pi/agent/models.json`` (provider ``heg`` → gateway
-``/v1/chat/completions``, apiKey ``$GATEWAY_CRED``), spawns
+``/v1/chat/completions``, apiKey ``$GATEWAY_CRED``) and
+``~/.pi/agent/extensions/heg-events.ts`` (hook forwarder →
+``adapters.common.hooks``), spawns
 ``pi --mode json --provider heg --model <model>``, and translates its JSONL
 event stream via ``translate.py``.
 """
@@ -32,6 +34,10 @@ MANIFEST = {
     "install": "npm i -g @mariozechner/pi-coding-agent",
     "image": IMAGE,
     "requires": ["gateway:/v1/chat/completions"],
+    "hooks": (
+        "generated extension (extensions/heg-events.ts) forwards "
+        "tool_execution_end → tool_result via adapters.common.hooks"
+    ),
 }
 
 

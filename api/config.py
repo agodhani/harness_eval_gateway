@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     # (missing/invalid scores.json) — small judge models flake ~1 in 3 evals;
     # one retry is a cheap coin-flip recover. Infra exceptions are not retried.
     EVAL_SCORE_RETRIES: int = 1
+    # Per-request output cap (chat-completions max_tokens) for the rubric
+    # draft call. Thinking models burn output tokens on <think> blocks — the
+    # old 2048 cap truncated rubric JSON mid-document on qwen3-class models.
+    RUBRIC_MAX_TOKENS: int = 8192
+    # Per-request output cap for the eval judge's chat calls (miniloop
+    # MAX_TOKENS in the eval sandbox). Rationale-heavy scores.json plus
+    # thinking-model overhead need headroom over the 4096 participant
+    # default — truncation yields missing/invalid scores.json.
+    EVAL_JUDGE_MAX_TOKENS: int = 8192
     # Host path of ./data as seen by the docker daemon — set by compose
     # (HOST_DATA_ROOT=${PWD}/data) so sandbox -v sources resolve on the host.
     # Empty (host-run dev / tests) => paths pass through verbatim.
@@ -78,6 +87,35 @@ class Settings(BaseSettings):
     # unauthenticated 60/hr api limit and unlocks private repos (best-effort;
     # codeload accepts a Bearer token). Public repos work without it.
     GITHUB_TOKEN: str = ""
+
+    # --- Objective scoring (PR7) ---
+    # Exec-signal kill switch — when false the collector reports "skipped"
+    # instead of running candidate build/tests/coverage inside the locked
+    # heg-exec container. Read via os.environ first (compose passes it
+    # through) so an explicit env var beats .env, then this setting.
+    SCORING_EXEC: bool = True
+    # Repo-built image ExecRunner spawns for exec scoring (never pulled):
+    #   docker build -f sandbox/images/exec.Dockerfile -t heg-exec:latest .
+    EXEC_IMAGE: str = "heg-exec:latest"
+    # PR8 generated-test signal kill switch — when false the evaluator skips
+    # LLM test-suite generation entirely (no gateway call, no exec). Same
+    # env-first resolution as SCORING_EXEC.
+    SCORING_TESTGEN: bool = True
+
+    # --- Run pacing (PR15) ---
+    # One active run at a time: approvals landing while a run executes (or
+    # is already queued) park in status="queued" and promote FIFO when the
+    # slot frees. No knob — it's the run state machine.
+    # Spawn memory gate: spawn_one waits for >= this much free host/VM
+    # memory before `docker run` (MiB). Probed via /proc/meminfo, then
+    # sysconf, then docker info+stats (unreadable probe => gate off).
+    # 0 disables. Default 2 GiB — headroom for the model + siblings.
+    SPAWN_MIN_FREE_MEM_MB: int = 2048
+    # Poll cadence + cap for the gate wait. An expired wait fails THAT
+    # sandbox like any spawn error — and collapses remaining configs' waits
+    # to a single probe, so sustained pressure can't hang a run for N×cap.
+    SPAWN_MEM_POLL_SECONDS: float = 5.0
+    SPAWN_MEM_WAIT_SECONDS: float = 3600.0
 
     # --- Artifact preview (F12) ---
     # Static-preview container image (`python -m http.server`); shares the

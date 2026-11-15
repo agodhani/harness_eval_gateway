@@ -11,12 +11,14 @@ CLI, Aider, custom minimal loops, ...) on coding tasks, with a **custom AI
 gateway** as the observability layer.
 
 A user submits a task (e.g. "build a replica of 2048") plus a run
-configuration. The system spawns isolated Docker sandboxes — one per harness —
-all running the **same underlying model**, so results compare *harness
-capability*, not raw model quality. An independent LLM evaluator scores each
-produced artifact against a human-approved rubric. All model traffic and agent
-activity are captured as structured events powering a live + persisted
-execution timeline.
+configuration. The system spawns isolated Docker sandboxes across a
+**config × model matrix** — each harness configuration runs on every selected
+participant model (a per-config `model` overrides the run-level model list;
+PR14 reversed the original harnesses-only stance). Results compare harness
+capability and model quality side by side. An independent LLM evaluator
+scores each produced artifact against a human-approved rubric. All model
+traffic and agent activity are captured as structured events powering a live
++ persisted execution timeline.
 
 **MVP shape:** 1 model (Ollama, small local model) × 2 harness configs → 2
 concurrent sandboxes. Evaluator runs afterwards in its own sandbox. Since
@@ -27,8 +29,10 @@ adapters are added.
 
 ## Core concepts
 
-- **Run** — one submitted evaluation. Spec = task prompt + model + set of
-  harnesses + skill packs + evaluator model.
+- **Run** — one submitted evaluation. Spec = task prompt + model(s) + set of
+  harnesses + skill packs + evaluator model. `model_name` is the default
+  participant model; `models` (normalized into `config.models`) selects the
+  full participant set.
 - **Sandbox** — a Docker container running one harness instance on the task,
   with an identical clean initial repo/workspace as its siblings.
 - **Harness adapter** — per-harness plugin: knows how to install, configure,
@@ -74,11 +78,12 @@ adapters are added.
 1. **Web UI (Next.js)** — submission form (task prompt, model, harnesses,
    skill packs, evaluator model), rubric review/edit screen, run status,
    live execution timeline (SSE), persisted timeline replay, results matrix,
-   flag when evaluator model == participant model.
+   flag when evaluator model == any participant model.
 2. **Control API + Orchestrator (FastAPI, async)** — validates submissions,
    expands run matrix, generates rubric via gateway, drives run state machine
-   (`submitted → rubric_review → provisioning → running → evaluating →
-   done | failed`), manages sandbox lifecycle, enforces termination policy.
+   (`submitted → rubric_review → [queued →] provisioning → running →
+   evaluating → done | failed`), manages sandbox lifecycle, enforces
+   termination policy, paces run/sandbox admission (below).
 3. **AI gateway (Python, custom)** — exposes an OpenAI-compatible
    (`/v1/chat/completions`) endpoint, translates to upstream providers
    (**Ollama is the default upstream for MVP** — small local models, e.g.
@@ -94,9 +99,16 @@ adapters are added.
    event stream, artifact metadata, evaluator scores.
 6. **Evaluator** — runs in its own sandbox post-run; fetches artifact + rubric,
    scores via gateway, returns score + rationale per dimension. Objective
-   signals (PR6): the `scoring` collector registry measures the workspace
-   before judging (parse-only static analysis — real cyclomatic complexity,
-   size, language mix) and feeds the judge `ANALYSIS.md`/`analysis.json`.
+   signals (PR6+PR7+PR8): the `scoring` collector registry measures the
+   workspace before judging — parse-only static analysis (real cyclomatic
+   complexity, size, language mix) plus, when enabled, exec scoring:
+   build/tests/coverage run inside a locked `heg-exec` container (zero
+   egress, resource-capped, artifact read-only). PR8 adds a third signal,
+   `generated_tests`: the evaluator itself calls the model (via gateway,
+   eval cred) to WRITE a pytest suite for the submission, persists it at
+   `<artifact>/generated_tests/`, and runs it against the untouched
+   workspace in the same locked container — pass rate folds into the same
+   report. All feed the judge `ANALYSIS.md`/`analysis.json`.
 7. **Artifact store** — `./data/artifacts/<run_id>/<sandbox_id>/` — repo
    tarballs, transcripts, event exports.
 
@@ -105,7 +117,17 @@ adapters are added.
 1. **Submit** — form → run spec (`POST /api/runs`).
 2. **Rubric draft** — orchestrator calls LLM via gateway → draft rubric →
    UI displays; user edits → approves → **frozen**, shared across sandboxes.
+   **Pacing (PR15):** runs serialize — one active run at a time; an approval
+   landing while a run executes (or is already queued) parks in `queued`
+   and promotes FIFO by approval when the slot frees (lifecycle end or the
+   next startup sweep). `started_at` = approval/queue-entry time.
 3. **Provision** — prepare identical initial repo; build/launch N sandboxes.
+   `spawn_one` additionally gates each `docker run` on host memory headroom
+   (`SPAWN_MIN_FREE_MEM_MB`, probed via `/proc/meminfo` → `sysconf` →
+   `docker info`+`stats`; unreadable probe = gate off). The wait is capped
+   by `SPAWN_MEM_WAIT_SECONDS` — expiry fails that one sandbox and makes
+   the remaining configs fail fast (one probe each), so sustained pressure
+   can't hold the run's slot for N×cap.
 4. **Execute** — agent loops; all model calls via gateway; adapter streams
    normalized events; UI shows live timeline.
 5. **Terminate** — each sandbox reaches a terminal state (below); workspace
@@ -124,7 +146,12 @@ Terminal states per sandbox:
 | `timeout` | Wall-clock cap hit |
 | `budget_exceeded` | Token/cost budget hit (enforced at gateway) |
 | `stuck_loop` | Repeated identical actions / retry cap hit |
-| `error` | Crash / unrecoverable failure |
+| `error` | Crash / unrecoverable failure / upstream provider outage |
+
+`budget_exceeded` keys on the gateway's own budget-gate event
+(`stage="budget"` + `reason="budget_exceeded"`) — a bare 429 from the
+*upstream provider* is NOT budget exhaustion: ≥3 `stage="upstream"` error
+events terminate the sandbox `error` instead.
 
 Provisional defaults (confirm with user): 60 min wall clock, $2 spend cap,
 stuck-loop = 3 consecutive identical tool calls.
@@ -139,8 +166,9 @@ done skill pack) that signals the orchestrator — `agent_done` is distinct from
 
 - **sources**: `gateway`, `harness`, `sandbox`, `evaluator`, `orchestrator`
 - **types**: `llm_request`, `llm_response` (tokens in/out, cache r/w, latency,
-  cost, model), `tool_call`, `shell_command`, `file_op`, `test_execution`,
-  `checkpoint`, `skill_invocation`, `done_signal`, `error`, `run_started`,
+  cost, model), `tool_call`, `tool_result` (hook-sourced tool outcomes),
+  `shell_command`, `file_op`, `test_execution`, `checkpoint`,
+  `skill_invocation`, `done_signal`, `error`, `run_started`,
   `terminal_state`, `context_compacted`, `miniloop_result` (authoritative
   list: `api/schemas.py::EventType` — a contract test AST-scans emitters)
 
@@ -148,6 +176,21 @@ Gateway events are captured passively from the request/response stream.
 Agent-level events (tool calls, shell, file ops) are produced by the harness
 adapter translating native output (e.g. Claude Code `--output-format
 stream-json`, Aider logs) or harness hooks where available.
+
+**Hook events (PR17):** harnesses with a native hook/plugin surface register
+the shared receiver `python3 -m adapters.common.hooks <adapter>` — payload
+JSON arrives on stdin (Claude Code `settings.json` hooks, pi's generated
+`heg-events.ts` extension) or argv (Codex `notify`), the adapter's
+`translate_hook` normalizes it, and events POST to `/internal/events` with
+`via: "hook"` stamped into the payload. The receiver always exits 0 and
+mirrors JSONL to stderr only (Claude injects SessionStart/UserPromptSubmit
+hook stdout into agent context). Hooked today: `claude_code` (PostToolUse →
+`tool_result`; session lifecycle → `checkpoint`), `codex`
+(agent-turn-complete → `checkpoint` incl. `last-assistant-message`), `pi`
+(tool_execution_end → `tool_result`). `deepseek` (no stable observer/plugin
+API — cordis loader internals only) and `miniloop` (our own agent, already
+first-class) stay on the translated path; new adapters opt in by adding
+`translate_hook` + a `MANIFEST["hooks"]` line (contract-tested pairing).
 
 ## Harness adapter contract
 
@@ -159,6 +202,9 @@ Each adapter provides:
 - `launch(task_prompt)` — start the agent loop (non-interactive mode)
 - `translate_events(stream)` → normalized `Event[]`
 - `completion_signal()` — how `done` / loop-completion is detected
+- *(optional)* `translate_hook` in `adapters/<name>/translate.py` + a
+  `MANIFEST["hooks"]` descriptor — wires the harness's native hook/plugin
+  surface into `adapters.common.hooks` (see Event model § hook events)
 
 **MVP adapter:** `miniloop` — our custom minimal coding agent (tool-call
 loop: shell exec, file read/write, `done`). Shipped CLI adapters (F10 +
@@ -175,13 +221,40 @@ Anthropic/OpenAI landed (env-switched, `PROVIDER_ROUTES` per-model).
 ## Rubric
 
 MVP dimensions: functional requirements, acceptance criteria, code
-implementation quality, cyclomatic complexity. Since PR6 the judge scores
-from **measured** signals where available — the `scoring` package's
+implementation quality, cyclomatic complexity. Since PR6/PR7 the judge
+scores from **measured** signals where available — the `scoring` package's
 static-analysis collector (lizard, parse-only) computes real cyclomatic
-complexity/size/language mix before evaluation; the report is staged as
-`ANALYSIS.md`/`analysis.json` for the judge, persisted at
-`<artifact>/analysis.json`, and surfaced on the results API. Remaining
-objective signals (build/test exec, coverage) are post-MVP.
+complexity/size/language mix, and the `exec` collector runs the
+submission's build/tests/coverage inside a locked `heg-exec` container
+(`--network none`, nobody user, resource caps, read-only artifact mount);
+the report is staged as `ANALYSIS.md`/`analysis.json` for the judge,
+persisted at `<artifact>/analysis.json`, and surfaced on the results API
+(flat `exec` summary included). Disable exec via `SCORING_EXEC=0`;
+requires the `heg-exec:latest` image (`docker build -f
+sandbox/images/exec.Dockerfile -t heg-exec:latest .`).
+
+PR8 adds **generated-test scoring** (`evaluator/testgen.py`): before
+staging, the evaluator calls the model through the gateway (metered on the
+per-eval cred — generation consumes the same `EVAL_TOKEN_BUDGET` allowance
+as the judge) with the rubric + bounded source listing → parses the output
+into `test_*.py` files (deterministic containment: each chunk must
+byte-compile AND define a `test_*` — anything else is dropped and a fully
+unusable generation degrades to `skipped`) → persists the suite to
+`<artifact>/generated_tests/` + `_manifest.json` (provenance, never the
+candidate's `workspace/`) → executes it via
+`ExecRunner.execute(workspace, test_target=…)` — the suite mounts
+read-only at `/srv/test_target` inside `heg-exec`, copied to a writable
+dir, pytest pointed at it; coverage stays `--source=/work` (the candidate
+code) and the build phase never compiles generated files. Pass rate,
+counts, failing names, and coverage land in the `generated_tests`
+`SignalReport` — same `analysis.json` envelope, `ANALYSIS.md` section,
+`eval_analysis`/`test_execution` (`phase=eval_testgen`) events, flat
+`generated_tests` summary on the results API, and a `generated_tests/`
+copy staged for the judge. Flags: `SCORING_TESTGEN=0` disables (conftest
+pins it); `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
+`TESTGEN_MAX_FILES` (8), `TESTGEN_MAX_TOKENS` (4096),
+`TESTGEN_TIMEOUT_SECONDS` (240). `EXEC_TEST_TARGET` is the
+ExecRunner→runner env contract for the suite mount.
 
 Flow: auto-generated from task spec → HITL review/edit in UI → frozen →
 applied identically to all sandboxes.
@@ -200,13 +273,14 @@ applied identically to all sandboxes.
 ## Repo layout (proposed)
 
 ```
-gateway/       # LLM proxy: providers, metering, budgets, event emission
+gateway/       # LLM proxy: providers, metering, budgets, event emission,
+               # opt-in response cache (PR18 replay)
 orchestrator/  # run state machine, matrix expansion, rubric gen, lifecycle
 api/           # control-plane HTTP API (FastAPI app)
 adapters/      # harness adapters (miniloop + shipped CLI adapters)
 sandbox/       # image defs, workspace prep, done mechanism, event collector
 evaluator/     # rubric scoring agent
-scoring/       # objective signal collectors (static analysis; PR7 adds exec/coverage)
+scoring/       # objective signal collectors (static analysis + exec/coverage)
 skillpacks/    # vendored default packs: superpowers, mattpocock-skills, spec-kit
 skillpack_import/  # F11 GitHub import: codeload fetch, SKILL.md scan, pack store
 web/           # Next.js app
@@ -240,45 +314,42 @@ or tests change.
 | F12 | Artifact preview (static html + desktop GUI via noVNC + python-server web apps) |
 | F13 | Graphical analysis page + cross-run trends (recharts) |
 | F14 | Eval iteration: re-score runs + versioned rubric edits |
-| F15 | Artifact thumbnails (headless screenshots via the preview stack) |
+| F15 | Submit UX: live model picker + install, named harness configs |
+| F16 | Model-vs-model matrix: multi-model runs + per-model analytics |
+| F17 | Artifact thumbnails (headless screenshots via the preview stack) |
 
 ## Post-MVP roadmap
 
 - Additional harness adapters beyond the shipped six (miniloop, codex,
   claude_code, pi, deepseek, aider)
 - Anthropic-compatible gateway endpoint (`/v1/messages`)
-- Model-vs-model comparisons (multi-model matrices)
-- Objective scoring: build/test execution, coverage as score dimensions
-  (PR7 — static analysis landed in PR6 via `scoring/` signal collectors)
-- Automated test-suite generation as eval target
+- ~~Model-vs-model comparisons (multi-model matrices)~~ — **landed as F16**
+- ~~Objective scoring: build/test execution, coverage~~ — **landed PR6
+  (static analysis) + PR7 (exec+coverage)** via `scoring/` signal
+  collectors
+- ~~Automated test-suite generation as eval target~~ — **landed PR8**:
+  `generated_tests` signal (LLM-written suite, exec via `test_target`,
+  pass rate into the judge brief)
 - Higher-fidelity instrumentation via harness hooks/plugins
 - Gateway response caching / deterministic replay
 - Multi-host / K8s sandbox scaling
-- Memory-aware spawn scheduling — gate `spawn_one` on host memory pressure
-  (docker info / cgroup stats) and queue pending sandboxes until headroom
-  exists, instead of launching all N configs at once (matters at 8x)
-- Run submission queue — pace/serialize whole runs so a new submission waits
-  behind the active run instead of overlapping; combined with memory-aware
-  spawn scheduling this bounds concurrent sandboxes when >2 would exceed
-  headroom for the loaded model
 - Auth, saved run templates, share links
-- Dynamic model picker — populate the submit form's model suggestions from
-  `ollama list` (gateway `/v1/models` pass-through already exists) instead of
-  the hardcoded `MODEL_SUGGESTIONS`, plus an install option (api endpoint →
-  `ollama pull`, stream pull progress into the UI)
-- Named harness configs — optional per-config label set at submit, persisted
-  onto the sandbox and surfaced in the timeline filter, results matrix, and
-  analytics so same-adapter sandboxes are distinguishable; default to
-  `<adapter>-<sandbox short id>` when left blank
+- ~~Dynamic model picker~~ + ~~named harness configs~~ — **landed as F15**
 - Cross-run analytics & cost dashboards
 - Timeline-side analytics — **landed (PR9)**: per-sandbox metrics strip on
   `web/app/runs/[id]/timeline/` (turns/tokens/latency/cost/errors chips +
   judge line; chips double as sandbox-filter selectors; 15s refresh while
   non-terminal). Leftover idea: on-event-hover cumulative stats.
-- Split-view trace comparison — side-by-side, time-aligned event streams for
-  two sandboxes on the traces/timeline page (today it's one merged stream
-  with a single-sandbox filter dropdown); scrolling/diff-alignment UX TBD
-- ~~Lightweight artifact thumbnails~~ — **landed as PR4/F15**: results-page
+- Split-view trace comparison — **landed (PR10)**: `merged | split` toggle
+  on `web/app/runs/[id]/timeline/`. Split renders two sandbox lanes on ONE
+  merged `(ts,id)` ordering inside a single scroll container — synchronized
+  scroll + time alignment are structural (no scroll mirroring); sticky lane
+  pickers (labels/status/count, swap-on-collision, `?view=split&left=&right=`
+  seeds), run-level + non-lane-sandbox events as full-width shared rows,
+  PR9 metrics chips assign lanes in split mode. Transform + tests:
+  `web/lib/splitTimeline.ts(.test.ts)`; shared row markup:
+  `timeline/EventRow.tsx`.
+- ~~Lightweight artifact thumbnails~~ — **landed as PR4/F17**: results-page
   `📷 snapshot` POSTs a bounded headless-chromium capture through the
   artifact's own preview stack; `<artifact>/thumbnail.png` heads the
   preview cell and clicks through to the full live preview.
@@ -300,16 +371,22 @@ or tests change.
 
 ## Decisions log
 
-- Compare **harnesses, not models**: same model across sandboxes in a run.
+- ~~Compare **harnesses, not models**~~ — **reversed by PR14 (F16)**: the
+  matrix is `configs × models`. `model_name` remains the default participant
+  model; `RunCreate.models` selects the full set (defaults to `[model_name]`)
+  and a per-config `model` overrides the run list for that config. Same-model
+  runs remain the default; `same_model_eval` now checks the evaluator against
+  *every* participant model.
 - Custom lightweight gateway (not LiteLLM) — observability is the core value.
 - Two-layer telemetry: passive gateway capture + adapter-translated harness
   events for agent-level detail.
 - HITL rubric approval; frozen pre-launch; shared across sandboxes.
-- Evaluator in own sandbox; UI flags evaluator == participant model.
+- Evaluator in own sandbox; UI flags evaluator == any participant model.
 - LLM-judge scoring, fed by measured signals: PR6 added parse-only static
-  analysis (real cyclomatic complexity + static metrics via lizard) as
-  judge evidence — exec-derived checks (build/test/coverage) remain
-  post-MVP (PR7).
+  analysis (real cyclomatic complexity + static metrics via lizard);
+  PR7 added exec-derived checks — build/test/coverage measured in a
+  locked, zero-egress `heg-exec` container (read-only artifact, nobody
+  user, resource-capped) — as judge evidence + a `test_execution` event.
 - Artifacts local; metadata in Postgres.
 - Evaluator model is user-selected at submission (independence is opt-in).
 - **Ollama is the default inference** for MVP — small local models; cost ≈ 0
@@ -340,8 +417,23 @@ or tests change.
   npm install happens before COPY so dependency layers cache. DeepSeek's
   `dsh` needs node >=24.9 → `node:24-slim` (others stay on 22). Aider is a
   Python CLI → `python:3.12-slim` + `pip install aider-chat` (PR13).
+- **PR15 pacing is DB-driven, not in-memory**: `queued` is a run status, so
+  the submission queue survives api restarts (startup sweep re-promotes).
+  Queue order = `started_at` (approval time). Spawn admission is a bounded
+  wait *inside* `spawn_one` (per-sandbox failure on timeout) rather than a
+  scheduler loop — sequential provisioning already makes spawns the unit of
+  queuing. `run.status` stays `String` — no migration needed for `queued`.
 - **`done` invocation**: bare `done` is a shell keyword in sh/bash — prompts
   instruct harnesses to run `/usr/local/bin/done` (or `command done`).
+- **PR17 — hook/plugin telemetry lane**: `adapters/common/hooks.py` is the
+  shared receiver (`python3 -m adapters.common.hooks <adapter> [json]`) for
+  native hooks — claude_code `settings.json` hooks (stdin), codex `notify`
+  (argv), pi's generated extension forwarder (stdin). Normalization stays in
+  Python via each adapter's `translate_hook` (contract-tested); events carry
+  `via: "hook"`. New `tool_result` EventType reports tool *outcomes* — the
+  detail translated streams drop to avoid double-counting tool calls. Hook
+  choice per CLI follows documented surfaces only (dsh/miniloop untranslated
+  paths unchanged).
 - **Imported skill packs (F11) live under `data/skillpacks/`**, not the
   vendored `skillpacks/` tree — vendored packs are committed and baked into
   the api image (ephemeral FS in compose), while `data/` is gitignored and
@@ -411,6 +503,20 @@ or tests change.
   (`PREVIEW_SCAN_TTL_SECONDS`, default 30s) keyed on
   (jail, run, sandbox, artifact_path) — workspaces only change on
   re-snapshot.
+- **Gateway response caching / deterministic replay (PR18)**: opt-in
+  `GATEWAY_CACHE_ENABLED` — OFF by default so real runs hit the live
+  upstream. Metered generation calls replay from a sqlite store
+  (`gateway/cache.py`, `GATEWAY_CACHE_PATH`) keyed on
+  `namespace + path + provider + outgoing-body` (post-transform, so
+  stream/buffered variants and PROVIDER_ROUTES targets can't collide;
+  bump `GATEWAY_CACHE_NAMESPACE` to invalidate). Semantics: hits still emit
+  `llm_request`/`llm_response` with `payload.cached: true`, usage is
+  re-metered from the stored body so cached spend counts toward the run
+  budget, and the budget gate runs before the lookup — a replayed run
+  accrues tokens and 429s identically to the live one. Only complete 2xx
+  bodies are stored; unmetered probes (`count_tokens`, `/v1/models`) bypass
+  the cache; cache failures degrade to a miss, never a proxy 5xx (same
+  doctrine as event emission).
 - **Preview registry lives on docker labels**, not in memory or Postgres —
   restart-safe discovery + the TTL reaper (default 15 min) works
   out-of-process; runner+proxy share `heg.preview_id`, stop removes all.
@@ -422,9 +528,14 @@ or tests change.
   judge models flake ~1-in-3 evals (observed modes: flat dimension-map JSON,
   paged-read stuck loops, grep-loop wander, unescaped quotes in rationale) —
   `EVAL_PROMPT.md` carries targeted counter-hints (paging, no inner `"`).
+  When all attempts produce no Score rows the orchestrator emits a final
+  `error` event (`stage="evaluation"`, `phase="eval_failed"`) for the
+  sandbox; the results API surfaces it as per-sandbox `eval_error` so the UI
+  shows "eval failed" rather than an empty score matrix — a sandbox can be
+  `done` with failed eval, so check `eval_error`, not score-null alone.
 - One live preview per sandbox (POST is idempotent — re-clicking returns the
   existing preview); dead containers are cleared on respawn.
-- **Artifact thumbnails (F15) reuse the preview stack, not a parallel one** —
+- **Artifact thumbnails (F17) reuse the preview stack, not a parallel one** —
   capture spawns the artifact's own `PreviewManager` topology with
   `heg.preview_purpose=thumb` (interactive endpoints filter on `preview`, so
   a mid-flight capture never surfaces as the live preview; the reaper/stop
@@ -440,8 +551,9 @@ or tests change.
 - **Charts: recharts** (F13) — picked over visx/chart.js: smallest fit for
   grouped/stacked bars + a composed bar-line trend under React 19 / Next 16;
   themed via hexes mirroring globals.css tokens (no CSS-var reads). The
-  cross-run trends endpoint (`GET /api/analytics/runs`) prices each point at
-  its own run's resolved price unless `?price_model=` forces uniform
+  cross-run trends endpoint (`GET /api/analytics/runs`) prices each point's
+  cells at their own model's rate (unlisted → the run's resolved rate)
+  unless `?price_model=` forces uniform
   repricing — same "estimate, not billing" framing as F9.
 - **Rubric versions are immutable** (F14): post-run edits INSERT a new
   `rubrics` row (`parent_id` → edited version, `version = max+1`,
@@ -457,6 +569,23 @@ or tests change.
   interrupted re-score (marked by a `rescore_requested`/`rescore_started`
   checkpoint) to `done` when ≥1 Score row exists — a first-pass eval with
   no marker still fails.
+- **Model catalog/install ride the gateway, not Ollama direct (F15)** — the
+  api mints a sandbox-null `heg.*` service cred to call `GET /v1/models`,
+  which keeps the
+  provider abstraction (Ollama today, OpenRouter next) behind the gateway;
+  the gateway stamps `X-HEG-Provider` so the UI only offers install when the
+  upstream can `ollama pull` (`POST /v1/models/pull` → `/api/pull`, 501
+  otherwise). Pull is **control-plane only**: creds carrying a `sandbox_id`
+  (every participant/evaluator cred, and `heg-dev`) get 403 — only
+  run-scoped service creds (`sandbox_id=None`) may pull; the body is
+  allowlisted to `name`/`model` (+ forced `stream`, `insecure` dropped) and
+  the upstream client is pinned to Ollama (`get_ollama_client`) so pull can
+  never follow per-model routing. Pull progress streams end-to-end as
+  NDJSON — never buffered.
+- **Sandbox names are persisted, not derived (F15)** — `HarnessConfigIn.name`
+  (≤64, whitespace-normalized) lands on `sandboxes.name`; `spawn_one` fills
+  blanks with `<adapter>-<shortid>` once the UUID exists. All UI surfaces
+  read the column — no per-component re-derivation to drift.
 
 ## Working conventions
 

@@ -8,7 +8,7 @@
 > (`feat/pr4-thumbnails`) added the `heg.preview_purpose` label and the
 > `.../thumbnail` capture endpoints. The detection, endpoint, and
 > isolation details below describe the original F12 PR; current behavior
-> lives in `FEATURE_MAP.md` F12/F15.*
+> lives in `FEATURE_MAP.md` F12/F17.*
 
 Lets a reviewer **see and run** the artifact a sandbox produced, straight from
 the results page — before this, artifacts were download-only. Two preview

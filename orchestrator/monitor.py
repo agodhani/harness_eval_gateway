@@ -5,9 +5,13 @@
 ``MONITOR_POLL_SECONDS`` cadence). Each iteration checks, in order:
 
 1. **Deadline** — ``started_at + wall_clock_seconds`` → terminate ``timeout``.
-2. **Budget** — gateway ``error`` events (``reason=="budget_exceeded"`` or
-   ``http_status==429``) for this sandbox, or run-wide
-   ``metering.tokens_used >= token_budget`` → terminate ``budget_exceeded``.
+2. **Budget/provider** — gateway ``error`` events for this sandbox:
+   ``reason=="budget_exceeded"`` (the gateway's own run-budget 429 — its
+   signature is ``stage="budget"`` + ``reason``, NOT the bare status) →
+   ``budget_exceeded``. ``stage=="upstream"`` events are provider-side
+   failures (rate-limit 429s, 5xx, unreachable) — ≥
+   ``UPSTREAM_ERROR_THRESHOLD`` of them terminate ``error`` instead. Run-wide
+   ``metering.tokens_used >= token_budget`` → ``budget_exceeded``.
 3. **Container state** — ``running`` → ``done_signal`` older than
    ``DONE_GRACE_SECONDS`` → terminate ``agent_done`` (safety net);
    ``exited``/``dead`` → parse ``MINILOOP_RESULT`` from logs, exit-code
@@ -42,6 +46,11 @@ from .events import emit
 log = logging.getLogger(__name__)
 
 DONE_GRACE_SECONDS = 30.0
+#: Gateway ``stage="upstream"`` error events (provider 429s/5xx/outages)
+#: tolerated before the monitor gives up on the run's provider — the harness
+#: may retry a transient blip, but this many failed calls means the upstream
+#: is effectively dead for this run (e.g. daily-quota exhaustion).
+UPSTREAM_ERROR_THRESHOLD = 3
 _AGENT_TERMINAL_STATES = frozenset(
     {"agent_done", "harness_complete", "stuck_loop", "error"}
 )
@@ -86,12 +95,23 @@ def _sandbox_done_signal_ts(
         return ts
 
 
-def _budget_event_seen(
+def _gateway_error_verdict(
     session_factory: sessionmaker[Session],
     run_id: uuid.UUID,
     sandbox_id: uuid.UUID,
-) -> bool:
-    """True when a gateway ``error`` event marks this sandbox budget-limited."""
+) -> str | None:
+    """Terminal reason implied by this sandbox's gateway ``error`` events.
+
+    Two distinct 429 sources used to be conflated here (any error event with
+    ``http_status==429`` → ``budget_exceeded``), which mislabeled upstream
+    provider rate-limits as budget exhaustion:
+
+    - ``stage="budget"`` / ``reason="budget_exceeded"`` — the gateway's OWN
+      run-token-budget gate → ``budget_exceeded``.
+    - ``stage="upstream"`` — the provider failed the call (rate-limit 429,
+      5xx, unreachable). ≥ ``UPSTREAM_ERROR_THRESHOLD`` → ``error``; a lone
+      transient blip doesn't kill a healthy sandbox.
+    """
     with session_factory() as session:
         payloads = session.execute(
             select(Event.payload).where(
@@ -100,12 +120,20 @@ def _budget_event_seen(
                 Event.type == "error",
             )
         ).scalars().all()
+    upstream_errors = 0
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
-        if payload.get("reason") == "budget_exceeded" or payload.get("http_status") == 429:
-            return True
-    return False
+        if (
+            payload.get("reason") == "budget_exceeded"
+            or payload.get("stage") == "budget"
+        ):
+            return "budget_exceeded"
+        if payload.get("stage") == "upstream":
+            upstream_errors += 1
+    if upstream_errors >= UPSTREAM_ERROR_THRESHOLD:
+        return "error"
+    return None
 
 
 def _run_tokens_used(
@@ -376,14 +404,16 @@ async def watch_sandbox(
                     reason="timeout",
                 )
 
-            # 2) budget: gateway error events, then run-wide token total
-            if _budget_event_seen(session_factory, run_id, sandbox_id):
+            # 2) gateway error events (budget gate vs upstream failures),
+            #    then run-wide token total
+            verdict = _gateway_error_verdict(session_factory, run_id, sandbox_id)
+            if verdict is not None:
                 return await _terminate(
                     session_factory=session_factory,
                     runtime=runtime,
                     run_id=run_id,
                     sandbox_id=sandbox_id,
-                    reason="budget_exceeded",
+                    reason=verdict,
                 )
             if token_budget:
                 used = _run_tokens_used(session_factory, run_id)
