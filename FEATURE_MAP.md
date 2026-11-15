@@ -265,38 +265,98 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `phase="eval_failed"`) which the results API surfaces as per-sandbox
   `eval_error` — distinguishable from "not yet scored" (F8). Judge per-request
   output cap is `EVAL_JUDGE_MAX_TOKENS` (default 8192; thinking judges).
-  **Objective signals (PR6):** before staging, the candidate workspace is
-  measured by the `scoring` package's signal collectors — `static_analysis`
-  runs lizard (multi-language, parse-only, no code execution) for real
-  cyclomatic complexity, nloc, function counts, nesting depth, and language
-  mix. The report is staged into the eval workspace as `ANALYSIS.md`
-  (judge-facing brief; judge is told to score `cyclomatic_complexity` from
-  measured values) + `analysis.json`, persisted at
-  `<artifact>/analysis.json`, summarized in an `eval_analysis` checkpoint
-  event, and re-validated + embedded as `analysis` on
-  `GET /api/runs/{id}/results` sandboxes. Candidate-authored
-  `ANALYSIS.md`/`analysis.json` files are dropped at staging (reserved
-  names — fake measured evidence can't reach the judge). Collection never
-  blocks evaluation: collector failures degrade to `status="error"` signal
-  entries / `status="unavailable"` event. Collector registry
-  (`scoring/collectors.py::COLLECTORS`) is the extension point for PR7's
-  exec/coverage signals.
+  **Objective signals (PR6+PR7):** before staging, the candidate workspace
+  is measured by the `scoring` package's signal collectors —
+  `static_analysis` runs lizard (multi-language, parse-only, no code
+  execution) for real cyclomatic complexity, nloc, function counts,
+  nesting depth, and language mix; `exec` runs the workspace's
+  build/tests/coverage inside a locked `heg-exec` container
+  (`--network none`, cap-drop ALL + cap-add SETUID/SETGID — the in-image
+  runner is uid 0 only to demote every candidate phase to nobody, keeping
+  the `/out` result channel and container stdout unforgeable —
+  no-new-privileges, cpu/memory/pids bounds, tmpfs-capped scratch,
+  artifact mounted read-only at `/srv/src` and copied to container-local
+  `/work` — the artifact is never written).
+  The report is staged into the eval workspace as `ANALYSIS.md`
+  (judge-facing brief incl. the executed-checks block; judge is told to
+  score `cyclomatic_complexity` from measured values and to treat
+  build/test/coverage as ground truth for functional/acceptance dims) +
+  `analysis.json`, persisted at `<artifact>/analysis.json`, summarized in
+  an `eval_analysis` checkpoint event (plus a `test_execution` event when
+  candidate tests ran), and re-validated + embedded as `analysis` + flat
+  `exec` ExecSummary on `GET /api/runs/{id}/results` sandboxes.
+  Candidate-authored `ANALYSIS.md`/`analysis.json` files are dropped at
+  staging (reserved names — fake measured evidence can't reach the judge).
+  Collection never blocks evaluation: collector failures degrade to
+  `status="error"`/`skipped` signal entries / `status="unavailable"`
+  event. Collector registry (`scoring/collectors.py::COLLECTORS`) is the
+  extension point for further signal types; `SCORING_EXEC=0` disables the
+  exec collector (conftest pins it for unit tests).
+  **Generated test suite (PR8):** a third `generated_tests` signal is
+  appended by the evaluator itself (`evaluator/testgen.py`, not a
+  registry collector — it needs gateway creds + the artifact dir).
+  Before staging, the evaluator calls the model through the gateway on
+  the per-eval cred (metered/budgeted like the judge; draws on the same
+  `EVAL_TOKEN_BUDGET` allowance) with the rubric + budget-capped source
+  listing (`build_testgen_prompt` in `prompts.py`) → parses output into
+  `test_*.py` files via `### FILE:` markers (deterministic containment:
+  every file must `compile()` AND define a `test_*`; rejected chunks are
+  reported, a fully unusable generation → `status="skipped"`) → persists
+  the suite + `_manifest.json` to `<artifact>/generated_tests/`
+  (provenance — never the candidate's `workspace/`) → runs it via
+  `ExecRunner.execute(workspace, test_target=…)` — PR8's
+  `EXEC_TEST_TARGET` contract: the dir mounts read-only at
+  `/srv/test_target`, exec_runner copies it to `/tmp/gen_tests`, pytest
+  runs there, coverage stays `--source=/work` and the build phase never
+  compiles generated files (a broken generated test can't be attributed
+  to the candidate's build). JUnit parsing now also captures failing
+  test names (`failed_tests`). The signal lands in the same envelope —
+  `ANALYSIS.md` "Generated test suite" section + `analysis.json` +
+  `eval_analysis` summary + `test_execution` `phase=eval_testgen` event
+  + flat `generated_tests` summary on the results API — and the suite is
+  staged into the eval workspace for the judge (a candidate-authored
+  `generated_tests/` is a reserved name, evicted at staging).
+  `SCORING_TESTGEN=0` disables (conftest pins it); knobs:
+  `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
+  `TESTGEN_MAX_FILES` (8), `TESTGEN_MAX_TOKENS` (4096),
+  `TESTGEN_TIMEOUT_SECONDS` (240).
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
-  `prompts.py`), `scoring/` (`models.py` — analysis.json/API pydantic
+  `prompts.py`, `testgen.py` — PR8 suite generation + exec orchestration),
+  `scoring/` (`models.py` — analysis.json/API pydantic
   contract, `collectors.py` — SignalCollector protocol + registry,
-  `static.py` — lizard collector, `render.py` — ANALYSIS.md), db `scores`,
-  `api/routers/results.py` (`SandboxResult.analysis`),
-  `api/schemas.py` (AnalysisReport re-export)
+  `static.py` — lizard collector, `exec.py` — exec collector,
+  `render.py` — ANALYSIS.md), `sandbox/exec.py` (ExecRunner — docker
+  lifecycle + result parsing + `test_target` mount) +
+  `sandbox/images/exec.Dockerfile` + `exec_runner.py` (in-image
+  build/test/coverage phases + `EXEC_TEST_TARGET` mode), db `scores`,
+  `api/routers/results.py` (`SandboxResult.analysis` + `.exec` +
+  `.generated_tests`), `api/schemas.py` (AnalysisReport re-export)
 - **Verify:**
   - Unit: `tests/unit/evaluator/` (`test_evaluate.py`, `test_scores.py`,
     `test_prompts.py`) — mocked runtime; staging, timeout salvage, malformed
-    scores covered; `tests/unit/scoring/` (`test_static.py`,
-    `test_collectors.py`, `test_render.py`) — workspaces with known CC
-    values, skip/cap/symlink rules, collector isolation, markdown render
+    scores covered; `tests/unit/evaluator/test_testgen.py` — fake gateway
+    client + fake exec runner: skip/error semantics, deterministic
+    containment of bad output (fences/markers/syntax/no-test rejection),
+    provenance layout, pass-rate metrics, cap knobs;
+    `tests/unit/scoring/` (`test_static.py`,
+    `test_collectors.py`, `test_render.py`, `test_exec.py`) — workspaces
+    with known CC values, skip/cap/symlink rules, collector isolation,
+    markdown render, exec metric mapping/status semantics;
+    `tests/unit/sandbox/test_exec.py` — exec run-argv isolation posture
+    (incl. `test_target` mount/env), result file/sentinel parsing,
+    timeout/missing-image paths; `tests/unit/sandbox/test_exec_runner.py`
+    — in-image helpers (junit failed names, target staging, discovery)
+  - Exec integration: `tests/integration/test_exec_scoring.py`
+    (`@pytest.mark.docker`) — real `heg-exec` container executes a trivial
+    artifact: build ok, 2/2 tests pass, coverage measured, container
+    force-removed, workspace untouched; PR8 cases run an external
+    `generated_tests` dir via `test_target` (pass + red suite w/ failing
+    names, mount stays byte-identical)
   - Results API: `tests/unit/api/test_results.py` — analysis embedded when
     `<artifact>/analysis.json` exists+valid, null otherwise
   - Manual: scores + rationale visible on results page; rationale for
-    cyclomatic_complexity cites measured CC values
+    cyclomatic_complexity cites measured CC values; build/test failures
+    visible in analysis + eval events
 - **Depends on:** F2, F4, artifacts from a completed run
 
 ### F8 — Results UI ✅

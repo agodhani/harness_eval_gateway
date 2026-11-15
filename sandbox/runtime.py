@@ -202,6 +202,7 @@ class SandboxRuntime:
             ["docker", *args],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
             check=False,
         )

@@ -37,7 +37,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -50,6 +50,7 @@ from orchestrator import events as orch_events
 from orchestrator import runner, state_machine
 from orchestrator.rubric import RubricContent, create_rubric_version
 from sandbox.preview import ScanCache
+from scoring.exec import exec_summary_dict
 from scoring.render import ANALYSIS_JSON_FILENAME
 
 router = APIRouter(tags=["results"])
@@ -75,6 +76,49 @@ def reset_scan_cache() -> None:
 class DimensionScore(BaseModel):
     score: float
     rationale: str = ""
+
+
+class ExecSummary(BaseModel):
+    """Flat exec-signal headline (PR7) — the measured build/test/coverage
+    outcome, derived from ``analysis.json``'s ``exec`` signal so UI
+    consumers don't re-derive it from nested metrics. ``status`` mirrors
+    the SignalReport status: ``ok`` = measured (build/tests may still be
+    red), ``skipped``/``error`` = not measured."""
+
+    status: str = "ok"
+    build_ok: bool | None = None
+    tests_detected: bool = False
+    tests_ok: bool | None = None
+    tests_collected: int = 0
+    tests_passed: int = 0
+    tests_failed: int = 0
+    tests_errors: int = 0
+    tests_skipped: int = 0
+    coverage_percent: float | None = None
+    timed_out: bool = False
+    duration_seconds: float | None = None
+    detail: str | None = None  # skip reason / error message
+
+
+class GeneratedTestsSummary(BaseModel):
+    """Flat generated-tests headline (PR8) — the evaluator-authored pytest
+    suite's outcome, derived from ``analysis.json``'s ``generated_tests``
+    signal. ``status`` mirrors the SignalReport status: ``ok`` = measured
+    (the suite may still be red), ``skipped``/``error`` = not measured."""
+
+    status: str = "ok"
+    model: str | None = None
+    files_written: int = 0
+    files_rejected: int = 0
+    tests_detected: bool = False
+    tests_collected: int = 0
+    tests_passed: int = 0
+    tests_failed: int = 0
+    tests_errors: int = 0
+    pass_rate: float | None = None
+    coverage_percent: float | None = None
+    timed_out: bool = False
+    detail: str | None = None  # skip reason / error message
 
 
 class ArtifactRef(BaseModel):
@@ -123,6 +167,12 @@ class SandboxResult(BaseModel):
     # (``<artifact>/analysis.json``). None when the evaluator ran without
     # signal collection or the report is unreadable.
     analysis: AnalysisReport | None = None
+    # PR7: flat view of the ``exec`` signal (build/test/coverage measured
+    # in the locked heg-exec container) — None when no analysis exists.
+    exec: ExecSummary | None = None
+    # PR8: flat view of the ``generated_tests`` signal (LLM-written suite
+    # executed against the submission) — None when no analysis exists.
+    generated_tests: GeneratedTestsSummary | None = None
 
 
 class RubricVersionOut(BaseModel):
@@ -229,6 +279,66 @@ def _load_analysis(jail: Path, sandbox: Sandbox) -> AnalysisReport | None:
         )
     except Exception:  # noqa: BLE001 — unreadable/invalid report -> absent
         return None
+
+
+def _exec_summary(analysis: AnalysisReport | None) -> ExecSummary | None:
+    """Flatten ``analysis``'s exec signal into a :class:`ExecSummary`.
+
+    None when there's no analysis or no exec signal at all; skipped/error
+    signals surface their status + a short detail (skip reason or error).
+    Malformed metric values degrade to the bare status — analysis.json is
+    persisted candidate-adjacent data, so summary coercion never 500s.
+    """
+    if analysis is None:
+        return None
+    sig = analysis.signal("exec")
+    if sig is None:
+        return None
+    detail = sig.error or (sig.warnings[0] if sig.warnings else None)
+    try:
+        return ExecSummary.model_validate(
+            {"status": sig.status, "detail": detail}
+            | exec_summary_dict(sig.metrics)
+        )
+    except ValidationError:
+        return ExecSummary(
+            status=sig.status, detail=detail or "malformed exec metrics"
+        )
+
+
+def _generated_tests_summary(
+    analysis: AnalysisReport | None,
+) -> GeneratedTestsSummary | None:
+    """Flatten ``analysis``'s ``generated_tests`` signal (PR8) — same
+    contract as :func:`_exec_summary`."""
+    if analysis is None:
+        return None
+    sig = analysis.signal("generated_tests")
+    if sig is None:
+        return None
+    m = sig.metrics
+    detail = sig.error or (sig.warnings[0] if sig.warnings else None)
+    try:
+        return GeneratedTestsSummary(
+            status=sig.status,
+            model=m.get("model"),
+            files_written=int(m.get("files_written") or 0),
+            files_rejected=int(m.get("files_rejected") or 0),
+            tests_detected=bool(m.get("tests_detected")),
+            tests_collected=int(m.get("tests_collected") or 0),
+            tests_passed=int(m.get("tests_passed") or 0),
+            tests_failed=int(m.get("tests_failed") or 0),
+            tests_errors=int(m.get("tests_errors") or 0),
+            pass_rate=m.get("pass_rate"),
+            coverage_percent=m.get("coverage_percent"),
+            timed_out=bool(m.get("timed_out")),
+            detail=detail,
+        )
+    except (ValidationError, TypeError, ValueError):
+        return GeneratedTestsSummary(
+            status=sig.status,
+            detail=detail or "malformed generated_tests metrics",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +548,7 @@ def get_run_results(
             ttl_seconds=scan_ttl,
         )
         plan = scan.plan if scan is not None else None
+        analysis = _load_analysis(jail, sb)
         dimensions: dict[str, DimensionScore] = {}
         overall: DimensionScore | None = None
         rubric_id: UUID | None = None
@@ -483,7 +594,9 @@ def get_run_results(
                     if scan is not None
                     else []
                 ),
-                analysis=_load_analysis(jail, sb),
+                analysis=analysis,
+                exec=_exec_summary(analysis),
+                generated_tests=_generated_tests_summary(analysis),
             )
         )
 

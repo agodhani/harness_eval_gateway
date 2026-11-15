@@ -88,6 +88,20 @@ class Settings(BaseSettings):
     # codeload accepts a Bearer token). Public repos work without it.
     GITHUB_TOKEN: str = ""
 
+    # --- Objective scoring (PR7) ---
+    # Exec-signal kill switch — when false the collector reports "skipped"
+    # instead of running candidate build/tests/coverage inside the locked
+    # heg-exec container. Read via os.environ first (compose passes it
+    # through) so an explicit env var beats .env, then this setting.
+    SCORING_EXEC: bool = True
+    # Repo-built image ExecRunner spawns for exec scoring (never pulled):
+    #   docker build -f sandbox/images/exec.Dockerfile -t heg-exec:latest .
+    EXEC_IMAGE: str = "heg-exec:latest"
+    # PR8 generated-test signal kill switch — when false the evaluator skips
+    # LLM test-suite generation entirely (no gateway call, no exec). Same
+    # env-first resolution as SCORING_EXEC.
+    SCORING_TESTGEN: bool = True
+
     # --- Run pacing (PR15) ---
     # One active run at a time: approvals landing while a run executes (or
     # is already queued) park in status="queued" and promote FIFO when the
