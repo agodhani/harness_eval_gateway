@@ -78,7 +78,7 @@ adapters are added.
 1. **Web UI (Next.js)** — submission form (task prompt, model, harnesses,
    skill packs, evaluator model), rubric review/edit screen, run status,
    live execution timeline (SSE), persisted timeline replay, results matrix,
-   flag when evaluator model == participant model.
+   flag when evaluator model == any participant model.
 2. **Control API + Orchestrator (FastAPI, async)** — validates submissions,
    expands run matrix, generates rubric via gateway, drives run state machine
    (`submitted → rubric_review → provisioning → running → evaluating →
@@ -404,11 +404,13 @@ or tests change.
 - **Charts: recharts** (F13) — picked over visx/chart.js: smallest fit for
   grouped/stacked bars + a composed bar-line trend under React 19 / Next 16;
   themed via hexes mirroring globals.css tokens (no CSS-var reads). The
-  cross-run trends endpoint (`GET /api/analytics/runs`) prices each point at
-  its own run's resolved price unless `?price_model=` forces uniform
+  cross-run trends endpoint (`GET /api/analytics/runs`) prices each point's
+  cells at their own model's rate (unlisted → the run's resolved rate)
+  unless `?price_model=` forces uniform
   repricing — same "estimate, not billing" framing as F9.
 - **Model catalog/install ride the gateway, not Ollama direct (F14)** — the
-  api mints a run-null `heg.*` cred to call `GET /v1/models`, which keeps the
+  api mints a sandbox-null `heg.*` service cred to call `GET /v1/models`,
+  which keeps the
   provider abstraction (Ollama today, OpenRouter next) behind the gateway;
   the gateway stamps `X-HEG-Provider` so the UI only offers install when the
   upstream can `ollama pull` (`POST /v1/models/pull` → `/api/pull`, 501

@@ -249,7 +249,7 @@ class RunOut(BaseModel):
     task_prompt: str
     model_name: str
     config: dict[str, Any]
-    # True when the evaluator model equals the participant model — the UI
+    # True when the evaluator model equals ANY participant model — the UI
     # flags this so users notice non-independent judging.
     same_model_eval: bool
     created_at: datetime

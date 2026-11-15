@@ -11,7 +11,9 @@
 - plain counts for ``shell_command`` / ``file_op`` / ``test_execution`` /
   ``error``; ``wall_clock_seconds`` = max−min event ts for the sandbox.
 - ``estimated_cost_usd`` at the selected ``price_model`` (api/pricing.py
-  ``PRICE_TABLE``); default = the run's model when priced, else first entry.
+  ``PRICE_TABLE``); auto mode (no param) costs each sandbox at its own
+  participant model's listed rate, falling back to the run's resolved rate
+  for unlisted models.
 
 Evaluator-phase split: eval creds carry the *participant* sandbox_id (F7 —
 judge events land on the participant timeline), so judge traffic would pollute

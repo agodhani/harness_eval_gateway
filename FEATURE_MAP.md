@@ -241,7 +241,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 - **What:** run list; per-run matrix (sandbox × rubric dimension); score +
   rationale view; link to timeline replay; artifact download; flag when
-  evaluator model == participant model. The run-detail rubric table also
+  evaluator model == any participant model. The run-detail rubric table also
   renders per-sandbox score columns + an `overall` row once results exist
   (`RunDetailClient.tsx` `RubricView` + `getRunResults` poll while
   `evaluating`).
@@ -526,8 +526,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `RunTrends{price_model|null, price_table, points[]}` — per-run roll-up of
   the same participant/evaluator event split (eval boundary per sandbox),
   latest-`overall`-score-per-sandbox mean, participant + judge tokens,
-  errors, cost. No `price_model` → each point costed at its own run's
-  resolved price ("auto", `price_model:null`); with it → uniform repricing.
+  errors, cost. No `price_model` → each point's participant cells costed
+  at their own model's listed rate (unlisted → the run's resolved rate;
+  `RunTrends.price_model:null` "auto" — a point's own `price_model` is the
+  single applied key, or null when cells priced at mixed rates); with it →
+  uniform repricing.
   Newest-first; `limit` 1–100 default 20.
 - **Where:** `api/routers/analytics.py` (`get_run_trends` +
   `_eval_boundaries`/`_is_eval_event` helpers, also used by the per-run
@@ -618,10 +621,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **What:** reverses the original "compare harnesses, not models" decision —
   a run can now vary the participant model as well as the harness config.
   - **Spec** — `RunCreate.models` (optional list, deduped/normalized against
-    `model_name`; omitted → `[model_name]`; empty/blank/over-`MAX_MATRIX_CELLS`
-    rejected). `HarnessConfigIn.model` optionally pins one config to a single
+    `model_name`; omitted/empty/blank → `[model_name]`;
+    over-`MAX_MATRIX_CELLS` expanded cells rejected).
+    `HarnessConfigIn.model` optionally pins one config to a single
     model, overriding the run list for that config. Normalized set persisted
-    as `run.config.models`; `RunOut`/`RunSummary` expose `models`.
+    as `run.config.models`; `RunSummary` exposes `models` (`RunOut` carries
+    it under `config`).
   - **Expansion** — `orchestrator/matrix.py`: `participant_models`,
     `expanded_configs` (config × models minus explicit overrides, deduped),
     `sandbox_model` (per-sandbox resolution). `lifecycle.py` provisions one
@@ -633,7 +638,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     *every* participant model; results carry `SandboxResult.model` +
     `RunResults.models`; analytics resolves pricing per sandbox's own model
     (`price_model` param still forces a uniform reprice, now optional) and
-    adds a `models` rollup (`ModelAnalytics`: tokens/cost/score aggregates
+    adds a `models` rollup (`ModelAnalytics`: tokens/cost aggregates
     per participant model).
   - **UI** — submit form gains a multi-model picker (chips + live catalog,
     Ollama pull preserved); run detail/list show the model set; results
@@ -649,6 +654,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `web/app/runs/page.tsx`, `web/app/runs/[id]/RunDetailClient.tsx`,
   `web/app/runs/[id]/results/{ResultsClient,AnalyticsSection}.tsx`,
   `web/app/runs/[id]/analysis/AnalysisClient.tsx`,
+  `web/app/runs/[id]/timeline/TimelineClient.tsx`,
+  `web/lib/timelineAnalytics.ts` (per-sandbox price basis in strips),
   `web/components/RunConsoleLive.tsx`, `web/app/globals.css`
 - **Verify:**
   - Unit: `tests/unit/orchestrator/test_matrix.py` (defaults, overrides,
