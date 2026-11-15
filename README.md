@@ -25,7 +25,8 @@ Docker sandboxes, rubric-scored by a sandboxed evaluator.
 
 **Live artifact previews** — produced artifacts run in throwaway, locked-down
 containers straight from the results page: static sites served on localhost,
-pygame/desktop apps streamed interactively via noVNC:
+GUI apps (pygame/pyglet/arcade/tkinter) streamed interactively via noVNC,
+python web apps (flask/django/…) executed and served on localhost:
 
 ![Live pygame preview over noVNC](docs/screenshots/ui/snake-novnc.png)
 

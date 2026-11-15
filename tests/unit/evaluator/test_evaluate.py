@@ -193,6 +193,8 @@ async def test_evaluate_happy_path(seeded, session_factory) -> None:
     assert spec.env["GATEWAY_CRED"] == "heg.testcred"
     assert spec.env["MODEL_NAME"] == "judge-model"
     assert spec.env["MAX_ITERS"] == "5"
+    # judge_max_tokens unset -> no MAX_TOKENS env (miniloop 4096 default)
+    assert "MAX_TOKENS" not in spec.env
     assert spec.env["GATEWAY_BASE_URL"] == "http://gateway:8080"
     assert spec.env["EVENTS_INGEST_URL"] == "http://gateway:8080/internal/events"
     assert "EVAL_PROMPT.md" in spec.env["TASK_PROMPT"]
@@ -228,6 +230,16 @@ async def test_evaluate_happy_path(seeded, session_factory) -> None:
     assert analysis_ev.payload["status"] == "ok"
     assert analysis_ev.payload["summary"]["files_analyzed"] == 1
     assert all(e.sandbox_id == seeded["sandbox_id"] for e in events)
+
+
+async def test_evaluate_judge_max_tokens_reaches_env(
+    seeded, session_factory
+) -> None:
+    """judge_max_tokens -> MAX_TOKENS in the eval sandbox env — the raised
+    output cap keeps thinking judges from truncating scores.json."""
+    fake = FakeRuntime()
+    await _eval(seeded, session_factory, fake, judge_max_tokens=8192)
+    assert fake.specs[0].env["MAX_TOKENS"] == "8192"
 
 
 async def test_evaluate_missing_scores_returns_empty_and_events(

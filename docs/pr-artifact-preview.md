@@ -3,6 +3,11 @@
 **Branch:** `feat/p25-artifact-preview` → `main`
 **Feature:** F12 in `FEATURE_MAP.md`
 
+> *Update — PR3 (`feat/pr3-preview-types`) added a third type
+> `python-server` and more desktop stacks (pyglet/arcade/tkinter). The
+> detection, endpoint, and isolation details below describe the original
+> F12 PR; current behavior lives in `FEATURE_MAP.md` F12.*
+
 Lets a reviewer **see and run** the artifact a sandbox produced, straight from
 the results page — before this, artifacts were download-only. Two preview
 types ship behind the same Preview column:
@@ -116,8 +121,8 @@ The FS probe behind these fields is memoized by `ScanCache` for
 `PREVIEW_SCAN_TTL_SECONDS` (default 30s) — workspaces only change on
 re-snapshot.
 
-`PreviewPlan.type`/`PreviewOut.type` stay open (`static | desktop | …`) for
-`python-server` previews later.
+`PreviewPlan.type`/`PreviewOut.type` stayed open (`static | desktop | …`) —
+`python-server` landed in PR3 (see note above).
 
 ## Files changed (vs `main`)
 
@@ -163,9 +168,11 @@ re-snapshot.
 
 ## Follow-ups (not in this PR)
 
-- `python-server` previews (uvicorn/flask apps — needs a serve-command
+- ~~`python-server` previews (uvicorn/flask apps — needs a serve-command
   contract), more desktop stacks (pyglet/arcade/tkinter — needs baked deps
-  or a wheelhouse mount; no egress means deps must pre-exist).
+  or a wheelhouse mount; no egress means deps must pre-exist)~~ — done
+  (PR3): `heg-preview-server` + `server-preview-runner.py` relay runner;
+  pyglet/arcade/tkinter baked into `heg-preview-desktop`.
 - ~~Cache `previewable`/`preview_type` probing~~ — done (PR2): `ScanCache`
   memoizes the results-GET probe for `PREVIEW_SCAN_TTL_SECONDS` (30s; the
   workspace only changes on re-snapshot).

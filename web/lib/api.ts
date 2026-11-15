@@ -19,6 +19,7 @@ export const API_BASE: string =
 export type RunStatus =
   | "submitted"
   | "rubric_review"
+  | "queued"
   | "provisioning"
   | "running"
   | "evaluating"
@@ -28,6 +29,7 @@ export type RunStatus =
 export const RUN_STATUSES: readonly RunStatus[] = [
   "submitted",
   "rubric_review",
+  "queued",
   "provisioning",
   "running",
   "evaluating",
@@ -74,6 +76,7 @@ export type EventType =
   | "llm_request"
   | "llm_response"
   | "tool_call"
+  | "tool_result"
   | "shell_command"
   | "file_op"
   | "test_execution"
@@ -91,6 +94,7 @@ export const EVENT_TYPES: readonly string[] = [
   "llm_request",
   "llm_response",
   "tool_call",
+  "tool_result",
   "shell_command",
   "file_op",
   "test_execution",
@@ -343,6 +347,10 @@ export interface SandboxResult {
   rubric_version?: number | null;
   dimensions: Record<string, DimensionScore>;
   overall: DimensionScore | null;
+  /** Judge/eval pipeline failure detail when the sandbox produced no Score
+   * rows — distinguishes "judge failed" from "no rubric scores" (pending or
+   * never evaluated). Null/absent when scored or not yet evaluated. */
+  eval_error?: string | null;
   /** PR6: measured signals (analysis.json); null when not collected. */
   analysis?: AnalysisReport | null;
   /** Optional artifact ids if/when the results API exposes them. */
@@ -909,7 +917,7 @@ export function artifactDownloadUrl(artifactId: string): string {
 export interface PreviewCandidate {
   /** Workspace-relative entry path, e.g. "index.html" or "game/main.py". */
   entry: string;
-  /** Preview type — "static" | "desktop" (pygame via noVNC). */
+  /** Preview type — "static" | "desktop" (GUI via noVNC) | "python-server" (web app). */
   type: string;
 }
 
@@ -917,7 +925,7 @@ export interface PreviewOut {
   preview_id: string;
   run_id: string;
   sandbox_id: string;
-  /** Preview type — "static" | "desktop" (pygame via noVNC); python-server planned. */
+  /** Preview type — "static" | "desktop" (GUI via noVNC) | "python-server" (web app). */
   type: string;
   /** Docker container status: created | running | exited | ... */
   status: string;
@@ -942,10 +950,11 @@ export function getPreview(runId: string, sandboxId: string): Promise<PreviewOut
  * the requested plan matches (an explicit different entry/type replaces it).
  * `entry` (workspace-relative) picks an explicit entry point — for
  * ambiguous scans or artifacts detection missed; `.html` → static,
- * `.py` → desktop. `type` overrides the pick: alone it selects the first
- * candidate of that type; with `entry` it forces the plan type —
- * `{entry: "x.py", type: "static"}` serves the file instead of executing
- * it ("view source"), while `desktop` requires a `.py` entry.
+ * `.py` → desktop, `manage.py` → python-server. `type` overrides the
+ * pick: alone it selects the first candidate of that type; with `entry`
+ * it forces the plan type — `{entry: "x.py", type: "static"}` serves the
+ * file instead of executing it ("view source"), while `desktop` and
+ * `python-server` require a `.py` entry.
  */
 export function startPreview(
   runId: string,
