@@ -198,7 +198,7 @@ export default function PreviewControls({
         selected ? { entry: selected.entry, type: selected.type } : undefined,
       );
       setThumbOverride({ superseded: thumbnail, ref: t });
-      setThumbBust(String(Date.now()));
+      setThumbBust((prev) => `${prev}.`);
     } catch (e) {
       setError(
         e instanceof ApiError ? e.detail : "thumbnail capture failed",

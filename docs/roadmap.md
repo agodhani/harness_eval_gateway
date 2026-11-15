@@ -89,7 +89,7 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR3, PR9,
+- **Depth 0 (start immediately):** PR1,
   PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
   PR17 (soft ←13 satisfied — PR13 landed).
 - **Depth 1:** PR8 (←7), PR10 (←9), PR14 (←1, +12 soft),

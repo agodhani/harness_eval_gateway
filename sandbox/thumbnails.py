@@ -52,7 +52,8 @@ Design notes:
   a world-writable scratch dir inside the artifact dir; the api validates
   the PNG magic before atomically ``os.replace``-ing it into place and
   writing ``thumbnail.json`` (``{version, captured_at, type, entry,
-  generator}`` — staleness is decided by explicit re-capture, not mtimes).
+  generator, width, height, bytes}`` — staleness is decided by explicit
+  re-capture, not mtimes).
   Any step failing raises :class:`ThumbnailError`; the stack and scratch
   are always cleaned up. Sync like :class:`PreviewManager` — the router
   wraps calls in ``asyncio.to_thread``.
