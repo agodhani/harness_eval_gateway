@@ -2,7 +2,8 @@
 
 The sandbox runs the Python shim (``python3 -m adapters.codex``) which writes
 ``$CODEX_HOME/config.toml`` (custom provider ``heg`` → gateway
-``/v1/responses``), spawns ``codex exec --json``, and translates its JSONL
+``/v1/responses`` + top-level ``notify`` → ``adapters.common.hooks``), spawns
+``codex exec --json``, and translates its JSONL
 item stream into normalized events via ``translate.py``.
 """
 
@@ -32,6 +33,10 @@ MANIFEST = {
     "install": "npm i -g @openai/codex",
     "image": IMAGE,
     "requires": ["gateway:/v1/responses"],
+    "hooks": (
+        "notify → adapters.common.hooks "
+        "(agent-turn-complete → checkpoint, last-assistant-message)"
+    ),
 }
 
 
