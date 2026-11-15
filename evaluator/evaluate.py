@@ -501,7 +501,6 @@ async def evaluate_sandbox(
             Path(art_root).parent / "eval" if art_root else DEFAULT_EVAL_ROOT
         )
     eval_sid = eval_sandbox_id(sandbox_uuid)
-    deadline = time.monotonic() + float(timeout_seconds)
 
     # ---- objective signals (PR6) --------------------------------------------
     # Parse-only measurement of the candidate workspace — runs BEFORE staging
@@ -670,6 +669,7 @@ async def evaluate_sandbox(
 
     last_status: dict[str, Any] = {"status": "unknown"}
     timed_out = False
+    deadline = time.monotonic() + float(timeout_seconds)
     try:
         last_status, timed_out = await _wait_for_exit(
             rt,

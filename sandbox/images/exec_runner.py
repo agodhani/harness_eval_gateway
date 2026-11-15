@@ -405,7 +405,10 @@ def main() -> int:
     # the suite comes from the staged copy instead — pytest is pointed at the
     # dir explicitly (its basedir insertion covers sibling test modules;
     # PYTHONPATH=/work set above covers candidate imports).
-    test_files = _test_files(tests_root if tests_root is not None else WORK)
+    if TEST_TARGET_SRC is not None:
+        test_files = _test_files(tests_root) if tests_root is not None else []
+    else:
+        test_files = _test_files(WORK)
     if not test_files:
         if TEST_TARGET_SRC is not None:
             warnings.append("EXEC_TEST_TARGET produced no test_*.py files")

@@ -234,21 +234,28 @@ def _generated_tests_summary(
     if sig is None:
         return None
     m = sig.metrics
-    return GeneratedTestsSummary(
-        status=sig.status,
-        model=m.get("model"),
-        files_written=int(m.get("files_written") or 0),
-        files_rejected=int(m.get("files_rejected") or 0),
-        tests_detected=bool(m.get("tests_detected")),
-        tests_collected=int(m.get("tests_collected") or 0),
-        tests_passed=int(m.get("tests_passed") or 0),
-        tests_failed=int(m.get("tests_failed") or 0),
-        tests_errors=int(m.get("tests_errors") or 0),
-        pass_rate=m.get("pass_rate"),
-        coverage_percent=m.get("coverage_percent"),
-        timed_out=bool(m.get("timed_out")),
-        detail=sig.error or (sig.warnings[0] if sig.warnings else None),
-    )
+    detail = sig.error or (sig.warnings[0] if sig.warnings else None)
+    try:
+        return GeneratedTestsSummary(
+            status=sig.status,
+            model=m.get("model"),
+            files_written=int(m.get("files_written") or 0),
+            files_rejected=int(m.get("files_rejected") or 0),
+            tests_detected=bool(m.get("tests_detected")),
+            tests_collected=int(m.get("tests_collected") or 0),
+            tests_passed=int(m.get("tests_passed") or 0),
+            tests_failed=int(m.get("tests_failed") or 0),
+            tests_errors=int(m.get("tests_errors") or 0),
+            pass_rate=m.get("pass_rate"),
+            coverage_percent=m.get("coverage_percent"),
+            timed_out=bool(m.get("timed_out")),
+            detail=detail,
+        )
+    except (ValidationError, TypeError, ValueError):
+        return GeneratedTestsSummary(
+            status=sig.status,
+            detail=detail or "malformed generated_tests metrics",
+        )
 
 
 # ---------------------------------------------------------------------------
