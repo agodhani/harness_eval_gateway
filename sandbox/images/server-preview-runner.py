@@ -104,7 +104,13 @@ def _listeners() -> set[tuple[str, int]]:
 
 
 def _is_loopback(host: str) -> bool:
-    return host.startswith("127.") or host == "::1"
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return addr.is_loopback
 
 
 def _pick(listeners: set[tuple[str, int]]) -> tuple[str, int]:

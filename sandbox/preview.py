@@ -193,10 +193,10 @@ _READ_CAP = 512 * 1024  # only the head of a file is scanned for evidence
 # http.server — stdlib, runs in any python image; `from http.server` is the
 # import form, matched by the dotted pattern below).
 _SERVER_ENTRY_NAMES = (
+    "manage.py",
     "main.py",
     "app.py",
     "server.py",
-    "manage.py",
     "wsgi.py",
     "asgi.py",
     "run.py",
