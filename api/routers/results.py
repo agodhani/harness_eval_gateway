@@ -44,7 +44,7 @@ from sqlalchemy.orm import Session
 from api.config import get_settings
 from api.deps import get_db
 from api.schemas import AnalysisReport, RubricOut
-from db.models import Artifact, Rubric, Run, Sandbox, Score
+from db.models import Artifact, Event, Rubric, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
 from orchestrator import events as orch_events
 from orchestrator import runner, state_machine
@@ -106,6 +106,10 @@ class SandboxResult(BaseModel):
     rubric_version: int | None = None
     dimensions: dict[str, DimensionScore] = Field(default_factory=dict)
     overall: DimensionScore | None = None
+    # Judge/eval pipeline failure detail — set only when the eval failed and
+    # the sandbox has no Score rows, so the UI can distinguish "judge failed"
+    # from "no rubric scores" (pending / never evaluated). Null otherwise.
+    eval_error: str | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     # F12: whether the snapshot workspace has a previewable entry —
     # drives the results-page Preview button. preview_candidates lists
@@ -225,6 +229,31 @@ def _load_analysis(jail: Path, sandbox: Sandbox) -> AnalysisReport | None:
         )
     except Exception:  # noqa: BLE001 — unreadable/invalid report -> absent
         return None
+
+
+# ---------------------------------------------------------------------------
+# eval-failure surfacing
+# ---------------------------------------------------------------------------
+
+#: ``error``-event payload markers that mean "the eval pipeline failed this
+#: sandbox": evaluator-emitted phases (spawn died, scores.json missing/
+#: invalid, final eval_failed marker) plus the orchestrator's
+#: ``stage="evaluation"`` catch-all (evaluate_sandbox exceptions).
+_EVAL_FAIL_PHASES = frozenset(
+    {"eval_scores_failed", "eval_spawn_failed", "eval_failed"}
+)
+
+
+def _eval_error_label(payload: dict[str, Any]) -> str | None:
+    """Short eval-failure label for a sandbox ``error`` event, else None."""
+    phase = payload.get("phase")
+    if phase not in _EVAL_FAIL_PHASES and payload.get("stage") != "evaluation":
+        return None
+    code = payload.get("reason") or phase or "evaluation"
+    detail = payload.get("detail") or payload.get("message")
+    if isinstance(detail, str) and detail.strip():
+        return f"{code}: {detail.strip()[:160]}"
+    return str(code)
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +402,27 @@ def get_run_results(
     for art in artifacts:
         artifacts_by_sandbox.setdefault(art.sandbox_id, []).append(art)
 
+    # Eval-failure events — latest label per sandbox. Only surfaced on
+    # sandboxes with NO Score rows: a retry that eventually produced scores
+    # supersedes its earlier failed attempts.
+    eval_failures: dict[UUID, str] = {}
+    if sandbox_ids:
+        err_rows = session.execute(
+            select(Event.sandbox_id, Event.payload)
+            .where(
+                Event.run_id == run_id,
+                Event.sandbox_id.in_(sandbox_ids),
+                Event.type == "error",
+            )
+            .order_by(Event.id)
+        ).all()
+        for sid, payload in err_rows:
+            if sid is None or not isinstance(payload, dict):
+                continue
+            label = _eval_error_label(payload)
+            if label is not None:
+                eval_failures[sid] = label
+
     jail = _artifact_jail()
     scan_ttl = get_settings().PREVIEW_SCAN_TTL_SECONDS
     results: list[SandboxResult] = []
@@ -416,6 +466,9 @@ def get_run_results(
                 rubric_version=sb_rubric_version,
                 dimensions=dimensions,
                 overall=overall,
+                eval_error=(
+                    None if by_sandbox.get(sb.id) else eval_failures.get(sb.id)
+                ),
                 artifacts=[
                     ArtifactRef(id=a.id, kind=a.kind, path=a.path)
                     for a in artifacts_by_sandbox.get(sb.id, [])

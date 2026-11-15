@@ -70,6 +70,7 @@ def build_eval_env(
     cred: str,
     model: str,
     max_iters: int = DEFAULT_EVAL_MAX_ITERS,
+    max_tokens: int | None = None,
 ) -> dict[str, str]:
     """Env vars for the eval sandbox, via the miniloop adapter contract.
 
@@ -77,6 +78,10 @@ def build_eval_env(
     same egress path participant sandboxes use (cred auth stamps run/sandbox
     ids; each per-eval cred carries the sandbox under evaluation, so judge
     events land on that sandbox's timeline).
+
+    ``max_tokens`` raises the judge's per-request output cap when set —
+    thinking judges burn completion tokens before emitting tool calls, so
+    the 4096 miniloop default can truncate scores.json into invalid JSON.
     """
     gw = sandbox_gateway_url(gateway_base_url)
     return miniloop_adapter.env(
@@ -86,6 +91,7 @@ def build_eval_env(
         model=model,
         events_ingest_url=f"{gw}/internal/events",
         max_iters=max_iters,
+        max_tokens=max_tokens,
     )
 
 
