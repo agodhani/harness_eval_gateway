@@ -434,7 +434,7 @@ or tests change.
   `<runner>-proxy:{8000|6080}` for the executed types (Xvnc is
   loopback-only, so noVNC is desktop's only window → bigger settle +
   virtual-time budget). Trigger is explicit-only (`POST .../thumbnail`,
-  bounded ~45s; results GET never spawns — it only jailed-probes
+  bounded ~2min; results GET never spawns — it only jailed-probes
   `thumbnail.png` + the `thumbnail.json` meta sidecar). Failures → 502 and
   "no thumbnail", never a broken results read.
 - **Charts: recharts** (F13) — picked over visx/chart.js: smallest fit for

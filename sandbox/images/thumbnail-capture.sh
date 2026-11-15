@@ -1,5 +1,5 @@
 #!/bin/sh
-# heg-preview-thumb entrypoint — screenshot CAPTURE_URL to $THUMB_OUT.
+# heg-preview-thumb entrypoint — screenshot CAPTURE_URL to /out/capture.png.
 #
 # Polls CAPTURE_URL until the preview stack serves, then runs chromium
 # headless once and exits; the caller validates the PNG on the host
@@ -18,7 +18,7 @@
 set -u
 
 : "${CAPTURE_URL:?CAPTURE_URL is required}"
-OUT="${THUMB_OUT:-/out/capture.png}"
+OUT=/out/capture.png
 WIDTH="${THUMB_WIDTH:-1280}"
 HEIGHT="${THUMB_HEIGHT:-800}"
 BUDGET="${THUMB_BUDGET_MS:-10000}"

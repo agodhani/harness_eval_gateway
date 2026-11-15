@@ -20,7 +20,7 @@
 #   THUMB_TIMEOUT_SECONDS  hard kill bound on chromium, default 45
 #   THUMB_READY_SECONDS    in-container wait for CAPTURE_URL to serve,
 #                          default 30
-#   THUMB_OUT              output path, default /out/capture.png
+#   (output path is fixed — /out/capture.png)
 #
 # python:3.12-slim base — same as the api + other preview images (typically
 # already pulled). `chromium` is the Debian package (headless=new mode);

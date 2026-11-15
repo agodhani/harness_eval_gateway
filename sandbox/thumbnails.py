@@ -273,6 +273,7 @@ class Thumbnailer:
             scratch.mkdir(mode=0o777)
             scratch.chmod(0o777)
         except OSError as exc:
+            shutil.rmtree(scratch, ignore_errors=True)
             raise ThumbnailError(
                 f"cannot create capture scratch dir under {artifact_dir}: {exc}"
             ) from exc

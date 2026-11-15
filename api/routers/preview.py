@@ -276,6 +276,24 @@ def _jail() -> Path:
     return Path(get_settings().ARTIFACT_ROOT).resolve()
 
 
+def _resolve_plan(workspace: Path, body: PreviewStart | None):
+    """Shared ``entry``/``type`` → plan resolution for the POST bodies."""
+    entry = body.entry if body else None
+    ptype = ((body.type or "").strip().lower() or None) if body else None
+    if entry:
+        # Explicit pick: jailed to the workspace; type= may override the
+        # suffix-derived plan (e.g. serve a .py instead of executing it).
+        return plan_for_entry(workspace, entry, ptype)
+    if ptype:
+        # Type-only override: first detected candidate of that type —
+        # a both-matching workspace defaults to static, {"type":
+        # "desktop"} reaches the game.
+        return plan_for_type(workspace, ptype)
+    # No explicit pick → the scan's default (candidates[0]; results
+    # payload carries the full list for the UI's dropdown).
+    return scan_preview(workspace).plan
+
+
 @router.post(
     "/api/runs/{run_id}/sandboxes/{sandbox_id}/preview",
     response_model=PreviewOut,
@@ -317,19 +335,7 @@ async def start_preview(
             detail="no snapshot workspace found for this sandbox",
         )
     try:
-        if entry:
-            # Explicit pick: jailed to the workspace; type= may override the
-            # suffix-derived plan (e.g. serve a .py instead of executing it).
-            plan = plan_for_entry(workspace, entry, ptype)
-        elif ptype:
-            # Type-only override: first detected candidate of that type —
-            # a both-matching workspace defaults to static, {"type":
-            # "desktop"} reaches the game.
-            plan = plan_for_type(workspace, ptype)
-        else:
-            # No explicit pick → the scan's default (candidates[0]; results
-            # payload carries the full list for the UI's dropdown).
-            plan = scan_preview(workspace).plan
+        plan = _resolve_plan(workspace, body)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -454,19 +460,6 @@ class ThumbOut(BaseModel):
 
 def _thumb_url(run_id: UUID, sandbox_id: UUID) -> str:
     return f"/api/runs/{run_id}/sandboxes/{sandbox_id}/thumbnail"
-
-
-def _resolve_plan(
-    workspace: Path, body: PreviewStart | None
-):
-    """Shared entry/type → plan resolution (same contract as start_preview)."""
-    entry = body.entry if body else None
-    ptype = ((body.type or "").strip().lower() or None) if body else None
-    if entry:
-        return plan_for_entry(workspace, entry, ptype)
-    if ptype:
-        return plan_for_type(workspace, ptype)
-    return scan_preview(workspace).plan
 
 
 @router.post(

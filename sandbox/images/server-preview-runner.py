@@ -51,8 +51,8 @@ from pathlib import Path
 ARTIFACT_RO = Path("/srv/artifact-ro")
 WORK = Path("/work")
 
-RELAY_PORT = int(os.environ.get("RUNNER_BIND_PORT", "8000"))
-APP_PORT = RELAY_PORT  # canonical port the socat sidecar targets
+RELAY_PORT = 8000  # canonical port the socat sidecar targets
+APP_PORT = RELAY_PORT
 _CHUNK = 64 * 1024
 
 

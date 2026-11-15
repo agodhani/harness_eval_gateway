@@ -107,6 +107,10 @@ export default function PreviewControls({
   const [preview, setPreview] = useState<PreviewOut | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pick, setPick] = useState<string>(options[0]?.key ?? "");
+  // A results refresh can replace `candidates` — fall back to the first
+  // option when the stored pick no longer exists so the dropdown and the
+  // POSTed plan can't disagree.
+  const selected = options.find((o) => o.key === pick) ?? options[0];
   const [thumbOverride, setThumbOverride] = useState<{
     superseded: ThumbRef | null;
     ref: ThumbRef;
@@ -182,11 +186,10 @@ export default function PreviewControls({
     setCapturing(true);
     setError(null);
     try {
-      const opt = options.find((o) => o.key === pick);
       const t = await captureThumbnail(
         runId,
         sandboxId,
-        opt ? { entry: opt.entry, type: opt.type } : undefined,
+        selected ? { entry: selected.entry, type: selected.type } : undefined,
       );
       setThumbOverride({ superseded: thumbnail, ref: t });
       setThumbBust(String(Date.now()));
@@ -205,7 +208,7 @@ export default function PreviewControls({
     if (phase === "active" && preview?.url) {
       window.open(preview.url, "_blank", "noopener,noreferrer");
     } else {
-      void start(options.find((o) => o.key === pick));
+      void start(selected);
     }
   }
 
@@ -329,7 +332,7 @@ export default function PreviewControls({
         {options.length > 1 ? (
           <>
             <select
-              value={pick}
+              value={selected?.key ?? ""}
               onChange={(e) => setPick(e.target.value)}
               disabled={busy}
               title="Entry point + how to preview it — 'view source' serves a .py file instead of executing it"
@@ -344,8 +347,8 @@ export default function PreviewControls({
             <button
               type="button"
               className="btn btn--sm"
-              onClick={() => void start(options.find((o) => o.key === pick))}
-              disabled={busy || !pick}
+              onClick={() => void start(selected)}
+              disabled={busy || !selected}
               title="Serve the selected entry in a throwaway container (new tab)"
             >
               {phase === "starting" ? "starting…" : "▶ Preview"}
