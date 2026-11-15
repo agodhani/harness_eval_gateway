@@ -44,14 +44,16 @@ export interface SandboxStrip {
 
 /**
  * Convert the analytics response into one strip per sandbox, in API order
- * (server sorts by started_at). `price_model` is resolved server-side — the
- * API 422s unknown models — so it always indexes `price_table`.
+ * (server sorts by started_at). Pricing basis mirrors the analysis page:
+ * an explicit `price_model` reprices every sandbox uniformly, while null
+ * (auto) prices each sandbox at its own resolved `sb.price_model`. Server
+ * 422s unknown models, so the resolved key always indexes `price_table`.
  */
 export function sandboxStrips(analytics: RunAnalytics): SandboxStrip[] {
-  const price = analytics.price_table[analytics.price_model];
-  return analytics.sandboxes.map((sb) =>
-    toStrip(sb, price, analytics.price_model),
-  );
+  return analytics.sandboxes.map((sb) => {
+    const priceName = analytics.price_model ?? sb.price_model;
+    return toStrip(sb, analytics.price_table[priceName], priceName);
+  });
 }
 
 function toStrip(

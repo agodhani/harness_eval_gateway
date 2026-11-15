@@ -27,6 +27,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F12 | Artifact preview (static html + desktop GUI via noVNC + python-server web apps, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `sandbox/images/server-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
 | F13 | Graphical analysis page + cross-run trends (recharts) | ✅ | `web/app/runs/[id]/analysis/`, `api/routers/analytics.py` (`GET /api/analytics/runs`), `web/app/runs/[id]/results/ResultsClient.tsx` (totals row) | `tests/unit/api/test_analytics.py` (trends section) |
 | F14 | Eval iteration (re-score + versioned rubrics) | ✅ | `api/routers/results.py`, `orchestrator/lifecycle.py` (`rescore_run`), `orchestrator/rubric.py` (`create_rubric_version`), `web/app/runs/[id]/results/RescoreControls.tsx` | `tests/unit/orchestrator/test_rescore.py`, `tests/unit/api/test_results.py`, `tests/unit/evaluator/test_evaluate.py` |
+| F15 | Submit UX: live model picker + install, named harness configs | ✅ | `api/routers/models.py`, `gateway/main.py` (`/v1/models/pull`), `web/app/submit/page.tsx`, `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`, `orchestrator/provision.py` | `tests/unit/api/test_models.py`, `tests/unit/gateway/test_proxy.py` (pull), `tests/unit/db/test_migrations.py`, `tests/unit/orchestrator/test_provision.py` (name) |
+| F16 | Model-vs-model matrix (config × model) + per-model analytics | ✅ | `orchestrator/matrix.py`, `orchestrator/lifecycle.py`, `orchestrator/provision.py`, `api/schemas.py`, `api/routers/runs.py`, `results.py`, `analytics.py`, `web/app/submit/page.tsx`, `web/lib/api.ts`, `web/app/runs/[id]/` (detail, results, analysis) | `tests/unit/orchestrator/test_matrix.py`, `test_lifecycle.py`, `test_provision.py`, `tests/unit/api/test_runs.py`, `test_results.py`, `test_analytics.py` |
 
 ## Feature details
 
@@ -363,7 +365,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 - **What:** run list; per-run matrix (sandbox × rubric dimension); score +
   rationale view; link to timeline replay; artifact download; flag when
-  evaluator model == participant model. The run-detail rubric table also
+  evaluator model == any participant model. The run-detail rubric table also
   renders per-sandbox score columns + an `overall` row once results exist
   (`RunDetailClient.tsx` `RubricView` + `getRunResults` poll while
   `evaluating`). Sandboxes whose eval failed surface an `eval failed` badge
@@ -719,8 +721,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `RunTrends{price_model|null, price_table, points[]}` — per-run roll-up of
   the same participant/evaluator event split (eval boundary per sandbox),
   latest-`overall`-score-per-sandbox mean, participant + judge tokens,
-  errors, cost. No `price_model` → each point costed at its own run's
-  resolved price ("auto", `price_model:null`); with it → uniform repricing.
+  errors, cost. No `price_model` → each point's participant cells costed
+  at their own model's listed rate (unlisted → the run's resolved rate;
+  `RunTrends.price_model:null` "auto" — a point's own `price_model` is the
+  single applied key, or null when cells priced at mixed rates); with it →
+  uniform repricing.
   Newest-first; `limit` 1–100 default 20.
 - **Where:** `api/routers/analytics.py` (`get_run_trends` +
   `_eval_boundaries`/`_is_eval_event` helpers, also used by the per-run
@@ -810,6 +815,120 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - UI: results page → pick an older version → matrix shows that pass's
     scores; edit rubric → save & re-score → run returns to `evaluating`.
 - **Depends on:** F7 (evaluator), F8 (results page), F4 (artifact store)
+
+### F15 — Submit UX: live model picker + install, named harness configs ✅
+
+- **What:** three submit-form upgrades shipped together.
+  - **Live model catalog** — `GET /api/models` proxies the gateway's
+    existing `GET /v1/models` (api mints a run-null `heg.*` cred with
+    `GATEWAY_CRED_SECRET`), normalizes `{object:"list",data:[...]}` →
+    `{models:[{id,...}], provider, pull_supported}`. The gateway stamps
+    `X-HEG-Provider` on the response so `pull_supported` is true only for
+    the `ollama` upstream. Submit page replaces the offline
+    `MODEL_SUGGESTIONS` fallback with the live ids once the catalog is
+    non-empty, for the two model ComboInputs.
+  - **Model install** — `POST /api/models/pull` → gateway
+    `POST /v1/models/pull` → upstream `POST /api/pull` (ollama-only —
+    `501` for other providers), NDJSON progress streamed end-to-end
+    (httpx `send(stream=True)` → `StreamingResponse`, pull body forced to
+    `{"name","stream":true}`). Submit page: a `name:tag` input + pull
+    button with a single status line — while streaming it shows the last
+    ollama status plus a `completed`/`total` percent, then the outcome
+    (errors styled as field errors); on success the model catalog
+    refreshes and the new id enters the suggestions. `pull_supported=false`
+    hides the control entirely.
+  - **Named harness configs** — optional `name` (≤64 chars) per
+    `HarnessConfigIn`; persisted on `sandboxes.name` (migration
+    `a2b3c4d5e6f7`), default `<adapter>-<sandbox-id[:8]>` assigned in
+    `spawn_one` after the UUID exists. Surfaced as `name` on
+    `SandboxOut`/`SandboxResult`/`SandboxAnalytics` and rendered —
+    with short-id fallback/tooltips — in the submit rows, run detail
+    (config summary + sandboxes table + rubric breakdown headers),
+    timeline sandbox filter + row labels, results matrix + artifacts
+    table, analytics column heads, analysis-page legend chips, and the
+    live run-console lane heads.
+- **Where:** `api/routers/models.py` (`ModelsOut`/`ModelPullIn`/
+  `ModelInfo`, + `api/main.py` include), `gateway/main.py` (`pull_model`,
+  provider header), `api/schemas.py` (`HarnessConfigIn.name`,
+  `SandboxOut.name`, `SandboxResult.name`, `SandboxAnalytics.name`),
+  `db/models.py` + `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`,
+  `orchestrator/provision.py` (`_sandbox_name` default),
+  `api/routers/results.py` + `analytics.py` (`name` fields),
+  `web/lib/api.ts` (`listModels`, `pullModel` streaming),
+  `web/app/submit/page.tsx`, `web/app/runs/[id]/` (`RunDetailClient`,
+  `timeline/TimelineClient`, `results/ResultsClient`,
+  `results/AnalyticsSection`, `analysis/AnalysisClient`),
+  `web/components/RunConsoleLive.tsx`
+- **Verify:**
+  - Unit: `tests/unit/api/test_models.py` (normalize, provider flag,
+    gateway error/unreachable, pull streaming + validation),
+    `tests/unit/gateway/test_proxy.py` (pull passthrough/stream-forced/
+    501 non-ollama/auth), `tests/unit/db/test_migrations.py`
+    (upgrade/downgrade on sqlite, single head, type match),
+    `tests/unit/orchestrator/test_provision.py` (custom name persisted,
+    default/whitespace → `adapter-shortid`),
+    `tests/unit/api/test_runs.py` (name round-trip, 64-char bound),
+    `test_results.py`/`test_analytics.py` (`name` in responses)
+  - Manual: `curl localhost:8001/api/models` → catalog + `pull_supported`;
+    `curl -N -X POST localhost:8001/api/models/pull -d '{"name":"qwen3:8b"}'`
+    → ndjson progress lines; submit form → model dropdown lists live ids,
+    install streams progress; run detail/timeline/results/analytics show
+    the configured names (or `adapter-shortid` defaults).
+- **Depends on:** F1 (submit form), F3 (gateway `/v1/models` + creds)
+
+### F16 — Model-vs-model matrix (config × model) + per-model analytics ✅
+
+- **What:** reverses the original "compare harnesses, not models" decision —
+  a run can now vary the participant model as well as the harness config.
+  - **Spec** — `RunCreate.models` (optional list, deduped/normalized against
+    `model_name`; omitted/empty/blank → `[model_name]`;
+    over-`MAX_MATRIX_CELLS` expanded cells rejected).
+    `HarnessConfigIn.model` optionally pins one config to a single
+    model, overriding the run list for that config. Normalized set persisted
+    as `run.config.models`; `RunSummary` exposes `models` (`RunOut` carries
+    it under `config`).
+  - **Expansion** — `orchestrator/matrix.py`: `participant_models`,
+    `expanded_configs` (config × models minus explicit overrides, deduped),
+    `sandbox_model` (per-sandbox resolution). `lifecycle.py` provisions one
+    sandbox per expanded cell; `provision.py` persists the resolved model in
+    `Sandbox.harness_config.model`, folds it into the sandbox name/label,
+    and passes it to the adapter env as `MODEL_NAME`. Per-cell spawn failures
+    stay isolated.
+  - **API** — `same_model_eval` now compares the evaluator model against
+    *every* participant model; results carry `SandboxResult.model` +
+    `RunResults.models`; analytics resolves pricing per sandbox's own model
+    (`price_model` param still forces a uniform reprice, now optional) and
+    adds a `models` rollup (`ModelAnalytics`: tokens/cost aggregates
+    per participant model).
+  - **UI** — submit form gains a multi-model picker (chips + live catalog,
+    Ollama pull preserved); run detail/list show the model set; results
+    matrix + timeline + live console label each cell with its model;
+    AnalyticsSection gains a sandbox/model segmented view with per-model
+    aggregation and per-model cost; the analysis page prices each sandbox at
+    its own model's rate in "auto" mode.
+- **Where:** `orchestrator/matrix.py` (new), `orchestrator/lifecycle.py`,
+  `orchestrator/provision.py`, `api/schemas.py` (`RunCreate.models`,
+  `HarnessConfigIn.model`, `MAX_MATRIX_CELLS`, `models` on run/results/
+  analytics schemas), `api/routers/runs.py`, `api/routers/results.py`,
+  `api/routers/analytics.py`, `web/lib/api.ts`, `web/app/submit/page.tsx`,
+  `web/app/runs/page.tsx`, `web/app/runs/[id]/RunDetailClient.tsx`,
+  `web/app/runs/[id]/results/{ResultsClient,AnalyticsSection}.tsx`,
+  `web/app/runs/[id]/analysis/AnalysisClient.tsx`,
+  `web/app/runs/[id]/timeline/TimelineClient.tsx`,
+  `web/lib/timelineAnalytics.ts` (per-sandbox price basis in strips),
+  `web/components/RunConsoleLive.tsx`, `web/app/globals.css`
+- **Verify:**
+  - Unit: `tests/unit/orchestrator/test_matrix.py` (defaults, overrides,
+    dedupe, limits), `test_lifecycle.py` (matrix expansion + spawn isolation),
+    `test_provision.py` (model persisted in harness_config + env),
+    `tests/unit/api/test_runs.py` (validation, normalization, same-model
+    eval across the set), `test_results.py` (`model`/`models` fields),
+    `test_analytics.py` (per-model pricing + rollup)
+  - Manual: submit with 2 configs × 2 models → 4 sandboxes named/labeled
+    per cell; results matrix + analytics "model" view group by model; cost
+    auto-mode prices each cell at its own model.
+- **Depends on:** F15 (PR1 — named configs + live model picker this stacks
+  on); best after multi-provider support so >1 model is usable.
 
 ## Implementation sequence
 

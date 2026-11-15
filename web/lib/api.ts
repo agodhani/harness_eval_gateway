@@ -162,19 +162,54 @@ export function dimensionOrder(keys: string[]): string[] {
   return [...canon, ...rest];
 }
 
-/** `adapter · pack1, pack2` — mirrors analytics._sandbox_label. */
+/** `adapter · model · pack1, pack2` — mirrors analytics._sandbox_label.
+ * The model segment only appears on multi-model matrix cells (PR14 — the
+ * ``model`` key is injected by matrix expansion); single-model runs keep
+ * the ``adapter · packs`` label. */
 export function harnessConfigLabel(
   hc: Record<string, unknown> | undefined,
 ): string {
   const adapter = String(hc?.adapter ?? hc?.harness ?? "?");
+  const parts = [adapter];
+  const model = String(hc?.model ?? "").trim();
+  if (model) parts.push(model);
   const packs = Array.isArray(hc?.skill_packs) ? (hc.skill_packs as unknown[]) : [];
-  return packs.length ? `${adapter} · ${packs.join(", ")}` : adapter;
+  if (packs.length) parts.push(packs.join(", "));
+  return parts.join(" · ");
+}
+
+/** Effective participant-model set for a run — [model_name] + config extras
+ * + any per-config ``model`` pins (PR14 — a pin counts as a participant even
+ * outside the run's model list). Falls back to [modelName] for runs that
+ * predate config.models. */
+export function runModels(
+  modelName: string,
+  configModels: unknown,
+  harnessConfigs?: { model?: unknown }[],
+): string[] {
+  const list = Array.isArray(configModels)
+    ? (configModels as unknown[]).map(String).filter(Boolean)
+    : [];
+  const out = [modelName];
+  for (const m of list) {
+    if (m && !out.includes(m)) out.push(m);
+  }
+  for (const hc of harnessConfigs ?? []) {
+    const m = String(hc?.model ?? "").trim();
+    if (m && !out.includes(m)) out.push(m);
+  }
+  return out;
 }
 
 export interface HarnessConfig {
   adapter: string;
   skill_packs: string[];
   system_prompt_extra?: string | null;
+  /** Optional label persisted onto the sandbox row (PR1 named configs). */
+  name?: string | null;
+  /** PR14: pin this config to a single participant model, overriding the
+   * run's model list for this config (one cell at the pinned model). */
+  model?: string | null;
 }
 
 export interface Budgets {
@@ -192,6 +227,9 @@ export const DEFAULT_BUDGETS: Budgets = {
 export interface RunCreate {
   task_prompt: string;
   model_name: string;
+  /** PR14: ADDITIONAL participant models — matrix expands to
+   * harness_configs × ([model_name] + models). Omit for single-model. */
+  models?: string[] | null;
   harness_configs: HarnessConfig[];
   evaluator_model?: string | null;
   budgets?: Budgets;
@@ -199,6 +237,8 @@ export interface RunCreate {
 
 export interface RunConfig {
   harness_configs?: HarnessConfig[];
+  /** PR14: effective participant-model set persisted at submit. */
+  models?: string[];
   evaluator_model?: string | null;
   budgets?: Budgets;
   same_model_eval?: boolean;
@@ -208,6 +248,8 @@ export interface RunConfig {
 export interface SandboxOut {
   id: string;
   harness_config: Record<string, unknown>;
+  /** Config label; "<adapter>-<shortid>" default assigned at provisioning. */
+  name: string | null;
   status: string;
   terminal_reason: string | null;
   artifact_path: string | null;
@@ -272,6 +314,8 @@ export interface RunSummary {
   status: string;
   task_prompt: string; // truncated to 200 chars server-side
   model_name: string;
+  /** PR14: full participant-model set (model_name + extras). */
+  models?: string[];
   created_at: string;
   finished_at: string | null;
   sandbox_count: number;
@@ -339,6 +383,11 @@ export interface AnalysisReport {
 export interface SandboxResult {
   sandbox_id: string;
   harness_config: Record<string, unknown>;
+  /** Config label from the sandbox row (PR1 named harness configs). */
+  name?: string | null;
+  /** PR14: participant model this sandbox ran (config ``model`` cell else
+   * the run's model_name). */
+  model?: string;
   status: string;
   terminal_reason: string | null;
   artifact_path: string | null;
@@ -381,6 +430,8 @@ export interface RunResults {
   run_id: string;
   status: string;
   model_name: string;
+  /** PR14: effective participant-model set ([model_name] + extras). */
+  models?: string[];
   evaluator_model: string | null;
   same_model_eval: boolean | null;
   /** PR5: the ?rubric_version= filter echoed back (null = newest-wins). */
@@ -690,10 +741,35 @@ export interface EvaluatorActivity {
 
 export interface SandboxAnalytics {
   sandbox_id: string;
+  /** Config label from the sandbox row (PR1 named harness configs). */
+  name?: string | null;
   label: string;
   harness_config: Record<string, unknown>;
+  /** PR14: participant model this sandbox ran + the price-table key its
+   * estimated_cost_usd was computed at. */
+  model: string;
+  price_model: string;
   status: string;
   terminal_reason: string | null;
+  llm_turns: number;
+  tokens: TokenUsage;
+  latency_ms: LatencyStats;
+  tool_calls: ToolCallStats;
+  skill_calls: SkillCallStats;
+  shell_commands: number;
+  file_ops: number;
+  test_executions: number;
+  errors: number;
+  wall_clock_seconds: number;
+  estimated_cost_usd: number;
+  evaluator: EvaluatorActivity | null;
+}
+
+/** PR14 — per-model rollup across a run's sandboxes (compare-by-model). */
+export interface ModelAnalytics {
+  model: string;
+  price_model: string;
+  sandbox_count: number;
   llm_turns: number;
   tokens: TokenUsage;
   latency_ms: LatencyStats;
@@ -711,10 +787,12 @@ export interface SandboxAnalytics {
 export interface RunAnalytics {
   run_id: string;
   model_name: string;
-  /** Which price_table entry `estimated_cost_usd` was computed at. */
-  price_model: string;
+  /** Explicit ?price_model= basis, or null for auto per-model pricing. */
+  price_model: string | null;
   price_table: Record<string, ModelPrice>;
   sandboxes: SandboxAnalytics[];
+  /** PR14: participant-model rollups (one per model in the run's matrix). */
+  models: ModelAnalytics[];
 }
 
 export function getRunAnalytics(runId: string, priceModel?: string): Promise<RunAnalytics> {
@@ -757,8 +835,10 @@ export interface RunTrendPoint {
   evaluator_llm_turns: number;
   evaluator_tokens: TokenUsage;
   evaluator_errors: number;
-  /** Price-table key `estimated_cost_usd` was computed at. */
-  price_model: string;
+  /** Price-table key `estimated_cost_usd` was computed at — the explicit
+   * param or the run's resolved rate; null when auto mode mixed per-model
+   * rates (no single honest key). */
+  price_model: string | null;
   estimated_cost_usd: number;
   /** Judge tokens priced at the evaluator model's rate when listed. */
   evaluator_cost_usd: number;
@@ -981,4 +1061,112 @@ export async function checkHealth(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// models (PR1 — live picker + ollama install via the gateway)
+// ---------------------------------------------------------------------------
+
+/** One upstream model entry (OpenAI /v1/models shape, extra fields kept). */
+export interface ModelInfo {
+  id: string;
+  [key: string]: unknown;
+}
+
+export interface ModelsOut {
+  models: ModelInfo[];
+  /** Gateway provider name — "ollama" | "openrouter" | "openai" |
+   * "anthropic" (PR12 adds these + PROVIDER_ROUTES per-model providers;
+   * pull stays ollama-only). */
+  provider: string | null;
+  /** True when the upstream can install models (ollama pull). */
+  pull_supported: boolean;
+}
+
+export function listModels(): Promise<ModelsOut> {
+  return request<ModelsOut>("/api/models");
+}
+
+/** One NDJSON progress line from `ollama pull` (status/digest/total/completed). */
+export interface ModelPullEvent {
+  status?: string;
+  digest?: string;
+  total?: number;
+  completed?: number;
+  error?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * POST /api/models/pull — streams the gateway's NDJSON progress lines;
+ * `onProgress` fires per line. Resolves with the last event; throws ApiError
+ * on non-2xx or when ANY stream line reports `{"error": ...}` — mid-stream
+ * errors surface too, not just a terminal one (the first error wins).
+ */
+export async function pullModel(
+  name: string,
+  onProgress?: (ev: ModelPullEvent) => void,
+): Promise<ModelPullEvent | null> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/api/models/pull`, {
+      method: "POST",
+      headers: {
+        Accept: "application/x-ndjson",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name }),
+    });
+  } catch (err) {
+    throw new ApiError(
+      0,
+      `cannot reach API at ${API_BASE} — is the backend running? (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+  if (!res.ok) throw await parseError(res);
+  if (!res.body) return null;
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let last: ModelPullEvent | null = null;
+  let firstError: ModelPullEvent | null = null;
+
+  const take = (line: string): ModelPullEvent | null => {
+    const s = line.trim();
+    if (!s) return null;
+    try {
+      return JSON.parse(s) as ModelPullEvent;
+    } catch {
+      return null; // non-JSON progress line — ignore
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const ev = take(buf.slice(0, nl));
+      buf = buf.slice(nl + 1);
+      if (ev) {
+        last = ev;
+        if (ev.error && !firstError) firstError = ev;
+        onProgress?.(ev);
+      }
+    }
+  }
+  buf += decoder.decode();
+  const tailEv = take(buf);
+  if (tailEv) {
+    last = tailEv;
+    if (tailEv.error && !firstError) firstError = tailEv;
+    onProgress?.(tailEv);
+  }
+
+  if (firstError) {
+    throw new ApiError(502, String(firstError.error), firstError);
+  }
+  return last;
 }

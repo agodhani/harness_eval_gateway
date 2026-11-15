@@ -11,12 +11,14 @@ CLI, Aider, custom minimal loops, ...) on coding tasks, with a **custom AI
 gateway** as the observability layer.
 
 A user submits a task (e.g. "build a replica of 2048") plus a run
-configuration. The system spawns isolated Docker sandboxes — one per harness —
-all running the **same underlying model**, so results compare *harness
-capability*, not raw model quality. An independent LLM evaluator scores each
-produced artifact against a human-approved rubric. All model traffic and agent
-activity are captured as structured events powering a live + persisted
-execution timeline.
+configuration. The system spawns isolated Docker sandboxes across a
+**config × model matrix** — each harness configuration runs on every selected
+participant model (a per-config `model` overrides the run-level model list;
+PR14 reversed the original harnesses-only stance). Results compare harness
+capability and model quality side by side. An independent LLM evaluator
+scores each produced artifact against a human-approved rubric. All model
+traffic and agent activity are captured as structured events powering a live
++ persisted execution timeline.
 
 **MVP shape:** 1 model (Ollama, small local model) × 2 harness configs → 2
 concurrent sandboxes. Evaluator runs afterwards in its own sandbox. Since
@@ -27,8 +29,10 @@ adapters are added.
 
 ## Core concepts
 
-- **Run** — one submitted evaluation. Spec = task prompt + model + set of
-  harnesses + skill packs + evaluator model.
+- **Run** — one submitted evaluation. Spec = task prompt + model(s) + set of
+  harnesses + skill packs + evaluator model. `model_name` is the default
+  participant model; `models` (normalized into `config.models`) selects the
+  full participant set.
 - **Sandbox** — a Docker container running one harness instance on the task,
   with an identical clean initial repo/workspace as its siblings.
 - **Harness adapter** — per-harness plugin: knows how to install, configure,
@@ -74,7 +78,7 @@ adapters are added.
 1. **Web UI (Next.js)** — submission form (task prompt, model, harnesses,
    skill packs, evaluator model), rubric review/edit screen, run status,
    live execution timeline (SSE), persisted timeline replay, results matrix,
-   flag when evaluator model == participant model.
+   flag when evaluator model == any participant model.
 2. **Control API + Orchestrator (FastAPI, async)** — validates submissions,
    expands run matrix, generates rubric via gateway, drives run state machine
    (`submitted → rubric_review → [queued →] provisioning → running →
@@ -310,13 +314,15 @@ or tests change.
 | F12 | Artifact preview (static html + desktop GUI via noVNC + python-server web apps) |
 | F13 | Graphical analysis page + cross-run trends (recharts) |
 | F14 | Eval iteration: re-score runs + versioned rubric edits |
+| F15 | Submit UX: live model picker + install, named harness configs |
+| F16 | Model-vs-model matrix: multi-model runs + per-model analytics |
 
 ## Post-MVP roadmap
 
 - Additional harness adapters beyond the shipped six (miniloop, codex,
   claude_code, pi, deepseek, aider)
 - Anthropic-compatible gateway endpoint (`/v1/messages`)
-- Model-vs-model comparisons (multi-model matrices)
+- ~~Model-vs-model comparisons (multi-model matrices)~~ — **landed as F16**
 - ~~Objective scoring: build/test execution, coverage~~ — **landed PR6
   (static analysis) + PR7 (exec+coverage)** via `scoring/` signal
   collectors
@@ -327,14 +333,7 @@ or tests change.
 - Gateway response caching / deterministic replay
 - Multi-host / K8s sandbox scaling
 - Auth, saved run templates, share links
-- Dynamic model picker — populate the submit form's model suggestions from
-  `ollama list` (gateway `/v1/models` pass-through already exists) instead of
-  the hardcoded `MODEL_SUGGESTIONS`, plus an install option (api endpoint →
-  `ollama pull`, stream pull progress into the UI)
-- Named harness configs — optional per-config label set at submit, persisted
-  onto the sandbox and surfaced in the timeline filter, results matrix, and
-  analytics so same-adapter sandboxes are distinguishable; default to
-  `<adapter>-<sandbox short id>` when left blank
+- ~~Dynamic model picker~~ + ~~named harness configs~~ — **landed as F15**
 - Cross-run analytics & cost dashboards
 - Timeline-side analytics — **landed (PR9)**: per-sandbox metrics strip on
   `web/app/runs/[id]/timeline/` (turns/tokens/latency/cost/errors chips +
@@ -369,12 +368,17 @@ or tests change.
 
 ## Decisions log
 
-- Compare **harnesses, not models**: same model across sandboxes in a run.
+- ~~Compare **harnesses, not models**~~ — **reversed by PR14 (F16)**: the
+  matrix is `configs × models`. `model_name` remains the default participant
+  model; `RunCreate.models` selects the full set (defaults to `[model_name]`)
+  and a per-config `model` overrides the run list for that config. Same-model
+  runs remain the default; `same_model_eval` now checks the evaluator against
+  *every* participant model.
 - Custom lightweight gateway (not LiteLLM) — observability is the core value.
 - Two-layer telemetry: passive gateway capture + adapter-translated harness
   events for agent-level detail.
 - HITL rubric approval; frozen pre-launch; shared across sandboxes.
-- Evaluator in own sandbox; UI flags evaluator == participant model.
+- Evaluator in own sandbox; UI flags evaluator == any participant model.
 - LLM-judge scoring, fed by measured signals: PR6 added parse-only static
   analysis (real cyclomatic complexity + static metrics via lizard);
   PR7 added exec-derived checks — build/test/coverage measured in a
@@ -531,8 +535,9 @@ or tests change.
 - **Charts: recharts** (F13) — picked over visx/chart.js: smallest fit for
   grouped/stacked bars + a composed bar-line trend under React 19 / Next 16;
   themed via hexes mirroring globals.css tokens (no CSS-var reads). The
-  cross-run trends endpoint (`GET /api/analytics/runs`) prices each point at
-  its own run's resolved price unless `?price_model=` forces uniform
+  cross-run trends endpoint (`GET /api/analytics/runs`) prices each point's
+  cells at their own model's rate (unlisted → the run's resolved rate)
+  unless `?price_model=` forces uniform
   repricing — same "estimate, not billing" framing as F9.
 - **Rubric versions are immutable** (F14): post-run edits INSERT a new
   `rubrics` row (`parent_id` → edited version, `version = max+1`,
@@ -548,6 +553,23 @@ or tests change.
   interrupted re-score (marked by a `rescore_requested`/`rescore_started`
   checkpoint) to `done` when ≥1 Score row exists — a first-pass eval with
   no marker still fails.
+- **Model catalog/install ride the gateway, not Ollama direct (F15)** — the
+  api mints a sandbox-null `heg.*` service cred to call `GET /v1/models`,
+  which keeps the
+  provider abstraction (Ollama today, OpenRouter next) behind the gateway;
+  the gateway stamps `X-HEG-Provider` so the UI only offers install when the
+  upstream can `ollama pull` (`POST /v1/models/pull` → `/api/pull`, 501
+  otherwise). Pull is **control-plane only**: creds carrying a `sandbox_id`
+  (every participant/evaluator cred, and `heg-dev`) get 403 — only
+  run-scoped service creds (`sandbox_id=None`) may pull; the body is
+  allowlisted to `name`/`model` (+ forced `stream`, `insecure` dropped) and
+  the upstream client is pinned to Ollama (`get_ollama_client`) so pull can
+  never follow per-model routing. Pull progress streams end-to-end as
+  NDJSON — never buffered.
+- **Sandbox names are persisted, not derived (F15)** — `HarnessConfigIn.name`
+  (≤64, whitespace-normalized) lands on `sandboxes.name`; `spawn_one` fills
+  blanks with `<adapter>-<shortid>` once the UUID exists. All UI surfaces
+  read the column — no per-component re-derivation to drift.
 
 ## Working conventions
 

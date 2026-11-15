@@ -15,7 +15,9 @@ import {
   createRun,
   DEFAULT_BUDGETS,
   listHarnesses,
+  listModels,
   listSkillPacks,
+  pullModel,
   SKILL_PACKS,
   type Budgets,
   type HarnessConfig,
@@ -27,11 +29,16 @@ import { ComboInput } from "@/components/ComboInput";
 import { Badge, Card, ErrorNote, InfoNote } from "@/components/ui";
 import { ImportSkillPackDialog } from "./ImportSkillPackDialog";
 
+// Offline fallback for the model pickers — the live list comes from
+// GET /api/models (gateway → upstream) when the backend is reachable.
 const MODEL_SUGGESTIONS = ["qwen3:8b", "qwen2.5-coder:3b", "qwen2.5-coder:7b"];
 const MAX_CONFIGS = 8;
+// Mirrors api/schemas.py MAX_MATRIX_CELLS — configs × models sandbox cap.
+const MAX_MATRIX_CELLS = 32;
 
 interface ConfigRow {
   key: number;
+  name: string;
   adapter: string;
   skill_packs: string[];
   system_prompt_extra: string;
@@ -39,7 +46,13 @@ interface ConfigRow {
 
 let nextKey = 1;
 function blankConfig(): ConfigRow {
-  return { key: nextKey++, adapter: "miniloop", skill_packs: [], system_prompt_extra: "" };
+  return {
+    key: nextKey++,
+    name: "",
+    adapter: "miniloop",
+    skill_packs: [],
+    system_prompt_extra: "",
+  };
 }
 
 export default function SubmitPage() {
@@ -47,6 +60,9 @@ export default function SubmitPage() {
 
   const [taskPrompt, setTaskPrompt] = useState("");
   const [modelName, setModelName] = useState("qwen3:8b");
+  // PR14: ADDITIONAL participant models — the run matrix expands to
+  // harness_configs × ([modelName] + extraModels). Empty = single-model.
+  const [extraModels, setExtraModels] = useState<string[]>([]);
   const [evaluatorModel, setEvaluatorModel] = useState("");
   const [configs, setConfigs] = useState<ConfigRow[]>(() => [blankConfig()]);
   const [budgets, setBudgets] = useState<Budgets>({ ...DEFAULT_BUDGETS });
@@ -56,6 +72,52 @@ export default function SubmitPage() {
   // Harness registry from GET /api/harnesses; static ADAPTERS is the fallback
   // when the API isn't running (page convention: degrade gracefully).
   const [harnesses, setHarnesses] = useState<HarnessManifest[]>([]);
+  // Live model catalog from GET /api/models (gateway → upstream). Empty +
+  // pullSupported=false while offline → MODEL_SUGGESTIONS fallback.
+  const [models, setModels] = useState<string[]>([]);
+  const [pullSupported, setPullSupported] = useState(false);
+  // ollama pull ("install model") state — pullMsg doubles as progress text.
+  const [pullName, setPullName] = useState("");
+  const [pulling, setPulling] = useState(false);
+  const [pullMsg, setPullMsg] = useState<string | null>(null);
+  const [pullFailed, setPullFailed] = useState(false);
+
+  const modelSuggestions = useMemo(
+    () => (models.length > 0 ? models : [...MODEL_SUGGESTIONS]),
+    [models],
+  );
+
+  // Effective participant-model set: primary first, extras deduped against
+  // it and each other (mirrors orchestrator.matrix.participant_models).
+  const participantModels = useMemo(() => {
+    const out: string[] = [];
+    for (const raw of [modelName, ...extraModels]) {
+      const m = raw.trim();
+      if (m && !out.includes(m)) out.push(m);
+    }
+    return out;
+  }, [modelName, extraModels]);
+  const modelCount = participantModels.length;
+  const sandboxCount = configs.length * Math.max(modelCount, 1);
+  // Catalog models eligible as extras — the primary is already a participant.
+  const extraModelOptions = useMemo(
+    () => modelSuggestions.filter((m) => m !== modelName.trim()),
+    [modelSuggestions, modelName],
+  );
+
+  function setPrimaryModel(v: string) {
+    setModelName(v);
+    // A model promoted to primary leaves the extras set (dedupe anyway,
+    // but keeping state clean avoids a stale checked box reappearing).
+    const p = v.trim();
+    if (p) setExtraModels((prev) => prev.filter((m) => m !== p));
+  }
+
+  function toggleExtraModel(m: string) {
+    setExtraModels((prev) =>
+      prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m],
+    );
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -65,6 +127,33 @@ export default function SubmitPage() {
       })
       .catch(() => {
         /* offline fallback: static ADAPTERS list */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** Refetch the live catalog — called after a successful pull too. */
+  async function refreshModels() {
+    try {
+      const r = await listModels();
+      if (r.models.length) setModels(r.models.map((m) => m.id));
+      setPullSupported(r.pull_supported);
+    } catch {
+      /* gateway/api down — MODEL_SUGGESTIONS fallback stays */
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    listModels()
+      .then((r) => {
+        if (cancelled) return;
+        if (r.models.length) setModels(r.models.map((m) => m.id));
+        setPullSupported(r.pull_supported);
+      })
+      .catch(() => {
+        /* offline fallback: static MODEL_SUGGESTIONS */
       });
     return () => {
       cancelled = true;
@@ -143,7 +232,10 @@ export default function SubmitPage() {
   }
 
   const effectiveEvaluator = evaluatorModel.trim() || modelName.trim();
-  const sameModelEval = effectiveEvaluator !== "" && effectiveEvaluator === modelName.trim();
+  // PR14: flagged when the judge equals ANY participant model —
+  // non-independent judging for that matrix cell.
+  const sameModelEval =
+    effectiveEvaluator !== "" && participantModels.includes(effectiveEvaluator);
 
   const canAddConfig = configs.length < MAX_CONFIGS;
 
@@ -166,8 +258,12 @@ export default function SubmitPage() {
       errs.token_budget = "token_budget must be ≥ 1000 (per-run).";
     if (budgets.wall_clock_seconds < 60 || budgets.wall_clock_seconds > 86400)
       errs.wall_clock_seconds = "wall_clock_seconds must be 60–86400.";
+    if (sandboxCount > MAX_MATRIX_CELLS)
+      errs.models =
+        `Matrix too large: ${configs.length} configs × ${modelCount} models ` +
+        `= ${sandboxCount} sandboxes (max ${MAX_MATRIX_CELLS}).`;
     return errs;
-  }, [taskPrompt, modelName, configs, budgets, adapterNames, packNames]);
+  }, [taskPrompt, modelName, configs, budgets, adapterNames, packNames, sandboxCount, modelCount]);
 
   const isValid = Object.keys(validation).length === 0;
 
@@ -186,6 +282,42 @@ export default function SubmitPage() {
     if (canAddConfig) setConfigs((cs) => [...cs, blankConfig()]);
   }
 
+  /** ollama pull via POST /api/models/pull — streams progress into pullMsg. */
+  async function onPull() {
+    const name = pullName.trim();
+    if (!name || pulling) return;
+    setPulling(true);
+    setPullFailed(false);
+    setPullMsg("starting pull…");
+    try {
+      const last = await pullModel(name, (ev) => {
+        const pct =
+          ev.total && ev.completed != null
+            ? ` ${Math.min(100, Math.round((100 * ev.completed) / ev.total))}%`
+            : "";
+        setPullMsg(`${ev.status ?? "pulling"}${pct}`);
+      });
+      setPullMsg(
+        last?.status === "success"
+          ? `installed ${name} — pick it from the model dropdown.`
+          : `pull finished (${last?.status ?? "done"})`,
+      );
+      setPullName("");
+      void refreshModels();
+    } catch (err) {
+      setPullFailed(true);
+      setPullMsg(
+        err instanceof ApiError
+          ? err.detail
+          : err instanceof Error
+            ? err.message
+            : "Pull failed.",
+      );
+    } finally {
+      setPulling(false);
+    }
+  }
+
   function removeConfig(key: number) {
     setConfigs((cs) => (cs.length > 1 ? cs.filter((c) => c.key !== key) : cs));
   }
@@ -200,6 +332,7 @@ export default function SubmitPage() {
       adapter: c.adapter,
       skill_packs: c.skill_packs,
       system_prompt_extra: c.system_prompt_extra.trim() || null,
+      name: c.name.trim() || null,
     }));
 
     setSubmitting(true);
@@ -207,6 +340,8 @@ export default function SubmitPage() {
       const run = await createRun({
         task_prompt: taskPrompt.trim(),
         model_name: modelName.trim(),
+        // PR14: extra participant models — empty list → single-model run.
+        models: extraModels.length ? extraModels : null,
         harness_configs,
         evaluator_model: evaluatorModel.trim() || null,
         budgets,
@@ -231,7 +366,7 @@ export default function SubmitPage() {
           <span className="kicker"><b>01</b> — experiment spec</span>
           <h1>Submit a run</h1>
           <p className="subtitle">
-            One task, one model, N harness configurations — evaluated side by side.
+            One task, N harness configurations × M models — evaluated side by side.
           </p>
         </div>
       </div>
@@ -270,8 +405,8 @@ export default function SubmitPage() {
               <ComboInput
                 id="model_name"
                 value={modelName}
-                onChange={setModelName}
-                suggestions={MODEL_SUGGESTIONS}
+                onChange={setPrimaryModel}
+                suggestions={modelSuggestions}
                 placeholder="qwen3:8b"
                 disabled={submitting}
                 mono
@@ -279,7 +414,11 @@ export default function SubmitPage() {
               {fieldErrors.model_name ? (
                 <span className="field__error">{fieldErrors.model_name}</span>
               ) : (
-                <span className="field__hint">Same model runs in every sandbox — we compare harnesses, not models.</span>
+                <span className="field__hint">
+                  {models.length > 0
+                    ? `${models.length} models from the gateway upstream — the primary model every config runs on.`
+                    : "Primary participant model — runs in every sandbox unless extended below."}
+                </span>
               )}
             </div>
             <div className="field">
@@ -290,7 +429,7 @@ export default function SubmitPage() {
                 id="evaluator_model"
                 value={evaluatorModel}
                 onChange={setEvaluatorModel}
-                suggestions={MODEL_SUGGESTIONS}
+                suggestions={modelSuggestions}
                 placeholder={modelName.trim() || "same as participant"}
                 disabled={submitting}
                 mono
@@ -302,10 +441,101 @@ export default function SubmitPage() {
                   scores may not be fully independent. This is allowed; the results page flags it.
                 </InfoNote>
               ) : (
-                <span className="field__hint">Leave empty to reuse the participant model.</span>
+                <span className="field__hint">
+                  Leave empty to reuse the primary participant model.
+                </span>
               )}
             </div>
           </div>
+          <div className="field" style={{ marginTop: "0.9rem" }}>
+            <label className="field__label" htmlFor="extra_models">
+              Additional models{" "}
+              <span className="faint">(optional — model-vs-model)</span>
+            </label>
+            <div
+              id="extra_models"
+              className="check-list check-list--scroll"
+              role="group"
+              aria-label="Additional participant models"
+            >
+              {extraModelOptions.map((m) => (
+                <label key={m} className="check-item">
+                  <input
+                    type="checkbox"
+                    checked={extraModels.includes(m)}
+                    onChange={() => toggleExtraModel(m)}
+                    disabled={submitting}
+                  />
+                  <code>{m}</code>
+                </label>
+              ))}
+            </div>
+            <span className="field__hint">
+              {modelCount > 1 ? (
+                <>
+                  <strong>
+                    {modelCount} models × {configs.length} configs = {sandboxCount}{" "}
+                    sandboxes
+                  </strong>{" "}
+                  — every config runs once per model.
+                </>
+              ) : (
+                "Check extra models to compare harness AND model in one run — each config runs once per model."
+              )}
+            </span>
+            {fieldErrors.models ? (
+              <span className="field__error">{fieldErrors.models}</span>
+            ) : null}
+          </div>
+          {pullSupported ? (
+            <div className="field" style={{ marginTop: "0.9rem" }}>
+              <label className="field__label" htmlFor="pull_model">
+                Install model <span className="faint">(ollama pull)</span>
+              </label>
+              <div className="row" style={{ flexWrap: "nowrap" }}>
+                <input
+                  id="pull_model"
+                  className="input input--mono"
+                  placeholder="name:tag — e.g. llama3.2:3b"
+                  value={pullName}
+                  onChange={(e) => setPullName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void onPull();
+                    }
+                  }}
+                  disabled={pulling || submitting}
+                  maxLength={255}
+                />
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => void onPull()}
+                  disabled={pulling || submitting || !pullName.trim()}
+                >
+                  {pulling ? (
+                    <>
+                      <span className="spinner" aria-hidden /> pulling…
+                    </>
+                  ) : (
+                    "pull"
+                  )}
+                </button>
+              </div>
+              {pullMsg ? (
+                pullFailed ? (
+                  <span className="field__error">{pullMsg}</span>
+                ) : (
+                  <span className="field__hint">{pullMsg}</span>
+                )
+              ) : (
+                <span className="field__hint">
+                  Downloads a model onto the gateway&apos;s Ollama upstream; progress streams here.
+                </span>
+              )}
+            </div>
+          ) : null}
         </Card>
 
         <Card
@@ -332,6 +562,20 @@ export default function SubmitPage() {
                   </button>
                 </div>
                 <div className="input-row">
+                  <div className="field">
+                    <label className="field__label">
+                      Name <span className="faint">(optional)</span>
+                    </label>
+                    <input
+                      className="input"
+                      value={cfg.name}
+                      maxLength={64}
+                      placeholder={`${cfg.adapter}-<id>`}
+                      onChange={(e) => updateConfig(cfg.key, { name: e.target.value })}
+                      disabled={submitting}
+                      title="Label shown in the timeline filter, results matrix, and analytics"
+                    />
+                  </div>
                   <div className="field">
                     <label className="field__label">Adapter</label>
                     <select

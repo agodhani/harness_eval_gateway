@@ -88,6 +88,12 @@ append-mostly; rebase on main before merge.
   (`POST /api/runs/{id}/rescore` → `lifecycle.rescore_run`), versioned
   post-run rubric edits (`parent_id` chain, `Score.rubric_version`/`seq`
   provenance, `?rubric_version=` results filter). See FEATURE_MAP.md F14.
+- **PR1 — Submit-form UX** (F15): live model picker via `GET /api/models`
+  (gateway `/v1/models` proxied, `pull_supported` flag from the
+  `x-heg-provider` stamp), `POST /api/models/pull` → `ollama pull` with
+  NDJSON progress (control-plane creds only), named harness configs
+  (`sandboxes.name`, default `<adapter>-<shortid>`). Details:
+  `FEATURE_MAP.md` F15.
 - **PR17 — hook/plugin telemetry lane**: shared receiver
   `adapters/common/hooks.py` (`python3 -m adapters.common.hooks <adapter>`)
   wired to claude_code `settings.json` hooks (stdin), codex `notify`
@@ -146,7 +152,7 @@ PR2, PR6, PR7, and PR8 landed). Max safe concurrency ≈ 9 lanes.
 
 ## PR cards
 
-### PR1 — Submit-form UX
+### PR1 — Submit-form UX ✅ landed (F15)
 - **Scope:** dynamic model picker (replace hardcoded `MODEL_SUGGESTIONS`
   with live list from gateway `/v1/models` — pass-through exists; add an
   api proxy route e.g. `GET /api/models` → `GATEWAY_URL`); model install
@@ -287,15 +293,22 @@ See "Already landed" — `evaluator/testgen.py` + `ExecRunner` `test_target`
 - **Verify:** `tests/unit/adapters/test_adapter_contract.py` covers it
   automatically + per-adapter tests; `test_adapter_images.py` docker test.
 
-### PR14 — Model-vs-model comparisons
-- **Scope:** multi-model matrices — vary model as well as harness config
-  (matrix expansion is `configs × model` already; needs spec/UI support +
-  compare-by-model analytics). Reverses the early "harnesses not models"
-  decision — flag in docs.
+### PR14 — Model-vs-model comparisons — ✅ implemented (F16)
+- **Scope:** multi-model matrices — vary model as well as harness config.
+  Reverses the early "harnesses not models" decision — flagged in
+  `AGENTS.md` decisions log + `FEATURE_MAP.md` F16.
+- **Landed:** `RunCreate.models` + per-config `model` override
+  (`api/schemas.py`), `orchestrator/matrix.py` expansion
+  (`configs × models`, deduped, `MAX_MATRIX_CELLS` cap), per-sandbox model
+  persisted in `harness_config.model` + passed to adapters as `MODEL_NAME`,
+  `same_model_eval` across all participant models, per-model pricing +
+  `ModelAnalytics` rollup in analytics, model labels across submit/results/
+  analytics/analysis/run-detail/run-list/console UI.
 - **Touch:** `api/schemas.py` run spec, `orchestrator/` matrix expansion,
   submit form, results/analytics UI.
 - **Depends on:** PR1 (HarnessConfigIn schema churn settles); best after
-  PR12 (needs >1 usable provider to be interesting).
+  PR12 (needs >1 usable provider to be interesting). **Stacked on
+  `feat/pr1-submit-ux` @ `4d1e12d`.**
 
 ### PR15 — Run pacing: submission queue + memory-aware scheduling — ✅ landed
 `queued` run status + `orchestrator/pacing.py` — see "Already landed" and

@@ -9,6 +9,8 @@
 body rewriting, and event attribution via FastAPI's per-request dep cache.
 ``get_upstream_client`` — httpx.AsyncClient pointed at that resolved
 upstream; tests override this dependency with a MockTransport.
+``get_ollama_client`` — same, pinned to Ollama regardless of provider
+routing (``/v1/models/pull`` only).
 ``get_response_cache`` — the opt-in replay cache (PR18); ``None`` unless
 ``GATEWAY_CACHE_ENABLED``. Tests override it to inject a tmp-path store.
 """
@@ -240,6 +242,22 @@ async def get_upstream_client(
     async with httpx.AsyncClient(
         base_url=settings.upstream_base_url_for(provider),
         headers=settings.upstream_headers_for(provider),
+        timeout=settings.UPSTREAM_TIMEOUT,
+    ) as client:
+        yield client
+
+
+async def get_ollama_client() -> AsyncIterator[httpx.AsyncClient]:
+    """Upstream client pinned to Ollama, bypassing provider routing.
+
+    ``/v1/models/pull`` is an Ollama host capability — it must never follow
+    per-model provider routing (a smuggled ``model`` field in the pull body
+    would otherwise retarget a routed dep to a provider that has no pull
+    API).
+    """
+    settings = get_settings()
+    async with httpx.AsyncClient(
+        base_url=settings.OLLAMA_UPSTREAM_URL.rstrip("/"),
         timeout=settings.UPSTREAM_TIMEOUT,
     ) as client:
         yield client

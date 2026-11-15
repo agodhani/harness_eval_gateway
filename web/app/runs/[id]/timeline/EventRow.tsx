@@ -194,12 +194,15 @@ export function EventRow({
   expanded,
   onToggle,
   showSandbox = true,
+  sandboxName,
 }: {
   ev: EventOut;
   expanded: boolean;
   onToggle: (id: number) => void;
   /** Hide the sandbox chip — split lane cells already identify the sandbox. */
   showSandbox?: boolean;
+  /** PR1 named harness config — chip shows the name instead of the short id. */
+  sandboxName?: string;
 }) {
   const isErr = ev.type === "error";
   return (
@@ -225,8 +228,11 @@ export function EventRow({
         <span className="tl-type" data-type={ev.type}>{ev.type}</span>
         {showSandbox ? (
           ev.sandbox_id ? (
-            <span className="tl-sandbox" title={ev.sandbox_id}>
-              {shortId(ev.sandbox_id)}
+            <span
+              className="tl-sandbox"
+              title={sandboxName ? `${sandboxName} · ${ev.sandbox_id}` : ev.sandbox_id}
+            >
+              {sandboxName ? truncate(sandboxName, 18) : shortId(ev.sandbox_id)}
             </span>
           ) : (
             <span className="tl-sandbox faint">run</span>

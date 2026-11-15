@@ -38,6 +38,7 @@ export default function SplitTimeline({
   expanded,
   onToggle,
   onPickLane,
+  names,
 }: {
   rows: SplitRow[];
   lanes: LaneSelection;
@@ -51,6 +52,8 @@ export default function SplitTimeline({
   expanded: Set<number>;
   onToggle: (id: number) => void;
   onPickLane: (side: LaneSide, sandboxId: string) => void;
+  /** PR1 named harness configs — shared-row chips + lane picker labels. */
+  names?: Map<string, string>;
 }) {
   const stripById = new Map(strips.map((s) => [s.sandboxId, s]));
   return (
@@ -61,6 +64,7 @@ export default function SplitTimeline({
           sel={lanes.left}
           sandboxIds={sandboxIds}
           labels={labels}
+          names={names}
           strip={lanes.left ? stripById.get(lanes.left) : undefined}
           count={counts.left}
           onPick={onPickLane}
@@ -70,6 +74,7 @@ export default function SplitTimeline({
           sel={lanes.right}
           sandboxIds={sandboxIds}
           labels={labels}
+          names={names}
           strip={lanes.right ? stripById.get(lanes.right) : undefined}
           count={counts.right}
           onPick={onPickLane}
@@ -94,6 +99,7 @@ export default function SplitTimeline({
               ev={ev}
               expanded={expanded.has(ev.id)}
               onToggle={onToggle}
+              sandboxName={ev.sandbox_id ? names?.get(ev.sandbox_id) : undefined}
             />
           );
         }
@@ -131,6 +137,7 @@ function LaneHead({
   sel,
   sandboxIds,
   labels,
+  names,
   strip,
   count,
   onPick,
@@ -139,6 +146,7 @@ function LaneHead({
   sel: string;
   sandboxIds: string[];
   labels: Map<string, string>;
+  names: Map<string, string> | undefined;
   strip: SandboxStrip | undefined;
   count: number;
   onPick: (side: LaneSide, sandboxId: string) => void;
@@ -159,8 +167,8 @@ function LaneHead({
           <option value={sel}>{shortId(sel)} — (unknown)</option>
         ) : null}
         {sandboxIds.map((id) => (
-          <option key={id} value={id}>
-            {shortId(id)}
+          <option key={id} value={id} title={id}>
+            {names?.get(id) ?? `sandbox ${shortId(id)}`}
             {labels.get(id) ? ` — ${labels.get(id)}` : ""}
           </option>
         ))}

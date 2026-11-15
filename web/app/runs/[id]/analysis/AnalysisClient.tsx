@@ -26,7 +26,6 @@ import {
   getRunTrends,
   harnessConfigLabel,
   TERMINAL_RUN_STATUSES,
-  type ModelPrice,
   type RunAnalytics,
   type RunOut,
   type RunResults,
@@ -166,6 +165,8 @@ export default function AnalysisClient({ runId }: { runId: string }) {
 
   const labelOf = useCallback(
     (id: string) =>
+      sbs.find((s) => s.sandbox_id === id)?.name ??
+      resSandboxes.find((s) => s.sandbox_id === id)?.name ??
       sbs.find((s) => s.sandbox_id === id)?.label ??
       harnessConfigLabel(
         resSandboxes.find((s) => s.sandbox_id === id)?.harness_config,
@@ -236,34 +237,55 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     [sbs],
   );
 
-  // Cost recompute — mirrors the server: participant at the selected price,
-  // evaluator at the evaluator model's rate when listed, else the selected.
-  const selected = priceModel ?? data.analytics?.price_model ?? "";
-  const price: ModelPrice | undefined = data.analytics?.price_table?.[selected];
+  // Cost recompute — mirrors the server: an explicit pick reprices every
+  // sandbox uniformly; auto ("") costs each sandbox at its OWN model's
+  // rate (PR14 — SandboxAnalytics.price_model is the server-resolved key).
+  const priceFor = useCallback(
+    (sb: { price_model?: string }) =>
+      data.analytics?.price_table?.[priceModel ?? sb.price_model ?? ""],
+    [data.analytics, priceModel],
+  );
   const evaluatorModel =
     data.results?.evaluator_model ?? data.run?.config?.evaluator_model ?? null;
-  const evalPrice: ModelPrice | undefined =
-    data.analytics?.price_table?.[evaluatorModel ?? ""] ?? price;
+  // Judge price mirrors the server: the evaluator model's own rate when
+  // listed, else the explicit pick, else the RUN's resolved rate (its
+  // model when listed, else the first table entry) — NOT each sandbox's.
+  const evalPrice = useMemo(() => {
+    const table = data.analytics?.price_table;
+    if (!table) return undefined;
+    if (evaluatorModel && table[evaluatorModel]) return table[evaluatorModel];
+    const runModel = data.analytics?.model_name ?? "";
+    const key = priceModel ?? (table[runModel] ? runModel : Object.keys(table)[0]);
+    return key ? table[key] : undefined;
+  }, [data.analytics, evaluatorModel, priceModel]);
 
   const costRows: Row[] = useMemo(
     () =>
-      sbs.map((sb, i) => ({
-        name: shortId(sb.sandbox_id),
-        color: SANDBOX_COLORS[i % SANDBOX_COLORS.length],
-        value: price ? estimateCostUsd(price, sb.tokens) : 0,
-      })),
-    [sbs, price],
+      sbs.map((sb, i) => {
+        const p = priceFor(sb);
+        return {
+          name: shortId(sb.sandbox_id),
+          color: SANDBOX_COLORS[i % SANDBOX_COLORS.length],
+          value: p ? estimateCostUsd(p, sb.tokens) : 0,
+        };
+      }),
+    [sbs, priceFor],
   );
 
   const splitRows: Row[] = useMemo(
     () =>
-      sbs.map((sb) => ({
-        name: shortId(sb.sandbox_id),
-        participant: price ? estimateCostUsd(price, sb.tokens) : 0,
-        evaluator:
-          sb.evaluator && evalPrice ? estimateCostUsd(evalPrice, sb.evaluator.tokens) : 0,
-      })),
-    [sbs, price, evalPrice],
+      sbs.map((sb) => {
+        const p = priceFor(sb);
+        return {
+          name: shortId(sb.sandbox_id),
+          participant: p ? estimateCostUsd(p, sb.tokens) : 0,
+          evaluator:
+            sb.evaluator && evalPrice
+              ? estimateCostUsd(evalPrice, sb.evaluator.tokens)
+              : 0,
+        };
+      }),
+    [sbs, priceFor, evalPrice],
   );
 
   /** Tool-call mix: top-N tool names across sandboxes + "other". */
@@ -467,10 +489,11 @@ export default function AnalysisClient({ runId }: { runId: string }) {
               <select
                 className="select"
                 style={{ width: "auto", padding: "0.3rem 0.5rem", fontSize: "0.8rem" }}
-                value={selected}
-                onChange={(e) => setPriceModel(e.target.value)}
+                value={priceModel ?? ""}
+                onChange={(e) => setPriceModel(e.target.value || null)}
                 aria-label="Estimated cost at"
               >
+                <option value="">auto — per-model</option>
                 {Object.entries(data.analytics?.price_table ?? {}).map(([name, p]) => (
                   <option key={name} value={name}>
                     {p.local ? `${name} (local — $0)` : name}
@@ -484,9 +507,9 @@ export default function AnalysisClient({ runId }: { runId: string }) {
             <InfoNote>Metrics unavailable: {notes.analytics}</InfoNote>
           ) : sbs.length === 0 ? (
             <EmptyState>No sandbox metrics yet.</EmptyState>
-          ) : price?.local ? (
+          ) : priceModel && data.analytics?.price_table?.[priceModel]?.local ? (
             <InfoNote>
-              Local model — $0 participant spend at <code>{selected}</code>. Pick a
+              Local model — $0 participant spend at <code>{priceModel}</code>. Pick a
               priced model above for an API-equivalent estimate.
             </InfoNote>
           ) : !costRows.some((r) => Number(r.value) > 0) ? (
@@ -525,8 +548,8 @@ export default function AnalysisClient({ runId }: { runId: string }) {
                 fmt={formatUsd}
               />
               <p className="chart-legend">
-                judge priced at {evaluatorModel ?? selected} when listed ·
-                participant at {selected}
+                judge priced at {evaluatorModel ?? "the run's rate"} when listed ·
+                participant at {priceModel ?? "each model's own rate"}
               </p>
             </>
           )}
