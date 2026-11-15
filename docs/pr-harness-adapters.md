@@ -10,6 +10,10 @@ the existing lifecycle/monitor machinery unchanged.
 
 Design doc: [`docs/p25-harness-adapters.md`](./p25-harness-adapters.md)
 
+> Historical note: written pre-PR14 (single-model runs) — "one sandbox per
+> config" is now one sandbox per expanded `configs × models` matrix cell;
+> see `orchestrator/matrix.py` and `FEATURE_MAP.md` F15.
+
 ## Feature overview
 
 - Five registered adapters: `miniloop` (existing), `codex`

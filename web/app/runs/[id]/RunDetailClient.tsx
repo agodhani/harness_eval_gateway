@@ -450,7 +450,7 @@ export default function RunDetailClient({ runId }: { runId: string }) {
             </h1>
             <Badge tone={statusTone(run.status)}>{run.status}</Badge>
             {run.same_model_eval ? (
-              <Badge tone="amber" title="evaluator model == participant model">
+              <Badge tone="amber" title="evaluator model == a participant model">
                 same-model eval
               </Badge>
             ) : null}
