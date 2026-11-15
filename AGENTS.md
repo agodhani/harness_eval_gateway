@@ -235,7 +235,7 @@ or tests change.
 | F9 | Run analytics: per-sandbox metrics + estimated cost |
 | F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) |
 | F11 | Skillpack import from GitHub (discover → select → import) |
-| F12 | Artifact preview (static html + desktop/pygame via noVNC) |
+| F12 | Artifact preview (static html + desktop GUI via noVNC + python-server web apps) |
 | F13 | Graphical analysis page + cross-run trends (recharts) |
 
 ## Post-MVP roadmap
@@ -275,8 +275,8 @@ or tests change.
   with a single-sandbox filter dropdown); scrolling/diff-alignment UX TBD
 - Lightweight artifact thumbnails — capture screenshots of produced artifacts
   for at-a-glance review before spawning a full live preview sandbox
-- Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.
-  (executes candidate code → needs hardened isolation; approved direction)
+- ~~Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.~~
+  — landed (F12; extended to pyglet/arcade/tkinter + python-server in PR3)
 - Re-score runs — re-run the evaluator on stored artifacts
 - Post-run rubric edits — modify the frozen rubric after a run and re-score
   with the updated rubric (keep score provenance per rubric version)
