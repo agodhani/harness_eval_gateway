@@ -54,6 +54,10 @@ class TestConfig:
             ("fancy-input", False),
         ):
             assert data[key] is want, key
+        # aider falls back to `whole` for unrecognized openai/* models;
+        # the whole-file coder can't extract suggested shell commands, so
+        # the pinned editblock format is what keeps `done` reachable.
+        assert data["edit-format"] == "diff"
         # History files relocated out of the workspace artifact.
         assert data["chat-history-file"] == f"{tmp_path}/.aider.chat.history.md"
         assert data["input-history-file"] == f"{tmp_path}/.aider.input.history"

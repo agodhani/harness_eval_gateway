@@ -58,6 +58,14 @@ def conf_lines(cfg: ShimConfig) -> list[str]:
         "auto-commits: true",
         "dirty-commits: true",
         "suggest-shell-commands: true",
+        # aider 0.86.2 doesn't recognize `openai/<ollama-model>` and falls
+        # back to the `whole` edit format — WholeFileCoder never extracts
+        # suggested shell commands (only the editblock coders do), so the
+        # model's ```bash /usr/local/bin/done suggestion can't run AND its
+        # fence makes the whole reply fail to parse ("No filename provided
+        # before ```" rejects every edit). Pin the editblock SEARCH/REPLACE
+        # format so edits apply and `done` stays reachable.
+        "edit-format: diff",
         # No non-gateway egress: never fetch URLs found in the prompt,
         # phone home for updates, or send analytics.
         "detect-urls: false",

@@ -217,7 +217,11 @@ Event mapping conventions across CLI harnesses:
   OpenAI-compatible endpoints; weak-model covers commit messages +
   history summarization — pinning it to the run model keeps the
   comparison axis clean), `yes-always`, `auto-commits`, `dirty-commits`,
-  `suggest-shell-commands` (how `done` gets invoked), `detect-urls:
+  `suggest-shell-commands` + `edit-format: diff` (how `done` gets
+  invoked — aider 0.86.2 falls back to `whole` for unrecognized
+  `openai/*` model names, and WholeFileCoder never extracts suggested
+  shell commands; the suggestion's ``` fence also makes the whole reply
+  fail edit parsing), `detect-urls:
   false`, `check-update: false`, `show-release-notes: false`,
   `analytics-disable: true`, `pretty: false`, `stream: false`,
   `fancy-input: false`, and history-file relocation into `$HOME`.
