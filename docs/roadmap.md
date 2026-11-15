@@ -86,14 +86,14 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR3, PR5, PR8, PR9,
+- **Depth 0 (start immediately):** PR1, PR3, PR5,
   PR15, PR19 — plus PR13/PR17 if soft-only deps are acceptable.
 - **Depth 1:** PR4 (←3), PR10 (←9), PR14 (←1), PR16 (←15),
   PR18 (←12).
 - **Floating:** PR20 (soft ←15).
 
 Critical path depth = 1 remaining (`3→4`; was 3 via `6→7→8` before
-PR2, PR6, and PR7 landed). Max safe concurrency ≈ 9 lanes.
+PR2, PR6, PR7, and PR8 landed). Max safe concurrency ≈ 9 lanes.
 
 ## Shared-file hotspots (merge-conflict risk)
 
