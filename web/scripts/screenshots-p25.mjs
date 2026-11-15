@@ -17,6 +17,18 @@ const OUT = "../docs/screenshots/p25-harness-adapters/";
 // Real output of orchestrator.adapters.harnesses() (registry order).
 const MANIFESTS = [
   {
+    name: "aider",
+    display_name: "Aider",
+    description:
+      "aider --yes-always --message in a Python sandbox; model traffic is OpenAI chat completions via litellm's openai provider (OPENAI_API_BASE → the AI gateway). Plain-text output is translated heuristically — aider has no JSONL mode.",
+    llm_protocol: "openai-chat-completions",
+    cli: "aider",
+    cli_version: "0.86.2",
+    install: "pip install aider-chat",
+    image: "heg-sandbox-aider:latest",
+    requires: ["gateway:/v1/chat/completions"],
+  },
+  {
     name: "claude_code",
     display_name: "Claude Code CLI",
     description:
@@ -86,7 +98,7 @@ await page.route("**/api/harnesses", (route) =>
 
 await page.goto(`${BASE}/submit`, { waitUntil: "networkidle" });
 
-// Wait until the manifest populated the select (5 options, display names).
+// Wait until the manifest populated the select (6 options, display names).
 const firstSelect = page.locator(".config-row select.select").first();
 await firstSelect
   .locator("option", { hasText: "DeepSeek Harness (dsh)" })
@@ -112,7 +124,7 @@ await page.screenshot({ path: `${OUT}submit-harness-configs.png`, fullPage: true
 console.log("captured submit-harness-configs.png");
 
 // 2 — manifest-visible dropdown: expand config 1's select inline (size=N)
-//      so all five display names render in-page, then crop the card.
+//      so all six display names render in-page, then crop the card.
 await page.evaluate(() => {
   const el = document.querySelector(".config-row select.select");
   el.size = el.options.length;
