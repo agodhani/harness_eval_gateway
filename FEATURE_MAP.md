@@ -581,9 +581,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     with short-id fallback/tooltips — in the submit rows, run detail
     (config summary + sandboxes table + rubric breakdown headers),
     timeline sandbox filter + row labels, results matrix + artifacts
-    table, analytics column heads, and the live run-console lane heads.
+    table, analytics column heads, analysis-page legend chips, and the
+    live run-console lane heads.
 - **Where:** `api/routers/models.py` (`ModelsOut`/`ModelPullIn`/
-  `ModelInfo`, + `api/main.py` include), `gateway/main.py` (`pull_models`,
+  `ModelInfo`, + `api/main.py` include), `gateway/main.py` (`pull_model`,
   provider header), `api/schemas.py` (`HarnessConfigIn.name`,
   `SandboxOut.name`, `SandboxResult.name`, `SandboxAnalytics.name`),
   `db/models.py` + `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`,
@@ -592,7 +593,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `web/lib/api.ts` (`listModels`, `pullModel` streaming),
   `web/app/submit/page.tsx`, `web/app/runs/[id]/` (`RunDetailClient`,
   `timeline/TimelineClient`, `results/ResultsClient`,
-  `results/AnalyticsSection`), `web/components/RunConsoleLive.tsx`
+  `results/AnalyticsSection`, `analysis/AnalysisClient`),
+  `web/components/RunConsoleLive.tsx`
 - **Verify:**
   - Unit: `tests/unit/api/test_models.py` (normalize, provider flag,
     gateway error/unreachable, pull streaming + validation),

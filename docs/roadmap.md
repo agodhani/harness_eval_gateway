@@ -53,6 +53,12 @@ append-mostly; rebase on main before merge.
   onto paid upstreams; caller `anthropic-beta`/`anthropic-version` headers
   forward to the anthropic upstream. Emitted `llm_*`/`error` events record
   the resolved provider.
+- **PR1 — Submit-form UX** (F14): live model picker via `GET /api/models`
+  (gateway `/v1/models` proxied, `pull_supported` flag from the
+  `x-heg-provider` stamp), `POST /api/models/pull` → `ollama pull` with
+  NDJSON progress (control-plane creds only), named harness configs
+  (`sandboxes.name`, default `<adapter>-<shortid>`). Details:
+  `FEATURE_MAP.md` F14.
 
 ## Dependency DAG
 
