@@ -89,11 +89,10 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1,
-  PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
+- **Depth 0 (start immediately):** PR1, PR10, PR15, PR18,
+  PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
   PR17 (soft ←13 satisfied — PR13 landed).
-- **Depth 1:** PR8 (←7), PR10 (←9), PR14 (←1, +12 soft),
-  PR16 (←15), PR18 (←12).
+- **Depth 1:** PR8 (←7), PR14 (←1, +12 soft), PR16 (←15).
 - **Floating:** PR20 (soft ←15).
 
 Critical path depth = 1 remaining (`7→8`; `3→4` closed when PR4 landed —
@@ -107,8 +106,6 @@ lanes.
 - `db/migrations/` — PR1 adds a migration; renumber revisions at merge.
 - `orchestrator/` — PR15 vs PR16 both touch the state machine;
   coordinate.
-- `sandbox/preview.py` + `api/routers/preview.py` + `PreviewControls.tsx` —
-  all of lane B; strictly sequential.
 
 ---
 
