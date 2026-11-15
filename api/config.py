@@ -130,6 +130,10 @@ class Settings(BaseSettings):
     # Viewport for the screenshot.
     THUMB_WIDTH: int = 1280
     THUMB_HEIGHT: int = 800
+    # chromium --virtual-time-budget per type — desktop (noVNC attach +
+    # framebuffer render) gets the longer budget.
+    THUMB_BUDGET_MS: int = 10_000
+    THUMB_DESKTOP_BUDGET_MS: int = 20_000
 
     LOG_LEVEL: str = "INFO"
 

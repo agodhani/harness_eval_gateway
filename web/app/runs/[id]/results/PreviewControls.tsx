@@ -19,7 +19,7 @@
  * capture through the preview stack). Clicking the shot opens the live
  * preview — spawning one first if needed.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import {
   ApiError,
   captureThumbnail,
@@ -117,14 +117,20 @@ export default function PreviewControls({
   } | null>(null);
   const [capturing, setCapturing] = useState(false);
   // Cache-bust key for thumbs whose ref lacks captured_at (bare
-  // thumbnail.png / tolerated meta-write failure) — mount-unique and
-  // bumped per capture so a recapture never reuses a cached URL.
-  const [thumbBust, setThumbBust] = useState(() => String(Date.now()));
+  // thumbnail.png / tolerated meta-write failure) — hydration-stable,
+  // mount-unique, and bumped per capture so a recapture never reuses a
+  // cached URL.
+  const mountId = useId();
+  const [thumbBust, setThumbBust] = useState(mountId);
   // The capture response shadows the `thumbnail` prop it superseded only —
-  // a results refresh delivering a different ref (newer capture, or none
-  // after a delete) wins over the stale local override.
+  // compared by capture identity (polls reparse the payload into fresh
+  // objects), so a refresh delivering the same capture keeps the override
+  // while a different ref (newer capture, or none after a delete) wins.
   const thumb =
-    thumbOverride !== null && thumbnail === thumbOverride.superseded
+    thumbOverride !== null &&
+    thumbnail?.captured_at === thumbOverride.superseded?.captured_at &&
+    thumbnail?.type === thumbOverride.superseded?.type &&
+    thumbnail?.entry === thumbOverride.superseded?.entry
       ? thumbOverride.ref
       : thumbnail;
 

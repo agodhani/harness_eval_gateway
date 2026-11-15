@@ -66,6 +66,7 @@ import math
 import os
 import shutil
 import subprocess
+import threading
 import time
 import urllib.parse
 import uuid
@@ -89,6 +90,7 @@ logger = logging.getLogger(__name__)
 
 THUMB_CONTAINER_PREFIX = "heg-thumb-"
 DEFAULT_THUMB_IMAGE = "heg-preview-thumb:latest"
+THUMB_DOCKERFILE = "sandbox/images/thumbnail-capture.Dockerfile"
 THUMB_FILENAME = "thumbnail.png"
 THUMB_META_FILENAME = "thumbnail.json"
 THUMB_META_VERSION = 1
@@ -164,6 +166,7 @@ class Thumbnailer:
         self.desktop_budget_ms = desktop_budget_ms
         self._sleep = sleep
         self._clock = clock
+        self._store_lock = threading.Lock()
 
     # -- public API ----------------------------------------------------------
 
@@ -182,6 +185,17 @@ class Thumbnailer:
         always stopped before returning. Raises :class:`ThumbnailError` on
         any failure (no half-written outputs are left in place).
         """
+        if (
+            self._previews._docker(
+                ["image", "inspect", self.image], check=False
+            ).returncode
+            != 0
+        ):
+            raise ThumbnailError(
+                f"thumbnail capture image {self.image!r} not found — "
+                f"build it: docker build -f {THUMB_DOCKERFILE} "
+                f"-t {self.image} ."
+            )
         preview = self._previews.spawn(
             run_id=run_id,
             sandbox_id=sandbox_id,
@@ -388,19 +402,6 @@ class Thumbnailer:
                 "capture output is not a PNG — refusing to store it"
             )
         dest = artifact_dir / THUMB_FILENAME
-        try:
-            os.replace(shot, dest)
-        except OSError as exc:
-            raise ThumbnailError(
-                f"cannot store thumbnail under {artifact_dir}: {exc}"
-            ) from exc
-        try:
-            os.chmod(dest, 0o644)
-        except OSError:
-            # The file is nobody-owned (container uid) — a non-owner api
-            # can't chmod it; the container umask already yields a
-            # readable file.
-            pass
         captured = datetime.now(UTC)
         meta: dict[str, Any] = {
             "version": THUMB_META_VERSION,
@@ -413,17 +414,32 @@ class Thumbnailer:
             "bytes": size,
         }
         meta_path = artifact_dir / THUMB_META_FILENAME
-        try:
-            meta_path.unlink(missing_ok=True)
-            meta_path.write_text(
-                json.dumps(meta, indent=2) + "\n", encoding="utf-8"
-            )
-        except OSError:
-            # The PNG is the artifact; the sidecar is best-effort metadata.
-            logger.warning(
-                "thumbnail: meta write failed under %s", artifact_dir,
-                exc_info=True,
-            )
+        with self._store_lock:
+            try:
+                os.replace(shot, dest)
+            except OSError as exc:
+                raise ThumbnailError(
+                    f"cannot store thumbnail under {artifact_dir}: {exc}"
+                ) from exc
+            try:
+                os.chmod(dest, 0o644)
+            except OSError:
+                # The file is nobody-owned (container uid) — a non-owner api
+                # can't chmod it; the container umask already yields a
+                # readable file.
+                pass
+            try:
+                meta_path.unlink(missing_ok=True)
+                meta_path.write_text(
+                    json.dumps(meta, indent=2) + "\n", encoding="utf-8"
+                )
+            except OSError:
+                # The PNG is the artifact; the sidecar is best-effort
+                # metadata.
+                logger.warning(
+                    "thumbnail: meta write failed under %s", artifact_dir,
+                    exc_info=True,
+                )
         logger.info(
             "thumbnail captured: %s (%s %s, %d bytes)",
             dest, plan.type, plan.entry, size,

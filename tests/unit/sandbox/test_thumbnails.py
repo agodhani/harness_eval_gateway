@@ -34,6 +34,7 @@ from sandbox.preview import (
     PreviewPlan,
 )
 from sandbox.thumbnails import (
+    DEFAULT_THUMB_IMAGE,
     PNG_MAGIC,
     THUMB_FILENAME,
     THUMB_META_FILENAME,
@@ -55,6 +56,9 @@ class ThumbFakeRuntime(FakeRuntime):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # The capture image exists locally (repo-built); tests that want
+        # the missing-image path discard it.
+        self.images.add(DEFAULT_THUMB_IMAGE)
         self.png_bytes: bytes = PNG_BYTES
         self.write_shot: bool = True
         self.thumb_rc: int = 0
@@ -430,6 +434,27 @@ def test_capture_container_failure(
         )
     assert not (artifact_dir / THUMB_FILENAME).exists()
     assert any(c[0] == "rm" and "cid123" in c for c in fake.calls)
+
+
+def test_capture_missing_thumb_image(
+    tmp_path: Path, urlopen_calls: list[str], sleeps: list[float]
+) -> None:
+    """A missing capture image fails fast with a build hint — before any
+    preview stack is spawned (nothing to clean up)."""
+    ws, artifact_dir = _ws(tmp_path, {"index.html": "x"})
+    fake = ThumbFakeRuntime()
+    fake.images.discard(DEFAULT_THUMB_IMAGE)
+    mgr = _static_manager(fake)
+    with pytest.raises(ThumbnailError, match="docker build"):
+        _thumbnailer(mgr, sleeps).capture(
+            run_id="run1",
+            sandbox_id="sb1",
+            workspace=ws,
+            artifact_dir=artifact_dir,
+            plan=PreviewPlan(type="static", entry="index.html"),
+        )
+    assert not any(c[0] == "run" for c in fake.calls)
+    assert not (artifact_dir / THUMB_FILENAME).exists()
 
 
 def test_capture_timeout_removes_container(

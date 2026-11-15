@@ -202,6 +202,8 @@ def get_thumbnailer() -> Thumbnailer:
             settle_seconds=settings.THUMB_SETTLE_SECONDS,
             width=settings.THUMB_WIDTH,
             height=settings.THUMB_HEIGHT,
+            budget_ms=settings.THUMB_BUDGET_MS,
+            desktop_budget_ms=settings.THUMB_DESKTOP_BUDGET_MS,
         )
     return _thumbnailer
 
