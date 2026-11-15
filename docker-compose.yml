@@ -61,6 +61,10 @@ services:
       # Optional GitHub PAT for skillpack import (F11) — private repos +
       # higher rate limits; public repos work without it.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Mirror of the gateway's provider routing for api-side introspection
+      # (non-secret only — upstream keys stay inside the gateway service).
+      UPSTREAM_PROVIDER: ${UPSTREAM_PROVIDER:-ollama}
+      PROVIDER_ROUTES: ${PROVIDER_ROUTES:-}
     ports:
       - "8001:8000"
     volumes:
@@ -100,12 +104,18 @@ services:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/harness_eval
       # Host Ollama from inside the container.
       OLLAMA_UPSTREAM_URL: http://host.docker.internal:11434
-      # Upstream provider switch: ollama (default) | openrouter (hosted
-      # free-tier models for testing). Set in .env (gitignored) — never
-      # commit the key here.
+      # Upstream provider: ollama (default) | openrouter | openai |
+      # anthropic, plus optional PROVIDER_ROUTES model-glob overrides. Set
+      # keys in .env (gitignored) — never commit them here.
       UPSTREAM_PROVIDER: ${UPSTREAM_PROVIDER:-ollama}
+      PROVIDER_ROUTES: ${PROVIDER_ROUTES:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com/v1}
+      ANTHROPIC_VERSION: ${ANTHROPIC_VERSION:-2023-06-01}
       # Control-plane ingest for metering events.
       API_INGEST_URL: http://api:8000
       INGEST_TOKEN: dev-ingest-token

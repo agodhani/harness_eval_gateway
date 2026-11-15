@@ -3,7 +3,8 @@
 Written inside the sandbox by the shim before ``codex exec`` starts. Codex's
 ``wire_api = "chat"`` support was removed upstream (Feb 2026), so the custom
 provider uses ``"responses"`` — the gateway exposes ``/v1/responses`` backed
-by Ollama's native implementation.
+by Ollama's native implementation by default (``PROVIDER_ROUTES`` can route
+it to real OpenAI).
 
 Stdlib-only (runs inside the sandbox).
 """

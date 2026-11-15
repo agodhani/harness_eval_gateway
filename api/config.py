@@ -20,6 +20,15 @@ class Settings(BaseSettings):
     # Ollama upstream for the AI gateway (host install for MVP).
     OLLAMA_BASE_URL: str = "http://localhost:11434"
 
+    # --- Upstream providers (consumed by the gateway service) ---
+    # Declared here so the api/orchestrator process loads the same shared
+    # .env cleanly and can introspect which provider a model routes to
+    # (e.g. a future submit-form hint). The provider API KEYS are
+    # deliberately NOT declared — only the gateway service loads them; they
+    # must never reach sandboxes, clients, or this process.
+    UPSTREAM_PROVIDER: str = "ollama"
+    PROVIDER_ROUTES: str = ""
+
     # Where the custom AI gateway will listen (F3). Host port 8081 — 8080 is
     # taken by another local project.
     GATEWAY_URL: str = "http://localhost:8081"
