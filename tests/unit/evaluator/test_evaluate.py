@@ -193,6 +193,8 @@ async def test_evaluate_happy_path(seeded, session_factory) -> None:
     assert spec.env["GATEWAY_CRED"] == "heg.testcred"
     assert spec.env["MODEL_NAME"] == "judge-model"
     assert spec.env["MAX_ITERS"] == "5"
+    # judge_max_tokens unset -> no MAX_TOKENS env (miniloop 4096 default)
+    assert "MAX_TOKENS" not in spec.env
     assert spec.env["GATEWAY_BASE_URL"] == "http://gateway:8080"
     assert spec.env["EVENTS_INGEST_URL"] == "http://gateway:8080/internal/events"
     assert "EVAL_PROMPT.md" in spec.env["TASK_PROMPT"]
@@ -228,6 +230,16 @@ async def test_evaluate_happy_path(seeded, session_factory) -> None:
     assert analysis_ev.payload["status"] == "ok"
     assert analysis_ev.payload["summary"]["files_analyzed"] == 1
     assert all(e.sandbox_id == seeded["sandbox_id"] for e in events)
+
+
+async def test_evaluate_judge_max_tokens_reaches_env(
+    seeded, session_factory
+) -> None:
+    """judge_max_tokens -> MAX_TOKENS in the eval sandbox env — the raised
+    output cap keeps thinking judges from truncating scores.json."""
+    fake = FakeRuntime()
+    await _eval(seeded, session_factory, fake, judge_max_tokens=8192)
+    assert fake.specs[0].env["MAX_TOKENS"] == "8192"
 
 
 async def test_evaluate_missing_scores_returns_empty_and_events(
@@ -321,6 +333,63 @@ async def test_evaluate_requires_params(seeded, session_factory) -> None:
         await _eval(seeded, session_factory, FakeRuntime(), rubric={})
     with pytest.raises(ValueError, match="session_factory"):
         await _eval(seeded, session_factory, FakeRuntime(), session_factory=None)
+
+
+async def test_evaluate_stamps_rubric_version(seeded, session_factory) -> None:
+    """PR5: Score rows carry rubric provenance — resolved from rubric_id
+    when no explicit version is passed."""
+    rows = await _eval(seeded, session_factory, FakeRuntime())
+    assert rows
+    assert all(r.rubric_version == 1 for r in rows)  # seeded rubric is v1
+    assert all(r.rubric_version == 1 for r in _scores_in_db(session_factory))
+
+    events = _events_in_db(session_factory)
+    started = [e for e in events if e.payload.get("phase") == "eval_started"]
+    scored = [e for e in events if e.payload.get("phase") == "eval_scored"]
+    assert started[0].payload["rubric_id"] == str(seeded["rubric_id"])
+    assert started[0].payload["rubric_version"] == 1
+    assert scored[0].payload["rubric_version"] == 1
+
+
+async def test_evaluate_rubric_version_kwarg_wins(seeded, session_factory) -> None:
+    """An explicit rubric_version (orchestrator-resolved) stamps rows as-is."""
+    rows = await _eval(seeded, session_factory, FakeRuntime(), rubric_version=7)
+    assert rows
+    assert all(r.rubric_version == 7 for r in rows)
+
+
+async def test_evaluate_rescore_provenance_distinct(seeded, session_factory) -> None:
+    """Two passes over the same artifact under different versions keep
+    separate Score rows — the re-score use case."""
+    s = session_factory()
+    try:
+        s.add(
+            Rubric(
+                run_id=seeded["run_id"], version=2, status="approved",
+                parent_id=seeded["rubric_id"], content=RUBRIC,
+            )
+        )
+        s.commit()
+        v2_id = s.execute(
+            select(Rubric.id).where(
+                Rubric.run_id == seeded["run_id"], Rubric.version == 2
+            )
+        ).scalar_one()
+    finally:
+        s.close()
+
+    await _eval(seeded, session_factory, FakeRuntime())  # v1 pass
+    await _eval(
+        seeded, session_factory, FakeRuntime(), rubric_id=v2_id, rubric_version=2
+    )  # re-score under v2
+
+    rows = _scores_in_db(session_factory)
+    v1_rows = [r for r in rows if r.rubric_version == 1]
+    v2_rows = [r for r in rows if r.rubric_version == 2]
+    assert len(v1_rows) == 3
+    assert len(v2_rows) == 3
+    assert all(r.rubric_id == seeded["rubric_id"] for r in v1_rows)
+    assert all(r.rubric_id == v2_id for r in v2_rows)
 
 
 async def test_candidate_scores_json_is_not_salvaged(

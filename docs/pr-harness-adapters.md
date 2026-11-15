@@ -15,6 +15,7 @@ Design doc: [`docs/p25-harness-adapters.md`](./p25-harness-adapters.md)
 - Five registered adapters: `miniloop` (existing), `codex`
   (`@openai/codex`), `claude_code` (`@anthropic-ai/claude-code`), `pi`
   (`@mariozechner/pi-coding-agent`), `deepseek` (`@deepseek-ai/dsh`).
+  (`aider` joined later via PR13 — see `docs/p25-harness-adapters.md`.)
 - A stdlib-only **shim** (`adapters/common/`) runs inside each CLI image:
   writes the harness's native config pointing at the gateway, launches the
   CLI in machine-readable JSONL mode, translates native records →

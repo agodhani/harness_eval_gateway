@@ -352,6 +352,20 @@ async def test_lifecycle_eval_retry_exhausted_still_fails(
     assert len(calls) == 2  # initial attempt + 1 retry, then give up
     with session_factory() as s:
         assert s.get(type(run), run.id).status == "failed"
+        # a final per-sandbox eval_failed error marks "gave up" (distinct
+        # from "retry pending") — the results API derives eval_error from it.
+        sb = s.execute(select(Sandbox).where(Sandbox.run_id == run.id)).scalar_one()
+        failed = [
+            e
+            for e in s.execute(
+                select(Event).where(
+                    Event.run_id == run.id, Event.sandbox_id == sb.id
+                )
+            ).scalars()
+            if e.type == "error" and e.payload.get("phase") == "eval_failed"
+        ]
+        assert len(failed) == 1
+        assert failed[0].payload["attempts"] == 2
 
 
 async def test_lifecycle_eval_exception_not_retried(
@@ -381,6 +395,12 @@ async def test_lifecycle_eval_exception_not_retried(
     assert len(calls) == 1
     with session_factory() as s:
         assert s.get(type(run), run.id).status == "failed"
+        evs = s.execute(select(Event).where(Event.run_id == run.id)).scalars().all()
+        eval_failed = [
+            e for e in evs
+            if e.type == "error" and e.payload.get("phase") == "eval_failed"
+        ]
+        assert len(eval_failed) == 1  # finality marker after the infra break
 
 
 async def test_lifecycle_no_approved_rubric_fails(

@@ -46,7 +46,7 @@ export default function Telemetry() {
           of everything that happened.
         </>
       }
-      lede="One events table. Five sources. Fourteen types. Every record is
+      lede="One events table. Five sources. Fifteen types. Every record is
       timestamped, sequenced and immutable — corrections are new events, never
       edits. The same stream powers the live timeline over SSE and the
       post-run replay."

@@ -40,7 +40,14 @@ def test_run_happy_path_transitions(session_factory) -> None:
 
 
 def test_run_failed_reachable_from_every_pre_terminal(session_factory) -> None:
-    for start in ("submitted", "rubric_review", "provisioning", "running", "evaluating"):
+    for start in (
+        "submitted",
+        "rubric_review",
+        "queued",
+        "provisioning",
+        "running",
+        "evaluating",
+    ):
         run = make_run(session_factory, status=start)
         with session_factory() as s:
             r = s.get(type(run), run.id)
@@ -58,6 +65,31 @@ def test_run_illegal_transition_raises(session_factory) -> None:
             transition(s, r, "running")  # skips rubric_review/provisioning
         with pytest.raises(InvalidTransition):
             transition(s, r, "done")
+        s.rollback()
+
+
+def test_run_queued_path_transitions(session_factory) -> None:
+    """PR15 pacing detour: rubric_review -> queued -> provisioning."""
+    run = make_run(session_factory, status="rubric_review")
+    with session_factory() as s:
+        r = s.get(type(run), run.id)
+        transition(s, r, "queued")
+        s.commit()
+    with session_factory() as s:
+        r = s.get(type(run), run.id)
+        transition(s, r, "provisioning")
+        s.commit()
+    assert s.get(type(run), run.id).status == "provisioning"
+
+
+def test_run_queued_cannot_skip_to_running(session_factory) -> None:
+    run = make_run(session_factory, status="queued")
+    with session_factory() as s:
+        r = s.get(type(run), run.id)
+        with pytest.raises(InvalidTransition):
+            transition(s, r, "running")
+        with pytest.raises(InvalidTransition):
+            transition(s, r, "rubric_review")  # no re-entry into review
         s.rollback()
 
 
@@ -169,3 +201,27 @@ def test_can_transition_helper(session_factory) -> None:
         r = s.get(type(run), run.id)
         assert state_machine.can_transition(r, "rubric_review")
         assert not state_machine.can_transition(r, "running")
+
+
+def test_run_terminal_can_reenter_evaluating(session_factory) -> None:
+    """PR5 re-score loop: done|failed → evaluating → terminal again; a
+    terminal run can never go back to ``running``."""
+    for terminal in ("done", "failed"):
+        run = make_run(session_factory, status=terminal)
+        with session_factory() as s:
+            r = s.get(type(run), run.id)
+            transition(s, r, "evaluating")
+            s.commit()
+        with session_factory() as s:
+            r2 = s.get(type(run), run.id)
+            assert r2.status == "evaluating"
+            transition(s, r2, terminal)
+            s.commit()
+        with session_factory() as s:
+            r3 = s.get(type(run), run.id)
+            assert r3.status == terminal
+            with pytest.raises(InvalidTransition):
+                transition(s, r3, "running")
+            with pytest.raises(InvalidTransition):
+                transition(s, r3, "provisioning")
+            s.rollback()

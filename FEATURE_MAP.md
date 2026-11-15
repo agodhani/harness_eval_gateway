@@ -22,10 +22,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F7 | Evaluator sandbox (rubric scoring + objective signals) | ✅ | `evaluator/`, `scoring/` | `tests/unit/evaluator/`, `tests/unit/scoring/` |
 | F8 | Results UI (matrix, scores, artifacts) | ✅ | `web/app/runs/`, `api/routers/results.py` | `tests/unit/api/test_results.py` |
 | F9 | Run analytics (per-sandbox metrics + cost) | ✅ | `api/routers/analytics.py`, `api/pricing.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx` | `tests/unit/api/test_analytics.py` |
-| F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
+| F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek, Aider) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek,aider}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
 | F11 | Skillpack import from GitHub | ✅ | `skillpack_import/`, `api/routers/skillpacks.py`, `web/app/submit/ImportSkillPackDialog.tsx` | `tests/unit/api/test_skillpacks.py`, `test_skillpack_import.py` |
-| F12 | Artifact preview (static html + desktop/pygame via noVNC, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
+| F12 | Artifact preview (static html + desktop GUI via noVNC + python-server web apps, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `sandbox/images/server-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
 | F13 | Graphical analysis page + cross-run trends (recharts) | ✅ | `web/app/runs/[id]/analysis/`, `api/routers/analytics.py` (`GET /api/analytics/runs`), `web/app/runs/[id]/results/ResultsClient.tsx` (totals row) | `tests/unit/api/test_analytics.py` (trends section) |
+| F14 | Eval iteration (re-score + versioned rubrics) | ✅ | `api/routers/results.py`, `orchestrator/lifecycle.py` (`rescore_run`), `orchestrator/rubric.py` (`create_rubric_version`), `web/app/runs/[id]/results/RescoreControls.tsx` | `tests/unit/orchestrator/test_rescore.py`, `tests/unit/api/test_results.py`, `tests/unit/evaluator/test_evaluate.py` |
 
 ## Feature details
 
@@ -58,7 +59,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 ### F1 — Submission form → run spec
 
 - **What:** form captures task prompt, model, harness configs (adapter +
-  skill pack selections — five adapters available, F10), evaluator model;
+  skill pack selections — six adapters available, F10), evaluator model;
   `POST /api/runs` persists spec with status `submitted`. The adapter
   dropdown is populated live from `GET /api/harnesses` (static fallback list
   when the API is unreachable); model inputs use the ComboInput suggestion
@@ -78,19 +79,33 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 ### F2 — Orchestrator ✅
 
-- **What:** run state machine (`submitted → rubric_review → provisioning →
-  running → evaluating → done | failed`); matrix expansion (harness configs ×
-  model); rubric draft generated via gateway → frozen on user approval;
-  termination policy watcher (timeout, budget, stuck-loop, done signal).
+- **What:** run state machine (`submitted → rubric_review → [queued →]
+  provisioning → running → evaluating → done | failed`); matrix expansion
+  (harness configs × model); rubric draft generated via gateway → frozen on
+  user approval; termination policy watcher (timeout, budget, stuck-loop,
+  done signal).
+- **Pacing (PR15):** one active run at a time — approvals while a run
+  executes (or is queued) park in `queued` and promote FIFO by approval
+  (`pacing.place_run` / `claim_next_queued`; promotion is wired into
+  `runner._lifecycle_then_promote` + re-kicked by `startup_sweep`). Spawn
+  memory gate: `spawn_one` waits for `SPAWN_MIN_FREE_MEM_MB` host headroom
+  before `docker run` (probed via `/proc/meminfo` → `sysconf` → `docker
+  info`+`stats`), capped by `SPAWN_MEM_WAIT_SECONDS`, expiry fails that
+  sandbox — remaining configs then fail fast (one probe each) so pressure
+  can't hold the slot for N×cap. Pacing emits `checkpoint` events keyed by
+  `payload.stage`: `run_queued`/`run_dequeued` (run scope),
+  `spawn_mem_wait`/`spawn_mem_release`/`spawn_mem_timeout` (sandbox scope).
 - **Where:** `orchestrator/` (`state_machine.py`, `lifecycle.py`,
-  `provision.py`, `monitor.py`, `rubric.py`, `runner.py`, `events.py`,
-  `adapters.py`), db `runs`/`sandboxes`/`rubrics`
+  `provision.py`, `monitor.py`, `rubric.py`, `runner.py`, `pacing.py`,
+  `events.py`, `adapters.py`), db `runs`/`sandboxes`/`rubrics`
 - **Verify:**
   - Unit: `tests/unit/orchestrator/` (`test_state_machine.py`,
     `test_lifecycle.py`, `test_monitor.py`, `test_provision.py`,
-    `test_rubric.py`)
+    `test_rubric.py`, `test_pacing.py`), queue E2E in
+    `tests/unit/api/test_runs.py::test_approve_queues_behind_active_run`
   - Manual: submit → edit/approve rubric → sandboxes spawn → terminal states
-    recorded correctly
+    recorded correctly; approve a second run mid-flight → `queued` badge →
+    promotes when the first finishes
 - **Depends on:** F3, F4, F5
 
 ### F3 — AI gateway ✅
@@ -119,15 +134,36 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   forward to the anthropic provider); endpoints a provider doesn't
   implement return its native 404; Ollama-only body params are stripped
   for hosted providers.
-- **Where:** `gateway/` (`main.py`, `creds.py`, `metering.py`, `deps.py`,
-  `config.py`, `mint_cred.py` CLI), compose service `gateway` (:8081→8080)
+- **Response cache / deterministic replay (PR18):** opt-in via
+  `GATEWAY_CACHE_ENABLED` (OFF by default — real runs hit the live
+  upstream). Metered generation calls (`/v1/chat/completions` streamed +
+  buffered, `/v1/messages`, `/v1/responses`) replay from a sqlite store
+  (`GATEWAY_CACHE_PATH`, default `./data/gateway_cache.sqlite3`,
+  `GATEWAY_CACHE_MAX_ENTRIES` LRU bound) keyed on
+  `namespace + path + provider + outgoing-body` (post-transform — stream vs
+  buffered and per-provider routes can't collide; bump
+  `GATEWAY_CACHE_NAMESPACE` to invalidate). Hits skip the upstream, return
+  an `x-heg-cache: hit` header, and still emit `llm_request`/`llm_response`
+  with `payload.cached: true` + the stored body re-metered for usage —
+  cached spend counts toward the run budget and the budget gate runs before
+  the lookup, so a replay 429s at the same point the live run did. Only
+  complete 2xx responses are stored; `count_tokens`/`/v1/models` bypass the
+  cache; cache failures degrade to a miss (never a proxy 5xx).
+- **Where:** `gateway/` (`main.py`, `cache.py`, `creds.py`, `metering.py`,
+  `deps.py`, `config.py`, `mint_cred.py` CLI), compose service `gateway`
+  (:8081→8080)
 - **Verify:**
   - Unit: `tests/unit/gateway/` (creds, metering, proxy — hermetic; protocol
     pass-throughs + SSE usage normalization covered),
     `test_upstream_provider.py` (provider selection, key validation,
     PROVIDER_ROUTES resolution, `x-heg-provider` override, per-provider
     client base/headers, ollama-param stripping, anthropic protocol-header
-    forwarding, provider attribution on emitted events)
+    forwarding, provider attribution on emitted events),
+    `test_cache.py` (key stability/provider+body+path keying, LRU bound,
+    file persistence, namespace invalidation, miss→hit replay for buffered +
+    SSE + /v1/messages + /v1/responses, cached-event flagging + usage
+    metering, budget gate before lookup, non-2xx and unmetered bypass,
+    lookup/store failure degradation)
   - Manual: mint cred (`uv run python -m gateway.mint_cred`) →
     `curl localhost:8081/v1/chat/completions` → completion + event rows
   - M2 e2e proven: sandbox→gateway→Ollama→events (see run
@@ -225,6 +261,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   rows is re-spawned up to `EVAL_SCORE_RETRIES` times (default 1) with a fresh
   cred, emitting an `eval_retry` checkpoint — covers small-model flake modes
   (malformed JSON, stuck-loop wander); infra exceptions are not retried.
+  Exhausted attempts leave a final `error` event (`stage="evaluation"`,
+  `phase="eval_failed"`) which the results API surfaces as per-sandbox
+  `eval_error` — distinguishable from "not yet scored" (F8). Judge per-request
+  output cap is `EVAL_JUDGE_MAX_TOKENS` (default 8192; thinking judges).
   **Objective signals (PR6):** before staging, the candidate workspace is
   measured by the `scoring` package's signal collectors — `static_analysis`
   runs lizard (multi-language, parse-only, no code execution) for real
@@ -266,7 +306,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   evaluator model == participant model. The run-detail rubric table also
   renders per-sandbox score columns + an `overall` row once results exist
   (`RunDetailClient.tsx` `RubricView` + `getRunResults` poll while
-  `evaluating`).
+  `evaluating`). Sandboxes whose eval failed surface an `eval failed` badge
+  (from `SandboxResult.eval_error`) instead of blank score cells.
 - **Where:** `web/app/runs/` (list, detail, `results/`), results components,
   `api/routers/results.py` (results + scores + artifact-download endpoints)
 - **Verify:**
@@ -318,27 +359,48 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **What:** pluggable adapter registry so runs can compare real harness CLIs,
   not just miniloop configs. Registered adapters: `miniloop`, `codex`
   (@openai/codex), `claude_code` (@anthropic-ai/claude-code), `pi`
-  (@mariozechner/pi-coding-agent), `deepseek` (@deepseek-ai/dsh). A shared
-  stdlib-only shim (`adapters/common/`) runs inside each image: writes the
-  harness's native config pointing at the gateway, launches the CLI in
-  machine-readable JSONL mode, translates native records → normalized
-  events, posts them to `/internal/events`, emits `terminal_state` + prints
-  `HEG_RESULT {…}`. Per-adapter Docker images pin the npm CLI version;
+  (@mariozechner/pi-coding-agent), `deepseek` (@deepseek-ai/dsh), `aider`
+  (aider-chat, PR13). A shared stdlib-only shim (`adapters/common/`) runs
+  inside each image: writes the harness's native config pointing at the
+  gateway, launches the CLI in machine-readable JSONL mode (aider emits
+  plain text only — the shim's `translate_text` hook maps its status lines
+  heuristically instead), translates records → normalized events, posts
+  them to `/internal/events`, emits `terminal_state` + prints
+  `HEG_RESULT {…}`. Per-adapter Docker images pin the CLI version;
   `orchestrator/provision.py` resolves each config's image from
   `image_spec()["image"]` (miniloop keeps the `SANDBOX_IMAGE` fallback).
   `GET /api/harnesses` serves adapter manifests (display name, LLM protocol,
   CLI, image) for the submit form; `HarnessConfigIn.adapter` validates
   against the registry. Design doc: `docs/p25-harness-adapters.md`.
-- **Where:** `adapters/common/` (`runner.py`, `contract.py`),
-  `adapters/{codex,claude_code,pi,deepseek}/` (`adapter.py`, `config.py`,
-  `translate.py`, `__main__.py`), `orchestrator/adapters.py`,
+- **Hook/plugin telemetry (PR17):** harnesses with a documented native hook
+  surface report higher-fidelity events through the shared receiver
+  `adapters/common/hooks.py` (`python3 -m adapters.common.hooks <adapter>
+  [json]` — stdin payload for Claude Code hooks and pi's extension
+  forwarder, argv for Codex `notify`). Each hooked adapter ships `translate_hook`
+  beside `translate_obj` in `translate.py` + a `MANIFEST["hooks"]` line;
+  emitted payloads are stamped `via: "hook"`. Coverage: `claude_code`
+  settings.json hooks (`PostToolUse` → `tool_result` — outcome detail the
+  stream translation drops; `SessionStart/End`, `Stop`, `SubagentStop`,
+  `Notification`, `PreCompact` → `checkpoint`), `codex` `notify`
+  (`agent-turn-complete` → `checkpoint` with `last-assistant-message`), `pi`
+  generated `extensions/heg-events.ts` (`tool_execution_end` →
+  `tool_result`). `deepseek`/`aider`/`miniloop` stay translated-only. The
+  receiver always exits 0 and mirrors to stderr (stdout can feed back into
+  agent context for some claude hook events).
+- **Where:** `adapters/common/` (`runner.py`, `contract.py`, `hooks.py`),
+  `adapters/{codex,claude_code,pi,deepseek,aider}/` (`adapter.py`, `config.py`,
+  `translate.py`, `__main__.py`; aider also `launcher.py` — the patched
+  entrypoint that lifts aider's explicit-yes gate on suggested shell
+  commands), `orchestrator/adapters.py`,
   `orchestrator/provision.py`, `sandbox/images/{codex,claude_code,pi,
-  deepseek}.Dockerfile`, `api/routers/harnesses.py`
+  deepseek,aider}.Dockerfile`, `api/routers/harnesses.py`
 - **Verify:**
   - Unit: `tests/unit/adapters/test_adapter_contract.py` (contract across all
     adapters: manifest, image_spec, env, launch, translation → valid
-    `EventType`s, `HEG_RESULT` parsing) + per-adapter tests under
-    `tests/unit/adapters/<name>/`
+    `EventType`s, `HEG_RESULT` parsing, hook-manifest ↔ `translate_hook`
+    pairing) + per-adapter tests under `tests/unit/adapters/<name>/` +
+    `tests/unit/adapters/common/test_hooks.py` (receiver: payload parsing,
+    via-stamping, ingest POST, exit-0 guarantee)
   - API: `tests/unit/api/test_harnesses.py`, multi-adapter submit in
     `test_runs.py::test_create_run_multi_adapter`
   - Docker: `tests/integration/test_adapter_images.py` (`-m docker`) — CLI
@@ -419,8 +481,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 - **What:** "Preview" button per sandbox on the results page → serves or
   *runs* the snapshot workspace in a throwaway container so the user can
-  see/play the artifact in a new browser tab. Types: `"static"` (html) and
-  `"desktop"` (pygame executed under Xvnc, streamed via noVNC).
+  see/play the artifact in a new browser tab. Types: `"static"` (html),
+  `"desktop"` (GUI executed under Xvnc, streamed via noVNC — pygame,
+  pyglet, arcade, tkinter), and `"python-server"` (a web app executed by
+  a relay runner and served on localhost — flask/fastapi/django/etc.).
   - `GET /api/runs/{run}/results` → per-sandbox `previewable` +
     `preview_type` (cheap FS probe of the jailed workspace).
   - `POST /api/runs/{run}/sandboxes/{sandbox}/preview` → `201
@@ -430,15 +494,18 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     run/sandbox/workspace missing, `422` zero candidates / bad `entry` /
     unsupported type, `502` docker failure. Optional body `{"entry":
     "rel/path"}` picks an entry — jailed to the workspace, must exist and
-    be non-symlinked; `.html`/`.htm` → static, `.py` → desktop (explicit
-    `.py` bypasses pygame evidence — the pick IS the disambiguation).
-    `{"type": "static"|"desktop"}` overrides the pick: alone it selects the
+    be non-symlinked; `.html`/`.htm` → static, `.py` → desktop,
+    `manage.py` → python-server (explicit `.py` bypasses framework
+    evidence — the pick IS the disambiguation; suffix alone can't tell a
+    GUI app from a web server, so a bare `.py` defaults to desktop and
+    `type=python-server` runs it as a web app).
+    `{"type": "static"|"desktop"|"python-server"}` overrides the pick: alone it selects the
     first detected candidate of that type (a both-matching workspace
     defaults to static — `{"type": "desktop"}` reaches the game); with
     `entry` it forces the plan — `static` serves any jailed file (view a
-    `.py`'s source — the entry is only the URL opened), `desktop` still
-    requires a `.py` entry. No body → the scan's default
-    (`candidates[0]`).
+    `.py`'s source — the entry is only the URL opened), `desktop` and
+    `python-server` still require a `.py` entry. No body → the scan's
+    default (`candidates[0]`).
   - `GET .../preview` → current state (any status) or `404`; `DELETE
     .../preview` → `204` stop.
 - **Detection** (`sandbox/preview.py::scan_preview` → `PreviewScan{plan,
@@ -446,23 +513,31 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   ordered default-first — `plan`/`candidates[0]` is just the dropdown's
   default selection, never a hidden decision. Static entries first
   (root `index.html`/`.htm` → other root `*.html` sorted → `*/index.html`
-  one level down sorted), then desktop `.py` entries (root + nested ≤3
+  one level down sorted — `templates/` skipped: it's the flask/django
+  render dir, not a site entry), then desktop `.py` entries, then
+  python-server `.py` entries (root + nested ≤3
   levels; hidden dirs, symlinks, `_DESKTOP_SKIP_DIRS` —
-  node_modules/__pycache__/tests/venv/dist/build/docs/... — skipped;
-  ordered shallower → named-rank → path). A `.py` is a candidate iff it
-  has pygame evidence — file imports pygame (line-anchored; comments
-  can't match), OR entry-shaped (named entry, or a dir containing
-  exactly one `.py`) AND a scanned `requirements.txt` names pygame on a
-  non-comment line. So a `static+pygame` workspace defaults to static
-  yet still offers the desktop entry; helper .py files with real pygame
-  imports are offered too.
+  node_modules/__pycache__/tests/venv/dist/build/docs/templates/... —
+  skipped; ordered shallower → named-rank → path). Both executed
+  detectors share `_py_candidates`: a `.py` is a candidate iff the file
+  itself has evidence — a line-anchored import (`pygame`/`pyglet`/
+  `arcade`/`tkinter` → desktop; `flask`/`fastapi`/`django`/`aiohttp`/
+  `http.server`/… → python-server; comments can't match) — OR it's
+  entry-shaped (named entry, or a dir containing exactly one `.py`) AND
+  a scanned `requirements.txt` names the stack on a non-comment line
+  (desktop req evidence: pygame(-ce)/pyglet/arcade — bare `tk` excluded,
+  it's the unrelated Tcl package and tkinter is stdlib; server req
+  evidence: the framework names). So a `static+pygame` workspace
+  defaults to static yet still offers the desktop entry; helper .py
+  files with real imports are offered too, under whichever type(s)
+  their evidence supports.
 - **UI**: `preview_candidates` (typed `{entry,type}`) rides
   `SandboxResult` → the dropdown lists each candidate plus type-override
   variants (`index.html (site)` / `game/main.py (desktop)` /
-  `game/main.py (view source)` — a `.py` can be served instead of
-  executed) + Preview button POSTing `{entry, type}`; one option → plain
-  button; zero → disabled button + "not supported" (artifact still
-  downloadable — preview is an add-on).
+  `app.py (server)` / `app.py (view source)` — any executed `.py` can be
+  served instead of run) + Preview button POSTing `{entry, type}`; one
+  option → plain button; zero → disabled button + "not supported"
+  (artifact still downloadable — preview is an add-on).
 - **Static posture** (`_spawn_static`): `python:3.12-slim` running
   `python -m http.server` over the workspace bind-mounted `:ro`; nobody
   user, `--read-only` rootfs, `--cap-drop ALL`, `no-new-privileges`.
@@ -470,19 +545,38 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   published ports on internal networks, verified) with
   `enable_ip_masquerade=false` (egress block on Linux; inert on Docker
   Desktop). Port publishes on `127.0.0.1` ephemeral only — no LAN exposure.
-- **Desktop posture** (`_spawn_desktop` — executes candidate code, so
-  stricter): the runner sits alone on `--internal` `heg-desktop` (zero
-  egress, zero published ports, only peer = its own proxy) with
+- **Executed-code posture** (`_spawn_desktop`/`_spawn_server` → shared
+  `_spawn_isolated` — candidate code *executes*, so stricter than
+  static): the runner sits on `--internal` `heg-desktop` — the isolation
+  boundary for ALL executed previews (zero egress, zero published ports;
+  peers = its own socat proxy plus other ephemeral preview runners, none
+  of which can egress) — with
   `--cpus`/`--memory`/`--pids-limit` bounds (`PREVIEW_DESKTOP_*` defaults
-  1 / 512m / 256), cap-drop ALL, no-new-privileges, nobody. A pinned
-  `alpine/socat:1.8.1.3` sidecar (`heg.preview_role=proxy`) straddles
-  `heg-desktop` + `heg-preview` — a dumb TCP pipe publishing `127.0.0.1`
-  port → runner's websockify `:6080` (noVNC UI at `/vnc.html`). The runner
-  image `heg-preview-desktop` (`sandbox/images/desktop-preview.Dockerfile`,
-  repo-root build context) bundles TigerVNC Xvnc + novnc + websockify +
-  pygame-ce; candidate deps beyond pygame can't install (no egress) — the
-  app fails at import and the runner exits visibly. Artifact is mounted
-  `:ro` then copied to writable `/work` (games may save state).
+  1 / 512m / 256, shared by both types), cap-drop ALL, no-new-privileges,
+  nobody. A pinned `alpine/socat:1.8.1.3` sidecar
+  (`heg.preview_role=proxy`) straddles `heg-desktop` + `heg-preview` — a
+  dumb TCP pipe publishing `127.0.0.1` → the runner's port.
+  - **desktop**: port = websockify `:6080` (noVNC UI at `/vnc.html`);
+    runner image `heg-preview-desktop`
+    (`sandbox/images/desktop-preview.Dockerfile`, repo-root build
+    context, multi-stage: wheels built in a gcc stage then installed
+    `--no-index` — pymunk has no aarch64 wheel) bundles TigerVNC Xvnc +
+    novnc + websockify + pygame-ce + pyglet + arcade + tkinter (system
+    `tk` libs + mesa GL for pyglet/arcade software rendering). Artifact
+    mounted `:ro`, staged to writable `/work`.
+  - **python-server**: port = `:8000`, where `server-preview-runner.py`
+    (baked as the image ENTRYPOINT) makes the candidate app reachable
+    whatever it binds — watches `/proc/net/tcp{,6}` for the app's first
+    LISTEN socket, then either lets a non-loopback `:8000` bind serve
+    directly or runs an asyncio TCP relay `:8000 → <detected>` (binding
+    the eth0 IP when the app squats `127.0.0.1:8000`); `manage.py` gets
+    `runserver 0.0.0.0:8000 --noreload`. Runner image
+    `sandbox/images/server-preview.Dockerfile` bakes the common web
+    frameworks (flask, fastapi/uvicorn, django, aiohttp, bottle, tornado,
+    gunicorn) — candidate deps beyond them can't install (no egress) —
+    the app fails at import and the runner exits visibly. URL = app root.
+  - Deps are baked/wheeled at image build — NEVER pip-installed at spawn
+    (preview nets have zero egress).
 - **Registry = docker labels** (`heg.preview*`) — `list()`/`get` rebuild
   state via `docker inspect`, so api restarts lose nothing; expiry rides a
   label so the reaper works out-of-process. Runner + proxy share
@@ -493,33 +587,49 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `artifact_path` or `<ARTIFACT_ROOT>/<run>/<sandbox>` must resolve inside
   `ARTIFACT_ROOT`, and `workspace` must not be a symlink escaping it.
 - **Where:** `sandbox/preview.py` (detection + `plan_for_entry`/
-  `plan_for_type` overrides, `ScanCache`, `PreviewManager`),
+  `plan_for_type` overrides, `ScanCache`, `PreviewManager` —
+  `_spawn_isolated` shared by `_spawn_desktop`/`_spawn_server`,
+  `_PROXIED_PORTS` maps type → sidecar port for port resolution),
   `api/routers/preview.py` (+ reaper),
-  `api/config.py` (`PREVIEW_*` incl. `PREVIEW_SCAN_TTL_SECONDS`),
+  `api/config.py` (`PREVIEW_*` incl. `PREVIEW_SCAN_TTL_SECONDS`,
+  `PREVIEW_SERVER_IMAGE`),
   `api/routers/results.py` (cached previewable probe via `_scan_cache`),
   `sandbox/images/desktop-preview.Dockerfile` +
   `desktop-preview-entrypoint.sh`,
+  `sandbox/images/server-preview.Dockerfile` +
+  `server-preview-runner.py`,
   `web/lib/api.ts` (`getPreview`/`startPreview`/`stopPreview`, `PreviewOut`),
   `web/app/runs/[id]/results/PreviewControls.tsx`
 - **Verify:**
-  - Unit: `tests/unit/sandbox/test_preview.py` (static + desktop detection
-    — nested depth bound, skip-dirs, candidate ordering/default-first,
-    non-named `.py` evidence, comment-stripped requirements,
-    `plan_for_entry` jail/validation + `type=` override, `plan_for_type`,
+  - Unit: `tests/unit/sandbox/test_preview.py` (static + desktop +
+    python-server detection — nested depth bound, skip-dirs incl.
+    templates/, candidate ordering/default-first, non-named `.py`
+    evidence, comment-stripped requirements, GUI stacks
+    pyglet/arcade/tkinter, `plan_for_entry` jail/validation + `type=`
+    override incl. manage.py→python-server, `plan_for_type`,
     `ScanCache` hit/expiry/LRU/clear; manager via stubbed docker —
-    runner/proxy args, role labels, stop-all) +
+    runner/proxy args for both executed types, role labels, stop-all) +
     `tests/unit/api/test_preview.py` (lifecycle, `entry=`/`type=`
     overrides, live-preview replace-on-different-plan, default-spawn
     semantics, typed `preview_candidates`, cached results probe)
   - Docker: `tests/integration/test_preview.py` (`@pytest.mark.docker` —
     static spawn → HTTP 200, localhost-only binding, reaper; desktop spawn
-    builds `heg-preview-desktop` once per session → real pygame executes
-    (PYGAME_OK in logs), runner on internal net with limits, sidecar
-    publishes localhost:6080, vnc.html 200, both containers cleaned)
+    builds `heg-preview-desktop` → real pygame executes
+    (PYGAME_OK in logs), tkinter/pyglet/arcade apps execute under Xvnc
+    (TK_OK/PYGLET_OK/ARCADE_OK markers), runner on internal net with
+    limits, sidecar publishes localhost:6080, vnc.html 200, both
+    containers cleaned; python-server spawn builds `heg-preview-server`
+    → flask app on 127.0.0.1:5000 served through the runner's relay +
+    stdlib app on 0.0.0.0:8000 served directly, HTTP 200 through the
+    sidecar, same internal-net/limits assertions, both containers
+    cleaned)
   - Manual: results page → "Preview" on a pygame artifact → noVNC desktop
-    opens in new tab; "■ stop". Build image first:
+    opens in new tab; on a flask artifact → the app's URL opens;
+    "■ stop". Build images first:
     `docker build -f sandbox/images/desktop-preview.Dockerfile -t
-    heg-preview-desktop:latest .`
+    heg-preview-desktop:latest .` and
+    `docker build -f sandbox/images/server-preview.Dockerfile -t
+    heg-preview-server:latest .`
   - Note: the `previewable`/`preview_type` results-GET probe rides
     `sandbox.preview.ScanCache` — memoized per (jail, run, sandbox,
     artifact_path) for `PREVIEW_SCAN_TTL_SECONDS` (default 30s; 0
@@ -575,6 +685,71 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     scored run; cost dropdown reprices the cost + split charts client-side.
 - **Depends on:** F6 (events), F7 (scores), F8 (results page), F9
   (analytics aggregation)
+
+### F14 — Eval iteration: re-score + versioned rubrics ✅
+
+- **What:** iterate on evaluation after a run finishes — without touching
+  participant sandboxes:
+  - **Post-run rubric edits** (`POST /api/runs/{id}/rubrics`): edits to a
+    completed run's rubric are persisted as a NEW `Rubric` row
+    (`version = max+1`, `parent_id` → the edited row, `status="approved"`);
+    the previous approved version is marked `superseded`, never mutated.
+    Old `Score` rows keep pointing at their original rubric version.
+  - **Re-score** (`POST /api/runs/{id}/rescore`): re-runs the evaluator on
+    stored artifact snapshots for terminal (`done`/`failed`) runs —
+    `done|failed → evaluating → done|failed` via the dedicated
+    `orchestrator.lifecycle.rescore_run` task (registered as `rescore` in
+    the runner task registry; a concurrent trigger → 409). Optional
+    `rubric_id` pin, `sandbox_ids` subset, and judge `model` override.
+    `POST …/rubrics` with `rescore=true` creates the version and queues
+    the re-score in one request. `_rescore_run` itself refuses non-
+    terminal runs (defense-in-depth — `evaluating` is admitted only with
+    a rescore marker, i.e. the API pre-transition), and the empty-pass
+    retry checks the score-count DELTA over the pre-pass baseline so
+    stale rows don't satisfy it; `rescore_finished` is always emitted
+    (error included on crash).
+  - **Score provenance:** every `Score` carries `rubric_id` +
+    denormalized `rubric_version` (stamped at write time, survives rubric
+    lookups). `GET /api/runs/{id}/results?rubric_version=N` filters the
+    matrix to one version's scores; the default view is per-sandbox
+    newest-wins (created_at, seq insertion-order tiebreak). `GET
+    /api/runs/{id}/rubrics`
+    lists versions + score counts; `GET /api/rubrics/{id}` returns one
+    version incl. content (prefills the editor).
+  - **Events stay append-only:** `rescore_requested` /
+    `rescore_started` / `rescore_finished` / `rubric_version_created`
+    checkpoints; eval `started`/`scored` payloads carry
+    `rubric_id`+`rubric_version`.
+  - **UI:** results page gains a "Re-score & rubric versions" card —
+    version selector (latest = newest-wins), re-score button, JSON rubric
+    editor that saves as the next version (+ optional re-score); per-
+    sandbox "judged: rubric vN" provenance in the matrix header.
+  - **Crash semantics:** an api restart mid-re-score keeps the startup-
+    sweep rule — an `evaluating` run carrying a `rescore_requested`/
+    `rescore_started` checkpoint with ≥1 Score row recovers to `done`
+    (a first-pass eval has no marker and still fails), so an
+    interrupted re-score doesn't demote a previously-done run.
+- **Where:** `db/models.py` (`Rubric.parent_id`, `Score.rubric_version`,
+  `uq_rubrics_run_version` unique constraint) +
+  migration `b3e7a1c9d2f4`; `orchestrator/rubric.py`
+  (`create_rubric_version`), `orchestrator/lifecycle.py` (`rescore_run`,
+  `_evaluate_all` refactor), `orchestrator/runner.py`
+  (`start_rescore_task`, `_track` coroutine-factory dedup),
+  `orchestrator/state_machine.py` (`done|failed → evaluating`);
+  `evaluator/evaluate.py` (`rubric_version` kwarg → Score rows + event
+  payloads); `api/routers/results.py` (rubrics/rescore endpoints, version
+  filter); `web/lib/api.ts`,
+  `web/app/runs/[id]/results/RescoreControls.tsx` + `ResultsClient.tsx`.
+- **Verify:**
+  - Unit: `tests/unit/orchestrator/test_rescore.py` (rescore_run paths,
+    task dedup, sweep rescue), `tests/unit/api/test_results.py`
+    (endpoints, guards, version filter), `tests/unit/evaluator/
+    test_evaluate.py` (provenance stamping), `test_state_machine.py`.
+  - API: `POST /api/runs/<id>/rescore` on a finished run → 202 → new
+    Score rows with the pinned `rubric_version`.
+  - UI: results page → pick an older version → matrix shows that pass's
+    scores; edit rubric → save & re-score → run returns to `evaluating`.
+- **Depends on:** F7 (evaluator), F8 (results page), F4 (artifact store)
 
 ## Implementation sequence
 

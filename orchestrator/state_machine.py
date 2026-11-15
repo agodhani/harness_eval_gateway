@@ -2,8 +2,17 @@
 
 Allowed transitions mirror the lifecycle in AGENTS.md / docs/orchestrator-plan.md:
 
-    run:     submitted → rubric_review → provisioning → running → evaluating → done | failed
+    run:     submitted → rubric_review → [queued →] provisioning → running
+             → evaluating → done | failed
     sandbox: provisioning → running → terminating → done | failed
+
+``queued`` (PR15 pacing) parks an approved run while another run holds the
+single execution slot — see ``orchestrator/pacing.py``. ``queued → failed``
+exists so sweeps / a future cancel can retire parked runs.
+
+PR5 adds the re-score loop: a terminal run may re-enter ``evaluating``
+(done|failed → evaluating) so the evaluator can re-run on stored artifacts;
+it then closes back to ``done`` or ``failed`` by the usual score-count rule.
 
 ``transition()`` is the ONLY sanctioned way to change ``status`` — it validates
 against the table, mutates the row, and emits an orchestrator ``checkpoint``
@@ -21,12 +30,14 @@ from .events import emit
 
 RUN_TRANSITIONS: dict[str, frozenset[str]] = {
     "submitted": frozenset({"rubric_review", "failed"}),
-    "rubric_review": frozenset({"provisioning", "failed"}),
+    "rubric_review": frozenset({"provisioning", "queued", "failed"}),
+    "queued": frozenset({"provisioning", "failed"}),
     "provisioning": frozenset({"running", "failed"}),
     "running": frozenset({"evaluating", "failed"}),
     "evaluating": frozenset({"done", "failed"}),
-    "done": frozenset(),
-    "failed": frozenset(),
+    # PR5 re-score: terminal runs may re-enter evaluating.
+    "done": frozenset({"evaluating"}),
+    "failed": frozenset({"evaluating"}),
 }
 
 SANDBOX_TRANSITIONS: dict[str, frozenset[str]] = {

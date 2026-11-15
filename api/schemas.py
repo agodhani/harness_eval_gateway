@@ -42,6 +42,11 @@ class EventType(str, Enum):
     LLM_REQUEST = "llm_request"
     LLM_RESPONSE = "llm_response"
     TOOL_CALL = "tool_call"
+    # tool_result is hook/plugin-sourced (PR17): harnesses with a native hook
+    # surface (claude_code settings.json hooks, pi extension forwarder) report
+    # tool OUTCOMES here — the adapter-translated streams deliberately skip
+    # result records to avoid double-counting tool_call/shell_command/file_op.
+    TOOL_RESULT = "tool_result"
     SHELL_COMMAND = "shell_command"
     FILE_OP = "file_op"
     TEST_EXECUTION = "test_execution"
@@ -110,8 +115,9 @@ class HarnessConfigIn(BaseModel):
     """One sandbox configuration in a run's comparison matrix.
 
     ``adapter`` picks the harness adapter — ``miniloop`` plus the Phase 2.5
-    CLI harnesses (``codex``, ``claude_code``, ``pi``, ``deepseek``; see
-    ``orchestrator/adapters.py`` and ``GET /api/harnesses``). ``skill_packs``
+    CLI harnesses (``codex``, ``claude_code``, ``pi``, ``deepseek``,
+    ``aider``; see ``orchestrator/adapters.py`` and ``GET /api/harnesses``).
+    ``skill_packs``
     selects which vendored packs under ``./skillpacks`` are staged into the
     sandbox, and ``system_prompt_extra`` appends run-specific instructions
     (native ``--append-system-prompt`` where the harness has one, otherwise
@@ -168,6 +174,8 @@ class RubricOut(BaseModel):
     id: uuid.UUID
     run_id: uuid.UUID
     version: int
+    # PR5: version chain — the rubric row this version was edited from.
+    parent_id: uuid.UUID | None = None
     status: str
     content: dict[str, Any]
     created_at: datetime

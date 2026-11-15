@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     # (missing/invalid scores.json) — small judge models flake ~1 in 3 evals;
     # one retry is a cheap coin-flip recover. Infra exceptions are not retried.
     EVAL_SCORE_RETRIES: int = 1
+    # Per-request output cap (chat-completions max_tokens) for the rubric
+    # draft call. Thinking models burn output tokens on <think> blocks — the
+    # old 2048 cap truncated rubric JSON mid-document on qwen3-class models.
+    RUBRIC_MAX_TOKENS: int = 8192
+    # Per-request output cap for the eval judge's chat calls (miniloop
+    # MAX_TOKENS in the eval sandbox). Rationale-heavy scores.json plus
+    # thinking-model overhead need headroom over the 4096 participant
+    # default — truncation yields missing/invalid scores.json.
+    EVAL_JUDGE_MAX_TOKENS: int = 8192
     # Host path of ./data as seen by the docker daemon — set by compose
     # (HOST_DATA_ROOT=${PWD}/data) so sandbox -v sources resolve on the host.
     # Empty (host-run dev / tests) => paths pass through verbatim.
@@ -79,6 +88,21 @@ class Settings(BaseSettings):
     # codeload accepts a Bearer token). Public repos work without it.
     GITHUB_TOKEN: str = ""
 
+    # --- Run pacing (PR15) ---
+    # One active run at a time: approvals landing while a run executes (or
+    # is already queued) park in status="queued" and promote FIFO when the
+    # slot frees. No knob — it's the run state machine.
+    # Spawn memory gate: spawn_one waits for >= this much free host/VM
+    # memory before `docker run` (MiB). Probed via /proc/meminfo, then
+    # sysconf, then docker info+stats (unreadable probe => gate off).
+    # 0 disables. Default 2 GiB — headroom for the model + siblings.
+    SPAWN_MIN_FREE_MEM_MB: int = 2048
+    # Poll cadence + cap for the gate wait. An expired wait fails THAT
+    # sandbox like any spawn error — and collapses remaining configs' waits
+    # to a single probe, so sustained pressure can't hang a run for N×cap.
+    SPAWN_MEM_POLL_SECONDS: float = 5.0
+    SPAWN_MEM_WAIT_SECONDS: float = 3600.0
+
     # --- Artifact preview (F12) ---
     # Static-preview container image (`python -m http.server`); shares the
     # python:3.12-slim base with the api/sandbox images — no extra pull.
@@ -94,14 +118,20 @@ class Settings(BaseSettings):
     # Results-GET preview probe cache TTL — the per-sandbox workspace scan is
     # reused this long (the workspace only changes on re-snapshot; 0 disables).
     PREVIEW_SCAN_TTL_SECONDS: float = 30.0
-    # --- Desktop previews (executes candidate code — pygame via noVNC) ---
-    # Runner image: repo-built, TigerVNC + noVNC/websockify + pygame-ce.
+    # --- Desktop previews (executes candidate code — GUI via noVNC) ---
+    # Runner image: repo-built, TigerVNC + noVNC/websockify + baked GUI
+    # stacks (pygame-ce, pyglet, arcade, tkinter).
     PREVIEW_DESKTOP_IMAGE: str = "heg-preview-desktop:latest"
-    # Sidecar that publishes the runner's noVNC port (dumb TCP pipe).
+    # --- python-server previews (executes candidate code — web app) ---
+    # Runner image: repo-built, common web frameworks baked in (flask,
+    # fastapi/uvicorn, django, aiohttp, bottle, tornado, gunicorn).
+    PREVIEW_SERVER_IMAGE: str = "heg-preview-server:latest"
+    # Sidecar that publishes the runner's port (dumb TCP pipe).
     PREVIEW_PROXY_IMAGE: str = "alpine/socat:1.8.1.3"
-    # Internal net for desktop runners — zero egress; only peer = own proxy.
+    # Internal net for executed-code runners — zero egress; peers = own proxy
+    # + other ephemeral preview runners, none of which can egress.
     PREVIEW_DESKTOP_NETWORK: str = "heg-desktop"
-    # Resource bounds on executed candidate code.
+    # Resource bounds on executed candidate code (desktop + python-server).
     PREVIEW_DESKTOP_CPUS: str = "1"
     PREVIEW_DESKTOP_MEMORY: str = "512m"
     PREVIEW_DESKTOP_PIDS: int = 256

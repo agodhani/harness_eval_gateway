@@ -33,6 +33,7 @@ def test_env_contract() -> None:
     assert "EVENTS_INGEST_URL" not in env
     assert "INGEST_TOKEN" not in env
     assert "MAX_ITERS" not in env
+    assert "MAX_TOKENS" not in env
 
 
 def test_env_optional_vars() -> None:
@@ -41,10 +42,12 @@ def test_env_optional_vars() -> None:
         events_ingest_url="http://g/internal/events",
         ingest_token="tok",
         max_iters=25,
+        max_tokens=8192,
     )
     assert env["EVENTS_INGEST_URL"] == "http://g/internal/events"
     assert env["INGEST_TOKEN"] == "tok"
     assert env["MAX_ITERS"] == "25"
+    assert env["MAX_TOKENS"] == "8192"
 
 
 def test_launch_returns_subprocess_spec(monkeypatch) -> None:

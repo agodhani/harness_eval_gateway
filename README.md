@@ -25,7 +25,8 @@ Docker sandboxes, rubric-scored by a sandboxed evaluator.
 
 **Live artifact previews** — produced artifacts run in throwaway, locked-down
 containers straight from the results page: static sites served on localhost,
-pygame/desktop apps streamed interactively via noVNC:
+GUI apps (pygame/pyglet/arcade/tkinter) streamed interactively via noVNC,
+python web apps (flask/django/…) executed and served on localhost:
 
 ![Live pygame preview over noVNC](docs/screenshots/ui/snake-novnc.png)
 
@@ -36,7 +37,7 @@ api/           FastAPI control-plane (health endpoints in F0)
 db/            SQLAlchemy models + Alembic migrations (db/migrations/)
 gateway/       LLM proxy: providers, metering, budgets      (F3)
 orchestrator/  run state machine, rubric gen, lifecycle      (F2)
-adapters/      harness adapters — miniloop first             (F5)
+adapters/      harness adapters — miniloop + shipped CLIs    (F5/F10)
 sandbox/       image defs, workspace prep, done mechanism    (F4)
 evaluator/     rubric scoring agent                          (F7)
 scoring/       objective signal collectors (static analysis) (F7)
