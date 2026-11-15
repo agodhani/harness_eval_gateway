@@ -28,11 +28,14 @@ function fixture(): RunAnalytics {
     model_name: "qwen3:8b",
     price_model: "gpt-4o",
     price_table: PRICE_TABLE,
+    models: [],
     sandboxes: [
       {
         sandbox_id: "aaaaaaa1-1111-1111-1111-111111111111",
         label: "miniloop · superpowers",
         harness_config: { adapter: "miniloop", skill_packs: ["superpowers"] },
+        model: "qwen3:8b",
+        price_model: "qwen3:8b",
         status: "done",
         terminal_reason: "agent_done",
         llm_turns: 12,
@@ -57,6 +60,8 @@ function fixture(): RunAnalytics {
         sandbox_id: "bbbbbbb2-2222-2222-2222-222222222222",
         label: "codex",
         harness_config: { adapter: "codex", skill_packs: [] },
+        model: "gpt-4o",
+        price_model: "gpt-4o",
         status: "running",
         terminal_reason: null,
         llm_turns: 0,
@@ -133,6 +138,18 @@ describe("sandboxStrips", () => {
     assert.equal(chip(a, "llm").value, "12");
   });
 
+  test("auto basis (null run price_model) prices each sandbox at its own model", () => {
+    const f = fixture();
+    f.price_model = null;
+    const [a, b] = sandboxStrips(f);
+    // sandbox a's own rate is local qwen → the $0 short-circuit chip
+    assert.equal(chip(a, "cost").value, "$0");
+    assert.match(chip(a, "cost").title ?? "", /qwen3:8b — local/);
+    // sandbox b's own rate is gpt-4o → normal estimate path on zero tokens
+    assert.equal(chip(b, "cost").value, "$0.00");
+    assert.match(chip(b, "cost").title ?? "", /gpt-4o/);
+  });
+
   test("empty run → no strips", () => {
     assert.deepEqual(
       sandboxStrips({
@@ -140,6 +157,7 @@ describe("sandboxStrips", () => {
         model_name: "m",
         price_model: "gpt-4o",
         price_table: PRICE_TABLE,
+        models: [],
         sandboxes: [],
       }),
       [],
