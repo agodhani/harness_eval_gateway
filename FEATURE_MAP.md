@@ -213,18 +213,42 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   stream; UI timeline page — live during run, replayable after with
   timestamps. API side (`api/routers/events.py`: ingest batch/single,
   query w/ filters+pagination, SSE tail) + timeline UI both landed.
+  **Split view (PR10):** a `merged | split` toggle in the toolbar switches
+  the stream to two sandbox lanes — side-by-side, time-aligned event
+  streams for comparison. Design: ONE scroll container renders a merged
+  `(ts, id)` ordering of both lanes' events as two-column rows (an event
+  fills only its lane's cell; the other stays empty), so synchronized
+  scroll + time alignment are structural — no scroll mirroring. A sticky
+  lane header holds per-lane sandbox pickers (labels from analytics,
+  status badge, per-lane event count); picking the id already in the
+  other lane swaps them. Run-level (`sandbox_id` null) and non-lane
+  sandbox events render as full-width shared rows. Lanes seed from
+  `?view=split&left=&right=` URL params, else auto-default to the first
+  two discovered sandboxes (never overwriting an explicit pick); the
+  sandbox filter dropdown is merged-only — in split mode the PR9 metrics
+  chips assign lanes instead (occupant clears, new id fills first empty
+  lane else replaces right). Row rendering is shared via `EventRow.tsx`
+  (same `.tl-*` markup + per-type colors as merged).
 - **Where:** `api/routers/events.py`, `api/schemas.py` (EventSource/EventType
-  enums), db `events`, `web/app/runs/[id]/timeline/` (`TimelineClient.tsx` +
-  `SandboxMetricsBar.tsx` — the PR9 metrics strip lives here; see F9)
+  enums), db `events`, `web/app/runs/[id]/timeline/` (`TimelineClient.tsx`,
+  `SandboxMetricsBar.tsx` — PR9 strip, `SplitTimeline.tsx` + `EventRow.tsx`
+  — PR10 split view, see F9), `web/lib/splitTimeline.ts` (`buildSplitRows`
+  merged-ordering transform, `pickLane`/`toggleLane`/`laneEventCounts`)
+  + `splitTimeline.test.ts`
 - **Run-detail console:** `web/components/RunConsoleLive.tsx` — per-sandbox
   event lanes on the run detail page (backlog + SSE + `after_id` poll, same
   merge as the timeline; evaluator/orchestrator traffic routed to a bottom
   lane). Shares the `evc-*` stylesheet in `globals.css` with the landing
   replay console.
 - **Verify:**
-  - Unit: `tests/unit/api/test_events.py` + `test_event_types.py` (13+ tests)
+  - Unit: `tests/unit/api/test_events.py` + `test_event_types.py` (13+ tests);
+    `cd web && npm test` — `splitTimeline.test.ts` covers the merged
+    `(ts,id)` ordering (incl. the mixed fractional-seconds ts edge),
+    day markers, shared rows, lane counts, and all lane-selection rules
   - Live: SSE verified via curl; M2 events persisted
-  - UI: run → timeline page shows live events; run detail shows live lanes
+  - UI: run → timeline page shows live events; `split` toggle → two lanes
+    scroll in lockstep on one time axis, lane pickers swap on collision,
+    run-level rows span both columns; run detail shows live lanes
 - **Depends on:** F0 (ingestion slice unblocks F3)
 
 ### F7 — Evaluator sandbox ✅
@@ -243,38 +267,98 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `phase="eval_failed"`) which the results API surfaces as per-sandbox
   `eval_error` — distinguishable from "not yet scored" (F8). Judge per-request
   output cap is `EVAL_JUDGE_MAX_TOKENS` (default 8192; thinking judges).
-  **Objective signals (PR6):** before staging, the candidate workspace is
-  measured by the `scoring` package's signal collectors — `static_analysis`
-  runs lizard (multi-language, parse-only, no code execution) for real
-  cyclomatic complexity, nloc, function counts, nesting depth, and language
-  mix. The report is staged into the eval workspace as `ANALYSIS.md`
-  (judge-facing brief; judge is told to score `cyclomatic_complexity` from
-  measured values) + `analysis.json`, persisted at
-  `<artifact>/analysis.json`, summarized in an `eval_analysis` checkpoint
-  event, and re-validated + embedded as `analysis` on
-  `GET /api/runs/{id}/results` sandboxes. Candidate-authored
-  `ANALYSIS.md`/`analysis.json` files are dropped at staging (reserved
-  names — fake measured evidence can't reach the judge). Collection never
-  blocks evaluation: collector failures degrade to `status="error"` signal
-  entries / `status="unavailable"` event. Collector registry
-  (`scoring/collectors.py::COLLECTORS`) is the extension point for PR7's
-  exec/coverage signals.
+  **Objective signals (PR6+PR7):** before staging, the candidate workspace
+  is measured by the `scoring` package's signal collectors —
+  `static_analysis` runs lizard (multi-language, parse-only, no code
+  execution) for real cyclomatic complexity, nloc, function counts,
+  nesting depth, and language mix; `exec` runs the workspace's
+  build/tests/coverage inside a locked `heg-exec` container
+  (`--network none`, cap-drop ALL + cap-add SETUID/SETGID — the in-image
+  runner is uid 0 only to demote every candidate phase to nobody, keeping
+  the `/out` result channel and container stdout unforgeable —
+  no-new-privileges, cpu/memory/pids bounds, tmpfs-capped scratch,
+  artifact mounted read-only at `/srv/src` and copied to container-local
+  `/work` — the artifact is never written).
+  The report is staged into the eval workspace as `ANALYSIS.md`
+  (judge-facing brief incl. the executed-checks block; judge is told to
+  score `cyclomatic_complexity` from measured values and to treat
+  build/test/coverage as ground truth for functional/acceptance dims) +
+  `analysis.json`, persisted at `<artifact>/analysis.json`, summarized in
+  an `eval_analysis` checkpoint event (plus a `test_execution` event when
+  candidate tests ran), and re-validated + embedded as `analysis` + flat
+  `exec` ExecSummary on `GET /api/runs/{id}/results` sandboxes.
+  Candidate-authored `ANALYSIS.md`/`analysis.json` files are dropped at
+  staging (reserved names — fake measured evidence can't reach the judge).
+  Collection never blocks evaluation: collector failures degrade to
+  `status="error"`/`skipped` signal entries / `status="unavailable"`
+  event. Collector registry (`scoring/collectors.py::COLLECTORS`) is the
+  extension point for further signal types; `SCORING_EXEC=0` disables the
+  exec collector (conftest pins it for unit tests).
+  **Generated test suite (PR8):** a third `generated_tests` signal is
+  appended by the evaluator itself (`evaluator/testgen.py`, not a
+  registry collector — it needs gateway creds + the artifact dir).
+  Before staging, the evaluator calls the model through the gateway on
+  the per-eval cred (metered/budgeted like the judge; draws on the same
+  `EVAL_TOKEN_BUDGET` allowance) with the rubric + budget-capped source
+  listing (`build_testgen_prompt` in `prompts.py`) → parses output into
+  `test_*.py` files via `### FILE:` markers (deterministic containment:
+  every file must `compile()` AND define a `test_*`; rejected chunks are
+  reported, a fully unusable generation → `status="skipped"`) → persists
+  the suite + `_manifest.json` to `<artifact>/generated_tests/`
+  (provenance — never the candidate's `workspace/`) → runs it via
+  `ExecRunner.execute(workspace, test_target=…)` — PR8's
+  `EXEC_TEST_TARGET` contract: the dir mounts read-only at
+  `/srv/test_target`, exec_runner copies it to `/tmp/gen_tests`, pytest
+  runs there, coverage stays `--source=/work` and the build phase never
+  compiles generated files (a broken generated test can't be attributed
+  to the candidate's build). JUnit parsing now also captures failing
+  test names (`failed_tests`). The signal lands in the same envelope —
+  `ANALYSIS.md` "Generated test suite" section + `analysis.json` +
+  `eval_analysis` summary + `test_execution` `phase=eval_testgen` event
+  + flat `generated_tests` summary on the results API — and the suite is
+  staged into the eval workspace for the judge (a candidate-authored
+  `generated_tests/` is a reserved name, evicted at staging).
+  `SCORING_TESTGEN=0` disables (conftest pins it); knobs:
+  `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
+  `TESTGEN_MAX_FILES` (8), `TESTGEN_MAX_TOKENS` (4096),
+  `TESTGEN_TIMEOUT_SECONDS` (240).
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
-  `prompts.py`), `scoring/` (`models.py` — analysis.json/API pydantic
+  `prompts.py`, `testgen.py` — PR8 suite generation + exec orchestration),
+  `scoring/` (`models.py` — analysis.json/API pydantic
   contract, `collectors.py` — SignalCollector protocol + registry,
-  `static.py` — lizard collector, `render.py` — ANALYSIS.md), db `scores`,
-  `api/routers/results.py` (`SandboxResult.analysis`),
-  `api/schemas.py` (AnalysisReport re-export)
+  `static.py` — lizard collector, `exec.py` — exec collector,
+  `render.py` — ANALYSIS.md), `sandbox/exec.py` (ExecRunner — docker
+  lifecycle + result parsing + `test_target` mount) +
+  `sandbox/images/exec.Dockerfile` + `exec_runner.py` (in-image
+  build/test/coverage phases + `EXEC_TEST_TARGET` mode), db `scores`,
+  `api/routers/results.py` (`SandboxResult.analysis` + `.exec` +
+  `.generated_tests`), `api/schemas.py` (AnalysisReport re-export)
 - **Verify:**
   - Unit: `tests/unit/evaluator/` (`test_evaluate.py`, `test_scores.py`,
     `test_prompts.py`) — mocked runtime; staging, timeout salvage, malformed
-    scores covered; `tests/unit/scoring/` (`test_static.py`,
-    `test_collectors.py`, `test_render.py`) — workspaces with known CC
-    values, skip/cap/symlink rules, collector isolation, markdown render
+    scores covered; `tests/unit/evaluator/test_testgen.py` — fake gateway
+    client + fake exec runner: skip/error semantics, deterministic
+    containment of bad output (fences/markers/syntax/no-test rejection),
+    provenance layout, pass-rate metrics, cap knobs;
+    `tests/unit/scoring/` (`test_static.py`,
+    `test_collectors.py`, `test_render.py`, `test_exec.py`) — workspaces
+    with known CC values, skip/cap/symlink rules, collector isolation,
+    markdown render, exec metric mapping/status semantics;
+    `tests/unit/sandbox/test_exec.py` — exec run-argv isolation posture
+    (incl. `test_target` mount/env), result file/sentinel parsing,
+    timeout/missing-image paths; `tests/unit/sandbox/test_exec_runner.py`
+    — in-image helpers (junit failed names, target staging, discovery)
+  - Exec integration: `tests/integration/test_exec_scoring.py`
+    (`@pytest.mark.docker`) — real `heg-exec` container executes a trivial
+    artifact: build ok, 2/2 tests pass, coverage measured, container
+    force-removed, workspace untouched; PR8 cases run an external
+    `generated_tests` dir via `test_target` (pass + red suite w/ failing
+    names, mount stays byte-identical)
   - Results API: `tests/unit/api/test_results.py` — analysis embedded when
     `<artifact>/analysis.json` exists+valid, null otherwise
   - Manual: scores + rationale visible on results page; rationale for
-    cyclomatic_complexity cites measured CC values
+    cyclomatic_complexity cites measured CC values; build/test failures
+    visible in analysis + eval events
 - **Depends on:** F2, F4, artifacts from a completed run
 
 ### F8 — Results UI ✅
@@ -310,10 +394,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   Timeline page (PR9) hosts the same numbers in-context: a per-sandbox
   metrics strip between the filter toolbar and the event stream — compact
   chips (turns · tokens in→out · avg latency · est. cost · errors, plus a
-  judge-traffic line once the evaluator runs). Chips double as
-  sandbox-filter selectors (same state as the toolbar dropdown, whose
-  options gain adapter labels), and the strip refreshes every 15s while the
-  run is non-terminal.
+  judge-traffic line once the evaluator runs). Chips double as sandbox
+  selectors: merged mode toggles the sandbox filter (same state as the
+  toolbar dropdown, whose options gain adapter labels); split mode (PR10)
+  assigns the sandbox to a comparison lane instead. The strip refreshes
+  every 15s while the run is non-terminal.
 - **Where:** `api/pricing.py`, `api/routers/analytics.py`, response schemas
   in `api/schemas.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx`,
   `web/lib/api.ts` (`getRunAnalytics`, `estimateCostUsd`),
@@ -328,7 +413,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - API: `curl localhost:8001/api/runs/<id>/analytics?price_model=gpt-4o`
   - UI: results page → "Analytics" card → switch price model → cost updates;
     timeline page → strip shows per-sandbox stats live → click a chip →
-    stream filters to that sandbox
+    stream filters to that sandbox (merged) / chip assigns a split lane
 - **Depends on:** F6 (events), F8 (results page)
 
 ### F10 — Multi-harness adapters ✅

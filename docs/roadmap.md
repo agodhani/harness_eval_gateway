@@ -30,6 +30,14 @@ append-mostly; rebase on main before merge.
   judge line; chips double as sandbox-filter selectors; `sandboxStrips`
   transform in `web/lib/timelineAnalytics.ts` + `node --test` unit tests).
   Leftover idea: on-event-hover cumulative stats.
+- **PR10 split-view trace comparison**: `merged | split` toggle on the
+  timeline page — two sandbox lanes on ONE merged `(ts,id)` ordering inside
+  a single scroll container (synchronized scroll + time alignment by
+  construction, no scroll mirroring); sticky lane pickers with
+  swap-on-collision, run-level/other-sandbox events as full-width shared
+  rows, metrics chips assign lanes in split mode; transform + tests in
+  `web/lib/splitTimeline.ts(.test.ts)`, shared row markup in
+  `timeline/EventRow.tsx`.
 - **OpenRouter provider** (commit 8014338): `UPSTREAM_PROVIDER=ollama|openrouter`
   in `gateway/config.py`; client base normalizes to `/api/` (httpx
   concatenates base+request paths); Ollama-only body params
@@ -42,6 +50,15 @@ append-mostly; rebase on main before merge.
   `dots-studio/dots-3-note-preview:free`. Mandatory-reasoning models (ernie,
   lfm) 400 on miniloop's `reasoning_effort:"none"`.
 - **PR6 — static-analysis signals** (`scoring/` package, see below).
+- **PR7 — exec + coverage signals** (`exec` collector in `scoring/` +
+  `sandbox/exec.py` ExecRunner + `heg-exec` image, see below).
+- **PR8 — Automated test-suite generation**: `evaluator/testgen.py` writes
+  a pytest suite via the gateway (eval cred, metered), persists it to
+  `<artifact>/generated_tests/`, runs it via `ExecRunner` `test_target`
+  (`EXEC_TEST_TARGET` env → `/srv/test_target` ro mount in `heg-exec`),
+  and folds pass rate into the `generated_tests` `SignalReport` →
+  `ANALYSIS.md`/judge brief/results API flat summary. `SCORING_TESTGEN=0`
+  opts out; `TESTGEN_*` knobs bound prompt budget, files, tokens, timeout.
 - **PR11 — Graphical analysis + cross-run dashboards** (F13): recharts,
   `GET /api/analytics/runs`, results-matrix totals row.
 - **OpenAI + Anthropic providers + per-model routing** (PR12):
@@ -112,15 +129,14 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR3, PR9,
-  PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
-  PR17 (soft ←13 satisfied — PR13 landed).
-- **Depth 1:** PR4 (←3), PR8 (←7), PR10 (←9), PR14 (←1), PR16 (←15),
+- **Depth 0 (start immediately):** PR1, PR3,
+  PR15, PR19 — plus PR17 (soft ←13 satisfied — PR13 landed).
+- **Depth 1:** PR4 (←3), PR10 (←9), PR14 (←1), PR16 (←15),
   PR18 (←12).
 - **Floating:** PR20 (soft ←15).
 
-Critical path depth = 1 remaining (`7→8`, `3→4`; was 3 via `6→7→8` before
-PR2 and PR6 landed). Max safe concurrency ≈ 9 lanes.
+Critical path depth = 1 remaining (`3→4`; was 3 via `6→7→8` before
+PR2, PR6, PR7, and PR8 landed). Max safe concurrency ≈ 9 lanes.
 
 ## Shared-file hotspots (merge-conflict risk)
 
@@ -193,20 +209,19 @@ evaluator stages `ANALYSIS.md`/`analysis.json` judge evidence, persists
 `<artifact>/analysis.json`, emits an `eval_analysis` checkpoint, and the
 results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 
-### PR7 — Objective scoring II: exec + coverage
-- **Scope:** execute candidate code in a locked sandbox — build success,
-  test pass, coverage as score dimensions. Reuse sandbox-runtime isolation
-  patterns (egress lockdown, resource bounds).
-- **Touch:** `evaluator/` (exec staging), `sandbox/runtime.py` or a new
-  exec sandbox spec, `api/routers/results.py`.
-- **Depends on:** PR6 (signal plumbing), PR5 (evaluator wiring) — both landed.
-- **Verify:** integration test executing a trivial artifact.
+### PR7 — Objective scoring II: exec + coverage — ✅ landed
+Landed as the `exec` signal collector: candidate build/tests/coverage run
+inside a locked `heg-exec` container (`--network none`, uid-split demotion
+of candidate phases to nobody, resource + tmpfs bounds, sentinel-first
+result channel). `analysis.json` gains the exec signal, `ANALYSIS.md` an
+"Executed checks" block, a `test_execution` event is emitted when tests
+ran, and `GET /api/runs/{id}/results` exposes a flat `exec` ExecSummary.
+`SCORING_EXEC=0` disables. Paths + tests: FEATURE_MAP F7.
 
-### PR8 — Automated test-suite generation
-- **Scope:** LLM-generated tests as the eval target — generate suite via
-  gateway, run via PR7 exec infra, fold pass-rate into scoring.
-- **Touch:** `evaluator/` (gen + exec orchestration), prompts.
-- **Depends on:** PR7.
+### PR8 — Automated test-suite generation — ✅ landed
+See "Already landed" — `evaluator/testgen.py` + `ExecRunner` `test_target`
+(`EXEC_TEST_TARGET`), `generated_tests` SignalReport → judge brief,
+`SCORING_TESTGEN`/`TESTGEN_*` flags.
 
 ### PR9 — Timeline-side analytics — ✅ landed
 - **Scope:** per-sandbox metrics (cost/tokens/latency) rendered alongside
@@ -218,13 +233,27 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 - **Landed:** metrics strip between toolbar and stream (`SandboxMetricsBar`
   + `sandboxStrips`); see "Already landed" + `FEATURE_MAP.md` F9.
 
-### PR10 — Split-view trace comparison
+### PR10 — Split-view trace comparison — ✅ landed
 - **Scope:** side-by-side, time-aligned event streams for two sandboxes on
   the timeline page (today: one merged stream + a single-sandbox filter
   dropdown); scrolling/diff-alignment UX TBD.
 - **Touch:** `web/app/runs/[id]/timeline/` (new split component),
   `web/lib/api.ts` if new query params needed.
 - **Depends on:** PR9 (same page — land it first).
+- **Landed:** `merged | split` toolbar toggle (`?view=split&left=&right=`
+  seeds lanes, auto-defaults to first two sandboxes until touched). Design
+  picked over scroll-mirroring: ONE scroll container renders a merged
+  `(ts,id)` ordering as two-column rows — each event fills only its lane's
+  cell, so sync scroll + time alignment are structural and a quiet lane
+  reads as gaps (diff-tool idiom). `buildSplitRows`/`pickLane`/`toggleLane`/
+  `laneEventCounts` in `web/lib/splitTimeline.ts` (+
+  node:test); `SplitTimeline.tsx` sticky lane heads (picker swap on
+  collision, status badge, per-lane counts); `EventRow.tsx` extraction
+  shares row markup/summaries/colors across both views; run-level +
+  non-lane-sandbox events span both columns; PR9 metrics chips assign lanes
+  in split mode (`selectedIds` prop); sandbox filter dropdown is
+  merged-only. `ts` ordering uses `Date.parse` (mixed fractional-seconds
+  ISO strings don't sort lexicographically).
 
 ### PR11 — Graphical analysis page + cross-run dashboards — ✅ landed
 - **Scope:** charts over F9 analytics + scores: per-dimension score

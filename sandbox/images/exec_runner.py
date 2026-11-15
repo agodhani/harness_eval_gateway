@@ -1,0 +1,539 @@
+"""heg exec runner — the process that runs INSIDE the locked exec container (PR7).
+
+Baked into the ``heg-exec`` image (``exec.Dockerfile``) and launched by
+:meth:`sandbox.exec.ExecRunner.execute` as the container's PID 1. Contract:
+
+- ``/srv/src`` — the candidate workspace, bind-mounted **read-only**. Copied
+  to ``/work`` (a container-local world-writable dir) so builds,
+  ``__pycache__``, pytest cache, and coverage data can write freely without
+  ever touching the artifact.
+- ``/out`` — a container-local dir owned by root (mode 755), NOT mounted.
+  The runner (uid 0) writes ``/out/exec_result.json`` AND prints it on
+  stdout as a ``HEG_EXEC_RESULT <json>`` sentinel line; the host retrieves
+  the file with ``docker cp`` after the container exits. Candidate phases
+  exec as nobody (65534) — they can neither write ``/out`` nor reach the
+  runner's stdout through ``/proc/*/fd/1``, so neither channel is
+  forgeable. ExecRunner trusts the LAST sentinel and uses the file as the
+  fallback channel for when stdout can't be recovered.
+- The container has ``--network none``, dropped capabilities (the runner
+  keeps only SETUID/SETGID to demote phases), and resource caps — this
+  script needs no other privileges and must not assume DNS/TCP exist.
+
+Phases (Python workspaces only for MVP — the collector gates detection):
+
+1. ``copy`` — byte-capped copy of /srv/src into /work; dependency/vendor
+   dirs pruned (they aren't the candidate's work and can be huge).
+2. ``build`` — ``python -m compileall`` over /work: "does the submission
+   byte-compile" is the cheap build-success signal for interpreted code.
+   (Never compiles the test-target copy — a broken generated test must not
+   be attributed to the candidate's build.)
+3. ``tests`` — ``coverage run -m pytest`` when test files are detected
+   (``test_*.py`` / ``*_test.py``); junit XML parsed for pass/fail counts.
+   With ``EXEC_TEST_TARGET`` set (PR8), pytest instead runs the externally
+   supplied suite mounted at that path — staged into ``/tmp/gen_tests`` so
+   pycache/cache writes never hit the read-only mount — while coverage
+   stays ``--source=/work`` (how much of the submission the suite covers).
+4. ``coverage`` — ``coverage json`` totals (percent covered, statements).
+
+Every phase is individually time-boxed (env knobs below) so a hanging test
+suite can't burn the outer docker timeout. The process exits 0 after
+emitting a result payload — a missing payload on the host side means the
+container itself died or refused (OOM, docker kill, euid/cap check),
+which the ExecRunner reports as an infra error, not a candidate failure.
+
+Env (injected by ExecRunner, all optional):
+    EXEC_BUILD_TIMEOUT_SECONDS   compileall cap            (default 60)
+    EXEC_TEST_TIMEOUT_SECONDS    pytest+coverage cap       (default 180)
+    EXEC_MAX_WORKSPACE_BYTES     copy cap                  (default 300 MiB)
+    EXEC_TEST_TARGET             external pytest suite dir (PR8; unset =
+                                 autodetect test files inside the workspace)
+    COVERAGE_FILE                coverage data path        (default /tmp/.coverage)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Any
+
+SRC = Path("/srv/src")
+WORK = Path("/work")
+OUT = Path("/out")
+RESULT_FILENAME = "exec_result.json"
+RESULT_SENTINEL = "HEG_EXEC_RESULT "
+
+#: Candidate phases exec under this uid/gid (nobody) — deliberately NOT the
+#: runner's uid. The uid split is the result-channel boundary: a same-uid
+#: candidate could write forged sentinel lines through /proc/*/fd/1 and
+#: rewrite /out; a different-uid one can reach neither.
+CANDIDATE_UID = 65534
+CANDIDATE_GID = 65534
+
+BUILD_TIMEOUT = float(os.environ.get("EXEC_BUILD_TIMEOUT_SECONDS", "60"))
+TEST_TIMEOUT = float(os.environ.get("EXEC_TEST_TIMEOUT_SECONDS", "180"))
+MAX_COPY_BYTES = int(
+    os.environ.get("EXEC_MAX_WORKSPACE_BYTES", str(300 * 1024 * 1024))
+)
+COVERAGE_DATA = os.environ.get("COVERAGE_FILE", "/tmp/.coverage")
+JUNIT_PATH = Path("/tmp/junit.xml")
+COVERAGE_JSON_PATH = Path("/tmp/coverage.json")
+
+#: PR8: external test suite mount (read-only bind) — when set, pytest runs
+#: THIS instead of workspace-autodetected tests. Staged to a writable dir
+#: first so the copy (pycache, conftest writes) can't hit the :ro mount.
+_raw_target = os.environ.get("EXEC_TEST_TARGET") or ""
+TEST_TARGET_SRC = Path(_raw_target) if _raw_target else None
+GEN_TESTS_DIR = Path("/tmp/gen_tests")
+
+#: Captured per-phase output kept in the result payload (host truncates too).
+TAIL_CHARS = 4000
+#: Files a candidate would plausibly produce that are never worth exec'ing —
+#: mirrors scoring.static.SKIP_DIRS (this file is standalone in the image and
+#: cannot import the repo package).
+SKIP_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".tox",
+        ".venv",
+        "venv",
+        "env",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".next",
+        ".nuxt",
+        ".turbo",
+        ".idea",
+        ".vscode",
+        "node_modules",
+        "bower_components",
+        "vendor",
+        "target",
+        "Pods",
+    }
+)
+
+_TEST_FILE_RE = re.compile(r"^(test_.*|.*_test)\.py$")
+
+
+def _tail(text: str | bytes | None) -> str:
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    return (text or "")[-TAIL_CHARS:]
+
+
+def _run(cmd: list[str], timeout: float, *, cwd: Path = WORK) -> dict[str, Any]:
+    """Run ``cmd`` with a timeout; return a compact phase-result dict."""
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            [str(c) for c in cmd],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            user=CANDIDATE_UID,
+            group=CANDIDATE_GID,
+            extra_groups=[],
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "command": " ".join(str(c) for c in cmd),
+            "ok": False,
+            "timed_out": True,
+            "exit_code": None,
+            "duration_seconds": round(time.monotonic() - started, 2),
+            "stdout_tail": _tail(exc.stdout),
+            "stderr_tail": _tail(exc.stderr),
+        }
+    except OSError as exc:  # missing binary — infra, not candidate failure
+        return {
+            "command": " ".join(str(c) for c in cmd),
+            "ok": False,
+            "timed_out": False,
+            "exit_code": None,
+            "duration_seconds": round(time.monotonic() - started, 2),
+            "stdout_tail": "",
+            "stderr_tail": _tail(f"{type(exc).__name__}: {exc}"),
+        }
+    return {
+        "command": " ".join(str(c) for c in cmd),
+        "ok": proc.returncode == 0,
+        "timed_out": False,
+        "exit_code": proc.returncode,
+        "duration_seconds": round(time.monotonic() - started, 2),
+        "stdout_tail": _tail(proc.stdout),
+        "stderr_tail": _tail(proc.stderr),
+    }
+
+
+def _copy_workspace(warnings: list[str]) -> dict[str, Any]:
+    """Copy /srv/src → /work with a byte cap and dep-dir pruning.
+
+    Regular files and symlinks only — a FIFO/device would block or copy
+    unbounded data. Symlinks are recreated (never followed): a link escaping
+    /work just dangles inside the throwaway container.
+    """
+    copied_bytes = 0
+    copied_files = 0
+    truncated = False
+    for dirpath, dirnames, filenames in os.walk(SRC):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        rel_dir = Path(dirpath).relative_to(SRC)
+        for name in sorted(filenames):
+            src = Path(dirpath) / name
+            dst = WORK / rel_dir / name
+            try:
+                st = src.lstat()
+            except OSError:
+                continue
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if stat.S_ISLNK(st.st_mode):
+                    if dst.is_symlink() or dst.exists():
+                        dst.unlink()
+                    os.symlink(os.readlink(src), dst)
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    warnings.append(f"skipped non-regular file: {src.relative_to(SRC)}")
+                    continue
+                copied_bytes += st.st_size
+                if copied_bytes > MAX_COPY_BYTES:
+                    truncated = True
+                    warnings.append(
+                        f"workspace copy truncated at {MAX_COPY_BYTES} bytes"
+                    )
+                    return {
+                        "ok": True,
+                        "bytes": copied_bytes,
+                        "files": copied_files,
+                        "truncated": True,
+                    }
+                shutil.copy2(src, dst)
+                copied_files += 1
+            except OSError as exc:
+                warnings.append(f"copy failed for {src.relative_to(SRC)}: {exc}")
+    return {
+        "ok": True,
+        "bytes": copied_bytes,
+        "files": copied_files,
+        "truncated": truncated,
+    }
+
+
+def _make_tree_writable(root: Path, warnings: list[str]) -> None:
+    """Open the copied tree to the nobody exec uid.
+
+    The runner copies /srv/src as uid 0, but phases exec as
+    ``CANDIDATE_UID`` and must write ``__pycache__``/build artifacts inside
+    the tree. Dirs go 777, files get a+rw (keeping any exec bits);
+    symlinks are left alone.
+    """
+    for dirpath, _dirnames, filenames in os.walk(root):
+        try:
+            os.chmod(dirpath, 0o777)
+        except OSError as exc:
+            warnings.append(f"chmod failed for {dirpath}: {exc}")
+        for name in filenames:
+            p = Path(dirpath) / name
+            try:
+                if p.is_symlink():
+                    continue
+                os.chmod(p, (p.stat().st_mode | 0o666) & 0o777)
+            except OSError as exc:
+                warnings.append(f"chmod failed for {p}: {exc}")
+
+
+def _python_files(root: Path = WORK) -> list[Path]:
+    out: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            if name.endswith(".py"):
+                out.append(Path(dirpath) / name)
+    return out
+
+
+def _test_files(root: Path = WORK) -> list[Path]:
+    return [p for p in _python_files(root) if _TEST_FILE_RE.match(p.name)]
+
+
+def _stage_test_target(src: Path, warnings: list[str]) -> Path | None:
+    """Copy the EXEC_TEST_TARGET mount into writable GEN_TESTS_DIR.
+
+    The runner (uid 0) owns the copy — open it to the nobody exec uid just
+    like /work so the demoted pytest phase can write ``__pycache__`` /
+    cache files inside the staged suite.
+    """
+    try:
+        if not src.is_dir():
+            warnings.append(f"EXEC_TEST_TARGET is not a directory: {src}")
+            return None
+        shutil.copytree(src, GEN_TESTS_DIR)
+        _make_tree_writable(GEN_TESTS_DIR, warnings)
+        return GEN_TESTS_DIR
+    except OSError as exc:
+        warnings.append(f"test target copy failed: {exc}")
+        return None
+
+
+#: Cap on junit failure names kept in the payload (judge-facing detail).
+MAX_FAILED_TEST_NAMES = 25
+
+
+def _parse_junit(path: Path) -> dict[str, Any] | None:
+    """Aggregate pytest junit XML → tests/failures/errors/skipped counts
+    plus the names of failing/errored cases (judge-citable detail)."""
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+    if not suites:
+        return None
+    agg: dict[str, Any] = {
+        "tests": 0,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "failed_tests": [],
+    }
+    failed_tests: list[str] = []
+    for suite in suites:
+        for key in ("tests", "failures", "errors", "skipped"):
+            try:
+                agg[key] += int(float(suite.get(key, 0) or 0))
+            except (TypeError, ValueError):
+                continue
+        for case in suite.iter("testcase"):
+            if case.find("failure") is None and case.find("error") is None:
+                continue
+            classname = case.get("classname") or ""
+            name = case.get("name") or "?"
+            failed_tests.append(f"{classname}::{name}" if classname else name)
+    agg["failed_tests"] = failed_tests[:MAX_FAILED_TEST_NAMES]
+    return agg
+
+
+def _read_coverage_json(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    totals = data.get("totals") or {}
+    return {
+        "ok": True,
+        "percent": totals.get("percent_covered"),
+        "statements": totals.get("num_statements"),
+        "covered": totals.get("covered_lines"),
+        "missing": totals.get("missing_lines"),
+    }
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        # Phase demotion (user=/group= on subprocess.run) needs uid 0 with
+        # CAP_SETUID/SETGID. Refuse rather than exec candidate code at the
+        # runner's own uid — same-uid phases could forge the result
+        # channels through /proc/*/fd/1.
+        print(
+            "heg-exec-runner requires uid 0 (cap SETUID/SETGID) to demote "
+            "candidate phases — refusing to run",
+            file=sys.stderr,
+        )
+        return 1
+    warnings: list[str] = []
+    result: dict[str, Any] = {
+        "version": 1,
+        "language": "python",
+        "phases": {},
+        "warnings": warnings,
+    }
+    phases: dict[str, Any] = result["phases"]
+
+    phases["copy"] = _copy_workspace(warnings)
+    _make_tree_writable(WORK, warnings)
+
+    # Put the copied tree on sys.path for child processes: pytest's own
+    # rootdir insertion only covers each test file's basedir, so a
+    # ``tests/test_x.py`` couldn't ``import`` a root-level module otherwise.
+    # (No pip install — the exec net is dead; PYTHONPATH is the honest
+    # substitute for flat layouts. Packaged/installed projects are a
+    # later-lane concern.)
+    os.environ["PYTHONPATH"] = os.pathsep.join(
+        p for p in (str(WORK), os.environ.get("PYTHONPATH", "")) if p
+    )
+
+    py_files = _python_files()
+    phases["scan"] = {"python_files": len(py_files)}
+
+    # PR8: an external suite overrides workspace autodetect — it is staged
+    # OUTSIDE /work so the build phase above only ever measures candidate
+    # code, and coverage keeps attributing statements to the submission.
+    tests_root: Path | None = None
+    if TEST_TARGET_SRC is not None:
+        result["test_target"] = str(TEST_TARGET_SRC)
+        tests_root = _stage_test_target(TEST_TARGET_SRC, warnings)
+
+    if not py_files:
+        warnings.append("no python sources found after copy — nothing to run")
+        _emit(result)
+        return 0
+
+    # -- build: byte-compile everything -------------------------------------
+    build = _run(
+        [sys.executable, "-m", "compileall", "-q", "-f", str(WORK)],
+        BUILD_TIMEOUT,
+    )
+    phases["build"] = build
+
+    # -- tests: coverage-wrapped pytest when test files exist ---------------
+    # Default: the workspace's own test_*.py under /work. With a test target
+    # the suite comes from the staged copy instead — pytest is pointed at the
+    # dir explicitly (its basedir insertion covers sibling test modules;
+    # PYTHONPATH=/work set above covers candidate imports).
+    if TEST_TARGET_SRC is not None:
+        test_files = _test_files(tests_root) if tests_root is not None else []
+    else:
+        test_files = _test_files(WORK)
+    if not test_files:
+        if TEST_TARGET_SRC is not None:
+            warnings.append("EXEC_TEST_TARGET produced no test_*.py files")
+        phases["tests"] = None
+    else:
+        pytest_target = str(tests_root) if tests_root is not None else "."
+        run = _run(
+            [
+                sys.executable,
+                "-m",
+                "coverage",
+                "run",
+                f"--source={WORK}",
+                f"--data-file={COVERAGE_DATA}",
+                "-m",
+                "pytest",
+                "-q",
+                "--tb=line",
+                "-p",
+                "no:cacheprovider",
+                f"--junitxml={JUNIT_PATH}",
+                pytest_target,
+            ],
+            TEST_TIMEOUT,
+        )
+        junit = _parse_junit(JUNIT_PATH)
+        tests: dict[str, Any] = {
+            "detected": True,
+            "test_files": len(test_files),
+            "command": run["command"],
+            "exit_code": run["exit_code"],
+            "timed_out": run["timed_out"],
+            "duration_seconds": run["duration_seconds"],
+            "stderr_tail": run["stderr_tail"],
+            "stdout_tail": run["stdout_tail"],
+        }
+        if tests_root is not None:
+            tests["target_dir"] = str(tests_root)
+        if junit is None:
+            warnings.append("pytest produced no parseable junit report")
+            tests.update(
+                {
+                    "collected": 0,
+                    "passed": 0,
+                    "failed": 0,
+                    "errors": 0,
+                    "skipped": 0,
+                    "failed_tests": [],
+                    # pytest exit 5 = no tests collected; anything else
+                    # nonzero still means "did not pass".
+                    "ok": False,
+                }
+            )
+        else:
+            collected = junit["tests"]
+            bad = junit["failures"] + junit["errors"]
+            tests.update(
+                {
+                    "collected": collected,
+                    "passed": max(collected - bad - junit["skipped"], 0),
+                    "failed": junit["failures"],
+                    "errors": junit["errors"],
+                    "skipped": junit["skipped"],
+                    "failed_tests": junit.get("failed_tests") or [],
+                    # exit 0 = green; exit 5 = files matched but nothing
+                    # collected — count that as detected-but-none, not fail.
+                    "ok": run["exit_code"] == 0,
+                }
+            )
+            if run["exit_code"] == 5:
+                warnings.append(
+                    "test files detected but pytest collected nothing"
+                )
+        phases["tests"] = tests
+
+        # -- coverage totals (only meaningful when tests actually ran) ------
+        if tests.get("collected"):
+            cov_run = _run(
+                [
+                    sys.executable,
+                    "-m",
+                    "coverage",
+                    "json",
+                    f"--data-file={COVERAGE_DATA}",
+                    "-o",
+                    str(COVERAGE_JSON_PATH),
+                ],
+                60,
+            )
+            cov = _read_coverage_json(COVERAGE_JSON_PATH)
+            if cov is not None:
+                cov["duration_seconds"] = cov_run["duration_seconds"]
+                phases["coverage"] = cov
+            else:
+                warnings.append(
+                    "coverage data unavailable "
+                    f"(coverage json rc={cov_run['exit_code']})"
+                )
+                phases["coverage"] = None
+        else:
+            phases["coverage"] = None
+
+    _emit(result)
+    return 0
+
+
+def _emit(result: dict[str, Any]) -> None:
+    """Publish the result on both channels: /out file, then stdout sentinel.
+
+    Both channels are runner-only: /out is a root-owned dir and candidate
+    phases exec under a different uid, so the workload can neither forge
+    the file nor print sentinels through /proc/*/fd/1. The sentinel —
+    emitted last — is the channel ExecRunner trusts; the file (fetched via
+    ``docker cp`` after confirmed exit) is the fallback.
+    """
+    payload = json.dumps(result, ensure_ascii=False)
+    try:
+        OUT.mkdir(parents=True, exist_ok=True)
+        tmp = OUT / f".{RESULT_FILENAME}.tmp"
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, OUT / RESULT_FILENAME)
+    except OSError:
+        pass
+    print(RESULT_SENTINEL + payload, flush=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
