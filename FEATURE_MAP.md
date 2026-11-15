@@ -79,19 +79,33 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 ### F2 — Orchestrator ✅
 
-- **What:** run state machine (`submitted → rubric_review → provisioning →
-  running → evaluating → done | failed`); matrix expansion (harness configs ×
-  model); rubric draft generated via gateway → frozen on user approval;
-  termination policy watcher (timeout, budget, stuck-loop, done signal).
+- **What:** run state machine (`submitted → rubric_review → [queued →]
+  provisioning → running → evaluating → done | failed`); matrix expansion
+  (harness configs × model); rubric draft generated via gateway → frozen on
+  user approval; termination policy watcher (timeout, budget, stuck-loop,
+  done signal).
+- **Pacing (PR15):** one active run at a time — approvals while a run
+  executes (or is queued) park in `queued` and promote FIFO by approval
+  (`pacing.place_run` / `claim_next_queued`; promotion is wired into
+  `runner._lifecycle_then_promote` + re-kicked by `startup_sweep`). Spawn
+  memory gate: `spawn_one` waits for `SPAWN_MIN_FREE_MEM_MB` host headroom
+  before `docker run` (probed via `/proc/meminfo` → `sysconf` → `docker
+  info`+`stats`), capped by `SPAWN_MEM_WAIT_SECONDS`, expiry fails that
+  sandbox — remaining configs then fail fast (one probe each) so pressure
+  can't hold the slot for N×cap. Pacing emits `checkpoint` events keyed by
+  `payload.stage`: `run_queued`/`run_dequeued` (run scope),
+  `spawn_mem_wait`/`spawn_mem_release`/`spawn_mem_timeout` (sandbox scope).
 - **Where:** `orchestrator/` (`state_machine.py`, `lifecycle.py`,
-  `provision.py`, `monitor.py`, `rubric.py`, `runner.py`, `events.py`,
-  `adapters.py`), db `runs`/`sandboxes`/`rubrics`
+  `provision.py`, `monitor.py`, `rubric.py`, `runner.py`, `pacing.py`,
+  `events.py`, `adapters.py`), db `runs`/`sandboxes`/`rubrics`
 - **Verify:**
   - Unit: `tests/unit/orchestrator/` (`test_state_machine.py`,
     `test_lifecycle.py`, `test_monitor.py`, `test_provision.py`,
-    `test_rubric.py`)
+    `test_rubric.py`, `test_pacing.py`), queue E2E in
+    `tests/unit/api/test_runs.py::test_approve_queues_behind_active_run`
   - Manual: submit → edit/approve rubric → sandboxes spawn → terminal states
-    recorded correctly
+    recorded correctly; approve a second run mid-flight → `queued` badge →
+    promotes when the first finishes
 - **Depends on:** F3, F4, F5
 
 ### F3 — AI gateway ✅
@@ -328,7 +342,22 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `GET /api/harnesses` serves adapter manifests (display name, LLM protocol,
   CLI, image) for the submit form; `HarnessConfigIn.adapter` validates
   against the registry. Design doc: `docs/p25-harness-adapters.md`.
-- **Where:** `adapters/common/` (`runner.py`, `contract.py`),
+- **Hook/plugin telemetry (PR17):** harnesses with a documented native hook
+  surface report higher-fidelity events through the shared receiver
+  `adapters/common/hooks.py` (`python3 -m adapters.common.hooks <adapter>
+  [json]` — stdin payload for Claude Code hooks and pi's extension
+  forwarder, argv for Codex `notify`). Each hooked adapter ships `translate_hook`
+  beside `translate_obj` in `translate.py` + a `MANIFEST["hooks"]` line;
+  emitted payloads are stamped `via: "hook"`. Coverage: `claude_code`
+  settings.json hooks (`PostToolUse` → `tool_result` — outcome detail the
+  stream translation drops; `SessionStart/End`, `Stop`, `SubagentStop`,
+  `Notification`, `PreCompact` → `checkpoint`), `codex` `notify`
+  (`agent-turn-complete` → `checkpoint` with `last-assistant-message`), `pi`
+  generated `extensions/heg-events.ts` (`tool_execution_end` →
+  `tool_result`). `deepseek`/`aider`/`miniloop` stay translated-only. The
+  receiver always exits 0 and mirrors to stderr (stdout can feed back into
+  agent context for some claude hook events).
+- **Where:** `adapters/common/` (`runner.py`, `contract.py`, `hooks.py`),
   `adapters/{codex,claude_code,pi,deepseek,aider}/` (`adapter.py`, `config.py`,
   `translate.py`, `__main__.py`; aider also `launcher.py` — the patched
   entrypoint that lifts aider's explicit-yes gate on suggested shell
@@ -338,8 +367,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Verify:**
   - Unit: `tests/unit/adapters/test_adapter_contract.py` (contract across all
     adapters: manifest, image_spec, env, launch, translation → valid
-    `EventType`s, `HEG_RESULT` parsing) + per-adapter tests under
-    `tests/unit/adapters/<name>/`
+    `EventType`s, `HEG_RESULT` parsing, hook-manifest ↔ `translate_hook`
+    pairing) + per-adapter tests under `tests/unit/adapters/<name>/` +
+    `tests/unit/adapters/common/test_hooks.py` (receiver: payload parsing,
+    via-stamping, ingest POST, exit-0 guarantee)
   - API: `tests/unit/api/test_harnesses.py`, multi-adapter submit in
     `test_runs.py::test_create_run_multi_adapter`
   - Docker: `tests/integration/test_adapter_images.py` (`-m docker`) — CLI

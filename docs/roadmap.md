@@ -66,6 +66,19 @@ append-mostly; rebase on main before merge.
   (`POST /api/runs/{id}/rescore` → `lifecycle.rescore_run`), versioned
   post-run rubric edits (`parent_id` chain, `Score.rubric_version`/`seq`
   provenance, `?rubric_version=` results filter). See FEATURE_MAP.md F14.
+- **PR17 — hook/plugin telemetry lane**: shared receiver
+  `adapters/common/hooks.py` (`python3 -m adapters.common.hooks <adapter>`)
+  wired to claude_code `settings.json` hooks (stdin), codex `notify`
+  (argv), and pi's generated `heg-events.ts` extension (stdin); per-adapter
+  `translate_hook` normalizes payloads stamped `via: "hook"`; new
+  `tool_result` EventType carries tool outcomes. Details: FEATURE_MAP.md
+  F10 + docs/p25-harness-adapters.md §PR17.
+- **PR15 — Run pacing** (`queued` run status + `orchestrator/pacing.py`):
+  `place_run`/`claim_next_queued` FIFO promotion via
+  `runner._lifecycle_then_promote` + `startup_sweep` re-kick; `spawn_one`
+  waits on `SPAWN_MIN_FREE_MEM_MB` headroom capped by
+  `SPAWN_MEM_WAIT_SECONDS` (timeout fails that sandbox, siblings fail
+  fast). Details: `FEATURE_MAP.md` F2.
 
 ## Dependency DAG
 
@@ -244,13 +257,9 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 - **Depends on:** PR1 (HarnessConfigIn schema churn settles); best after
   PR12 (needs >1 usable provider to be interesting).
 
-### PR15 — Run pacing: submission queue + memory-aware scheduling
-- **Scope:** serialize runs so a new submission queues behind the active
-  one; gate `spawn_one` on host memory pressure (docker info/cgroup stats)
-  and queue pending sandboxes until headroom exists (matters at 8x).
-- **Touch:** `orchestrator/runner.py`, `orchestrator/provision.py`,
-  `orchestrator/monitor.py`, run state machine (queued state?).
-- **Verify:** unit tests with stubbed memory readings + queue ordering.
+### PR15 — Run pacing: submission queue + memory-aware scheduling — ✅ landed
+`queued` run status + `orchestrator/pacing.py` — see "Already landed" and
+`FEATURE_MAP.md` F2.
 
 ### PR16 — "Add next prompt" (multi-turn runs)
 - **Scope:** continue a finished sandbox with a follow-up prompt on the
@@ -260,11 +269,18 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
   sandbox runtime (resume semantics), run detail UI.
 - **Depends on:** PR15 (same files; pacing settles first).
 
-### PR17 — Higher-fidelity instrumentation via hooks/plugins
-- **Scope:** richer agent-level events via harness hooks/plugins where the
-  CLIs support them (beyond adapter-translated output).
-- **Touch:** `adapters/common/` shim, `api/schemas.py` EventType (maybe new
-  types — contract test AST-scans emitters), adapter translate fns.
+### PR17 — Higher-fidelity instrumentation via hooks/plugins — ✅ landed
+Landed as the hook/plugin telemetry lane: `adapters/common/hooks.py` shared
+receiver (right-to-left argv dict-JSON scan → select-gated bounded stdin,
+always exit 0, JSONL mirror to stderr only) + per-adapter `translate_hook`
+paired with `MANIFEST["hooks"]` (contract-tested). claude_code
+`settings.json` hooks (`PostToolUse` → `tool_result`; lifecycle /
+notification → `checkpoint`), codex `notify` (`agent-turn-complete` →
+`checkpoint` + `last-assistant-message`), pi generated
+`extensions/heg-events.ts` (`tool_execution_end` → `tool_result`);
+deepseek/miniloop stay translated-only. New `tool_result` EventType carries
+tool outcomes; `via: "hook"` stamped on every hook payload. Details:
+FEATURE_MAP F10, docs/p25-harness-adapters.md §PR17.
 
 ### PR18 — Gateway response caching / deterministic replay ✅ landed
 - **Scope:** cache upstream responses keyed on request for deterministic

@@ -77,8 +77,9 @@ adapters are added.
    flag when evaluator model == participant model.
 2. **Control API + Orchestrator (FastAPI, async)** — validates submissions,
    expands run matrix, generates rubric via gateway, drives run state machine
-   (`submitted → rubric_review → provisioning → running → evaluating →
-   done | failed`), manages sandbox lifecycle, enforces termination policy.
+   (`submitted → rubric_review → [queued →] provisioning → running →
+   evaluating → done | failed`), manages sandbox lifecycle, enforces
+   termination policy, paces run/sandbox admission (below).
 3. **AI gateway (Python, custom)** — exposes an OpenAI-compatible
    (`/v1/chat/completions`) endpoint, translates to upstream providers
    (**Ollama is the default upstream for MVP** — small local models, e.g.
@@ -105,7 +106,17 @@ adapters are added.
 1. **Submit** — form → run spec (`POST /api/runs`).
 2. **Rubric draft** — orchestrator calls LLM via gateway → draft rubric →
    UI displays; user edits → approves → **frozen**, shared across sandboxes.
+   **Pacing (PR15):** runs serialize — one active run at a time; an approval
+   landing while a run executes (or is already queued) parks in `queued`
+   and promotes FIFO by approval when the slot frees (lifecycle end or the
+   next startup sweep). `started_at` = approval/queue-entry time.
 3. **Provision** — prepare identical initial repo; build/launch N sandboxes.
+   `spawn_one` additionally gates each `docker run` on host memory headroom
+   (`SPAWN_MIN_FREE_MEM_MB`, probed via `/proc/meminfo` → `sysconf` →
+   `docker info`+`stats`; unreadable probe = gate off). The wait is capped
+   by `SPAWN_MEM_WAIT_SECONDS` — expiry fails that one sandbox and makes
+   the remaining configs fail fast (one probe each), so sustained pressure
+   can't hold the run's slot for N×cap.
 4. **Execute** — agent loops; all model calls via gateway; adapter streams
    normalized events; UI shows live timeline.
 5. **Terminate** — each sandbox reaches a terminal state (below); workspace
@@ -139,8 +150,9 @@ done skill pack) that signals the orchestrator — `agent_done` is distinct from
 
 - **sources**: `gateway`, `harness`, `sandbox`, `evaluator`, `orchestrator`
 - **types**: `llm_request`, `llm_response` (tokens in/out, cache r/w, latency,
-  cost, model), `tool_call`, `shell_command`, `file_op`, `test_execution`,
-  `checkpoint`, `skill_invocation`, `done_signal`, `error`, `run_started`,
+  cost, model), `tool_call`, `tool_result` (hook-sourced tool outcomes),
+  `shell_command`, `file_op`, `test_execution`, `checkpoint`,
+  `skill_invocation`, `done_signal`, `error`, `run_started`,
   `terminal_state`, `context_compacted`, `miniloop_result` (authoritative
   list: `api/schemas.py::EventType` — a contract test AST-scans emitters)
 
@@ -148,6 +160,21 @@ Gateway events are captured passively from the request/response stream.
 Agent-level events (tool calls, shell, file ops) are produced by the harness
 adapter translating native output (e.g. Claude Code `--output-format
 stream-json`, Aider logs) or harness hooks where available.
+
+**Hook events (PR17):** harnesses with a native hook/plugin surface register
+the shared receiver `python3 -m adapters.common.hooks <adapter>` — payload
+JSON arrives on stdin (Claude Code `settings.json` hooks, pi's generated
+`heg-events.ts` extension) or argv (Codex `notify`), the adapter's
+`translate_hook` normalizes it, and events POST to `/internal/events` with
+`via: "hook"` stamped into the payload. The receiver always exits 0 and
+mirrors JSONL to stderr only (Claude injects SessionStart/UserPromptSubmit
+hook stdout into agent context). Hooked today: `claude_code` (PostToolUse →
+`tool_result`; session lifecycle → `checkpoint`), `codex`
+(agent-turn-complete → `checkpoint` incl. `last-assistant-message`), `pi`
+(tool_execution_end → `tool_result`). `deepseek` (no stable observer/plugin
+API — cordis loader internals only) and `miniloop` (our own agent, already
+first-class) stay on the translated path; new adapters opt in by adding
+`translate_hook` + a `MANIFEST["hooks"]` line (contract-tested pairing).
 
 ## Harness adapter contract
 
@@ -159,6 +186,9 @@ Each adapter provides:
 - `launch(task_prompt)` — start the agent loop (non-interactive mode)
 - `translate_events(stream)` → normalized `Event[]`
 - `completion_signal()` — how `done` / loop-completion is detected
+- *(optional)* `translate_hook` in `adapters/<name>/translate.py` + a
+  `MANIFEST["hooks"]` descriptor — wires the harness's native hook/plugin
+  surface into `adapters.common.hooks` (see Event model § hook events)
 
 **MVP adapter:** `miniloop` — our custom minimal coding agent (tool-call
 loop: shell exec, file read/write, `done`). Shipped CLI adapters (F10 +
@@ -252,14 +282,8 @@ or tests change.
   (PR7 — static analysis landed in PR6 via `scoring/` signal collectors)
 - Automated test-suite generation as eval target
 - Higher-fidelity instrumentation via harness hooks/plugins
+- Gateway response caching / deterministic replay
 - Multi-host / K8s sandbox scaling
-- Memory-aware spawn scheduling — gate `spawn_one` on host memory pressure
-  (docker info / cgroup stats) and queue pending sandboxes until headroom
-  exists, instead of launching all N configs at once (matters at 8x)
-- Run submission queue — pace/serialize whole runs so a new submission waits
-  behind the active run instead of overlapping; combined with memory-aware
-  spawn scheduling this bounds concurrent sandboxes when >2 would exceed
-  headroom for the loaded model
 - Auth, saved run templates, share links
 - Dynamic model picker — populate the submit form's model suggestions from
   `ollama list` (gateway `/v1/models` pass-through already exists) instead of
@@ -332,8 +356,23 @@ or tests change.
   npm install happens before COPY so dependency layers cache. DeepSeek's
   `dsh` needs node >=24.9 → `node:24-slim` (others stay on 22). Aider is a
   Python CLI → `python:3.12-slim` + `pip install aider-chat` (PR13).
+- **PR15 pacing is DB-driven, not in-memory**: `queued` is a run status, so
+  the submission queue survives api restarts (startup sweep re-promotes).
+  Queue order = `started_at` (approval time). Spawn admission is a bounded
+  wait *inside* `spawn_one` (per-sandbox failure on timeout) rather than a
+  scheduler loop — sequential provisioning already makes spawns the unit of
+  queuing. `run.status` stays `String` — no migration needed for `queued`.
 - **`done` invocation**: bare `done` is a shell keyword in sh/bash — prompts
   instruct harnesses to run `/usr/local/bin/done` (or `command done`).
+- **PR17 — hook/plugin telemetry lane**: `adapters/common/hooks.py` is the
+  shared receiver (`python3 -m adapters.common.hooks <adapter> [json]`) for
+  native hooks — claude_code `settings.json` hooks (stdin), codex `notify`
+  (argv), pi's generated extension forwarder (stdin). Normalization stays in
+  Python via each adapter's `translate_hook` (contract-tested); events carry
+  `via: "hook"`. New `tool_result` EventType reports tool *outcomes* — the
+  detail translated streams drop to avoid double-counting tool calls. Hook
+  choice per CLI follows documented surfaces only (dsh/miniloop untranslated
+  paths unchanged).
 - **Imported skill packs (F11) live under `data/skillpacks/`**, not the
   vendored `skillpacks/` tree — vendored packs are committed and baked into
   the api image (ephemeral FS in compose), while `data/` is gitignored and
