@@ -160,12 +160,15 @@ def _read_text_capped(path: Path, max_chars: int) -> str | None:
     try:
         if path.is_symlink() or not path.is_file():
             return None
-        text = path.read_text(encoding="utf-8", errors="replace")
+        with path.open("rb") as fh:
+            raw = fh.read(max_chars * 4 + 1)
+            has_more = bool(fh.read(1))
     except OSError:
         return None
+    text = raw.decode("utf-8", errors="replace")
     if not text.strip():
         return None
-    if len(text) > max_chars:
+    if has_more or len(text) > max_chars:
         text = text[:max_chars] + "\n... [truncated]\n"
     return text
 
