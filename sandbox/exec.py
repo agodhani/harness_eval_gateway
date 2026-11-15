@@ -8,11 +8,17 @@ Isolation posture (same family as ``sandbox/preview.py``'s desktop runner,
 tightened — exec needs NO network at all, not even the gateway):
 
 - ``--network none`` — zero egress; no DNS, no peers, no published ports.
-- ``--user 65534:65534`` + ``--cap-drop ALL`` + ``no-new-privileges``.
+- ``--user 0:0`` + ``--cap-drop ALL`` + ``--cap-add SETUID --cap-add
+  SETGID`` + ``no-new-privileges`` — the in-image runner is root ONLY so
+  every candidate phase can exec demoted to nobody (65534). The uid split
+  is what makes the result channels unforgeable: a same-uid candidate
+  could write fake ``HEG_EXEC_RESULT`` lines through ``/proc/*/fd/1`` and
+  rewrite ``/out``; a different-uid one can reach neither (and can't
+  snoop/swallow the runner's stdout or environ either).
 - ``--cpus``/``--memory``/``--pids-limit`` resource bounds.
-- ``--tmpfs`` size caps on the container's writable scratch dirs (``/tmp``
-  and ``/work``) so candidate code can't fill the host disk; retried
-  without them on daemons that reject the mount opts.
+- ``--tmpfs`` size caps on the only candidate-writable dirs (``/tmp`` and
+  ``/work``) so candidate code can't fill the host disk; retried without
+  them on daemons that reject the mount opts.
 - Candidate workspace bind-mounted **read-only** at ``/srv/src``; the
   in-image runner copies it to the container-local ``/work`` (byte-capped)
   before executing — the artifact on disk is never written to.
@@ -20,11 +26,15 @@ tightened — exec needs NO network at all, not even the gateway):
   ``docker logs --tail`` → ``docker rm -f``. Container output NEVER
   streams into api memory: an attached ``docker run`` buffers ALL stdout+
   stderr in-process for the whole timeout, so a ``while True: print()``
-  candidate could OOM the control plane.
-- Result channel: a scratch dir mounted at ``/out`` (``exec_result.json``)
-  is the fallback; the LAST ``HEG_EXEC_RESULT <json>`` stdout sentinel is
-  authoritative — it is the runner's final act, printed after the file
-  write, while /out is candidate-writable through the whole run.
+  candidate could OOM the control plane. Container stdout is also
+  runner-only output (phases are captured, demoted code can't reach the
+  console fd), so it stays small.
+- Result channel: the runner writes ``/out/exec_result.json`` inside the
+  container rootfs (root-owned, never mounted — candidate phases can't
+  write it at all) and prints a ``HEG_EXEC_RESULT <json>`` sentinel as
+  its final stdout line. The sentinel stays authoritative; the file —
+  fetched via ``docker cp`` only after the container is confirmed exited —
+  is the fallback. Nothing is parsed while the container may still run.
 - A forced ``docker rm -f`` always runs — nothing leaks. (No ``--rm``:
   the container must outlive ``docker wait`` so logs are still fetchable.)
 - Per-phase inner timeouts (compile/test) inside the runner plus an outer
@@ -122,8 +132,10 @@ class ExecLimits:
     cpus: str = "1"
     memory: str = "1g"
     pids: int = 256
-    #: Outer docker-wait cap — must exceed the inner phase timeouts.
-    timeout_seconds: float = 300.0
+    #: Outer docker-wait cap — inner phase timeouts (60+180+60=300) plus
+    #: headroom for copy/scan/process startup so the runner can report
+    #: inner timeouts as data instead of being killed mid-payload.
+    timeout_seconds: float = 420.0
     #: Inner per-phase caps (in-container, env-injected).
     build_timeout_seconds: float = 60.0
     test_timeout_seconds: float = 180.0
@@ -234,7 +246,7 @@ class ExecRunner:
         return f"{mib}m"
 
     def _build_args(
-        self, *, name: str, workspace: Path, out_dir: Path, bounded: bool = True
+        self, *, name: str, workspace: Path, bounded: bool = True
     ) -> list[str]:
         """``docker run`` argv for one exec container (testable, no side effects).
 
@@ -256,10 +268,17 @@ class ExecRunner:
             "none",  # zero egress — exec needs no gateway, no DNS, no peers
             "--restart",
             "no",
+            # Runner is root ONLY to demote candidate phases to nobody —
+            # the uid split keeps /out and /proc/*/fd/1 out of candidate
+            # reach, which is what makes the result channels unforgeable.
             "--user",
-            "65534:65534",
+            "0:0",
             "--cap-drop",
             "ALL",
+            "--cap-add",
+            "SETUID",
+            "--cap-add",
+            "SETGID",
             "--security-opt",
             "no-new-privileges",
             "--cpus",
@@ -270,19 +289,21 @@ class ExecRunner:
             str(limits.pids),
         ]
         if bounded:
-            # tmpfs size caps on the only container-local writable dirs so a
-            # candidate can't fill the host disk (the copy cap alone doesn't
-            # bound caches/coverage/test junk). /out stays a bind mount —
-            # it's the result-file channel and docker cp can't read tmpfs.
-            # NOTE: a tmpfs over an existing dir inherits its ownership —
-            # /work needs the explicit uid/gid or nobody can't copy into it.
+            # tmpfs size caps on the only candidate-writable dirs — the
+            # rootfs and /out are root-owned, so once /tmp and /work are
+            # bounded a candidate can't fill the host disk (the copy cap
+            # alone doesn't bound caches/coverage/test junk). mode=1777:
+            # the runner copies in as uid 0, demoted phases write as nobody.
             if limits.tmp_size:
-                args += ["--tmpfs", f"{CONTAINER_TMP}:size={limits.tmp_size}"]
+                args += [
+                    "--tmpfs",
+                    f"{CONTAINER_TMP}:size={limits.tmp_size},mode=1777",
+                ]
             work_size = self._work_tmpfs_size()
             if work_size:
                 args += [
                     "--tmpfs",
-                    f"{CONTAINER_WORK}:size={work_size},uid=65534,gid=65534",
+                    f"{CONTAINER_WORK}:size={work_size},mode=1777",
                 ]
         args += [
             "-e",
@@ -299,10 +320,11 @@ class ExecRunner:
             "/work",
             # The candidate tree is READ-ONLY — the in-image runner copies it
             # to /work before executing, so the artifact is never written to.
+            # No /out mount: the result file stays in the container rootfs
+            # (root-owned, unreachable by demoted phases) and comes out via
+            # ``docker cp`` once the container has exited.
             "-v",
             f"{self._rt.to_host_path(workspace)}:{CONTAINER_SRC}:ro",
-            "-v",
-            f"{self._rt.to_host_path(out_dir)}:{CONTAINER_OUT}",
             self.image,
         ]
         return args
@@ -335,7 +357,7 @@ class ExecRunner:
     def _file_result(
         out_dir: Path, warnings: list[str]
     ) -> dict[str, Any] | None:
-        """``/out/exec_result.json`` payload — the fallback channel."""
+        """``/out/exec_result.json`` payload (docker-cp'd) — the fallback."""
         path = out_dir / RESULT_FILENAME
         try:
             if path.is_symlink():
@@ -362,14 +384,14 @@ class ExecRunner:
     def _parse_result(
         out_dir: Path, stdout: str, warnings: list[str]
     ) -> dict[str, Any] | None:
-        """Result payload: LAST stdout sentinel wins; /out file is fallback.
+        """Result payload: LAST stdout sentinel wins; the cp'd file is the
+        fallback.
 
-        Both channels are in principle candidate-writable (a daemonized child
-        could re-write /out or print a fake sentinel in the teardown race
-        window). The sentinel is preferred because it is the runner's final
-        act — emitted AFTER the file write — while /out stays writable for
-        the container's whole life. When both exist and disagree, the file
-        is the suspect: keep the sentinel and warn.
+        Both channels are runner-only — candidate phases exec under a
+        different uid so they can neither write ``/out`` (root-owned) nor
+        print sentinels through ``/proc/*/fd/1`` — and the file is fetched
+        via ``docker cp`` only after a confirmed exit. The last-wins and
+        disagreement checks stay as belt-and-suspenders.
         """
         sentinel = ExecRunner._sentinel_result(stdout, warnings)
         file_data = ExecRunner._file_result(out_dir, warnings)
@@ -377,7 +399,7 @@ class ExecRunner:
             if file_data is not None and file_data != sentinel:
                 warnings.append(
                     "result file disagrees with the stdout sentinel — "
-                    "trusting the sentinel (file is candidate-writable)"
+                    "trusting the sentinel"
                 )
             return sentinel
         return file_data
@@ -409,7 +431,6 @@ class ExecRunner:
         name = f"{self.container_prefix}{uuid.uuid4().hex[:12]}"
         outcome.container = name
         work_dir = self.work_root / name
-        out_dir = work_dir / "out"
         timeout = (
             float(timeout_seconds)
             if timeout_seconds is not None
@@ -418,33 +439,28 @@ class ExecRunner:
         started = time.monotonic()
         spawned = False
         try:
-            out_dir.mkdir(parents=True, mode=0o777)
-            out_dir.chmod(0o777)  # nobody inside the container must write here
-            spawned = self._spawn(name, ws, out_dir, outcome)
+            spawned = self._spawn(name, ws, outcome)
         except (OSError, subprocess.SubprocessError) as exc:
             outcome.error = f"docker run failed: {type(exc).__name__}: {exc}"
 
         if spawned:
             self._wait(name, timeout, outcome)
-            # Logs + result still fetchable on a stopped container — and on a
-            # still-RUNNING one (timeout path) before the forced remove.
-            self._collect(name, out_dir, outcome)
+            # Logs + result still fetchable on a stopped container.
+            self._collect(name, work_dir / "out", outcome)
         self._remove(name)
         outcome.duration_seconds = round(time.monotonic() - started, 2)
         # Scratch dir is diagnostic-only once the payload is parsed — drop it.
         shutil.rmtree(work_dir, ignore_errors=True)
         return outcome
 
-    def _spawn(
-        self, name: str, ws: Path, out_dir: Path, outcome: ExecOutcome
-    ) -> bool:
+    def _spawn(self, name: str, ws: Path, outcome: ExecOutcome) -> bool:
         """``docker run -d`` the exec container; True when it started.
 
         On a failure whose stderr points at the tmpfs/mount opts, retries
         once WITHOUT the disk bounds — a degraded-but-working exec beats a
         hard failure on a daemon that doesn't support them.
         """
-        args = self._build_args(name=name, workspace=ws, out_dir=out_dir)
+        args = self._build_args(name=name, workspace=ws)
         proc = self._rt._docker(
             args, check=False, timeout=_SPAWN_TIMEOUT_SECONDS
         )
@@ -456,9 +472,7 @@ class ExecRunner:
             outcome.warnings.append(
                 "daemon rejected tmpfs disk bounds — retrying without them"
             )
-            args = self._build_args(
-                name=name, workspace=ws, out_dir=out_dir, bounded=False
-            )
+            args = self._build_args(name=name, workspace=ws, bounded=False)
             proc = self._rt._docker(
                 args, check=False, timeout=_SPAWN_TIMEOUT_SECONDS
             )
@@ -489,24 +503,45 @@ class ExecRunner:
                 f"docker wait failed (exit {proc.returncode}): "
                 f"{(proc.stderr or '').strip()}"
             )
-        outcome.exit_code = self._inspect_exit_code(name)
+        running, exit_code = self._inspect_state(name)
+        outcome.exit_code = exit_code
+        if running is not False:
+            # Exit not positively confirmed — the container may still be
+            # running, so nothing collectable now is a finished result.
+            outcome.timed_out = True
+            outcome.error = "exec container exit unconfirmed — killed"
 
-    def _inspect_exit_code(self, name: str) -> int | None:
-        """Exit-code fallback for when ``docker wait``'s output is unusable."""
+    def _inspect_state(self, name: str) -> tuple[bool | None, int | None]:
+        """(running, exit_code) for when ``docker wait``'s output is unusable.
+
+        ``.State.ExitCode`` alone reports 0 for a still-RUNNING container —
+        only an explicit ``Running == false`` counts as a confirmed exit.
+        """
         try:
             proc = self._rt._docker(
-                ["inspect", "-f", "{{.State.ExitCode}}", name],
+                [
+                    "inspect",
+                    "-f",
+                    "{{.State.Running}}|{{.State.ExitCode}}",
+                    name,
+                ],
                 check=False,
                 timeout=30,
             )
             if proc.returncode == 0:
-                return int(proc.stdout.strip())
-        except (OSError, subprocess.SubprocessError, ValueError):
+                running_s, _, code_s = proc.stdout.strip().partition("|")
+                running = {"true": True, "false": False}.get(running_s)
+                try:
+                    exit_code: int | None = int(code_s)
+                except ValueError:
+                    exit_code = None
+                return running, exit_code
+        except (OSError, subprocess.SubprocessError):
             pass
-        return None
+        return None, None
 
     def _collect(self, name: str, out_dir: Path, outcome: ExecOutcome) -> None:
-        """Bounded ``docker logs --tail`` + result parse, before removal."""
+        """Bounded ``docker logs --tail`` + result fetch, before removal."""
         stdout_tail = ""
         try:
             proc = self._rt._docker(
@@ -531,10 +566,10 @@ class ExecRunner:
             )
 
         if outcome.timed_out:
-            # The runner emits its result only on completion — a payload
-            # found while the container is still running can only be
-            # candidate-planted, never a real measurement.
+            # The runner emits its result only on completion — anything
+            # collectable before a confirmed exit is pre-completion data.
             return
+        self._cp_result(name, out_dir, outcome)
         outcome.result = self._parse_result(
             out_dir, stdout_tail, outcome.warnings
         )
@@ -542,6 +577,33 @@ class ExecRunner:
             outcome.error = (
                 "exec container produced no result payload "
                 f"(exit {outcome.exit_code})"
+            )
+
+    def _cp_result(self, name: str, out_dir: Path, outcome: ExecOutcome) -> None:
+        """``docker cp`` the result file out of the stopped container.
+
+        The file lives in the container rootfs (root-owned) — cp works on
+        stopped containers, so this only ever runs after a confirmed exit.
+        """
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            proc = self._rt._docker(
+                [
+                    "cp",
+                    f"{name}:{CONTAINER_OUT}/{RESULT_FILENAME}",
+                    str(self._rt.to_host_path(out_dir)),
+                ],
+                check=False,
+                timeout=_DOCKER_CALL_TIMEOUT_SECONDS,
+            )
+            if proc.returncode != 0:
+                outcome.warnings.append(
+                    "docker cp of result file failed "
+                    f"(exit {proc.returncode}): {(proc.stderr or '').strip()}"
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            outcome.warnings.append(
+                f"docker cp of result file failed: {type(exc).__name__}: {exc}"
             )
 
     def _remove(self, name: str) -> None:

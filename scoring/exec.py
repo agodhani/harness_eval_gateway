@@ -136,6 +136,25 @@ def _flat_metrics(outcome: ExecOutcome) -> dict[str, Any]:
     return metrics
 
 
+def exec_summary_dict(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Flat exec headline shared by the evaluator's event payloads
+    (``eval_analysis`` / ``test_execution``) and the results API's
+    ``ExecSummary`` — the single definition of the summary field list."""
+    return {
+        "build_ok": metrics.get("build_ok"),
+        "tests_detected": metrics.get("tests_detected", False),
+        "tests_ok": metrics.get("tests_ok"),
+        "tests_collected": metrics.get("tests_collected", 0),
+        "tests_passed": metrics.get("tests_passed", 0),
+        "tests_failed": metrics.get("tests_failed", 0),
+        "tests_errors": metrics.get("tests_errors", 0),
+        "tests_skipped": metrics.get("tests_skipped", 0),
+        "coverage_percent": metrics.get("coverage_percent"),
+        "timed_out": metrics.get("timed_out", False),
+        "duration_seconds": metrics.get("duration_seconds"),
+    }
+
+
 class ExecSandboxCollector:
     """Measured exec signals: build success, test pass, coverage.
 

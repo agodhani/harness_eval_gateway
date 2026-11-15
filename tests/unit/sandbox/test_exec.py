@@ -1,11 +1,12 @@
 """ExecRunner unit tests (PR7) — fake docker plumbing, no daemon.
 
 Covers the docker-run argv (the isolation posture IS the feature — detached
-``run -d``, tmpfs disk bounds, caps), result parsing (sentinel primary /
-file fallback, spoof ordering, symlink guard), and the full detached
-``execute`` lifecycle against a stub runtime — run → wait → bounded logs →
-rm — including timeouts, missing image, and the no-unbounded-buffer
-contract (api never sees more than ``docker logs --tail N``).
+``run -d``, root-runner + demoted phases, tmpfs disk bounds, caps), result
+parsing (sentinel primary / file fallback, spoof ordering, symlink guard),
+and the full detached ``execute`` lifecycle against a stub runtime — run →
+wait → bounded logs → docker cp → rm — including timeouts, missing image,
+the unconfirmed-exit gate, and the no-unbounded-buffer contract (api never
+sees more than ``docker logs --tail N``).
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ import subprocess
 from pathlib import Path
 
 from sandbox.exec import (
-    CONTAINER_OUT,
     CONTAINER_TMP,
     CONTAINER_WORK,
     LOG_TAIL_CHARS,
@@ -49,6 +49,7 @@ class _FakeRuntime:
         wait_proc: subprocess.CompletedProcess[str] | None = None,
         wait_exc: Exception | None = None,
         logs_proc: subprocess.CompletedProcess[str] | None = None,
+        inspect_proc: subprocess.CompletedProcess[str] | None = None,
         image_ok: bool = True,
         docker_ok: bool = True,
         write_result: dict | None = None,
@@ -62,6 +63,7 @@ class _FakeRuntime:
         self.wait_proc = wait_proc
         self.wait_exc = wait_exc
         self.logs_proc = logs_proc
+        self.inspect_proc = inspect_proc
         self.image_ok = image_ok
         self.docker_ok = docker_ok
         self.write_result = write_result
@@ -86,12 +88,6 @@ class _FakeRuntime:
         if head == "run":
             if self.run_exc is not None:
                 raise self.run_exc
-            if self.write_result is not None:
-                out_dir = self._out_dir_from_args(args)
-                out_dir.mkdir(parents=True, exist_ok=True)
-                (out_dir / RESULT_FILENAME).write_text(
-                    json.dumps(self.write_result)
-                )
             if self.run_procs:
                 return self.run_procs.pop(0)
             return self.run_proc or _cp(args, 0, "containerid\n")
@@ -101,15 +97,18 @@ class _FakeRuntime:
             return self.wait_proc or _cp(args, 0, "0\n")
         if head == "logs":
             return self.logs_proc or _cp(args, 0)
-        # rm / inspect / anything else — succeed quietly
+        if head == "cp":
+            # args: cp <name>:/out/exec_result.json <dest_dir>
+            if self.write_result is None:
+                return _cp(args, 1, err="No such container:path")
+            dest = Path(args[-1])
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / RESULT_FILENAME).write_text(json.dumps(self.write_result))
+            return _cp(args, 0)
+        if head == "inspect":
+            return self.inspect_proc or _cp(args, 0, "false|0\n")
+        # rm / anything else — succeed quietly
         return _cp(args, 0)
-
-    @staticmethod
-    def _out_dir_from_args(args: list[str]) -> Path:
-        for i, arg in enumerate(args):
-            if arg == "-v" and args[i + 1].endswith(f":{CONTAINER_OUT}"):
-                return Path(args[i + 1].rsplit(":", 1)[0])
-        raise AssertionError("no /out mount in run args")
 
 
 def _runner(
@@ -138,26 +137,27 @@ def test_run_args_lock_down_container(tmp_path: Path) -> None:
     rt = _FakeRuntime(tmp_path)
     runner = _runner(tmp_path, rt, limits=ExecLimits(cpus="2", memory="512m"))
     ws = _ws(tmp_path)
-    out_dir = tmp_path / "exec-scratch" / "x" / "out"
-    args = runner._build_args(
-        name="hegexec-test", workspace=ws, out_dir=out_dir
-    )
+    args = runner._build_args(name="hegexec-test", workspace=ws)
     # Detached, no --rm: wait+logs replace streaming stdout; we rm -f later.
     assert args[:4] == ["run", "-d", "--init", "--name"]
     assert "--rm" not in args
     assert args[args.index("--network") + 1] == "none"
-    assert args[args.index("--user") + 1] == "65534:65534"
+    # Runner is uid 0 only to demote candidate phases to nobody — the uid
+    # split is what keeps /out and /proc/*/fd/1 out of candidate reach.
+    assert args[args.index("--user") + 1] == "0:0"
     assert args[args.index("--cap-drop") + 1] == "ALL"
+    cap_adds = [args[i + 1] for i, a in enumerate(args) if a == "--cap-add"]
+    assert cap_adds == ["SETUID", "SETGID"]
     assert "no-new-privileges" in args
     assert args[args.index("--cpus") + 1] == "2"
     assert args[args.index("--memory") + 1] == "512m"
     assert args[args.index("--pids-limit") + 1] == str(
         runner.limits.pids
     )
-    # workspace mounted read-only at /srv/src; /out is the rw result channel
+    # workspace mounted read-only at /srv/src — the ONLY mount; /out is a
+    # root-owned rootfs dir (no candidate-writable bind mount exists).
     vols = [args[i + 1] for i, a in enumerate(args) if a == "-v"]
-    assert f"{ws}:/srv/src:ro" in vols
-    assert any(v.endswith(f":{CONTAINER_OUT}") for v in vols)
+    assert vols == [f"{ws}:/srv/src:ro"]
     assert args[-1] == runner.image
 
 
@@ -165,15 +165,13 @@ def test_run_args_bound_disk_writes(tmp_path: Path) -> None:
     """tmpfs size caps ride the run argv so candidate writes stay bounded."""
     rt = _FakeRuntime(tmp_path)
     runner = _runner(tmp_path, rt)
-    args = runner._build_args(
-        name="hegexec-x", workspace=_ws(tmp_path), out_dir=tmp_path / "o"
-    )
+    args = runner._build_args(name="hegexec-x", workspace=_ws(tmp_path))
     tmpfs = [args[i + 1] for i, a in enumerate(args) if a == "--tmpfs"]
-    assert f"{CONTAINER_TMP}:size=256m" in tmpfs
-    # /work derives from the 300MiB copy cap + headroom, owned by nobody —
-    # a tmpfs over an existing dir inherits its (root-owned) mode otherwise.
+    assert f"{CONTAINER_TMP}:size=256m,mode=1777" in tmpfs
+    # /work derives from the 300MiB copy cap + headroom, world-writable so
+    # the root runner can copy in and demoted phases can write artifacts.
     work = [t for t in tmpfs if t.startswith(f"{CONTAINER_WORK}:")]
-    assert work and "uid=65534" in work[0] and "gid=65534" in work[0]
+    assert work and "mode=1777" in work[0]
 
 
 def test_run_args_unbounded_drops_tmpfs(tmp_path: Path) -> None:
@@ -183,7 +181,6 @@ def test_run_args_unbounded_drops_tmpfs(tmp_path: Path) -> None:
     args = runner._build_args(
         name="hegexec-x",
         workspace=_ws(tmp_path),
-        out_dir=tmp_path / "o",
         bounded=False,
     )
     assert "--tmpfs" not in args
@@ -290,9 +287,9 @@ def test_execute_happy_path_reads_result_file(tmp_path: Path) -> None:
     assert outcome.exit_code == 0
     assert outcome.error is None
     assert outcome.container.startswith("hegexec-")
-    # detached lifecycle: run -d → wait → logs → rm -f, in that order
+    # detached lifecycle: run -d → wait → logs → cp → rm -f, in order
     heads = [c[0] for c in rt.calls if c and c[0] != "info"]
-    assert heads == ["image", "run", "wait", "logs", "rm"]
+    assert heads == ["image", "run", "wait", "logs", "cp", "rm"]
     run_call = next(c for c in rt.calls if c[0] == "run")
     assert "-d" in run_call
     wait_call = next(c for c in rt.calls if c[0] == "wait")
@@ -340,7 +337,8 @@ def test_execute_timeout_kills_container(tmp_path: Path) -> None:
     assert outcome.timed_out is True
     assert outcome.ok is False
     assert "killed" in (outcome.error or "")
-    # logs still fetched (diagnostics) BEFORE the forced remove
+    # logs still fetched (diagnostics) BEFORE the forced remove — but no
+    # result fetch: nothing collectable while running is a real result
     heads = [c[0] for c in rt.calls if c and c[0] != "info"]
     assert heads == ["image", "run", "wait", "logs", "rm"]
     rm_call = next(c for c in rt.calls if c[0] == "rm")
@@ -349,8 +347,8 @@ def test_execute_timeout_kills_container(tmp_path: Path) -> None:
 
 
 def test_execute_timeout_ignores_planted_result_file(tmp_path: Path) -> None:
-    """A result file present mid-run can only be candidate-planted — the
-    runner emits its payload strictly at completion."""
+    """A result file present mid-run is never trusted — the result is only
+    fetched (docker cp) after a confirmed exit, and a timeout skips it."""
     rt = _FakeRuntime(
         tmp_path,
         wait_exc=subprocess.TimeoutExpired(["docker"], 300),
@@ -359,6 +357,45 @@ def test_execute_timeout_ignores_planted_result_file(tmp_path: Path) -> None:
     outcome = _runner(tmp_path, rt).execute(_ws(tmp_path))
     assert outcome.timed_out is True
     assert outcome.result is None
+    assert not [c for c in rt.calls if c[0] == "cp"]
+
+
+def test_execute_wait_failure_still_running_distrusts_result(
+    tmp_path: Path,
+) -> None:
+    """``docker wait`` failing while the container still runs must not
+    trust collectable state — inspect's Running flag gates the fetch."""
+    rt = _FakeRuntime(
+        tmp_path,
+        wait_proc=_cp([], 1, err="wait exploded"),
+        inspect_proc=_cp([], 0, "true|0\n"),
+        write_result={"version": 1, "phases": {"planted": True}},
+        logs_proc=_cp([], 0, f"{RESULT_SENTINEL}{json.dumps({'x': 1})}\n"),
+    )
+    outcome = _runner(tmp_path, rt).execute(_ws(tmp_path))
+    assert outcome.timed_out is True
+    assert outcome.result is None
+    assert outcome.error
+    assert not [c for c in rt.calls if c[0] == "cp"]
+    rm_call = next(c for c in rt.calls if c[0] == "rm")
+    assert rm_call[:2] == ["rm", "-f"]
+
+
+def test_execute_wait_failure_confirmed_exit_uses_inspect(
+    tmp_path: Path,
+) -> None:
+    """wait-failure + Running=false → parse normally, exit code from inspect."""
+    payload = {"version": 1, "phases": {"build": {"ok": True}}}
+    rt = _FakeRuntime(
+        tmp_path,
+        wait_proc=_cp([], 1, err="wait exploded"),
+        inspect_proc=_cp([], 0, "false|7\n"),
+        write_result=payload,
+    )
+    outcome = _runner(tmp_path, rt).execute(_ws(tmp_path))
+    assert outcome.timed_out is False
+    assert outcome.exit_code == 7
+    assert outcome.result == payload
 
 
 def test_execute_never_buffers_container_output(tmp_path: Path) -> None:

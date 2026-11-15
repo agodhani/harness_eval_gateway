@@ -25,7 +25,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -35,6 +35,7 @@ from api.schemas import AnalysisReport
 from db.models import Artifact, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
 from sandbox.preview import ScanCache
+from scoring.exec import exec_summary_dict
 from scoring.render import ANALYSIS_JSON_FILENAME
 
 router = APIRouter(tags=["results"])
@@ -178,29 +179,24 @@ def _exec_summary(analysis: AnalysisReport | None) -> ExecSummary | None:
 
     None when there's no analysis or no exec signal at all; skipped/error
     signals surface their status + a short detail (skip reason or error).
+    Malformed metric values degrade to the bare status — analysis.json is
+    persisted candidate-adjacent data, so summary coercion never 500s.
     """
     if analysis is None:
         return None
     sig = analysis.signal("exec")
     if sig is None:
         return None
-    m = sig.metrics
-    summary = ExecSummary(
-        status=sig.status,
-        build_ok=m.get("build_ok"),
-        tests_detected=bool(m.get("tests_detected")),
-        tests_ok=m.get("tests_ok"),
-        tests_collected=int(m.get("tests_collected") or 0),
-        tests_passed=int(m.get("tests_passed") or 0),
-        tests_failed=int(m.get("tests_failed") or 0),
-        tests_errors=int(m.get("tests_errors") or 0),
-        tests_skipped=int(m.get("tests_skipped") or 0),
-        coverage_percent=m.get("coverage_percent"),
-        timed_out=bool(m.get("timed_out")),
-        duration_seconds=m.get("duration_seconds"),
-        detail=sig.error or (sig.warnings[0] if sig.warnings else None),
-    )
-    return summary
+    detail = sig.error or (sig.warnings[0] if sig.warnings else None)
+    try:
+        return ExecSummary.model_validate(
+            {"status": sig.status, "detail": detail}
+            | exec_summary_dict(sig.metrics)
+        )
+    except ValidationError:
+        return ExecSummary(
+            status=sig.status, detail=detail or "malformed exec metrics"
+        )
 
 
 # ---------------------------------------------------------------------------

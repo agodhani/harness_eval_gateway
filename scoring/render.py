@@ -24,6 +24,13 @@ def _fmt_num(value: object) -> str:
     return str(value)
 
 
+def _fmt_seconds(value: object) -> str:
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return "0"
+
+
 def _render_static(sig: SignalReport) -> list[str]:
     m = sig.metrics
     cc = m.get("cyclomatic_complexity") or {}
@@ -121,7 +128,7 @@ def _render_exec(sig: SignalReport) -> list[str]:
             f" {m.get('tests_errors', 0)} errors /"
             f" {m.get('tests_skipped', 0)} skipped"
             f" (collected {m.get('tests_collected', 0)}"
-            f" in {m.get('test_duration_seconds') or 0:g}s"
+            f" in {_fmt_seconds(m.get('test_duration_seconds'))}s"
             f" from {m.get('test_files', 0)} test file(s))"
         )
         if m.get("timed_out"):

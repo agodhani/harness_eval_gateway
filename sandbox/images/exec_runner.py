@@ -4,16 +4,20 @@ Baked into the ``heg-exec`` image (``exec.Dockerfile``) and launched by
 :meth:`sandbox.exec.ExecRunner.execute` as the container's PID 1. Contract:
 
 - ``/srv/src`` — the candidate workspace, bind-mounted **read-only**. Copied
-  to ``/work`` (a container-local dir owned by the nobody user) so builds,
+  to ``/work`` (a container-local world-writable dir) so builds,
   ``__pycache__``, pytest cache, and coverage data can write freely without
   ever touching the artifact.
-- ``/out`` — a host-visible scratch dir (bind-mounted rw). The result payload
-  is written to ``/out/exec_result.json`` AND printed on stdout as a
-  ``HEG_EXEC_RESULT <json>`` sentinel line. ExecRunner trusts the LAST
-  sentinel (the runner's final act) and uses the file as the fallback
-  channel for when stdout can't be recovered.
-- The container has ``--network none``, dropped capabilities, and resource
-  caps — this script needs no privileges and must not assume DNS/TCP exist.
+- ``/out`` — a container-local dir owned by root (mode 755), NOT mounted.
+  The runner (uid 0) writes ``/out/exec_result.json`` AND prints it on
+  stdout as a ``HEG_EXEC_RESULT <json>`` sentinel line; the host retrieves
+  the file with ``docker cp`` after the container exits. Candidate phases
+  exec as nobody (65534) — they can neither write ``/out`` nor reach the
+  runner's stdout through ``/proc/*/fd/1``, so neither channel is
+  forgeable. ExecRunner trusts the LAST sentinel and uses the file as the
+  fallback channel for when stdout can't be recovered.
+- The container has ``--network none``, dropped capabilities (the runner
+  keeps only SETUID/SETGID to demote phases), and resource caps — this
+  script needs no other privileges and must not assume DNS/TCP exist.
 
 Phases (Python workspaces only for MVP — the collector gates detection):
 
@@ -26,10 +30,10 @@ Phases (Python workspaces only for MVP — the collector gates detection):
 4. ``coverage`` — ``coverage json`` totals (percent covered, statements).
 
 Every phase is individually time-boxed (env knobs below) so a hanging test
-suite can't burn the outer docker timeout. The process always exits 0 after
+suite can't burn the outer docker timeout. The process exits 0 after
 emitting a result payload — a missing payload on the host side means the
-container itself died (OOM, docker kill), which the ExecRunner reports as an
-infra error, not a candidate failure.
+container itself died or refused (OOM, docker kill, euid/cap check),
+which the ExecRunner reports as an infra error, not a candidate failure.
 
 Env (injected by ExecRunner, all optional):
     EXEC_BUILD_TIMEOUT_SECONDS   compileall cap            (default 60)
@@ -57,6 +61,13 @@ WORK = Path("/work")
 OUT = Path("/out")
 RESULT_FILENAME = "exec_result.json"
 RESULT_SENTINEL = "HEG_EXEC_RESULT "
+
+#: Candidate phases exec under this uid/gid (nobody) — deliberately NOT the
+#: runner's uid. The uid split is the result-channel boundary: a same-uid
+#: candidate could write forged sentinel lines through /proc/*/fd/1 and
+#: rewrite /out; a different-uid one can reach neither.
+CANDIDATE_UID = 65534
+CANDIDATE_GID = 65534
 
 BUILD_TIMEOUT = float(os.environ.get("EXEC_BUILD_TIMEOUT_SECONDS", "60"))
 TEST_TIMEOUT = float(os.environ.get("EXEC_TEST_TIMEOUT_SECONDS", "180"))
@@ -116,8 +127,12 @@ def _run(cmd: list[str], timeout: float, *, cwd: Path = WORK) -> dict[str, Any]:
             cwd=cwd,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
             check=False,
+            user=CANDIDATE_UID,
+            group=CANDIDATE_GID,
+            extra_groups=[],
         )
     except subprocess.TimeoutExpired as exc:
         return {
@@ -204,6 +219,29 @@ def _copy_workspace(warnings: list[str]) -> dict[str, Any]:
     }
 
 
+def _make_tree_writable(root: Path, warnings: list[str]) -> None:
+    """Open the copied tree to the nobody exec uid.
+
+    The runner copies /srv/src as uid 0, but phases exec as
+    ``CANDIDATE_UID`` and must write ``__pycache__``/build artifacts inside
+    the tree. Dirs go 777, files get a+rw (keeping any exec bits);
+    symlinks are left alone.
+    """
+    for dirpath, _dirnames, filenames in os.walk(root):
+        try:
+            os.chmod(dirpath, 0o777)
+        except OSError as exc:
+            warnings.append(f"chmod failed for {dirpath}: {exc}")
+        for name in filenames:
+            p = Path(dirpath) / name
+            try:
+                if p.is_symlink():
+                    continue
+                os.chmod(p, (p.stat().st_mode | 0o666) & 0o777)
+            except OSError as exc:
+                warnings.append(f"chmod failed for {p}: {exc}")
+
+
 def _python_files() -> list[Path]:
     out: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(WORK):
@@ -253,6 +291,17 @@ def _read_coverage_json(path: Path) -> dict[str, Any] | None:
 
 
 def main() -> int:
+    if os.geteuid() != 0:
+        # Phase demotion (user=/group= on subprocess.run) needs uid 0 with
+        # CAP_SETUID/SETGID. Refuse rather than exec candidate code at the
+        # runner's own uid — same-uid phases could forge the result
+        # channels through /proc/*/fd/1.
+        print(
+            "heg-exec-runner requires uid 0 (cap SETUID/SETGID) to demote "
+            "candidate phases — refusing to run",
+            file=sys.stderr,
+        )
+        return 1
     warnings: list[str] = []
     result: dict[str, Any] = {
         "version": 1,
@@ -263,6 +312,7 @@ def main() -> int:
     phases: dict[str, Any] = result["phases"]
 
     phases["copy"] = _copy_workspace(warnings)
+    _make_tree_writable(WORK, warnings)
 
     # Put the copied tree on sys.path for child processes: pytest's own
     # rootdir insertion only covers each test file's basedir, so a
@@ -391,11 +441,11 @@ def main() -> int:
 def _emit(result: dict[str, Any]) -> None:
     """Publish the result on both channels: /out file, then stdout sentinel.
 
-    The file write goes last-after-everything so a candidate can't pre-place
-    a fake result (the /out dir starts empty and we overwrite atomically).
-    The stdout sentinel — emitted last, after the file — is the channel
-    ExecRunner trusts (LAST line wins, so candidate stdout can't spoof a
-    later one); the file is the fallback when stdout can't be recovered.
+    Both channels are runner-only: /out is a root-owned dir and candidate
+    phases exec under a different uid, so the workload can neither forge
+    the file nor print sentinels through /proc/*/fd/1. The sentinel —
+    emitted last — is the channel ExecRunner trusts; the file (fetched via
+    ``docker cp`` after confirmed exit) is the fallback.
     """
     payload = json.dumps(result, ensure_ascii=False)
     try:

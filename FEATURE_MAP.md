@@ -207,9 +207,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   execution) for real cyclomatic complexity, nloc, function counts,
   nesting depth, and language mix; `exec` runs the workspace's
   build/tests/coverage inside a locked `heg-exec` container
-  (`--network none`, nobody user, cap-drop ALL, no-new-privileges,
-  cpu/memory/pids bounds, artifact mounted read-only at `/srv/src` and
-  copied to container-local `/work` — the artifact is never written).
+  (`--network none`, cap-drop ALL + cap-add SETUID/SETGID — the in-image
+  runner is uid 0 only to demote every candidate phase to nobody, keeping
+  the `/out` result channel and container stdout unforgeable —
+  no-new-privileges, cpu/memory/pids bounds, tmpfs-capped scratch,
+  artifact mounted read-only at `/srv/src` and copied to container-local
+  `/work` — the artifact is never written).
   The report is staged into the eval workspace as `ANALYSIS.md`
   (judge-facing brief incl. the executed-checks block; judge is told to
   score `cyclomatic_complexity` from measured values and to treat

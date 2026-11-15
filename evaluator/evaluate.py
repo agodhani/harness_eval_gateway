@@ -86,6 +86,7 @@ from evaluator.scores import (
 )
 from sandbox.runtime import DEFAULT_IMAGE, SandboxRuntime
 from scoring import AnalysisReport, collect_signals
+from scoring.exec import exec_summary_dict
 from scoring.render import (
     ANALYSIS_JSON_FILENAME,
     ANALYSIS_MD_FILENAME,
@@ -202,26 +203,8 @@ def _analysis_event_payload(report: AnalysisReport | None) -> dict[str, Any]:
         }
     exec_sig = report.signal("exec")
     if exec_sig is not None and exec_sig.status == "ok":
-        payload["exec"] = _exec_summary(exec_sig.metrics)
+        payload["exec"] = exec_summary_dict(exec_sig.metrics)
     return payload
-
-
-def _exec_summary(metrics: dict[str, Any]) -> dict[str, Any]:
-    """Flat exec headline shared by the eval_analysis payload + the
-    ``test_execution`` event (PR7)."""
-    return {
-        "build_ok": metrics.get("build_ok"),
-        "tests_detected": metrics.get("tests_detected", False),
-        "tests_ok": metrics.get("tests_ok"),
-        "tests_collected": metrics.get("tests_collected", 0),
-        "tests_passed": metrics.get("tests_passed", 0),
-        "tests_failed": metrics.get("tests_failed", 0),
-        "tests_errors": metrics.get("tests_errors", 0),
-        "tests_skipped": metrics.get("tests_skipped", 0),
-        "coverage_percent": metrics.get("coverage_percent"),
-        "timed_out": metrics.get("timed_out", False),
-        "duration_seconds": metrics.get("duration_seconds"),
-    }
 
 
 def _persist_analysis(artifact_dir: Path, report: AnalysisReport | None) -> Path | None:
@@ -504,7 +487,7 @@ async def evaluate_sandbox(
                 "phase": "eval_exec",
                 "eval_sandbox_id": eval_sid,
                 "image": exec_sig.metrics.get("image"),
-                **_exec_summary(exec_sig.metrics),
+                **exec_summary_dict(exec_sig.metrics),
             },
         )
 
