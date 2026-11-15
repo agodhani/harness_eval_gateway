@@ -1,4 +1,4 @@
-"""Boilerplate for the four CLI-harness adapters' contract functions.
+"""Boilerplate for the CLI-harness adapters' contract functions.
 
 This module runs in the orchestrator/api process (never inside a sandbox —
 the sandbox side of the same mechanism is ``adapters/common/runner.py``).
@@ -128,12 +128,16 @@ def cli_launch(
 
 
 def cli_translate_events(
-    lines: Iterable[str], translate_obj: Callable[[dict[str, Any]], list[dict[str, Any]]]
+    lines: Iterable[str],
+    translate_obj: Callable[[dict[str, Any]], list[dict[str, Any]]],
+    translate_text: Callable[[str], list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     """``translate_events(lines)`` for CLI adapters.
 
     Folds native JSONL records (via ``translate_obj``) and the shim's
-    ``HEG_RESULT`` marker lines into normalized event dicts.
+    ``HEG_RESULT`` marker lines into normalized event dicts. Lines that are
+    not JSON objects go through the optional ``translate_text`` hook —
+    plain-text harnesses like aider pass their status-line translator here.
     """
     events: list[dict[str, Any]] = []
     for raw in lines:
@@ -146,9 +150,13 @@ def cli_translate_events(
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
+            if translate_text is not None:
+                events.extend(translate_text(line))
             continue
         if isinstance(obj, dict):
             events.extend(translate_obj(obj))
+        elif translate_text is not None:
+            events.extend(translate_text(line))
     return events
 
 

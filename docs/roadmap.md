@@ -11,8 +11,8 @@ append-mostly; rebase on main before merge.
 ## Already landed (do not redo)
 
 - F0–F12 (see FEATURE_MAP.md): orchestrator, gateway w/ metering+budgets,
-  sandbox runtime + egress lockdown, miniloop + 4 CLI adapters (codex,
-  claude_code, pi, deepseek), evaluator w/ judge retries, results UI,
+  sandbox runtime + egress lockdown, miniloop + 5 CLI adapters (codex,
+  claude_code, pi, deepseek, aider), evaluator w/ judge retries, results UI,
   analytics (F9), skillpack import (F11), artifact preview static+desktop
   (F12).
 - **PR2 preview fixes**: `type=` POST-body override on the artifact preview
@@ -53,12 +53,16 @@ append-mostly; rebase on main before merge.
   onto paid upstreams; caller `anthropic-beta`/`anthropic-version` headers
   forward to the anthropic upstream. Emitted `llm_*`/`error` events record
   the resolved provider.
-- **PR1 — Submit-form UX** (F14): live model picker via `GET /api/models`
+- **PR5 — Eval iteration** (F14): re-score on stored artifacts
+  (`POST /api/runs/{id}/rescore` → `lifecycle.rescore_run`), versioned
+  post-run rubric edits (`parent_id` chain, `Score.rubric_version`/`seq`
+  provenance, `?rubric_version=` results filter). See FEATURE_MAP.md F14.
+- **PR1 — Submit-form UX** (F15): live model picker via `GET /api/models`
   (gateway `/v1/models` proxied, `pull_supported` flag from the
   `x-heg-provider` stamp), `POST /api/models/pull` → `ollama pull` with
   NDJSON progress (control-plane creds only), named harness configs
   (`sandboxes.name`, default `<adapter>-<shortid>`). Details:
-  `FEATURE_MAP.md` F14.
+  `FEATURE_MAP.md` F15.
 
 ## Dependency DAG
 
@@ -74,8 +78,6 @@ PR1  Submit UX ────────▶ PR14 Model-vs-model ◀╌╌╌╌ P
 PR2  Preview fixes ────▶ PR3  Preview types ──▶ PR4  Thumbnails
 
 PR6  Static analysis ──▶ PR7  Exec+coverage ──▶ PR8  Test-suite-gen
-                            ▲
-PR5  Re-score/rub-edits ╌╌╌╌┘
 
 PR15 Queue/mem-aware ──▶ PR16 Add-next-prompt ╌╌▶ PR20 K8s
 PR19 Auth/templates/share — independent
@@ -83,9 +85,9 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR3, PR5, PR9,
+- **Depth 0 (start immediately):** PR1, PR3, PR9,
   PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
-  PR13/PR17 if soft-only deps are acceptable.
+  PR17 (soft ←13 satisfied — PR13 landed).
 - **Depth 1:** PR4 (←3), PR8 (←7), PR10 (←9), PR14 (←1), PR16 (←15),
   PR18 (←12).
 - **Floating:** PR20 (soft ←15).
@@ -97,9 +99,9 @@ PR2 and PR6 landed). Max safe concurrency ≈ 9 lanes.
 
 - `api/schemas.py`, `web/lib/api.ts` — most PRs append here.
 - `AGENTS.md`, `FEATURE_MAP.md` — every PR updates docs; rebase.
-- `db/migrations/` — PR1 + PR5 add migrations; renumber revisions at merge.
-- `orchestrator/` — PR5 (re-score trigger) vs PR15/PR16 (state machine);
-  stagger C and I lanes or coordinate.
+- `db/migrations/` — PR1 adds a migration; renumber revisions at merge.
+- `orchestrator/` — PR15 vs PR16 both touch the state machine;
+  coordinate.
 - `sandbox/preview.py` + `api/routers/preview.py` + `PreviewControls.tsx` —
   all of lane B; strictly sequential.
 
@@ -107,7 +109,7 @@ PR2 and PR6 landed). Max safe concurrency ≈ 9 lanes.
 
 ## PR cards
 
-### PR1 — Submit-form UX ✅ landed (F14)
+### PR1 — Submit-form UX ✅ landed (F15)
 - **Scope:** dynamic model picker (replace hardcoded `MODEL_SUGGESTIONS`
   with live list from gateway `/v1/models` — pass-through exists; add an
   api proxy route e.g. `GET /api/models` → `GATEWAY_URL`); model install
@@ -143,16 +145,14 @@ landed" and `FEATURE_MAP.md` F12.
 - **Touch:** `sandbox/preview.py` or new `sandbox/thumbnails.py`, artifact
   store layout (`data/artifacts/<run>/<sandbox>/`), results API + UI.
 
-### PR5 — Eval iteration: re-score + rubric edits
-- **Scope:** re-score runs (re-run evaluator on stored artifacts — trigger
-  endpoint + orchestrator hook); post-run rubric edits (versioned rubrics —
-  `rubrics` get a version/parent, scores keep `rubric_version` provenance so
-  old vs new scores stay distinguishable).
-- **Touch:** `orchestrator/` (eval trigger — likely `runner.py`/`lifecycle.py`),
-  `api/routers/results.py`, `evaluator/`, db `rubrics`/`scores` (migration),
-  results UI (re-score button + version selector).
-- **Verify:** `tests/unit/evaluator/`, orchestrator unit tests; re-score on a
-  stored run end-to-end.
+### PR5 — Eval iteration: re-score + rubric edits — ✅ landed
+Landed as F14: `POST /api/runs/{id}/rubrics` appends immutable rubric
+versions (`parent_id` chain, previous approved → `superseded`,
+`uq_rubrics_run_version`), `POST /api/runs/{id}/rescore` re-runs the
+evaluator on stored artifacts via `orchestrator.lifecycle.rescore_run`
+(terminal runs only, `rescore` task-kind dedup), and Score rows carry
+`rubric_version`/`seq` provenance for the newest-wins matrix merge.
+Paths + tests: FEATURE_MAP F14.
 
 ### PR6 — Objective scoring I: static analysis — ✅ landed
 Landed as the `scoring/` collector registry (lizard, parse-only): the
@@ -166,7 +166,7 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
   patterns (egress lockdown, resource bounds).
 - **Touch:** `evaluator/` (exec staging), `sandbox/runtime.py` or a new
   exec sandbox spec, `api/routers/results.py`.
-- **Depends on:** PR6 (signal plumbing), PR5 soft (evaluator wiring settles).
+- **Depends on:** PR6 (signal plumbing), PR5 (evaluator wiring) — both landed.
 - **Verify:** integration test executing a trivial artifact.
 
 ### PR8 — Automated test-suite generation
@@ -218,6 +218,10 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 - **Verify:** `tests/unit/gateway/test_upstream_provider.py` pattern.
 
 ### PR13 — Aider adapter (+ dsh helpers if needed)
+
+> **Status: landed** — `adapters/aider/` shipped; dsh native helpers
+> skipped (no TTY-dependent evals — see `docs/p25-harness-adapters.md`).
+
 - **Scope:** Aider CLI adapter following the F10 shim pattern; dsh native
   helpers (spawn-helper, node-pty via `--allow-scripts`) ONLY if evals hit
   TTY-dependent tasks — otherwise skip.
