@@ -45,7 +45,7 @@ function typeLabel(type: string): string {
 }
 
 function buildOptions(candidates: PreviewCandidate[]): Option[] {
-  return candidates.flatMap((c) => {
+  const options = candidates.flatMap((c) => {
     const base: Option = {
       key: `${c.entry}|${c.type}`,
       entry: c.entry,
@@ -65,6 +65,7 @@ function buildOptions(candidates: PreviewCandidate[]): Option[] {
         ]
       : [base];
   });
+  return [...new Map(options.map((o) => [o.key, o])).values()];
 }
 
 function expiryLabel(expiresAt: string | null): string | null {

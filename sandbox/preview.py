@@ -203,13 +203,13 @@ _SERVER_ENTRY_NAMES = (
     "api.py",
 )
 _SERVER_REQ_RE = re.compile(
-    r"flask|fastapi|uvicorn|starlette|aiohttp|bottle|django|gunicorn|tornado|waitress|hypercorn",
+    r"flask|fastapi|uvicorn|starlette|aiohttp|bottle|django|gunicorn|tornado",
     re.IGNORECASE,
 )
 _SERVER_IMPORT_RE = re.compile(
     r"^\s*(?:import|from)\s+"
     r"(?:flask|fastapi|uvicorn|starlette|aiohttp|bottle|django|gunicorn|"
-    r"tornado|waitress|hypercorn|http\.server)\b",
+    r"tornado|http\.server)\b",
     re.MULTILINE,
 )
 
