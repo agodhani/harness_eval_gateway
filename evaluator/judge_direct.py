@@ -125,6 +125,8 @@ def _gather_sources(
                 continue
             path = Path(dirpath) / name
             try:
+                if path.is_symlink() or not path.is_file():
+                    continue
                 size = path.stat().st_size
             except OSError:
                 continue
@@ -156,6 +158,8 @@ def _gather_sources(
 def _read_text_capped(path: Path, max_chars: int) -> str | None:
     """Whole-file text truncated to ``max_chars``; None when absent/empty."""
     try:
+        if path.is_symlink() or not path.is_file():
+            return None
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
@@ -169,6 +173,8 @@ def _read_text_capped(path: Path, max_chars: int) -> str | None:
 def _read_tail(path: Path, max_bytes: int) -> str | None:
     """Last ``max_bytes`` of ``path`` as text; None when absent/empty."""
     try:
+        if path.is_symlink() or not path.is_file():
+            return None
         size = path.stat().st_size
         with path.open("rb") as fh:
             if size > max_bytes:

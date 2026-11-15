@@ -122,6 +122,11 @@ DEFAULT_EVAL_ROOT = _REPO_ROOT / "data" / "eval"
 #: Container states worth continuing to poll for (docker .State.Status).
 _ACTIVE_STATES = {"created", "running", "restarting", "paused"}
 
+#: Seconds of the attempt deadline reserved after the direct-fallback call
+#: — a call bounded AT the deadline could be cancelled while its scores
+#: were being persisted.
+_FALLBACK_EXIT_RESERVE_SECONDS = 5.0
+
 
 # ---------------------------------------------------------------------------
 # small helpers
@@ -455,6 +460,7 @@ async def _direct_judge_fallback(
     terminal_reason: str | None,
     prior_error: str | None,
     client: httpx.AsyncClient | None,
+    time_budget_seconds: float,
 ) -> tuple[ParsedScores | None, str | None]:
     """Control-plane last resort: ONE direct chat call for the scores doc.
 
@@ -463,6 +469,11 @@ async def _direct_judge_fallback(
     staged ANALYSIS.md, a capped source gather, and the transcript tail can
     still land scores a wandering tool loop couldn't write.
 
+    ``time_budget_seconds`` bounds the call to what remains of the
+    attempt's deadline — an overlong fallback cancelled by the caller's
+    outer ``wait_for`` surfaces as a deterministic failure and burns the
+    configured retry budget; expiry instead degrades to a detail.
+
     Returns ``(parsed, None)`` on success — the canonical doc is written
     back over ``eval_ws/scores.json`` so artifact/debug parity holds — or
     ``(None, detail)`` when disabled or failed. NEVER raises; callers fold
@@ -470,16 +481,27 @@ async def _direct_judge_fallback(
     """
     if not direct_fallback_enabled():
         return None, "direct fallback disabled (EVAL_DIRECT_FALLBACK=0)"
+    if time_budget_seconds <= 0:
+        return None, "attempt deadline exhausted — no budget for direct fallback"
     try:
-        parsed = await judge_direct(
-            eval_workspace=eval_ws,
-            rubric=rubric,
-            gateway_base_url=gateway_base_url,
-            cred=cred,
-            model=model,
-            terminal_reason=terminal_reason,
-            prior_error=prior_error,
-            client=client,
+        parsed = await asyncio.wait_for(
+            judge_direct(
+                eval_workspace=eval_ws,
+                rubric=rubric,
+                gateway_base_url=gateway_base_url,
+                cred=cred,
+                model=model,
+                terminal_reason=terminal_reason,
+                prior_error=prior_error,
+                client=client,
+            ),
+            timeout=time_budget_seconds,
+        )
+    except TimeoutError:
+        logger.warning("evaluator: direct judge fallback hit the attempt deadline")
+        return None, (
+            f"direct fallback exceeded the attempt deadline "
+            f"({time_budget_seconds:.1f}s left)"
         )
     except Exception as exc:  # noqa: BLE001 — fallback must not escape eval
         logger.warning("evaluator: direct judge fallback failed: %s", exc)
@@ -494,8 +516,12 @@ async def _direct_judge_fallback(
         doc["overall"] = parsed.overall
     if parsed.summary:
         doc["summary"] = parsed.summary
+    scores_out = eval_ws / SCORES_FILENAME
     try:
-        (eval_ws / SCORES_FILENAME).write_text(
+        # The judge could leave a symlink at scores.json — unlink so the
+        # write can't be redirected through it to an arbitrary host path.
+        scores_out.unlink(missing_ok=True)
+        scores_out.write_text(
             json.dumps(doc, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
@@ -529,6 +555,7 @@ async def evaluate_sandbox(
     gateway_cred: str | None = None,
     session_factory: sessionmaker[Session] | None = None,
     timeout_seconds: float = 1800.0,
+    deadline_margin_seconds: float = 60.0,
     runtime: SandboxRuntime | None = None,
     max_iters: int = DEFAULT_EVAL_MAX_ITERS,
     judge_max_tokens: int | None = None,
@@ -560,8 +587,15 @@ async def evaluate_sandbox(
     — when the agentic judge leaves a missing/unusable scores.json, one
     control-plane chat call on the same eval cred asks for the scores
     document directly; disable via ``EVAL_DIRECT_FALLBACK=0``.
+
+    ``deadline_margin_seconds`` is the slack the caller grants beyond
+    ``timeout_seconds`` for the whole attempt (the orchestrator's outer
+    ``wait_for`` margin); the direct fallback is bounded to what remains of
+    it so a slow fallback can't outlive the attempt and forfeit the
+    configured score retries.
     """
     # ---- resolve + validate ------------------------------------------------
+    attempt_started = time.monotonic()
     run_uuid = _as_uuid(run_id, "run_id")
     sandbox_uuid = _as_uuid(sandbox_id, "sandbox_id")
 
@@ -833,6 +867,13 @@ async def evaluate_sandbox(
             terminal_reason=terminal_reason,
             prior_error="\n".join(prior_parts) or None,
             client=direct_client,
+            time_budget_seconds=(
+                attempt_started
+                + float(timeout_seconds)
+                + float(deadline_margin_seconds)
+                - _FALLBACK_EXIT_RESERVE_SECONDS
+                - time.monotonic()
+            ),
         )
         if parsed is None:
             _emit_event(

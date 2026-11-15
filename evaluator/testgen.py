@@ -142,6 +142,8 @@ def _gather_sources(
                 continue
             path = Path(dirpath) / name
             try:
+                if path.is_symlink() or not path.is_file():
+                    continue
                 candidates.append((path.stat().st_size, path))
             except OSError:
                 continue
