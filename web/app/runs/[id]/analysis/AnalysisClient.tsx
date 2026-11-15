@@ -166,6 +166,8 @@ export default function AnalysisClient({ runId }: { runId: string }) {
 
   const labelOf = useCallback(
     (id: string) =>
+      sbs.find((s) => s.sandbox_id === id)?.name ??
+      resSandboxes.find((s) => s.sandbox_id === id)?.name ??
       sbs.find((s) => s.sandbox_id === id)?.label ??
       harnessConfigLabel(
         resSandboxes.find((s) => s.sandbox_id === id)?.harness_config,

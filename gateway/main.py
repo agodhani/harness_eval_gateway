@@ -524,7 +524,7 @@ async def list_models(
             "content-type": upstream_resp.headers.get(
                 "content-type", "application/json"
             ),
-            "x-heg-provider": get_settings().UPSTREAM_PROVIDER,
+            "x-heg-provider": provider,
         },
     )
 
@@ -594,6 +594,7 @@ async def pull_model(
         body=pull,
         claims=claims,
         upstream=upstream,
+        provider="ollama",
         meter=False,
     )
 
