@@ -6,7 +6,8 @@
 #   websockify :6080  serves /usr/share/novnc (vnc.html) + proxies ws -> :5900
 #   python /work/...  the candidate app, DISPLAY=:0, cwd = entry's dir
 #
-# APP_ENTRY is detection-derived (a root-level .py name), never user input.
+# APP_ENTRY is a workspace-relative .py path — detected, or an explicit
+# entry= pick jailed + validated api-side (relative, no "..", non-symlink).
 set -u
 
 # Stage a writable copy — the bind mount is :ro and apps may write saves.

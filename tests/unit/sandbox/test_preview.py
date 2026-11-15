@@ -23,12 +23,17 @@ from sandbox.preview import (
     DESKTOP_CONTAINER_PORT,
     DESKTOP_NETWORK,
     PREVIEW_NETWORK,
+    PREVIEW_TYPES,
     SERVE_ROOT,
+    SERVER_CONTAINER_PORT,
     Preview,
     PreviewManager,
     PreviewPlan,
     detect_preview,
+    plan_for_entry,
+    plan_for_type,
     resolve_workspace_dir,
+    scan_preview,
 )
 
 # ---------------------------------------------------------------------------
@@ -690,7 +695,7 @@ def test_spawn_rejects_unknown_type(tmp_path: Path) -> None:
             run_id="r1",
             sandbox_id="s1",
             serve_dir=tmp_path,
-            plan=PreviewPlan(type="python-server", entry="app.py"),
+            plan=PreviewPlan(type="quantum", entry="app.py"),
         )
     assert not [c for c in fake.calls if c[0] == "run"]
 
@@ -1248,3 +1253,287 @@ def test_scan_cache_clear(tmp_path: Path) -> None:
     cache.clear()
     scan = cache.scan(**kw)  # re-probed — sees the removal
     assert scan is not None and scan.plan is None
+
+
+# ---------------------------------------------------------------------------
+# PR3 — desktop GUI stacks (pyglet / arcade / tkinter) + python-server
+# ---------------------------------------------------------------------------
+
+
+def test_preview_types_include_executed_code() -> None:
+    assert PREVIEW_TYPES == {"static", "desktop", "python-server"}
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "import pyglet\n",
+        "from pyglet import window\n",
+        "import arcade\n",
+        "from arcade import Window\n",
+        "import tkinter\n",
+        "from tkinter import Tk\n",
+    ],
+)
+def test_detect_desktop_new_gui_stacks(tmp_path: Path, src: str) -> None:
+    """pyglet/arcade/tkinter imports are desktop evidence — all baked into
+    heg-preview-desktop (PR3)."""
+    (tmp_path / "main.py").write_text(src)
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="desktop", entry="main.py")
+
+
+@pytest.mark.parametrize("req", ["pyglet==2.1.19", "arcade==3.3.3"])
+def test_detect_desktop_gui_requirements(tmp_path: Path, req: str) -> None:
+    """requirements.txt naming pyglet/arcade counts as evidence for an
+    entry-shaped .py (tkinter is stdlib — no pip evidence exists)."""
+    (tmp_path / "app.py").write_text("import engine\n")
+    (tmp_path / "requirements.txt").write_text(f"{req}\n")
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="desktop", entry="app.py")
+
+
+def test_detect_desktop_tk_bare_requirements_not_evidence(tmp_path: Path) -> None:
+    """`tk` in requirements.txt is the unrelated Tcl-binding package — not
+    tkinter evidence (stdlib, can't be pip-installed)."""
+    (tmp_path / "main.py").write_text("print('hi')\n")
+    (tmp_path / "requirements.txt").write_text("tk==0.1.0\n")
+    assert detect_preview(tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "from flask import Flask\n",
+        "import fastapi\n",
+        "from fastapi import FastAPI\n",
+        "import uvicorn\n",
+        "import django\n",
+        "from django.core.management import execute_from_command_line\n",
+        "import aiohttp\n",
+        "import bottle\n",
+        "import tornado\n",
+        "from http.server import HTTPServer\n",
+    ],
+)
+def test_detect_python_server_frameworks(tmp_path: Path, src: str) -> None:
+    """Web-framework imports are python-server evidence."""
+    (tmp_path / "main.py").write_text(src)
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="python-server", entry="main.py")
+
+
+def test_detect_python_server_manage_py(tmp_path: Path) -> None:
+    """A django manage.py (django import) → python-server candidate."""
+    (tmp_path / "manage.py").write_text(
+        "#!/usr/bin/env python\n"
+        "import os\n"
+        "import sys\n"
+        "from django.core.management import execute_from_command_line\n"
+    )
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="python-server", entry="manage.py")
+
+
+def test_detect_python_server_requirements(tmp_path: Path) -> None:
+    """Entry-shaped .py + requirements naming flask → python-server."""
+    (tmp_path / "server.py").write_text("import engine\n")
+    (tmp_path / "requirements.txt").write_text("flask>=3\n")
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="python-server", entry="server.py")
+
+
+def test_detect_python_server_nested(tmp_path: Path) -> None:
+    (tmp_path / "api").mkdir()
+    (tmp_path / "api" / "app.py").write_text("import fastapi\n")
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="python-server", entry="api/app.py")
+
+
+def test_detect_flask_templates_not_static(tmp_path: Path) -> None:
+    """templates/index.html is the server app's render fragment, not a
+    static site — a flask workspace defaults to python-server."""
+    (tmp_path / "templates").mkdir()
+    (tmp_path / "templates" / "index.html").write_text("<h1>{{x}}</h1>")
+    (tmp_path / "app.py").write_text("from flask import Flask\n")
+    plan = detect_preview(tmp_path)
+    assert plan == PreviewPlan(type="python-server", entry="app.py")
+
+
+def test_scan_mixed_desktop_and_server(tmp_path: Path) -> None:
+    """A GUI game + a web app → both executed candidates listed;
+    the .py importing flask appears ONLY as python-server."""
+    (tmp_path / "game.py").write_text("import pygame\n")
+    (tmp_path / "app.py").write_text("from flask import Flask\n")
+    scan = scan_preview(tmp_path)
+    # no static → first executed candidate is the default
+    assert scan.plan == PreviewPlan(type="desktop", entry="game.py")
+    by_entry = {c.entry: c.type for c in scan.candidates}
+    assert by_entry == {"game.py": "desktop", "app.py": "python-server"}
+
+
+def test_plan_for_entry_manage_py_is_python_server(tmp_path: Path) -> None:
+    """Bare manage.py pick → python-server (only it publishes the app port)."""
+    (tmp_path / "manage.py").write_text("import django\n")
+    plan = plan_for_entry(tmp_path, "manage.py")
+    assert plan == PreviewPlan(type="python-server", entry="manage.py")
+
+
+def test_plan_for_entry_py_still_desktop(tmp_path: Path) -> None:
+    """Bare .py (non-manage) pick stays desktop — can't tell GUI from web
+    by suffix; the user picks type=python-server explicitly for servers."""
+    (tmp_path / "app.py").write_text("from flask import Flask\n")
+    plan = plan_for_entry(tmp_path, "app.py")
+    assert plan == PreviewPlan(type="desktop", entry="app.py")
+
+
+def test_plan_for_entry_type_python_server(tmp_path: Path) -> None:
+    """type=python-server forces the plan on any .py entry."""
+    (tmp_path / "app.py").write_text("print(1)\n")
+    plan = plan_for_entry(tmp_path, "app.py", "python-server")
+    assert plan == PreviewPlan(type="python-server", entry="app.py")
+
+
+def test_plan_for_entry_type_python_server_on_html_rejected(tmp_path: Path) -> None:
+    (tmp_path / "index.html").write_text("x")
+    with pytest.raises(ValueError, match="execute a .py entry"):
+        plan_for_entry(tmp_path, "index.html", "python-server")
+
+
+def test_plan_for_type_python_server(tmp_path: Path) -> None:
+    (tmp_path / "index.html").write_text("x")
+    (tmp_path / "app.py").write_text("from flask import Flask\n")
+    plan = plan_for_type(tmp_path, "python-server")
+    assert plan == PreviewPlan(type="python-server", entry="app.py")
+
+
+def test_preview_url_python_server() -> None:
+    from sandbox.preview import _preview_url
+
+    # The app owns its routes — the URL is just the published root.
+    assert _preview_url(8000, "app.py", "python-server") == "http://localhost:8000/"
+    assert _preview_url(None, "app.py", "python-server") is None
+
+
+# ---------------------------------------------------------------------------
+# PreviewManager — python-server spawn (runner on internal net + socat)
+# ---------------------------------------------------------------------------
+
+PID_SERVER = "66666666-6666-6666-6666-666666666666"
+
+
+def _server_fake() -> FakeRuntime:
+    """Server runner row (no published port) + proxy row (publishes :8000)."""
+    runner = _inspect_row(
+        container_id="cid123",
+        name="/heg-prev-web",
+        port=None,
+        labels=_labels(
+            **{
+                "heg.preview_id": PID_SERVER,
+                "heg.preview_type": "python-server",
+                "heg.preview_entry": "app.py",
+                "heg.preview_role": "runner",
+            }
+        ),
+    )
+    proxy = _inspect_row(
+        container_id="cidproxy",
+        name="/heg-prev-web-proxy",
+        port=None,
+        labels=_labels(
+            **{
+                "heg.preview_id": PID_SERVER,
+                "heg.preview_type": "python-server",
+                "heg.preview_role": "proxy",
+            }
+        ),
+    )
+    proxy["NetworkSettings"] = {
+        "Ports": {
+            f"{SERVER_CONTAINER_PORT}/tcp": [
+                {"HostIp": "127.0.0.1", "HostPort": "49666"}
+            ]
+        }
+    }
+    fake = FakeRuntime()
+    fake.rows_by_id = {"cid123": runner, "cidproxy": proxy}
+    fake.ps_ids = ["cid123", "cidproxy"]
+    fake.proxy_ps_ids = ["cidproxy"]
+    fake.images.add("heg-preview-server:latest")
+    return fake
+
+
+def test_spawn_server_runner_args(tmp_path: Path) -> None:
+    """python-server: same isolated topology as desktop — internal net,
+    socat sidecar, resource bounds — but the SERVER image + PORT/HOST env
+    and the sidecar publishes the app port (:8000)."""
+    fake = _server_fake()
+    mgr = _manager(fake)
+    mgr.spawn(
+        run_id="r1",
+        sandbox_id="s1",
+        serve_dir=tmp_path,
+        plan=PreviewPlan(type="python-server", entry="app.py"),
+    )
+    runs = [c for c in fake.calls if c[0] == "run"]
+    assert len(runs) == 2
+    runner, proxy = runs[0], runs[1]
+
+    # Runner: internal net, NO published port, resource bounds, :ro mount.
+    assert runner[runner.index("--network") + 1] == DESKTOP_NETWORK
+    assert "-p" not in runner
+    assert runner[runner.index("--cpus") + 1] == "1"
+    assert runner[runner.index("--memory") + 1] == "512m"
+    assert runner[runner.index("--pids-limit") + 1] == "256"
+    assert runner[runner.index("-v") + 1] == f"{tmp_path}:{DESKTOP_ARTIFACT_ROOT}:ro"
+    envs = [runner[i + 1] for i, v in enumerate(runner) if v == "-e"]
+    assert "APP_ENTRY=app.py" in envs
+    assert f"PORT={SERVER_CONTAINER_PORT}" in envs
+    assert "HOST=0.0.0.0" in envs
+    labels = [runner[i + 1] for i, v in enumerate(runner) if v == "--label"]
+    assert "heg.preview_role=runner" in labels
+    assert "heg.preview_type=python-server" in labels
+    assert "heg-preview-server:latest" in runner
+
+    # Internal network ensured (--internal create).
+    creates = [c for c in fake.calls if c[:2] == ["network", "create"]]
+    desk_create = next(c for c in creates if DESKTOP_NETWORK in c)
+    assert "--internal" in desk_create
+
+    # Proxy: publishable net + socat pipe to the runner's :8000.
+    assert proxy[proxy.index("--network") + 1] == PREVIEW_NETWORK
+    assert proxy[proxy.index("-p") + 1] == f"127.0.0.1::{SERVER_CONTAINER_PORT}"
+    assert "alpine/socat:1.8.1.3" in proxy
+    tail = proxy[proxy.index("alpine/socat:1.8.1.3") :]
+    assert f"TCP-LISTEN:{SERVER_CONTAINER_PORT},fork,reuseaddr" in tail
+    assert tail[-1].startswith("TCP:heg-prev-") and tail[-1].endswith(":8000")
+    plabels = [proxy[i + 1] for i, v in enumerate(proxy) if v == "--label"]
+    assert "heg.preview_role=proxy" in plabels
+
+
+def test_spawn_server_resolves_port_and_url(tmp_path: Path) -> None:
+    fake = _server_fake()
+    preview = _manager(fake).spawn(
+        run_id="r1",
+        sandbox_id="s1",
+        serve_dir=tmp_path,
+        plan=PreviewPlan(type="python-server", entry="app.py"),
+    )
+    assert preview.type == "python-server"
+    assert preview.port == 49666
+    assert preview.url == "http://localhost:49666/"
+    assert preview.live
+
+
+def test_spawn_server_missing_image(tmp_path: Path) -> None:
+    fake = FakeRuntime()  # no images
+    mgr = _manager(fake)
+    with pytest.raises(RuntimeError, match="heg-preview-server.*not found"):
+        mgr.spawn(
+            run_id="r1",
+            sandbox_id="s1",
+            serve_dir=tmp_path,
+            plan=PreviewPlan(type="python-server", entry="app.py"),
+        )
+    assert not [c for c in fake.calls if c[0] == "run"]
