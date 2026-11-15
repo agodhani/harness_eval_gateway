@@ -3,9 +3,12 @@
 Marked ``docker``; run with ``uv run pytest -m docker`` or
 ``uv run pytest tests/integration/test_preview.py``.
 
-Exercises the real spawn path: a ``python:3.12-slim`` container running
-``python -m http.server`` on the internal ``heg-preview`` network, serving a
-fake snapshot workspace over an ephemeral localhost port.
+Exercises the real spawn paths: a ``python:3.12-slim`` static container
+running ``python -m http.server`` on the ``heg-preview`` bridge, serving a
+fake snapshot workspace over an ephemeral localhost port; plus executed-code
+previews (desktop GUI under Xvnc/noVNC, python-server web app behind the
+listen-socket relay) — a runner on the internal ``heg-desktop`` net with a
+socat sidecar publishing the port on localhost.
 """
 
 import json
