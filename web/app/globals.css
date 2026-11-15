@@ -660,12 +660,6 @@ select.select option {
   flex-wrap: wrap;
   gap: 0.5rem 1.1rem;
 }
-/* Scrollable variant for long catalogs (PR14 model multi-select). */
-.check-list--scroll {
-  max-height: 9.5rem;
-  overflow-y: auto;
-  padding-right: 0.35rem;
-}
 .check-item {
   display: inline-flex;
   align-items: center;
@@ -740,6 +734,32 @@ details.advanced > summary:hover {
 }
 details.advanced > .advanced__body {
   padding: 0.4rem 0.8rem 0.9rem;
+}
+
+/* participant/evaluator model-picker rows — label + provider select +
+   ComboInput + (remove slot — row 1 renders it visibility:hidden so every
+   row's model input lines up) */
+.model-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+.model-row {
+  display: grid;
+  grid-template-columns: 6.8rem 8.5rem minmax(0, 1fr) auto;
+  gap: 0.6rem;
+  align-items: center;
+}
+.model-row__label {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* config editor rows */
@@ -2035,5 +2055,25 @@ a.chip:hover {
   }
   .tl-payload {
     padding-left: 0.8rem;
+  }
+  /* model-picker rows stack: label+provider on line 1, model+remove on 2 */
+  .model-row {
+    grid-template-columns: auto 1fr auto;
+    grid-template-areas:
+      "label provider provider"
+      "model model remove";
+    row-gap: 0.45rem;
+  }
+  .model-row__label {
+    grid-area: label;
+  }
+  .model-row .select {
+    grid-area: provider;
+  }
+  .model-row .combo {
+    grid-area: model;
+  }
+  .model-row .btn {
+    grid-area: remove;
   }
 }

@@ -626,7 +626,12 @@ or tests change.
   (`sandbox_id=None`; unknown/unkeyed values 400 — silently ignored on
   sandbox-scoped creds so agent code can't pick paid upstreams). Emitted
   `llm_request`/`llm_response`/`error` events record the resolved provider.
-  Tests pin `UPSTREAM_PROVIDER=ollama` in `tests/conftest.py`.
+  `GET /api/models?provider=<name>` forwards that header on its minted
+  service cred so the submit form's per-row provider picker browses each
+  upstream's catalog (row provider is picker metadata only — `RunCreate`
+  carries no per-model provider; routing still resolves per model name via
+  PROVIDER_ROUTES). Tests pin `UPSTREAM_PROVIDER=ollama` in
+  `tests/conftest.py`.
 - `GET /api/skillpacks` (F11) lists vendored + imported packs (the submit
   form's source of truth); `POST /api/skillpacks/discover` (GitHub URL →
   skills), `POST /api/skillpacks/import` (selection → `data/skillpacks/`;

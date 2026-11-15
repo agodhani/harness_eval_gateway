@@ -1142,14 +1142,31 @@ export interface ModelsOut {
   models: ModelInfo[];
   /** Gateway provider name — "ollama" | "openrouter" | "openai" |
    * "anthropic" (PR12 adds these + PROVIDER_ROUTES per-model providers;
-   * pull stays ollama-only). */
+   * pull stays ollama-only). Reflects the gateway's RESOLVED provider for
+   * the request — with `provider=` this is the forced upstream, without it
+   * the gateway's UPSTREAM_PROVIDER default. */
   provider: string | null;
   /** True when the upstream can install models (ollama pull). */
   pull_supported: boolean;
 }
 
-export function listModels(): Promise<ModelsOut> {
-  return request<ModelsOut>("/api/models");
+/** Upstream provider names the gateway can route to
+ * (gateway/config.py `ProviderName`). The submit form's per-row provider
+ * picker uses this to fetch that upstream's catalog via
+ * `getModels(provider)` — picker metadata only; a run still resolves the
+ * provider per model name gateway-side via PROVIDER_ROUTES. */
+export const PROVIDERS: readonly string[] = [
+  "ollama",
+  "openrouter",
+  "openai",
+  "anthropic",
+];
+
+/** Live model catalog. `provider` forwards as the gateway's
+ * `x-heg-provider` override (service cred) — omit for the gateway's
+ * configured default upstream. */
+export function getModels(provider?: string): Promise<ModelsOut> {
+  return request<ModelsOut>(`/api/models${qs({ provider })}`);
 }
 
 /** One NDJSON progress line from `ollama pull` (status/digest/total/completed). */
