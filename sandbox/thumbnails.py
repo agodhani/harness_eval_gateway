@@ -412,8 +412,10 @@ class Thumbnailer:
             "height": self.height,
             "bytes": size,
         }
+        meta_path = artifact_dir / THUMB_META_FILENAME
         try:
-            (artifact_dir / THUMB_META_FILENAME).write_text(
+            meta_path.unlink(missing_ok=True)
+            meta_path.write_text(
                 json.dumps(meta, indent=2) + "\n", encoding="utf-8"
             )
         except OSError:

@@ -588,11 +588,12 @@ def _thumbnail_paths(
     if artifact_dir is None:
         return None
     jail = _jail()
+    png = artifact_dir / THUMB_FILENAME
     try:
-        png = (artifact_dir / THUMB_FILENAME).resolve()
+        resolved = png.resolve()
     except OSError:
         return None
-    if png != jail and jail not in png.parents:
+    if resolved != jail and jail not in resolved.parents:
         return None
     return png, artifact_dir / THUMB_META_FILENAME
 
