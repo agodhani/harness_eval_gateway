@@ -4,9 +4,11 @@
 **Feature:** F12 in `FEATURE_MAP.md`
 
 > *Update — PR3 (`feat/pr3-preview-types`) added a third type
-> `python-server` and more desktop stacks (pyglet/arcade/tkinter). The
-> detection, endpoint, and isolation details below describe the original
-> F12 PR; current behavior lives in `FEATURE_MAP.md` F12.*
+> `python-server` and more desktop stacks (pyglet/arcade/tkinter); PR4
+> (`feat/pr4-thumbnails`) added the `heg.preview_purpose` label and the
+> `.../thumbnail` capture endpoints. The detection, endpoint, and
+> isolation details below describe the original F12 PR; current behavior
+> lives in `FEATURE_MAP.md` F12/F17.*
 
 Lets a reviewer **see and run** the artifact a sandbox produced, straight from
 the results page — before this, artifacts were download-only. Two preview

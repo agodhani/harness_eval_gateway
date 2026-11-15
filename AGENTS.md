@@ -316,6 +316,7 @@ or tests change.
 | F14 | Eval iteration: re-score runs + versioned rubric edits |
 | F15 | Submit UX: live model picker + install, named harness configs |
 | F16 | Model-vs-model matrix: multi-model runs + per-model analytics |
+| F17 | Artifact thumbnails (headless screenshots via the preview stack) |
 
 ## Post-MVP roadmap
 
@@ -348,8 +349,10 @@ or tests change.
   PR9 metrics chips assign lanes in split mode. Transform + tests:
   `web/lib/splitTimeline.ts(.test.ts)`; shared row markup:
   `timeline/EventRow.tsx`.
-- Lightweight artifact thumbnails — capture screenshots of produced artifacts
-  for at-a-glance review before spawning a full live preview sandbox
+- ~~Lightweight artifact thumbnails~~ — **landed as PR4/F17**: results-page
+  `📷 snapshot` POSTs a bounded headless-chromium capture through the
+  artifact's own preview stack; `<artifact>/thumbnail.png` heads the
+  preview cell and clicks through to the full live preview.
 - ~~Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.~~
   — landed (F12; extended to pyglet/arcade/tkinter + python-server in PR3)
 - "Add next prompt" — continue a finished sandbox with a follow-up prompt
@@ -532,6 +535,19 @@ or tests change.
   `done` with failed eval, so check `eval_error`, not score-null alone.
 - One live preview per sandbox (POST is idempotent — re-clicking returns the
   existing preview); dead containers are cleared on respawn.
+- **Artifact thumbnails (F17) reuse the preview stack, not a parallel one** —
+  capture spawns the artifact's own `PreviewManager` topology with
+  `heg.preview_purpose=thumb` (interactive endpoints filter on `preview`, so
+  a mid-flight capture never surfaces as the live preview; the reaper/stop
+  see both), then a one-shot `heg-preview-thumb` container (debian chromium
+  on `python:3.12-slim`, nobody/read-only/tmpfs) joins `heg-preview` and
+  screenshots the in-network URL — `<runner>:8000` for static,
+  `<runner>-proxy:{8000|6080}` for the executed types (Xvnc is
+  loopback-only, so noVNC is desktop's only window → bigger settle +
+  virtual-time budget). Trigger is explicit-only (`POST .../thumbnail`,
+  bounded ~2min; results GET never spawns — it only jailed-probes
+  `thumbnail.png` + the `thumbnail.json` meta sidecar). Failures → 502 and
+  "no thumbnail", never a broken results read.
 - **Charts: recharts** (F13) — picked over visx/chart.js: smallest fit for
   grouped/stacked bars + a composed bar-line trend under React 19 / Next 16;
   themed via hexes mirroring globals.css tokens (no CSS-var reads). The

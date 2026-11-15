@@ -63,8 +63,12 @@ class FakeManager:
             return list(self.previews)
         return [p for p in self.previews if p.sandbox_id == sandbox_id]
 
-    def get_for_sandbox(self, sandbox_id: str) -> Preview | None:
+    def get_for_sandbox(
+        self, sandbox_id: str, *, purpose: str | None = "preview"
+    ) -> Preview | None:
         matches = self.list(sandbox_id=sandbox_id)
+        if purpose is not None:
+            matches = [p for p in matches if p.purpose == purpose]
         return matches[0] if matches else None
 
     def spawn(self, **kw) -> Preview:

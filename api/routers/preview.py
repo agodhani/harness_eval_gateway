@@ -34,6 +34,13 @@ under Xvnc, streamed via noVNC through a socat sidecar), and
 binds is made reachable on :8000, published through the same socat sidecar
 topology). All executed-code types run on the ``--internal``
 ``heg-desktop`` net with zero egress.
+
+PR4 thumbnails: ``.../thumbnail`` endpoints screenshot the artifact through
+the same preview stack (spawned with ``heg.preview_purpose=thumb`` so the
+interactive endpoints above never see capture stacks) and persist
+``<artifact>/thumbnail.png``. ``POST`` captures synchronously (bounded;
+``502`` on capture failure — never breaks results), ``GET`` serves the PNG
+(``404`` when absent), ``DELETE`` removes it.
 """
 
 from __future__ import annotations
@@ -46,6 +53,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -55,12 +63,21 @@ from db.models import Run, Sandbox
 from orchestrator import runner
 from orchestrator.events import emit
 from sandbox.preview import (
+    PURPOSE_PREVIEW,
+    PURPOSE_THUMB,
     Preview,
     PreviewManager,
     plan_for_entry,
     plan_for_type,
+    resolve_artifact_dir,
     resolve_workspace_dir,
     scan_preview,
+)
+from sandbox.thumbnails import (
+    THUMB_FILENAME,
+    THUMB_META_FILENAME,
+    Thumbnailer,
+    ThumbnailError,
 )
 
 log = logging.getLogger(__name__)
@@ -163,6 +180,41 @@ def reset_preview_manager() -> None:
     _manager = None
 
 
+_thumbnailer: Thumbnailer | None = None
+
+
+def get_thumbnailer() -> Thumbnailer:
+    """Process-wide Thumbnailer over the shared PreviewManager (PR4).
+
+    Capture spawns thumb-purpose preview stacks through the same manager —
+    same networks, labels, and host-path translation as interactive
+    previews.
+    """
+    global _thumbnailer
+    if _thumbnailer is None:
+        settings = get_settings()
+        _thumbnailer = Thumbnailer(
+            previews=get_preview_manager(),
+            image=settings.PREVIEW_THUMB_IMAGE,
+            ready_seconds=settings.THUMB_READY_SECONDS,
+            capture_seconds=settings.THUMB_CAPTURE_SECONDS,
+            preview_ttl_seconds=settings.THUMB_PREVIEW_TTL_SECONDS,
+            desktop_settle_seconds=settings.THUMB_DESKTOP_SETTLE_SECONDS,
+            settle_seconds=settings.THUMB_SETTLE_SECONDS,
+            width=settings.THUMB_WIDTH,
+            height=settings.THUMB_HEIGHT,
+            budget_ms=settings.THUMB_BUDGET_MS,
+            desktop_budget_ms=settings.THUMB_DESKTOP_BUDGET_MS,
+        )
+    return _thumbnailer
+
+
+def reset_thumbnailer() -> None:
+    """Test hook: drop the cached thumbnailer."""
+    global _thumbnailer
+    _thumbnailer = None
+
+
 # ---------------------------------------------------------------------------
 # TTL reaper (lifespan hooks)
 # ---------------------------------------------------------------------------
@@ -227,6 +279,33 @@ def _jail() -> Path:
     return Path(get_settings().ARTIFACT_ROOT).resolve()
 
 
+def _capture_in_flight(preview: Preview) -> bool:
+    """A live ``purpose=thumb`` stack belongs to an in-flight capture —
+    interactive endpoints coexist with it (unique names, ephemeral ports)
+    rather than killing the capture mid-flight. The capture's own cleanup
+    and the TTL reaper own its removal; a *dead* thumb stack is a stale
+    leftover and stays sweepable."""
+    return preview.live and preview.purpose == PURPOSE_THUMB
+
+
+def _resolve_plan(workspace: Path, body: PreviewStart | None):
+    """Shared ``entry``/``type`` → plan resolution for the POST bodies."""
+    entry = body.entry if body else None
+    ptype = ((body.type or "").strip().lower() or None) if body else None
+    if entry:
+        # Explicit pick: jailed to the workspace; type= may override the
+        # suffix-derived plan (e.g. serve a .py instead of executing it).
+        return plan_for_entry(workspace, entry, ptype)
+    if ptype:
+        # Type-only override: first detected candidate of that type —
+        # a both-matching workspace defaults to static, {"type":
+        # "desktop"} reaches the game.
+        return plan_for_type(workspace, ptype)
+    # No explicit pick → the scan's default (candidates[0]; results
+    # payload carries the full list for the UI's dropdown).
+    return scan_preview(workspace).plan
+
+
 @router.post(
     "/api/runs/{run_id}/sandboxes/{sandbox_id}/preview",
     response_model=PreviewOut,
@@ -242,7 +321,11 @@ async def start_preview(
     mgr = get_preview_manager()
 
     existing = await asyncio.to_thread(mgr.list, sandbox_id=str(sandbox_id))
-    live = next((p for p in existing if p.live), None)
+    # A live *interactive* preview is returned as-is — thumbnail capture
+    # stacks (purpose=thumb, PR4) never satisfy the reuse check.
+    live = next(
+        (p for p in existing if p.live and p.purpose == PURPOSE_PREVIEW), None
+    )
     entry = body.entry if body else None
     ptype = ((body.type or "").strip().lower() or None) if body else None
     # Idempotent: a live preview is returned as-is — unless an explicit
@@ -263,19 +346,7 @@ async def start_preview(
             detail="no snapshot workspace found for this sandbox",
         )
     try:
-        if entry:
-            # Explicit pick: jailed to the workspace; type= may override the
-            # suffix-derived plan (e.g. serve a .py instead of executing it).
-            plan = plan_for_entry(workspace, entry, ptype)
-        elif ptype:
-            # Type-only override: first detected candidate of that type —
-            # a both-matching workspace defaults to static, {"type":
-            # "desktop"} reaches the game.
-            plan = plan_for_type(workspace, ptype)
-        else:
-            # No explicit pick → the scan's default (candidates[0]; results
-            # payload carries the full list for the UI's dropdown).
-            plan = scan_preview(workspace).plan
+        plan = _resolve_plan(workspace, body)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -294,8 +365,11 @@ async def start_preview(
     if live is not None and live.type == plan.type and live.entry == plan.entry:
         return _out(live)
     # Clear stale containers — dead ones always, and a live one whose plan
-    # doesn't match the explicit request.
+    # doesn't match the explicit request — except a live capture stack:
+    # killing it mid-capture would fail that POST .../thumbnail.
     for preview in existing:
+        if _capture_in_flight(preview):
+            continue
         await asyncio.to_thread(mgr.stop, preview.preview_id)
 
     try:
@@ -361,11 +435,15 @@ async def stop_preview(run_id: UUID, sandbox_id: UUID, session: DbSession) -> No
     _find_sandbox(session, run_id, sandbox_id)
     mgr = get_preview_manager()
     existing = await asyncio.to_thread(mgr.list, sandbox_id=str(sandbox_id))
-    if not existing:
+    # A live purpose=thumb stack is an in-flight capture, not "the
+    # preview" — invisible to GET and unstoppable here (a sandbox with
+    # only a capture running 404s, same as GET).
+    stoppable = [p for p in existing if not _capture_in_flight(p)]
+    if not stoppable:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="no preview for this sandbox"
         )
-    for preview in existing:
+    for preview in stoppable:
         await asyncio.to_thread(mgr.stop, preview.preview_id)
     try:
         emit(
@@ -375,10 +453,201 @@ async def stop_preview(run_id: UUID, sandbox_id: UUID, session: DbSession) -> No
             event_type="checkpoint",
             payload={
                 "stage": "preview_stopped",
-                "preview_ids": [p.preview_id for p in existing],
+                "preview_ids": [p.preview_id for p in stoppable],
             },
         )
         session.commit()
     except Exception:
         session.rollback()
         log.warning("preview_stopped event emit failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# PR4 — artifact thumbnails (headless screenshots via the preview stack)
+# ---------------------------------------------------------------------------
+
+
+class ThumbOut(BaseModel):
+    """Result of a successful capture — ``url`` is the GET path for the PNG."""
+
+    url: str
+    captured_at: datetime | None = None
+    type: str
+    entry: str | None = None
+
+
+def _thumb_url(run_id: UUID, sandbox_id: UUID) -> str:
+    return f"/api/runs/{run_id}/sandboxes/{sandbox_id}/thumbnail"
+
+
+@router.post(
+    "/api/runs/{run_id}/sandboxes/{sandbox_id}/thumbnail",
+    response_model=ThumbOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def capture_thumbnail(
+    run_id: UUID,
+    sandbox_id: UUID,
+    session: DbSession,
+    body: Annotated[PreviewStart | None, Body()] = None,
+) -> ThumbOut:
+    """Screenshot the artifact through its own preview stack (PR4).
+
+    Explicit-only trigger — the results page never auto-captures (that GET
+    is polled); the button POSTs here and the PNG lands at
+    ``<artifact>/thumbnail.png``. Optional ``{"entry","type"}`` picks the
+    captured candidate exactly like ``POST .../preview`` (default = the
+    scan's default plan). Synchronous but bounded (ready wait + settle +
+    chromium timeout); ``ThumbnailError`` → 502, no partial outputs.
+    """
+    sb = _find_sandbox(session, run_id, sandbox_id)
+    jail = _jail()
+    # The write target is the same resolve_artifact_dir the GET/DELETE
+    # paths probe — deriving it from workspace.parent would diverge when
+    # artifact_path exists without a workspace (workspace falls back to
+    # the jail layout while reads probe artifact_path) or when the
+    # workspace is a symlink into a sibling artifact dir.
+    artifact_dir = resolve_artifact_dir(
+        jail=jail,
+        run_id=str(run_id),
+        sandbox_id=str(sandbox_id),
+        artifact_path=sb.artifact_path,
+    )
+    workspace = resolve_workspace_dir(
+        jail=jail,
+        run_id=str(run_id),
+        sandbox_id=str(sandbox_id),
+        artifact_path=sb.artifact_path,
+    )
+    if (
+        artifact_dir is None
+        or workspace is None
+        or artifact_dir not in workspace.parents
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="no snapshot workspace found for this sandbox",
+        )
+    try:
+        plan = _resolve_plan(workspace, body)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+    if plan is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "no previewable artifact to screenshot: expected a "
+                ".html/.htm entry, a GUI app, or a web app"
+            ),
+        )
+
+    try:
+        result = await asyncio.to_thread(
+            get_thumbnailer().capture,
+            run_id=str(run_id),
+            sandbox_id=str(sandbox_id),
+            workspace=workspace,
+            artifact_dir=artifact_dir,
+            plan=plan,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    except ThumbnailError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"thumbnail capture failed: {exc}",
+        ) from exc
+
+    try:
+        emit(
+            session,
+            run_id=run_id,
+            sandbox_id=sandbox_id,
+            event_type="checkpoint",
+            payload={
+                "stage": "thumbnail_captured",
+                "type": result.type,
+                "entry": result.entry,
+            },
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+        log.warning("thumbnail_captured event emit failed", exc_info=True)
+
+    return ThumbOut(
+        url=_thumb_url(run_id, sandbox_id),
+        captured_at=result.captured_at,
+        type=result.type,
+        entry=result.entry,
+    )
+
+
+def _thumbnail_paths(
+    run_id: UUID, sandbox_id: UUID, artifact_path: str | None
+) -> tuple[Path, Path] | None:
+    """``(png, meta)`` under the jailed artifact dir, or None — the png must
+    still resolve inside the jail (a planted symlink can't escape it)."""
+    artifact_dir = resolve_artifact_dir(
+        jail=_jail(),
+        run_id=str(run_id),
+        sandbox_id=str(sandbox_id),
+        artifact_path=artifact_path,
+    )
+    if artifact_dir is None:
+        return None
+    jail = _jail()
+    png = artifact_dir / THUMB_FILENAME
+    try:
+        resolved = png.resolve()
+    except OSError:
+        return None
+    if resolved != jail and jail not in resolved.parents:
+        return None
+    return png, artifact_dir / THUMB_META_FILENAME
+
+
+@router.get("/api/runs/{run_id}/sandboxes/{sandbox_id}/thumbnail")
+async def get_thumbnail(run_id: UUID, sandbox_id: UUID, session: DbSession) -> FileResponse:
+    """Serve ``thumbnail.png`` (404 when never captured / workspace gone)."""
+    sb = _find_sandbox(session, run_id, sandbox_id)
+    paths = _thumbnail_paths(run_id, sandbox_id, sb.artifact_path)
+    if paths is None or not paths[0].is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="no thumbnail captured"
+        )
+    return FileResponse(paths[0], media_type="image/png")
+
+
+@router.delete(
+    "/api/runs/{run_id}/sandboxes/{sandbox_id}/thumbnail",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_thumbnail(
+    run_id: UUID, sandbox_id: UUID, session: DbSession
+) -> None:
+    """Remove the captured PNG + meta sidecar (404 when absent)."""
+    sb = _find_sandbox(session, run_id, sandbox_id)
+    paths = _thumbnail_paths(run_id, sandbox_id, sb.artifact_path)
+    if paths is None or not paths[0].is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="no thumbnail captured"
+        )
+    png, meta = paths
+    try:
+        png.unlink()
+        meta.unlink(missing_ok=True)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"could not remove thumbnail: {exc}",
+        ) from exc

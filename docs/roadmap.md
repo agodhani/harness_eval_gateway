@@ -107,6 +107,11 @@ append-mostly; rebase on main before merge.
   waits on `SPAWN_MIN_FREE_MEM_MB` headroom capped by
   `SPAWN_MEM_WAIT_SECONDS` (timeout fails that sandbox, siblings fail
   fast). Details: `FEATURE_MAP.md` F2.
+- **PR4 — Artifact thumbnails** (F17): explicit `POST .../thumbnail` →
+  bounded headless-chromium screenshot through the artifact's own
+  thumb-purpose preview stack; `<artifact>/thumbnail.png` +
+  `thumbnail.json` embedded on `SandboxResult.thumbnail`; click-through
+  to full live preview. Details: `FEATURE_MAP.md` F17.
 
 ## Dependency DAG
 
@@ -129,14 +134,12 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR3,
-  PR15, PR19 — plus PR17 (soft ←13 satisfied — PR13 landed).
-- **Depth 1:** PR4 (←3), PR10 (←9), PR14 (←1), PR16 (←15),
-  PR18 (←12).
+- **Depth 0 (start immediately):** PR16 (hard dep PR15 landed), PR19.
 - **Floating:** PR20 (soft ←15).
 
-Critical path depth = 1 remaining (`3→4`; was 3 via `6→7→8` before
-PR2, PR6, PR7, and PR8 landed). Max safe concurrency ≈ 9 lanes.
+Critical path depth = 0 — every hard edge has landed (`3→4` closed when
+PR4 landed; `6→7→8`, `1→14`, `9→10`, `12→18`, `15→16`'s blocker all
+landed). Max safe concurrency ≈ 3 lanes.
 
 ## Shared-file hotspots (merge-conflict risk)
 
@@ -145,8 +148,6 @@ PR2, PR6, PR7, and PR8 landed). Max safe concurrency ≈ 9 lanes.
 - `db/migrations/` — PR1 adds a migration; renumber revisions at merge.
 - `orchestrator/` — PR15 vs PR16 both touch the state machine;
   coordinate.
-- `sandbox/preview.py` + `api/routers/preview.py` + `PreviewControls.tsx` —
-  all of lane B; strictly sequential.
 
 ---
 
@@ -187,12 +188,23 @@ landed" and `FEATURE_MAP.md` F12.
   `PREVIEW_TYPES` = {static, desktop, python-server}; `templates/` skipped in
   scans (flask render dir). Details: `FEATURE_MAP.md` F12.
 
-### PR4 — Artifact thumbnails
+### PR4 — Artifact thumbnails — ✅ landed
 - **Scope:** lightweight screenshots of produced artifacts for at-a-glance
   review before spawning a full preview sandbox (reuses preview spawn infra
   + a headless capture step).
-- **Touch:** `sandbox/preview.py` or new `sandbox/thumbnails.py`, artifact
-  store layout (`data/artifacts/<run>/<sandbox>/`), results API + UI.
+- **Landed:** new `sandbox/thumbnails.py::Thumbnailer` — spawns the
+  artifact's own preview stack with `heg.preview_purpose=thumb` (new
+  purpose label; interactive endpoints filter on `preview`, reaper/stop
+  see both), waits for it to serve, settles (desktop longer — Xvnc is
+  loopback-only so noVNC is the only window), then one-shots
+  `heg-preview-thumb` (debian chromium on `python:3.12-slim`,
+  `sandbox/images/thumbnail-capture.{Dockerfile,sh}`) on `heg-preview`
+  against the in-network URL. PNG-magic-validated → atomic
+  `<artifact>/thumbnail.png` + `thumbnail.json` meta. Explicit-only
+  trigger: `POST/GET/DELETE .../thumbnail` (502 on failure — never breaks
+  results; results GET embeds `SandboxResult.thumbnail` as a cheap jailed
+  FS probe, no spawning). UI: `📷 snapshot`/`↻ recapture` + clickable
+  shot that opens the full live preview. Details: `FEATURE_MAP.md` F17.
 
 ### PR5 — Eval iteration: re-score + rubric edits — ✅ landed
 Landed as F14: `POST /api/runs/{id}/rubrics` appends immutable rubric

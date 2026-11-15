@@ -13,15 +13,23 @@
  * `.py` entry can run as a desktop/server app or be served as a file
  * ("view source"). An explicit pick that differs from the live preview's
  * plan replaces the running container server-side.
+ *
+ * PR4: the row is headed by the artifact's captured thumbnail
+ * (results-embedded `thumbnail`; "📷 snapshot" POSTs a headless-chromium
+ * capture through the preview stack). Clicking the shot opens the live
+ * preview — spawning one first if needed.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import {
   ApiError,
+  captureThumbnail,
   getPreview,
   startPreview,
   stopPreview,
+  thumbnailUrl,
   type PreviewCandidate,
   type PreviewOut,
+  type ThumbRef,
 } from "@/lib/api";
 
 type Phase = "checking" | "idle" | "starting" | "active" | "stopping";
@@ -82,6 +90,7 @@ export default function PreviewControls({
   sandboxId,
   previewable,
   candidates = [],
+  thumbnail = null,
 }: {
   runId: string;
   sandboxId: string;
@@ -89,12 +98,41 @@ export default function PreviewControls({
   /** Every detected runnable entry, default-first — >1 renders a dropdown
    *  and the pick is POSTed as {entry, type}. */
   candidates?: PreviewCandidate[];
+  /** PR4: captured screenshot ref from the results payload (null when
+   *  never captured). Local state overrides after a fresh capture. */
+  thumbnail?: ThumbRef | null;
 }) {
   const options = buildOptions(candidates);
   const [phase, setPhase] = useState<Phase>("checking");
   const [preview, setPreview] = useState<PreviewOut | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pick, setPick] = useState<string>(options[0]?.key ?? "");
+  // A results refresh can replace `candidates` — fall back to the first
+  // option when the stored pick no longer exists so the dropdown and the
+  // POSTed plan can't disagree.
+  const selected = options.find((o) => o.key === pick) ?? options[0];
+  const [thumbOverride, setThumbOverride] = useState<{
+    superseded: ThumbRef | null;
+    ref: ThumbRef;
+  } | null>(null);
+  const [capturing, setCapturing] = useState(false);
+  // Cache-bust key for thumbs whose ref lacks captured_at (bare
+  // thumbnail.png / tolerated meta-write failure) — hydration-stable,
+  // mount-unique, and bumped per capture so a recapture never reuses a
+  // cached URL.
+  const mountId = useId();
+  const [thumbBust, setThumbBust] = useState(mountId);
+  // The capture response shadows the `thumbnail` prop it superseded only —
+  // compared by capture identity (polls reparse the payload into fresh
+  // objects), so a refresh delivering the same capture keeps the override
+  // while a different ref (newer capture, or none after a delete) wins.
+  const thumb =
+    thumbOverride !== null &&
+    thumbnail?.captured_at === thumbOverride.superseded?.captured_at &&
+    thumbnail?.type === thumbOverride.superseded?.type &&
+    thumbnail?.entry === thumbOverride.superseded?.entry
+      ? thumbOverride.ref
+      : thumbnail;
 
   useEffect(() => {
     let cancelled = false;
@@ -148,6 +186,86 @@ export default function PreviewControls({
     setPhase("idle");
   }
 
+  /** PR4 — synchronous bounded capture; the api returns 502 on failure
+   *  (a missing thumbnail is a fine outcome, never a broken page). */
+  async function capture() {
+    setCapturing(true);
+    setError(null);
+    try {
+      const t = await captureThumbnail(
+        runId,
+        sandboxId,
+        selected ? { entry: selected.entry, type: selected.type } : undefined,
+      );
+      setThumbOverride({ superseded: thumbnail, ref: t });
+      setThumbBust((prev) => `${prev}.`);
+    } catch (e) {
+      setError(
+        e instanceof ApiError ? e.detail : "thumbnail capture failed",
+      );
+    } finally {
+      setCapturing(false);
+    }
+  }
+
+  /** Thumbnail click → full live preview: open the running one, else
+   *  spawn the selected plan (start() opens the URL on success). */
+  function openFull() {
+    if (phase === "active" && preview?.url) {
+      window.open(preview.url, "_blank", "noopener,noreferrer");
+    } else {
+      void start(selected);
+    }
+  }
+
+  const busy = phase === "starting" || phase === "stopping";
+  const canCapture = previewable || options.length > 0;
+
+  /** PR4 thumbnail block — heads the cell in both idle and active
+   *  states; the shot itself is the "open full preview" affordance. */
+  const thumbBlock = (
+    <div className="thumb-row">
+      {thumb ? (
+        <button
+          type="button"
+          className="thumb-btn"
+          onClick={openFull}
+          disabled={busy || capturing}
+          title={
+            phase === "active" && preview?.url
+              ? "Open the live preview"
+              : `Captured ${thumb.captured_at ?? "earlier"}${thumb.entry ? ` — ${thumb.type}: ${thumb.entry}` : ""}. Click to spawn a full live preview.`
+          }
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element -- small
+              artifact PNG served by the api; next/image isn't configured
+              for it */}
+          <img
+            className="thumb-img"
+            src={thumbnailUrl(runId, sandboxId, thumb.captured_at ?? thumbBust)}
+            alt={`artifact screenshot${thumb.type ? ` — ${thumb.type}` : ""}`}
+            onError={() => setThumbOverride(null)}
+          />
+        </button>
+      ) : (
+        <span className="thumb-empty faint">no snapshot</span>
+      )}
+      <button
+        type="button"
+        className="btn btn--sm"
+        onClick={() => void capture()}
+        disabled={busy || capturing || !canCapture}
+        title={
+          canCapture
+            ? "Screenshot the artifact through its preview stack (stored under the artifact dir)"
+            : "Thumbnail capture isn't supported for this artifact — it needs an HTML entry, GUI app, or web app"
+        }
+      >
+        {capturing ? "capturing…" : thumb ? "↻ recapture" : "📷 snapshot"}
+      </button>
+    </div>
+  );
+
   if (phase === "checking") {
     return <span className="faint" style={{ fontSize: "0.8rem" }}>…</span>;
   }
@@ -155,125 +273,134 @@ export default function PreviewControls({
   if (phase === "active" && preview) {
     const expiry = expiryLabel(preview.expires_at);
     return (
-      <div className="chip-row">
-        <span
-          className="faint"
-          style={{ fontSize: "0.75rem" }}
-          title={
-            preview.type === "desktop"
-              ? "Desktop preview — the artifact executes in an isolated container (no egress), streamed via noVNC"
-              : preview.type === "python-server"
-                ? "Server preview — the artifact's web app executes in an isolated container (no egress) and is served on localhost"
-                : "Static preview — workspace files served read-only, nothing executed"
-          }
-        >
-          {preview.type === "desktop"
-            ? "🖥 desktop"
-            : preview.type === "python-server"
-              ? "🌐 server"
-              : preview.type}
-        </span>
-        {preview.url ? (
-          <a
-            className="chip"
-            style={{ textDecoration: "none" }}
-            href={preview.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            title={`Open preview (${preview.type}: ${preview.entry ?? "site"})`}
+      <div className="preview-cell">
+        {thumbBlock}
+        <div className="chip-row">
+          <span
+            className="faint"
+            style={{ fontSize: "0.75rem" }}
+            title={
+              preview.type === "desktop"
+                ? "Desktop preview — the artifact executes in an isolated container (no egress), streamed via noVNC"
+                : preview.type === "python-server"
+                  ? "Server preview — the artifact's web app executes in an isolated container (no egress) and is served on localhost"
+                  : "Static preview — workspace files served read-only, nothing executed"
+            }
           >
-            ↗ open
-          </a>
-        ) : (
-          <span className="faint" style={{ fontSize: "0.8rem" }}>
-            {preview.status}
+            {preview.type === "desktop"
+              ? "🖥 desktop"
+              : preview.type === "python-server"
+                ? "🌐 server"
+                : preview.type}
           </span>
-        )}
-        <button
-          type="button"
-          className="btn btn--sm"
-          onClick={stop}
-          title="Stop the preview container"
-        >
-          ■ stop
-        </button>
-        {expiry ? (
-          <span className="faint" style={{ fontSize: "0.75rem" }} title={preview.expires_at ?? undefined}>
-            {expiry}
+          {preview.url ? (
+            <a
+              className="chip"
+              style={{ textDecoration: "none" }}
+              href={preview.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={`Open preview (${preview.type}: ${preview.entry ?? "site"})`}
+            >
+              ↗ open
+            </a>
+          ) : (
+            <span className="faint" style={{ fontSize: "0.8rem" }}>
+              {preview.status}
+            </span>
+          )}
+          <button
+            type="button"
+            className="btn btn--sm"
+            onClick={stop}
+            title="Stop the preview container"
+          >
+            ■ stop
+          </button>
+          {expiry ? (
+            <span className="faint" style={{ fontSize: "0.75rem" }} title={preview.expires_at ?? undefined}>
+              {expiry}
+            </span>
+          ) : null}
+        </div>
+        {error ? (
+          <span className="field__error" title={error}>
+            {error}
           </span>
         ) : null}
       </div>
     );
   }
 
-  const busy = phase === "starting" || phase === "stopping";
-
   return (
-    <div className="chip-row">
-      {options.length > 1 ? (
-        <>
-          <select
-            value={pick}
-            onChange={(e) => setPick(e.target.value)}
-            disabled={busy}
-            title="Entry point + how to preview it — 'view source' serves a .py file instead of executing it"
-            style={{ fontSize: "0.8rem", maxWidth: 220 }}
-          >
-            {options.map((o) => (
-              <option key={o.key} value={o.key}>
-                {o.label}
-              </option>
-            ))}
-          </select>
+    <div className="preview-cell">
+      {thumbBlock}
+      <div className="chip-row">
+        {options.length > 1 ? (
+          <>
+            <select
+              value={selected?.key ?? ""}
+              onChange={(e) => setPick(e.target.value)}
+              disabled={busy}
+              title="Entry point + how to preview it — 'view source' serves a .py file instead of executing it"
+              style={{ fontSize: "0.8rem", maxWidth: 220 }}
+            >
+              {options.map((o) => (
+                <option key={o.key} value={o.key}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="btn btn--sm"
+              onClick={() => void start(selected)}
+              disabled={busy || !selected}
+              title="Serve the selected entry in a throwaway container (new tab)"
+            >
+              {phase === "starting" ? "starting…" : "▶ Preview"}
+            </button>
+          </>
+        ) : previewable ? (
           <button
             type="button"
             className="btn btn--sm"
-            onClick={() => void start(options.find((o) => o.key === pick))}
-            disabled={busy || !pick}
-            title="Serve the selected entry in a throwaway container (new tab)"
+            onClick={() => void start()}
+            disabled={busy}
+            title="Serve this sandbox's artifact in a throwaway container (new tab)"
           >
             {phase === "starting" ? "starting…" : "▶ Preview"}
           </button>
-        </>
-      ) : previewable ? (
-        <button
-          type="button"
-          className="btn btn--sm"
-          onClick={() => void start()}
-          disabled={busy}
-          title="Serve this sandbox's artifact in a throwaway container (new tab)"
-        >
-          {phase === "starting" ? "starting…" : "▶ Preview"}
-        </button>
-      ) : (
-        <>
-          <button
-            type="button"
-            className="btn btn--sm"
-            disabled
-            title="Preview isn't supported for this artifact — it needs an HTML entry point, a GUI app, or a web app. The artifact itself is fine and still downloadable above."
-          >
-            ▶ Preview
-          </button>
-          <span
-            className="faint"
-            style={{ fontSize: "0.75rem" }}
-            title="Preview supports static sites, GUI apps (pygame/pyglet/arcade/tkinter), and web apps (flask/fastapi/django/…)"
-          >
-            not supported
+        ) : (
+          <>
+            <button
+              type="button"
+              className="btn btn--sm"
+              disabled
+              title="Preview isn't supported for this artifact — it needs an HTML entry point, a GUI app, or a web app. The artifact itself is fine and still downloadable above."
+            >
+              ▶ Preview
+            </button>
+            <span
+              className="faint"
+              style={{ fontSize: "0.75rem" }}
+              title="Preview supports static sites, GUI apps (pygame/pyglet/arcade/tkinter), and web apps (flask/fastapi/django/…)"
+            >
+              not supported
+            </span>
+          </>
+        )}
+        {preview && !LIVE_STATUSES.has(preview.status) ? (
+          <span className="faint" style={{ fontSize: "0.75rem" }}>
+            ({preview.status})
           </span>
-        </>
-      )}
-      {preview && !LIVE_STATUSES.has(preview.status) ? (
-        <span className="faint" style={{ fontSize: "0.75rem" }}>
-          ({preview.status})
-        </span>
-      ) : null}
-      {error ? (
-        <span className="field__error" title={error}>
-          {error}
-        </span>
-      ) : null}
+        ) : null}
+        {error ? (
+          <span className="field__error" title={error}>
+            {error}
+          </span>
+        ) : null}
+      </div>
     </div>
   );
 }
