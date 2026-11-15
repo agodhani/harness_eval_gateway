@@ -308,7 +308,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   against the registry. Design doc: `docs/p25-harness-adapters.md`.
 - **Where:** `adapters/common/` (`runner.py`, `contract.py`),
   `adapters/{codex,claude_code,pi,deepseek,aider}/` (`adapter.py`, `config.py`,
-  `translate.py`, `__main__.py`), `orchestrator/adapters.py`,
+  `translate.py`, `__main__.py`; aider also `launcher.py` — the patched
+  entrypoint that lifts aider's explicit-yes gate on suggested shell
+  commands), `orchestrator/adapters.py`,
   `orchestrator/provision.py`, `sandbox/images/{codex,claude_code,pi,
   deepseek,aider}.Dockerfile`, `api/routers/harnesses.py`
 - **Verify:**
