@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from db.models import Rubric, Run
@@ -141,6 +142,63 @@ class RubricContent(BaseModel):
 
 class RubricParseError(ValueError):
     """Raised when LLM output can't be massaged into RubricContent."""
+
+
+def create_rubric_version(
+    session: Session,
+    run: Run,
+    content: RubricContent,
+    *,
+    base: Rubric | None = None,
+) -> Rubric:
+    """Append a post-run rubric version (PR5).
+
+    New row: ``version`` = max+1, ``status="approved"`` (post-run edits are
+    frozen on save — no second review gate), ``parent_id`` = ``base`` or the
+    latest existing row. Previously ``approved`` rows become ``superseded``
+    so exactly one live rubric exists per run; ``_latest_approved_rubric``
+    keeps working unchanged. Emits a ``rubric_version_created`` checkpoint.
+    The caller owns the commit.
+    """
+    rows = list(
+        session.execute(
+            select(Rubric)
+            .where(Rubric.run_id == run.id)
+            .order_by(Rubric.version.desc())
+        )
+        .scalars()
+        .all()
+    )
+    if base is None:
+        base = rows[0] if rows else None
+    version = (rows[0].version + 1) if rows else 1
+    superseded: list[int] = []
+    for row in rows:
+        if row.status == "approved":
+            row.status = "superseded"
+            superseded.append(row.version)
+    rubric = Rubric(
+        run_id=run.id,
+        version=version,
+        parent_id=base.id if base is not None else None,
+        status="approved",
+        content=content.model_dump(mode="json"),
+    )
+    session.add(rubric)
+    session.flush()  # populate rubric.id for the event payload + response
+    emit(
+        session,
+        run_id=run.id,
+        event_type="checkpoint",
+        payload={
+            "stage": "rubric_version_created",
+            "rubric_id": str(rubric.id),
+            "version": version,
+            "parent_version": base.version if base is not None else None,
+            "superseded": superseded,
+        },
+    )
+    return rubric
 
 
 # ---------------------------------------------------------------------------
