@@ -61,7 +61,7 @@ export default function Pipeline() {
           as a state machine.
         </>
       }
-      lede="A run is a strict lifecycle — submitted → rubric_review → provisioning →
+      lede="A run is a strict lifecycle — submitted → rubric_review → [queued →] provisioning →
       running → evaluating → done. Every transition is an event; every event is
       persisted. Nothing about a run is ephemeral."
     >

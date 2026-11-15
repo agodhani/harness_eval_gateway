@@ -19,6 +19,7 @@ export const API_BASE: string =
 export type RunStatus =
   | "submitted"
   | "rubric_review"
+  | "queued"
   | "provisioning"
   | "running"
   | "evaluating"
@@ -28,6 +29,7 @@ export type RunStatus =
 export const RUN_STATUSES: readonly RunStatus[] = [
   "submitted",
   "rubric_review",
+  "queued",
   "provisioning",
   "running",
   "evaluating",
