@@ -7,8 +7,9 @@ coverage as :class:`~scoring.models.SignalReport` metrics — the
 
 Unlike ``static_analysis`` this collector DOES execute candidate code — the
 ``SignalCollector`` contract allows it when the collector's own contract
-sandboxes the exec (``--network none``, nobody user, cap-drop, resource
-bounds, read-only artifact mount). The workspace is never modified.
+sandboxes the exec (``--network none``, candidate phases demoted to nobody
+by the root in-image runner, cap-drop, resource bounds, read-only artifact
+mount). The workspace is never modified.
 
 Config knobs (env / api settings, overridable via constructor for tests/PR8):
 

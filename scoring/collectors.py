@@ -32,7 +32,7 @@ class SignalCollector(Protocol):
     """One objective-signal source over a candidate workspace."""
 
     #: Registry/SignalReport id — stable, unique, snake_case
-    #: (``"static_analysis"``; PR7: e.g. ``"exec"``).
+    #: (``"static_analysis"``, ``"exec"``).
     name: str
 
     def collect(self, workspace: Path) -> SignalReport:

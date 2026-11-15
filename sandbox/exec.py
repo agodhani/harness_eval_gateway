@@ -71,8 +71,8 @@ EXEC_IMAGE = "heg-exec:latest"
 CONTAINER_PREFIX = "hegexec-"
 RESULT_FILENAME = "exec_result.json"
 RESULT_SENTINEL = "HEG_EXEC_RESULT "
-#: Refuse to parse a result file larger than this — a candidate can write to
-#: /out, so bound what we read back.
+#: Refuse to parse a result file larger than this — /out is root-owned and
+#: unreachable by candidate phases, but bound what we read back anyway.
 MAX_RESULT_BYTES = 1024 * 1024
 #: Merged container output retained on the outcome (for warnings/debugging).
 LOG_TAIL_CHARS = 4000
