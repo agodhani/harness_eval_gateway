@@ -7,7 +7,7 @@ these can be the defaults for now."
 This document captures the research + decisions so reviewers don't have to
 redo them. Where the ask was ambiguous the call made is recorded and flagged.
 
-## What the four harnesses are
+## What the harnesses are
 
 | Adapter name | Upstream | Install | Non-interactive mode | Wire protocol |
 |---|---|---|---|---|
@@ -105,12 +105,13 @@ docker CMD: python3 -m adapters.<name>
          TASK_PROMPT, WORKSPACE, SKILLPACKS_ROOT, EVENTS_INGEST_URL,
          SYSTEM_PROMPT_EXTRA)
       2. write harness-native config (codex config.toml, pi models.json,
-         claude .claude.json, dsh cordis.patch.yml)
+         claude .claude.json, dsh cordis.patch.yml, aider .aider.conf.yml)
       3. emit run_started
       4. spawn CLI argv (cwd=/workspace, stderr merged into stdout)
-      5. per JSONL stdout line: echo raw line to stderr (transcript) +
-         translate → normalized events → stdout JSONL + POST /internal/events
-         (cred auth → run/sandbox ids stamped)
+      5. per stdout line: echo raw line to stderr (transcript) + translate
+         → normalized events → stdout JSONL + POST /internal/events (cred
+         auth → run/sandbox ids stamped); JSONL CLIs feed translate(obj),
+         aider's plain text feeds translate_text (see the aider section)
       6. on exit: emit terminal_state + print `HEG_RESULT {json}` marker;
          exit 0, or 2 on error
 ```

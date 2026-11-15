@@ -203,7 +203,7 @@ applied identically to all sandboxes.
 gateway/       # LLM proxy: providers, metering, budgets, event emission
 orchestrator/  # run state machine, matrix expansion, rubric gen, lifecycle
 api/           # control-plane HTTP API (FastAPI app)
-adapters/      # harness adapters (miniloop first; cli adapters post-MVP)
+adapters/      # harness adapters (miniloop + shipped CLI adapters)
 sandbox/       # image defs, workspace prep, done mechanism, event collector
 evaluator/     # rubric scoring agent
 scoring/       # objective signal collectors (static analysis; PR7 adds exec/coverage)
@@ -235,7 +235,7 @@ or tests change.
 | F7 | Evaluator sandbox: rubric scoring + rationale |
 | F8 | Results UI: matrix, scores, timeline, artifacts |
 | F9 | Run analytics: per-sandbox metrics + estimated cost |
-| F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) |
+| F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek, Aider) |
 | F11 | Skillpack import from GitHub (discover → select → import) |
 | F12 | Artifact preview (static html + desktop/pygame via noVNC) |
 | F13 | Graphical analysis page + cross-run trends (recharts) |

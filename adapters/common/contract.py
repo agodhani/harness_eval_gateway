@@ -1,4 +1,4 @@
-"""Boilerplate for the four CLI-harness adapters' contract functions.
+"""Boilerplate for the CLI-harness adapters' contract functions.
 
 This module runs in the orchestrator/api process (never inside a sandbox —
 the sandbox side of the same mechanism is ``adapters/common/runner.py``).

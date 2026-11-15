@@ -8,9 +8,10 @@ One ``run_shim`` loop serves every CLI adapter:
    ``SYSTEM_PROMPT_EXTRA``).
 2. An adapter ``setup`` hook writes the CLI's native config
    (codex ``config.toml``, pi ``models.json``, claude ``~/.claude.json``,
-   dsh ``cordis.patch.yml``).
-3. The CLI is spawned in its JSONL machine mode (cwd = workspace, stderr
-   merged into stdout so docker logs keep one ordered transcript).
+   dsh ``cordis.patch.yml``, aider ``~/.aider.conf.yml``).
+3. The CLI is spawned in its machine-output mode — JSONL where the CLI
+   has one (aider prints plain text instead); cwd = workspace, stderr
+   merged into stdout so docker logs keep one ordered transcript.
 4. Every stdout line is echoed to the shim's stderr (raw transcript) and
    JSON-parsed; ``translate(obj)`` maps native records to normalized event
    dicts which are printed as harness JSONL **and** POSTed to

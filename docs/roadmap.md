@@ -11,8 +11,8 @@ append-mostly; rebase on main before merge.
 ## Already landed (do not redo)
 
 - F0–F12 (see FEATURE_MAP.md): orchestrator, gateway w/ metering+budgets,
-  sandbox runtime + egress lockdown, miniloop + 4 CLI adapters (codex,
-  claude_code, pi, deepseek), evaluator w/ judge retries, results UI,
+  sandbox runtime + egress lockdown, miniloop + 5 CLI adapters (codex,
+  claude_code, pi, deepseek, aider), evaluator w/ judge retries, results UI,
   analytics (F9), skillpack import (F11), artifact preview static+desktop
   (F12).
 - **PR2 preview fixes**: `type=` POST-body override on the artifact preview
@@ -79,7 +79,7 @@ PR19 Auth/templates/share — independent
 
 - **Depth 0 (start immediately):** PR1, PR3, PR5, PR9,
   PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
-  PR13/PR17 if soft-only deps are acceptable.
+  PR17 (soft ←13 satisfied — PR13 landed).
 - **Depth 1:** PR4 (←3), PR8 (←7), PR10 (←9), PR14 (←1), PR16 (←15),
   PR18 (←12).
 - **Floating:** PR20 (soft ←15).
