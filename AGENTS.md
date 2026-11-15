@@ -230,7 +230,8 @@ applied identically to all sandboxes.
 ## Repo layout (proposed)
 
 ```
-gateway/       # LLM proxy: providers, metering, budgets, event emission
+gateway/       # LLM proxy: providers, metering, budgets, event emission,
+               # opt-in response cache (PR18 replay)
 orchestrator/  # run state machine, matrix expansion, rubric gen, lifecycle
 api/           # control-plane HTTP API (FastAPI app)
 adapters/      # harness adapters (miniloop + shipped CLI adapters)
@@ -280,6 +281,7 @@ or tests change.
 - Objective scoring: build/test execution, coverage as score dimensions
   (PR7 — static analysis landed in PR6 via `scoring/` signal collectors)
 - Automated test-suite generation as eval target
+- Higher-fidelity instrumentation via harness hooks/plugins
 - Gateway response caching / deterministic replay
 - Multi-host / K8s sandbox scaling
 - Auth, saved run templates, share links
@@ -425,6 +427,20 @@ or tests change.
   (`PREVIEW_SCAN_TTL_SECONDS`, default 30s) keyed on
   (jail, run, sandbox, artifact_path) — workspaces only change on
   re-snapshot.
+- **Gateway response caching / deterministic replay (PR18)**: opt-in
+  `GATEWAY_CACHE_ENABLED` — OFF by default so real runs hit the live
+  upstream. Metered generation calls replay from a sqlite store
+  (`gateway/cache.py`, `GATEWAY_CACHE_PATH`) keyed on
+  `namespace + path + provider + outgoing-body` (post-transform, so
+  stream/buffered variants and PROVIDER_ROUTES targets can't collide;
+  bump `GATEWAY_CACHE_NAMESPACE` to invalidate). Semantics: hits still emit
+  `llm_request`/`llm_response` with `payload.cached: true`, usage is
+  re-metered from the stored body so cached spend counts toward the run
+  budget, and the budget gate runs before the lookup — a replayed run
+  accrues tokens and 429s identically to the live one. Only complete 2xx
+  bodies are stored; unmetered probes (`count_tokens`, `/v1/models`) bypass
+  the cache; cache failures degrade to a miss, never a proxy 5xx (same
+  doctrine as event emission).
 - **Preview registry lives on docker labels**, not in memory or Postgres —
   restart-safe discovery + the TTL reaper (default 15 min) works
   out-of-process; runner+proxy share `heg.preview_id`, stop removes all.
