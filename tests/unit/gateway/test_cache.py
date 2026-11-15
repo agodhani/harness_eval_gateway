@@ -568,6 +568,13 @@ def test_responses_endpoint_replays(
     resp = gw_client.post("/v1/responses", json=body, headers=_auth(cred))
     assert resp.headers["x-heg-cache"] == "hit"
     assert len(upstream["seen"]) == 1
+    resp_events = [c for c in emitted if c["type"] == "llm_response"]
+    assert resp_events[-1]["payload"]["cached"] is True
+    assert resp_events[-1]["payload"]["usage"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": 1,
+        "total_tokens": 3,
+    }
 
 
 def test_count_tokens_preflight_bypasses_cache(
@@ -618,6 +625,28 @@ def test_cache_store_failure_does_not_break_response(
     resp = _post_chat(gw_client, _cred())
     assert resp.status_code == 200
     assert resp.json()["usage"]["total_tokens"] == 5
+
+
+def test_cache_init_failure_degrades_to_disabled(
+    gw_client: TestClient,
+    upstream: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unconstructable cache (bad GATEWAY_CACHE_PATH) must disable the
+    replay path, not 5xx every metered endpoint."""
+    deps.reset_response_cache()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "GATEWAY_CACHE_ENABLED", True)
+    # A directory path makes sqlite's connect fail inside ResponseCache().
+    monkeypatch.setattr(settings, "GATEWAY_CACHE_PATH", str(tmp_path))
+    try:
+        cred = _cred()
+        assert _post_chat(gw_client, cred).status_code == 200
+        assert _post_chat(gw_client, cred).status_code == 200
+        assert len(upstream["seen"]) == 2
+    finally:
+        deps.reset_response_cache()
 
 
 def test_namespace_bump_invalidates(

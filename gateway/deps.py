@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 _engine = None
 _session_factory: sessionmaker[Session] | None = None
 _response_cache: ResponseCache | None = None
+_cache_failed = False
 
 
 def get_session_factory() -> sessionmaker[Session]:
@@ -64,22 +65,30 @@ def get_response_cache() -> ResponseCache | None:
     Lazily built from settings on first use (like ``get_session_factory``);
     ``GATEWAY_CACHE_PATH``/``_MAX_ENTRIES``/``_NAMESPACE`` configure it.
     """
-    global _response_cache
+    global _response_cache, _cache_failed
     settings = get_settings()
     if not settings.GATEWAY_CACHE_ENABLED:
         return None
-    if _response_cache is None:
-        _response_cache = ResponseCache(
-            settings.GATEWAY_CACHE_PATH,
-            max_entries=settings.GATEWAY_CACHE_MAX_ENTRIES,
-            namespace=settings.GATEWAY_CACHE_NAMESPACE,
-        )
+    if _response_cache is None and not _cache_failed:
+        try:
+            _response_cache = ResponseCache(
+                settings.GATEWAY_CACHE_PATH,
+                max_entries=settings.GATEWAY_CACHE_MAX_ENTRIES,
+                namespace=settings.GATEWAY_CACHE_NAMESPACE,
+            )
+        except Exception:
+            _cache_failed = True
+            log.warning(
+                "response cache init failed; replay cache disabled",
+                exc_info=True,
+            )
     return _response_cache
 
 
 def reset_response_cache() -> None:
     """Drop the singleton (tests toggling settings between cases)."""
-    global _response_cache
+    global _response_cache, _cache_failed
+    _cache_failed = False
     if _response_cache is not None:
         _response_cache.close()
         _response_cache = None
