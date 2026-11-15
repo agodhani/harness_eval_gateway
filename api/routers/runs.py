@@ -31,7 +31,7 @@ from api.schemas import (
 from db.models import Rubric, Run, Sandbox
 from orchestrator import adapters as orch_adapters
 from orchestrator import events as orch_events
-from orchestrator import provision, runner, state_machine
+from orchestrator import pacing, provision, runner
 from orchestrator.rubric import RubricContent
 from skillpack_import.store import imported_root
 
@@ -255,11 +255,17 @@ async def update_rubric(
 
 @router.post("/{run_id}/approve")
 async def approve_run(run_id: uuid.UUID, session: DbSession) -> RunOut:
-    """Freeze the rubric and kick off provisioning/lifecycle."""
+    """Freeze the rubric and kick off provisioning/lifecycle.
+
+    PR15 pacing: when another run holds the execution slot (or is already
+    queued), the approved run parks in ``queued`` instead — promotion to
+    ``provisioning`` happens FIFO when the active run finishes
+    (``runner._lifecycle_then_promote``) or on the next startup sweep.
+    ``started_at`` = approval/queue-entry time, as before.
+    """
     run, rubric = _editable_rubric(session, run_id)
 
     rubric.status = "approved"
-    state_machine.transition(session, run, "provisioning")
     run.started_at = datetime.now(UTC)
     orch_events.emit(
         session,
@@ -271,7 +277,9 @@ async def approve_run(run_id: uuid.UUID, session: DbSession) -> RunOut:
             "version": rubric.version,
         },
     )
+    placed = pacing.place_run(session, run)
     session.commit()
 
-    runner.start_lifecycle_task(run.id)
+    if placed == "provisioning":
+        runner.start_lifecycle_task(run.id)
     return _run_out(session, run)

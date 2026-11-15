@@ -4,7 +4,9 @@ Hermetic: file-backed sqlite (tmp_path) + FakeRuntime — NO real docker, NO
 real gateway. ``settings`` is a SimpleNamespace carrying every attribute the
 orchestrator modules read (GATEWAY_URL, GATEWAY_CRED_SECRET, RUBRIC_MODEL,
 SANDBOX_IMAGE, MONITOR_POLL_SECONDS, EVAL_TIMEOUT_SECONDS, EVAL_TOKEN_BUDGET,
-HOST_DATA_ROOT, SKILLPACKS_DIR, ARTIFACT_ROOT).
+HOST_DATA_ROOT, SKILLPACKS_DIR, ARTIFACT_ROOT, SPAWN_MIN_FREE_MEM_MB,
+SPAWN_MEM_POLL_SECONDS, SPAWN_MEM_WAIT_SECONDS). The memory gate defaults
+OFF (0) so spawn tests stay hermetic; pacing tests opt in per-test.
 """
 
 from __future__ import annotations
@@ -60,6 +62,10 @@ def settings(tmp_path: Path, skillpacks_dir: Path) -> SimpleNamespace:
         HOST_DATA_ROOT="",
         SKILLPACKS_DIR=skillpacks_dir,
         ARTIFACT_ROOT=tmp_path / "artifacts",
+        # PR15 pacing knobs — gate disabled by default; tests opt in.
+        SPAWN_MIN_FREE_MEM_MB=0,
+        SPAWN_MEM_POLL_SECONDS=0.01,
+        SPAWN_MEM_WAIT_SECONDS=30.0,
     )
 
 
