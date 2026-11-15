@@ -419,6 +419,69 @@ async def test_lifecycle_eval_retry_recovers_empty_scores(
         assert retries[0].payload["attempt"] == 2
 
 
+async def test_lifecycle_eval_retry_feeds_prior_error(
+    session_factory, settings, artifact_root
+) -> None:
+    """Error-feedback retry: attempt 2's prior_error carries the previous
+    attempt's eval_scores_failed detail — feedback, not a blind respawn."""
+    cfg = run_config()
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+    settings.EVAL_SCORE_RETRIES = 1
+
+    fake = FakeRuntime(artifact_root=artifact_root, default_logs=RESULT_DONE)
+    calls: list = []
+
+    async def flaky_eval(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            # mimic evaluate_sandbox's eval_scores_failed error event
+            with kwargs["session_factory"]() as s:
+                s.add(
+                    Event(
+                        run_id=kwargs["run_id"],
+                        sandbox_id=kwargs["sandbox_id"],
+                        source="evaluator",
+                        type="error",
+                        payload={
+                            "phase": "eval_scores_failed",
+                            "reason": "scores_invalid",
+                            "detail": "scores.json is not valid JSON",
+                        },
+                    )
+                )
+                s.commit()
+            return []
+        with kwargs["session_factory"]() as s:
+            s.add(
+                Score(
+                    sandbox_id=kwargs["sandbox_id"],
+                    rubric_id=kwargs["rubric_id"],
+                    dimension="d",
+                    score=8.0,
+                    rationale="ok",
+                )
+            )
+            s.commit()
+        return []
+
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=flaky_eval,
+    )
+
+    assert len(calls) == 2
+    # first attempt: no feedback — nothing failed yet
+    assert not calls[0].get("prior_error")
+    prior = calls[1].get("prior_error")
+    assert prior is not None
+    assert "scores_invalid" in prior
+    assert "not valid JSON" in prior
+
+
 async def test_lifecycle_eval_retry_exhausted_still_fails(
     session_factory, settings, artifact_root
 ) -> None:

@@ -40,6 +40,44 @@ SCORES_OBJ = {
 }
 
 
+class _FakeResponse:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class _FakeClient:
+    """Duck-typed httpx.AsyncClient for the direct-judge fallback — records
+    calls, returns canned chat content or raises a canned exception."""
+
+    def __init__(self, text: str | None = None, exc: Exception | None = None) -> None:
+        self._text = text if text is not None else json.dumps(SCORES_OBJ)
+        self._exc = exc
+        self.calls: list[dict] = []
+
+    async def post(self, url: str, json: dict | None = None, headers: dict | None = None):
+        self.calls.append({"url": url, "json": json, "headers": headers})
+        if self._exc is not None:
+            raise self._exc
+        return _FakeResponse({"choices": [{"message": {"content": self._text}}]})
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _failing_client() -> _FakeClient:
+    """Direct-judge client whose gateway call always fails — keeps the
+    no-scores tests hermetic (no real POST to http://gateway:8080)."""
+    import httpx
+
+    return _FakeClient(exc=httpx.ConnectError("refused"))
+
+
 class FakeRuntime:
     """Duck-typed SandboxRuntime: spawn writes canned scores.json."""
 
@@ -246,7 +284,7 @@ async def test_evaluate_missing_scores_returns_empty_and_events(
     seeded, session_factory
 ) -> None:
     fake = FakeRuntime(scores_obj=None)  # agent never writes scores.json
-    rows = await _eval(seeded, session_factory, fake)
+    rows = await _eval(seeded, session_factory, fake, direct_client=_failing_client())
     assert rows == []
     assert _scores_in_db(session_factory) == []
 
@@ -263,7 +301,10 @@ async def test_evaluate_invalid_scores_returns_empty(seeded, session_factory) ->
             super().spawn(spec)
             (Path(spec.workspace_host_path) / "scores.json").write_text("not json{{{")
 
-    rows = await _eval(seeded, session_factory, BadRuntime(scores_obj=None))
+    rows = await _eval(
+        seeded, session_factory, BadRuntime(scores_obj=None),
+        direct_client=_failing_client(),
+    )
     assert rows == []
     events = _events_in_db(session_factory)
     err = [e for e in events if e.type == "error" and e.source == "evaluator"]
@@ -400,7 +441,7 @@ async def test_candidate_scores_json_is_not_salvaged(
     scores_missing, not fabricated scores."""
     (seeded["workspace"] / "scores.json").write_text(json.dumps(SCORES_OBJ))
     fake = FakeRuntime(scores_obj=None)  # judge never writes
-    rows = await _eval(seeded, session_factory, fake)
+    rows = await _eval(seeded, session_factory, fake, direct_client=_failing_client())
     assert rows == []
     assert _scores_in_db(session_factory) == []
     events = _events_in_db(session_factory)
@@ -614,12 +655,145 @@ async def test_judge_fifo_scores_is_rejected(seeded, session_factory) -> None:
             super().spawn(spec)
             os.mkfifo(Path(spec.workspace_host_path) / "scores.json")
 
-    rows = await _eval(seeded, session_factory, FifoRuntime(scores_obj=None))
+    rows = await _eval(
+        seeded, session_factory, FifoRuntime(scores_obj=None),
+        direct_client=_failing_client(),
+    )
     assert rows == []
     assert _scores_in_db(session_factory) == []
     events = _events_in_db(session_factory)
     err = [e for e in events if e.type == "error" and e.source == "evaluator"]
     assert err[0].payload["reason"] == "scores_invalid"
+
+
+# ---------------------------------------------------------------------------
+# direct-judge fallback (evaluator/judge_direct.py wiring)
+# ---------------------------------------------------------------------------
+
+
+async def test_direct_fallback_scores_when_agent_fails(
+    seeded, session_factory
+) -> None:
+    """Agent writes nothing → the control-plane direct call lands scores →
+    rows inserted through the normal path + eval_scored mode + scores.json
+    rewritten for artifact/debug parity."""
+    client = _FakeClient()  # returns SCORES_OBJ as assistant content
+    fake = FakeRuntime(scores_obj=None)
+    rows = await _eval(seeded, session_factory, fake, direct_client=client)
+    assert len(rows) == 3  # 2 dims + overall — same as the agentic path
+    assert _scores_in_db(session_factory)
+
+    events = _events_in_db(session_factory)
+    scored = [e for e in events if e.payload.get("phase") == "eval_scored"]
+    assert len(scored) == 1
+    assert scored[0].payload["mode"] == "direct_fallback"
+    assert scored[0].payload["overall"] == 7.0
+    assert not [
+        e for e in events if e.payload.get("phase") == "eval_scores_failed"
+    ]
+
+    # parsed doc written back over eval_ws/scores.json
+    eval_ws = Path(fake.specs[0].workspace_host_path)
+    assert json.loads((eval_ws / "scores.json").read_text())["overall"] == 7.0
+
+    # the call went through the gateway with the eval cred + json_object
+    assert len(client.calls) == 1
+    call = client.calls[0]
+    assert call["headers"]["Authorization"] == "Bearer heg.testcred"
+    assert call["json"]["response_format"] == {"type": "json_object"}
+    assert call["json"]["model"] == "judge-model"
+    # current attempt's parse failure is echoed in the direct prompt
+    user = call["json"]["messages"][1]["content"]
+    assert "scores_missing" in user
+
+
+async def test_direct_fallback_failure_emits_fallback_detail(
+    seeded, session_factory
+) -> None:
+    """Both judge paths fail → eval_scores_failed carries the agentic detail
+    AND the fallback's failure so the timeline shows both."""
+    import httpx
+
+    client = _FakeClient(exc=httpx.ConnectError("gateway unreachable"))
+    rows = await _eval(
+        seeded, session_factory, FakeRuntime(scores_obj=None), direct_client=client
+    )
+    assert rows == []
+    events = _events_in_db(session_factory)
+    err = [
+        e
+        for e in events
+        if e.type == "error" and e.payload.get("phase") == "eval_scores_failed"
+    ]
+    assert len(err) == 1
+    assert err[0].payload["reason"] == "scores_missing"
+    assert "gateway unreachable" in err[0].payload["fallback_detail"]
+
+
+async def test_direct_fallback_disabled_by_env(
+    seeded, session_factory, monkeypatch
+) -> None:
+    """EVAL_DIRECT_FALLBACK=0 — no gateway call at all; the disable reason
+    still lands in fallback_detail."""
+    monkeypatch.setenv("EVAL_DIRECT_FALLBACK", "0")
+    client = _FakeClient()
+    rows = await _eval(
+        seeded, session_factory, FakeRuntime(scores_obj=None), direct_client=client
+    )
+    assert rows == []
+    assert client.calls == []
+    events = _events_in_db(session_factory)
+    err = [
+        e for e in events if e.payload.get("phase") == "eval_scores_failed"
+    ]
+    assert "disabled" in err[0].payload["fallback_detail"]
+
+
+async def test_eval_scored_mode_is_agentic_on_normal_path(
+    seeded, session_factory
+) -> None:
+    fake = FakeRuntime()
+    rows = await _eval(seeded, session_factory, fake, direct_client=_FakeClient())
+    assert len(rows) == 3
+    events = _events_in_db(session_factory)
+    scored = [e for e in events if e.payload.get("phase") == "eval_scored"]
+    assert scored[0].payload["mode"] == "agentic"
+
+
+async def test_prior_error_threads_into_eval_prompt(
+    seeded, session_factory
+) -> None:
+    """Error-feedback retry: prior_error lands in EVAL_PROMPT.md so the
+    respawned judge sees why its previous output was rejected."""
+    fake = FakeRuntime()
+    await _eval(
+        seeded,
+        session_factory,
+        fake,
+        prior_error="scores_invalid: single-quoted strings",
+    )
+    prompt = (Path(fake.specs[0].workspace_host_path) / "EVAL_PROMPT.md").read_text()
+    assert "Previous attempt failed" in prompt
+    assert "single-quoted strings" in prompt
+    assert "ONE JSON object" in prompt
+
+
+async def test_prior_error_reaches_direct_prompt(
+    seeded, session_factory
+) -> None:
+    """The fallback prompt sees BOTH the orchestrator retry feedback and the
+    current attempt's parse failure."""
+    client = _FakeClient()
+    await _eval(
+        seeded,
+        session_factory,
+        FakeRuntime(scores_obj=None),
+        prior_error="earlier attempt: wandered off",
+        direct_client=client,
+    )
+    user = client.calls[0]["json"]["messages"][1]["content"]
+    assert "wandered off" in user
+    assert "scores_missing" in user
 
 
 def test_sandbox_gateway_url_normalization() -> None:

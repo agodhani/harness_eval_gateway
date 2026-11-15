@@ -246,3 +246,74 @@ def test_parse_salvages_loose_entry_objects() -> None:
 def test_parse_still_raises_on_total_garbage() -> None:
     with pytest.raises(ScoresFileError):
         parse_scores_json("no json here at all... just prose {unclosed")
+
+
+# ---------------------------------------------------------------------------
+# literal_eval repair — observed live failure: single-quoted pseudo-JSON
+# ---------------------------------------------------------------------------
+
+
+def test_parse_single_quoted_python_literal() -> None:
+    """Observed qwen3:8b scores_invalid output: single-quoted dict — strict
+    JSON rejects it, ast.literal_eval parses it exactly."""
+    text = (
+        "{'scores': ["
+        "{'dimension': 'functional_requirements', 'score': 8,"
+        " 'rationale': 'hello.txt present'},"
+        " {'dimension': 'code_quality', 'score': 6,"
+        " 'rationale': 'Handles valid moves only'}],"
+        " 'overall': 7.0, 'summary': 'Minimal but working.'}"
+    )
+    parsed = parse_scores_json(text)
+    assert [e.dimension for e in parsed.entries] == [
+        "functional_requirements",
+        "code_quality",
+    ]
+    assert parsed.entries[1].rationale == "Handles valid moves only"
+    assert parsed.overall == 7.0
+    assert parsed.summary == "Minimal but working."
+
+
+def test_parse_mixed_quotes_python_literal() -> None:
+    text = (
+        "{'scores': [{'dimension': \"d1\", 'score': 8, 'rationale': 'x'}],"
+        " 'overall': 7}"
+    )
+    parsed = parse_scores_json(text)
+    assert parsed.entries[0].dimension == "d1"
+    assert parsed.entries[0].rationale == "x"
+    assert parsed.overall == 7.0
+
+
+def test_parse_fenced_single_quoted_literal() -> None:
+    text = "```json\n{'scores': [{'dimension': 'd', 'score': 4}]}\n```"
+    parsed = parse_scores_json(text)
+    assert parsed.entries[0].dimension == "d"
+
+
+def test_parse_python_literals_true_none_inside() -> None:
+    """True/None literals are valid inside a literal_eval'd document."""
+    text = (
+        "{'scores': [{'dimension': 'd', 'score': 5, 'rationale': 'ok',"
+        " 'extra': None}], 'verified': True, 'overall': 6}"
+    )
+    parsed = parse_scores_json(text)
+    assert parsed.entries[0].score == 5.0
+    assert parsed.overall == 6.0
+
+
+def test_parse_literal_eval_rejects_garbage() -> None:
+    # Syntactically broken pseudo-JSON — literal_eval must fail safely.
+    with pytest.raises(ScoresFileError):
+        parse_scores_json("{'scores': [{'dimension': 'd', 'score': }]}")
+    with pytest.raises(ScoresFileError):
+        parse_scores_json("{'scores': [{'dimension': 'd', 'score': 5}")
+
+
+def test_parse_literal_eval_rejects_scalars() -> None:
+    """A bare literal that parses (string/number) is not a scores doc —
+    the dict/list guard rejects it before validation."""
+    with pytest.raises(ScoresFileError):
+        parse_scores_json("'just a quoted string'")
+    with pytest.raises(ScoresFileError):
+        parse_scores_json("(1, 2, 3)")

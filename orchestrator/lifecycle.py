@@ -184,6 +184,37 @@ def _sandbox_score_count(
         )
 
 
+def _last_eval_scores_error(
+    session_factory: sessionmaker[Session], sandbox_id: uuid.UUID
+) -> str | None:
+    """Latest ``eval_scores_failed`` detail for a sandbox — retry feedback.
+
+    The evaluator emits that error event when the judge's scores.json is
+    missing/unusable; feeding the detail into the retry's EVAL_PROMPT.md
+    (``prior_error``) tells the respawned judge exactly which output shape
+    failed instead of letting it flake identically.
+    """
+    with session_factory() as session:
+        row = session.execute(
+            select(Event.payload)
+            .where(
+                Event.sandbox_id == sandbox_id,
+                Event.type == "error",
+                Event.payload["phase"].as_string() == "eval_scores_failed",
+            )
+            .order_by(Event.id.desc())
+            .limit(1)
+        ).first()
+    if not row:
+        return None
+    payload = row[0] or {}
+    parts = [
+        str(payload.get(k) or "").strip() for k in ("reason", "detail")
+    ]
+    parts = [p for p in parts if p]
+    return ": ".join(parts) or None
+
+
 def _has_rescore_marker(
     session_factory: sessionmaker[Session], run_id: uuid.UUID
 ) -> bool:
@@ -363,6 +394,16 @@ async def _evaluate_all(
                     ttl_seconds=int(settings.EVAL_TIMEOUT_SECONDS) + 600,
                     max_tokens=_run_tokens_used(session_factory, run.id)
                     + int(settings.EVAL_TOKEN_BUDGET),
+                )
+                # Error-feedback retry: the previous attempt's
+                # eval_scores_failed detail lands in the retry's
+                # EVAL_PROMPT.md (prior_error) — a blind respawn with the
+                # same prompt flakes identically. Queried fresh per attempt
+                # so a second retry sees the latest failure.
+                kwargs["prior_error"] = (
+                    _last_eval_scores_error(session_factory, sb.id)
+                    if attempt > 1
+                    else None
                 )
                 await asyncio.wait_for(
                     evaluator_fn(**kwargs),

@@ -53,6 +53,15 @@ What it does:
    ``Score`` rows (one per rubric dimension + an ``overall`` pseudo-row when
    present) plus ``source="evaluator"`` events — all in one transaction.
 
+   When scores.json is missing or unparseable, a control-plane fallback
+   (``evaluator/judge_direct.py`` — one direct chat-completions call on the
+   same eval cred, ``response_format=json_object``) gets a bounded rubric +
+   evidence prompt before the attempt is abandoned; on success the parsed
+   doc is written back over scores.json and the ``eval_scored`` event
+   carries ``mode="direct_fallback"`` (vs ``"agentic"``), on failure the
+   ``eval_scores_failed`` event gains a ``fallback_detail`` field. Disable
+   via ``EVAL_DIRECT_FALLBACK=0``.
+
 Return / failure semantics (plan §6): returns the ``Score`` rows it
 managed to persist. A missing/invalid ``scores.json`` yields an ``error``
 event + ``[]`` — the orchestrator decides run-level failure by counting
@@ -74,10 +83,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import httpx
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from db.models import Event, Rubric, Score
+from evaluator.judge_direct import direct_fallback_enabled, judge_direct
 from evaluator.prompts import build_eval_prompt
 from evaluator.sandbox_spec import (
     DEFAULT_EVAL_MAX_ITERS,
@@ -89,6 +100,7 @@ from evaluator.sandbox_spec import (
 from evaluator.scores import (
     OVERALL_DIMENSION,
     SCORES_FILENAME,
+    ParsedScores,
     ScoresFileError,
     load_scores_file,
 )
@@ -322,6 +334,7 @@ def _stage_eval_workspace(
     transcript_path: Path | None,
     rubric: dict[str, Any],
     terminal_reason: str | None,
+    prior_error: str | None = None,
     analysis: AnalysisReport | None = None,
     generated_tests_dir: Path | None = None,
 ) -> Path:
@@ -382,7 +395,9 @@ def _stage_eval_workspace(
         encoding="utf-8",
     )
     (eval_ws / "EVAL_PROMPT.md").write_text(
-        build_eval_prompt(rubric, terminal_reason=terminal_reason),
+        build_eval_prompt(
+            rubric, terminal_reason=terminal_reason, prior_error=prior_error
+        ),
         encoding="utf-8",
     )
     if transcript_path is not None and Path(transcript_path).is_file():
@@ -430,6 +445,68 @@ async def _wait_for_exit(
         await asyncio.sleep(poll_interval)
 
 
+async def _direct_judge_fallback(
+    *,
+    eval_ws: Path,
+    rubric: dict[str, Any],
+    model: str,
+    gateway_base_url: str,
+    cred: str,
+    terminal_reason: str | None,
+    prior_error: str | None,
+    client: httpx.AsyncClient | None,
+) -> tuple[ParsedScores | None, str | None]:
+    """Control-plane last resort: ONE direct chat call for the scores doc.
+
+    The agentic judge's failures are output-side (no scores.json, or
+    unparseable pseudo-JSON) — a bounded prompt carrying the rubric, the
+    staged ANALYSIS.md, a capped source gather, and the transcript tail can
+    still land scores a wandering tool loop couldn't write.
+
+    Returns ``(parsed, None)`` on success — the canonical doc is written
+    back over ``eval_ws/scores.json`` so artifact/debug parity holds — or
+    ``(None, detail)`` when disabled or failed. NEVER raises; callers fold
+    a failure into the normal ``eval_scores_failed`` path.
+    """
+    if not direct_fallback_enabled():
+        return None, "direct fallback disabled (EVAL_DIRECT_FALLBACK=0)"
+    try:
+        parsed = await judge_direct(
+            eval_workspace=eval_ws,
+            rubric=rubric,
+            gateway_base_url=gateway_base_url,
+            cred=cred,
+            model=model,
+            terminal_reason=terminal_reason,
+            prior_error=prior_error,
+            client=client,
+        )
+    except Exception as exc:  # noqa: BLE001 — fallback must not escape eval
+        logger.warning("evaluator: direct judge fallback failed: %s", exc)
+        return None, f"{type(exc).__name__}: {exc}"
+    doc: dict[str, Any] = {
+        "scores": [
+            {"dimension": e.dimension, "score": e.score, "rationale": e.rationale}
+            for e in parsed.entries
+        ]
+    }
+    if parsed.overall is not None:
+        doc["overall"] = parsed.overall
+    if parsed.summary:
+        doc["summary"] = parsed.summary
+    try:
+        (eval_ws / SCORES_FILENAME).write_text(
+            json.dumps(doc, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        logger.warning(
+            "evaluator: could not write fallback scores.json to %s", eval_ws,
+            exc_info=True,
+        )
+    return parsed, None
+
+
 # ---------------------------------------------------------------------------
 # contract
 # ---------------------------------------------------------------------------
@@ -446,6 +523,7 @@ async def evaluate_sandbox(
     workspace_dir: Path | str | None = None,
     transcript_path: Path | str | None = None,
     terminal_reason: str | None = None,
+    prior_error: str | None = None,
     model: str | None = None,
     gateway_base_url: str = SANDBOX_GATEWAY_URL,
     gateway_cred: str | None = None,
@@ -457,6 +535,7 @@ async def evaluate_sandbox(
     eval_root: Path | str | None = None,
     poll_interval_seconds: float = 2.0,
     image: str = DEFAULT_IMAGE,
+    direct_client: httpx.AsyncClient | None = None,
 ) -> list[Score]:
     """Score one sandbox's artifact with a sandboxed judge agent.
 
@@ -472,6 +551,15 @@ async def evaluate_sandbox(
 
     ``judge_max_tokens`` overrides the judge's per-request output cap
     (miniloop ``MAX_TOKENS`` env); ``None`` keeps the 4096 agent default.
+
+    ``prior_error`` (error-feedback retry) carries the previous attempt's
+    ``eval_scores_failed`` detail into EVAL_PROMPT.md so a re-spawned judge
+    sees WHY its output was rejected instead of repeating the same failure
+    mode; the orchestrator supplies it on retries. ``direct_client`` is a
+    DI/test knob for the direct-judge fallback (``evaluator.judge_direct``)
+    — when the agentic judge leaves a missing/unusable scores.json, one
+    control-plane chat call on the same eval cred asks for the scores
+    document directly; disable via ``EVAL_DIRECT_FALLBACK=0``.
     """
     # ---- resolve + validate ------------------------------------------------
     run_uuid = _as_uuid(run_id, "run_id")
@@ -648,6 +736,7 @@ async def evaluate_sandbox(
         transcript_path=transcript,
         rubric=rubric,
         terminal_reason=terminal_reason,
+        prior_error=prior_error,
         analysis=analysis_report,
         generated_tests_dir=gen_stage_dir,
     )
@@ -725,26 +814,45 @@ async def evaluate_sandbox(
 
     # ---- collect scores -----------------------------------------------------
     scores_path = eval_ws / SCORES_FILENAME
+    mode = "agentic"
     try:
         parsed = await asyncio.to_thread(load_scores_file, scores_path)
     except ScoresFileError as exc:
         reason = "scores_missing" if not scores_path.exists() else "scores_invalid"
-        _emit_event(
-            session_factory,
-            run_id=run_uuid,
-            sandbox_id=sandbox_uuid,
-            event_type="error",
-            payload={
-                "phase": "eval_scores_failed",
-                "reason": reason,
-                "detail": str(exc),
-                "eval_sandbox_id": eval_sid,
-                "container_status": container_state,
-                "exit_code": exit_code,
-                "timed_out": timed_out,
-            },
+        # Direct-judge fallback: the tool loop failed at OUTPUT, not
+        # reasoning — one bounded control-plane call may still land scores.
+        # The prompt sees both the orchestrator-supplied retry feedback and
+        # this attempt's parse failure.
+        prior_parts = [p for p in (prior_error, f"{reason}: {exc}") if p]
+        parsed, fallback_detail = await _direct_judge_fallback(
+            eval_ws=eval_ws,
+            rubric=rubric,
+            model=model_name,
+            gateway_base_url=gateway_base_url,
+            cred=cred_token,
+            terminal_reason=terminal_reason,
+            prior_error="\n".join(prior_parts) or None,
+            client=direct_client,
         )
-        return []
+        if parsed is None:
+            _emit_event(
+                session_factory,
+                run_id=run_uuid,
+                sandbox_id=sandbox_uuid,
+                event_type="error",
+                payload={
+                    "phase": "eval_scores_failed",
+                    "reason": reason,
+                    "detail": str(exc),
+                    "fallback_detail": fallback_detail,
+                    "eval_sandbox_id": eval_sid,
+                    "container_status": container_state,
+                    "exit_code": exit_code,
+                    "timed_out": timed_out,
+                },
+            )
+            return []
+        mode = "direct_fallback"
 
     rows = [
         Score(
@@ -787,6 +895,7 @@ async def evaluate_sandbox(
                 payload={
                     "phase": "eval_scored",
                     "eval_sandbox_id": eval_sid,
+                    "mode": mode,
                     "container_status": container_state,
                     "exit_code": exit_code,
                     "timed_out": timed_out,

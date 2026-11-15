@@ -109,6 +109,13 @@ adapters are added.
    `<artifact>/generated_tests/`, and runs it against the untouched
    workspace in the same locked container — pass rate folds into the same
    report. All feed the judge `ANALYSIS.md`/`analysis.json`.
+   Judge-output hardening (small local judges): the scores parser repairs
+   single-quoted Python-literal pseudo-JSON (`ast.literal_eval`), retries
+   feed the prior `eval_scores_failed` detail back into `EVAL_PROMPT.md`
+   (`prior_error`), and a control-plane direct-completion fallback
+   (`evaluator/judge_direct.py` — one chat call on the eval cred,
+   `response_format=json_object`; `EVAL_DIRECT_FALLBACK=0` disables) lands
+   scores when the agentic judge's output is unusable.
 7. **Artifact store** — `./data/artifacts/<run_id>/<sandbox_id>/` — repo
    tarballs, transcripts, event exports.
 
@@ -527,8 +534,19 @@ or tests change.
   infra exceptions are deterministic and not retried. Motivation: small local
   judge models flake ~1-in-3 evals (observed modes: flat dimension-map JSON,
   paged-read stuck loops, grep-loop wander, unescaped quotes in rationale) —
-  `EVAL_PROMPT.md` carries targeted counter-hints (paging, no inner `"`).
-  When all attempts produce no Score rows the orchestrator emits a final
+  `EVAL_PROMPT.md` carries targeted counter-hints (paging, no inner `"`),
+  and retries additionally pass the last `eval_scores_failed` detail as
+  `prior_error` so the respawned judge sees *why* its output was rejected
+  (queried from the events table per attempt — blind respawns flake
+  identically). Two more output-side safety nets sit under the retry loop:
+  `parse_scores_json` repairs single-quoted Python-literal dicts via
+  `ast.literal_eval`, and a direct-completion fallback
+  (`evaluator/judge_direct.py` — one bounded control-plane chat call on the
+  eval cred with `response_format=json_object`, retrying once without the
+  field on a 4xx) runs before an attempt is abandoned; its scores write
+  back over `scores.json` and land via the normal row-insert path with
+  `eval_scored` `mode="direct_fallback"`, while a fallback failure adds
+  `fallback_detail` to the `eval_scores_failed` event. When all attempts produce no Score rows the orchestrator emits a final
   `error` event (`stage="evaluation"`, `phase="eval_failed"`) for the
   sandbox; the results API surfaces it as per-sandbox `eval_error` so the UI
   shows "eval failed" rather than an empty score matrix — a sandbox can be

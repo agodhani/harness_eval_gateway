@@ -64,19 +64,38 @@ def _render_dimensions(rubric: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_eval_prompt(rubric: dict[str, Any], *, terminal_reason: str | None = None) -> str:
+def build_eval_prompt(
+    rubric: dict[str, Any],
+    *,
+    terminal_reason: str | None = None,
+    prior_error: str | None = None,
+) -> str:
     """Render EVAL_PROMPT.md — the judge's self-contained brief.
 
     ``rubric`` is the frozen ``Rubric.content`` dict. ``terminal_reason`` is
     the candidate sandbox's terminal state (e.g. ``agent_done``, ``timeout``)
     — surfaced as context so the judge knows e.g. a timeout-cut artifact is
-    still judged on its merits.
+    still judged on its merits. ``prior_error`` (error-feedback retry) is
+    the previous attempt's ``eval_scores_failed`` detail — a judge respawned
+    with the SAME prompt flakes identically, so the failure mode is spelled
+    out with an explicit output-shape reminder.
     """
     summary = str(rubric.get("summary") or "").strip()
     term_line = (
         f"- The candidate run ended with terminal state: `{terminal_reason}`. "
         "Judge the artifact as it stands.\n"
         if terminal_reason
+        else ""
+    )
+    prior = (prior_error or "").strip()[:300]
+    retry_block = (
+        f"""## Previous attempt failed — fix the output this time
+
+Your previous attempt's `scores.json` could not be used: {prior}
+Write ONE JSON object — double-quoted strings, no markdown fences, no text
+before or after it — then read it back and fix it before calling `done`.
+"""
+        if prior
         else ""
     )
     return f"""# Evaluation task — score the candidate submission
@@ -187,7 +206,7 @@ same object. Valid JSON in this schema:
 {term_line}- Evaluator model: see `MODEL_NAME` — irrelevant to scoring.
 - You have limited iterations: be efficient. List files once, read what
   matters, write scores.json, verify, done.
-"""
+{retry_block}"""
 
 
 # ---------------------------------------------------------------------------

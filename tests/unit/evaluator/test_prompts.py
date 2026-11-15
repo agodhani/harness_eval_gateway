@@ -65,3 +65,23 @@ def test_task_prompt_points_at_files() -> None:
     assert "scores.json" in EVAL_TASK_PROMPT
     assert "rubric.json" in EVAL_TASK_PROMPT
     assert "done" in EVAL_TASK_PROMPT
+
+
+def test_prompt_prior_error_renders_retry_feedback() -> None:
+    prompt = build_eval_prompt(RUBRIC, prior_error="scores_invalid: single-quoted strings")
+    assert "Previous attempt failed" in prompt
+    assert "single-quoted strings" in prompt
+    assert "ONE JSON object" in prompt
+    assert "double-quoted" in prompt
+
+
+def test_prompt_prior_error_omitted_when_absent() -> None:
+    prompt = build_eval_prompt(RUBRIC)
+    assert "Previous attempt failed" not in prompt
+    prompt = build_eval_prompt(RUBRIC, prior_error="   ")
+    assert "Previous attempt failed" not in prompt
+
+
+def test_prompt_prior_error_capped() -> None:
+    prompt = build_eval_prompt(RUBRIC, prior_error="x" * 1000)
+    assert "x" * 400 not in prompt

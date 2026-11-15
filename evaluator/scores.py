@@ -17,7 +17,9 @@ Canonical schema::
     }
 
 Parsing is deliberately tolerant — a 3-8B judge model will occasionally wrap
-the JSON in markdown fences or add prose. ``parse_scores_json`` strips fences,
+the JSON in markdown fences, add prose, or emit single-quoted Python
+literals. ``parse_scores_json`` strips fences, falls back to
+``ast.literal_eval`` for pseudo-JSON dicts,
 extracts the outermost object, validates each entry individually, and reports
 per-entry problems in ``ParsedScores.warnings`` rather than failing the whole
 file. Only a structurally unusable file (not JSON, no ``scores`` list, zero
@@ -26,6 +28,7 @@ valid entries) raises :class:`ScoresFileError`.
 
 from __future__ import annotations
 
+import ast
 import json
 import math
 import re
@@ -78,27 +81,46 @@ class ParsedScores:
     warnings: list[str] = field(default_factory=list)
 
 
+def _literal_eval(text: str) -> Any | None:
+    """``ast.literal_eval`` repair path — dict/list results only.
+
+    Small judges emit Python-literal pseudo-JSON (single-quoted strings —
+    the observed ``scores_invalid`` mode) that ``json.loads`` rejects but
+    ``literal_eval`` parses exactly. Scalars (``True``, ``5``, a bare
+    string) are rejected: they can never be a scores document.
+    """
+    try:
+        obj = ast.literal_eval(text)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+    return obj if isinstance(obj, (dict, list)) else None
+
+
 def _loads_lenient(text: str) -> Any | None:
     """Best-effort JSON load; returns None instead of raising.
 
     Tries the whole document, then a ``` fence strip, then the outermost
-    ``{...}`` block — covering the common small-model failure modes.
+    ``{...}`` block — covering the common small-model failure modes. When
+    strict JSON fails on every candidate the same candidates go through
+    :func:`_literal_eval` (single-quoted Python literals).
     """
     candidate = text.strip()
     if candidate.startswith("```"):
         candidate = _FENCE_RE.sub("", candidate).strip()
-    for attempt in (candidate,):
+    candidates = [candidate]
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(candidate[start : end + 1])
+    for attempt in candidates:
         try:
             return json.loads(attempt)
         except json.JSONDecodeError:
             pass
-    start = candidate.find("{")
-    end = candidate.rfind("}")
-    if start != -1 and end > start:
-        try:
-            return json.loads(candidate[start : end + 1])
-        except json.JSONDecodeError:
-            pass
+    for attempt in candidates:
+        obj = _literal_eval(attempt)
+        if obj is not None:
+            return obj
     return None
 
 
