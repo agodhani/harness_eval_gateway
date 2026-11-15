@@ -161,8 +161,10 @@ Each adapter provides:
 - `completion_signal()` — how `done` / loop-completion is detected
 
 **MVP adapter:** `miniloop` — our custom minimal coding agent (tool-call
-loop: shell exec, file read/write, `done`). Post-MVP adapters: Claude Code
-CLI, Codex CLI, Aider (note: these need paid accounts/API keys — not free).
+loop: shell exec, file read/write, `done`). Shipped CLI adapters (F10 +
+PR13): Claude Code, Codex, Pi, DeepSeek `dsh`, Aider — each runs against
+the same model via the gateway (paid accounts only needed if pointing at
+hosted providers; Ollama keeps everything free).
 
 **Default skill packs** (named presets, vendored under `skillpacks/`):
 `superpowers`, `mattpocock-skills`, `spec-kit`.
@@ -201,7 +203,7 @@ applied identically to all sandboxes.
 gateway/       # LLM proxy: providers, metering, budgets, event emission
 orchestrator/  # run state machine, matrix expansion, rubric gen, lifecycle
 api/           # control-plane HTTP API (FastAPI app)
-adapters/      # harness adapters (miniloop first; cli adapters post-MVP)
+adapters/      # harness adapters (miniloop + shipped CLI adapters)
 sandbox/       # image defs, workspace prep, done mechanism, event collector
 evaluator/     # rubric scoring agent
 scoring/       # objective signal collectors (static analysis; PR7 adds exec/coverage)
@@ -233,14 +235,16 @@ or tests change.
 | F7 | Evaluator sandbox: rubric scoring + rationale |
 | F8 | Results UI: matrix, scores, timeline, artifacts |
 | F9 | Run analytics: per-sandbox metrics + estimated cost |
-| F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) |
+| F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek, Aider) |
 | F11 | Skillpack import from GitHub (discover → select → import) |
 | F12 | Artifact preview (static html + desktop GUI via noVNC + python-server web apps) |
 | F13 | Graphical analysis page + cross-run trends (recharts) |
+| F14 | Eval iteration: re-score runs + versioned rubric edits |
 
 ## Post-MVP roadmap
 
-- Additional harness adapters: Claude Code CLI, Codex CLI, Aider
+- Additional harness adapters beyond the shipped six (miniloop, codex,
+  claude_code, pi, deepseek, aider)
 - Anthropic-compatible gateway endpoint (`/v1/messages`)
 - Model-vs-model comparisons (multi-model matrices)
 - Objective scoring: build/test execution, coverage as score dimensions
@@ -277,9 +281,6 @@ or tests change.
   for at-a-glance review before spawning a full live preview sandbox
 - ~~Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.~~
   — landed (F12; extended to pyglet/arcade/tkinter + python-server in PR3)
-- Re-score runs — re-run the evaluator on stored artifacts
-- Post-run rubric edits — modify the frozen rubric after a run and re-score
-  with the updated rubric (keep score provenance per rubric version)
 - "Add next prompt" — continue a finished sandbox with a follow-up prompt
   on the same workspace (multi-turn runs: new phase in the event stream +
   artifact re-snapshotted; resume-in-place vs respawn-from-snapshot TBD)
@@ -322,7 +323,9 @@ or tests change.
   (stdlib-only) writes each CLI's native config, launches it in JSONL mode,
   translates records → normalized events, prints `HEG_RESULT`. Registry in
   `orchestrator/adapters.py` covers miniloop, codex, claude_code, pi,
-  deepseek; `GET /api/harnesses` serves manifests to the submit form.
+  deepseek, aider; `GET /api/harnesses` serves manifests to the submit
+  form. Aider has no JSONL mode — the shim's `translate_text` hook
+  (PR13) maps its plain-text status lines heuristically instead.
 - **Gateway protocol fan-out**: `/v1/messages` (+`count_tokens`) for
   Anthropic-SDK CLIs, `/v1/responses` for Codex, `/v1/models` for probes —
   pass-throughs that preserve `stream` with a metering tee
@@ -332,7 +335,8 @@ or tests change.
 - **CLI image pattern**: node:slim base + `python3` for the shim + pinned
   npm CLI + `adapters/` under `/opt/harness` + `done` at `/usr/local/bin`.
   npm install happens before COPY so dependency layers cache. DeepSeek's
-  `dsh` needs node >=24.9 → `node:24-slim` (others stay on 22).
+  `dsh` needs node >=24.9 → `node:24-slim` (others stay on 22). Aider is a
+  Python CLI → `python:3.12-slim` + `pip install aider-chat` (PR13).
 - **`done` invocation**: bare `done` is a shell keyword in sh/bash — prompts
   instruct harnesses to run `/usr/local/bin/done` (or `command done`).
 - **Imported skill packs (F11) live under `data/skillpacks/`**, not the
@@ -423,6 +427,20 @@ or tests change.
   cross-run trends endpoint (`GET /api/analytics/runs`) prices each point at
   its own run's resolved price unless `?price_model=` forces uniform
   repricing — same "estimate, not billing" framing as F9.
+- **Rubric versions are immutable** (F14): post-run edits INSERT a new
+  `rubrics` row (`parent_id` → edited version, `version = max+1`,
+  previous approved → `superseded`); the frozen row is never mutated.
+  `Score.rubric_id` + denormalized `Score.rubric_version` keep per-pass
+  provenance so old/new score sets stay distinguishable — re-score only
+  ever adds Score rows, never rewrites them.
+- **Re-score is a dedicated path, not a lifecycle replay**: terminal runs
+  (`done|failed`) transition to `evaluating` and back via
+  `orchestrator.lifecycle.rescore_run` over stored artifact snapshots —
+  participant sandboxes are never respawned. Registered as the `rescore`
+  task kind so a concurrent trigger 409s; the startup sweep rescues an
+  interrupted re-score (marked by a `rescore_requested`/`rescore_started`
+  checkpoint) to `done` when ≥1 Score row exists — a first-pass eval with
+  no marker still fails.
 
 ## Working conventions
 
