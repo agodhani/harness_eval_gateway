@@ -325,7 +325,7 @@ function TrendMeta({ meta }: { meta: Row }) {
     errors?: number;
     evaluator_errors?: number;
     estimated_cost_usd?: number;
-    price_model?: string;
+    price_model?: string | null;
     task_prompt?: string;
   };
   return (
@@ -337,7 +337,8 @@ function TrendMeta({ meta }: { meta: Row }) {
         {m.evaluator_errors ? ` · ${m.evaluator_errors} judge err` : ""}
       </div>
       <div>
-        est. ${(m.estimated_cost_usd ?? 0).toFixed(4)} at {m.price_model}
+        est. ${(m.estimated_cost_usd ?? 0).toFixed(4)} at{" "}
+        {m.price_model ?? "per-model rates"}
       </div>
     </>
   );

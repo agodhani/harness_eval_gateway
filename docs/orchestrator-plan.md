@@ -4,6 +4,12 @@ Implementation spec for the F2 orchestrator and the `/api/runs*` endpoints.
 Read `AGENTS.md`, `FEATURE_MAP.md`, and the Phase-1 code first; this doc assumes
 them. Everything below maps to existing code.
 
+> Historical note: written pre-PR14 (single-model runs). §1's `RunCreate`
+> sketch and `same_model_eval` formula are superseded by the model matrix —
+> `RunCreate.models`, per-config `model` pins, and the expanded same-model
+> check live in `api/schemas.py` / `orchestrator/matrix.py` (see
+> `FEATURE_MAP.md` F16).
+
 ## 0. Facts that constrain the design (verified in Phase-1 code)
 
 - **`terminal_state` never reaches the DB.** miniloop emits

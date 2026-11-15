@@ -48,6 +48,7 @@ from db.models import Artifact, Rubric, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
 from orchestrator import events as orch_events
 from orchestrator import runner, state_machine
+from orchestrator.matrix import run_models, sandbox_model
 from orchestrator.rubric import RubricContent, create_rubric_version
 from sandbox.preview import ScanCache
 from scoring.render import ANALYSIS_JSON_FILENAME
@@ -100,6 +101,9 @@ class SandboxResult(BaseModel):
     # Config label from the sandbox row (PR1 named harness configs); NULL
     # on sandboxes that predate the column.
     name: str | None = None
+    # PR14: the participant model this sandbox ran — the harness_config
+    # ``model`` cell on multi-model runs, else the run's ``model_name``.
+    model: str = ""
     status: str
     terminal_reason: str | None = None
     artifact_path: str | None = None
@@ -182,6 +186,10 @@ class RunResults(BaseModel):
     run_id: UUID
     status: str
     model_name: str
+    # PR14: the run's full participant-model set — [model_name] + extras +
+    # per-config pins — so the UI can render multi-model runs without
+    # re-deriving the matrix.
+    models: list[str] = Field(default_factory=list)
     evaluator_model: str | None = None
     same_model_eval: bool | None = None
     # PR5: the ?rubric_version= filter echoed back (None = newest-wins view).
@@ -413,6 +421,7 @@ def get_run_results(
                 sandbox_id=sb.id,
                 harness_config=sb.harness_config or {},
                 name=sb.name,
+                model=sandbox_model(sb.harness_config or {}, run.model_name),
                 status=sb.status,
                 terminal_reason=sb.terminal_reason,
                 artifact_path=sb.artifact_path,
@@ -444,6 +453,7 @@ def get_run_results(
         run_id=run.id,
         status=run.status,
         model_name=run.model_name,
+        models=run_models(cfg, run.model_name),
         evaluator_model=cfg.get("evaluator_model"),
         same_model_eval=cfg.get("same_model_eval"),
         selected_rubric_version=rubric_version,
