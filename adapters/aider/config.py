@@ -49,7 +49,9 @@ def conf_lines(cfg: ShimConfig) -> list[str]:
         ]
     lines += [
         # Auto-confirm every prompt: add-file, dirty-commit, repo-create,
-        # and the shell-command suggestions (how `done` gets invoked).
+        # and the shell-command suggestions (how `done` gets invoked —
+        # the launcher entrypoint lifts aider's explicit-yes gate on
+        # "Run shell command?" so yes-always covers it too).
         "yes-always: true",
         # aider's native checkpoints — `Commit <sha>` events + a reviewable
         # git log inside the workspace artifact.

@@ -2,8 +2,10 @@
 
 Writes ``$HOME/.aider.conf.yml`` (openai provider → gateway
 ``/v1/chat/completions``, headless flags, relocated history files), then
-spawns ``aider --yes-always --message "<task>"`` and translates its
-plain-text status lines via ``translate.py``.
+spawns ``aider --yes-always --message "<task>"`` (via the
+``adapters.aider.launcher`` entrypoint — aider's explicit-yes gate on
+suggested shell commands would otherwise make ``done`` unreachable) and
+translates its plain-text status lines via ``translate.py``.
 """
 
 from __future__ import annotations
@@ -18,7 +20,19 @@ from adapters.common.runner import ShimConfig, build_task_text, run_shim
 
 def _argv(cfg: ShimConfig) -> list[str]:
     # Every steady flag lives in the conf file; argv is just the invocation.
-    return ["aider", "--yes-always", "--message", build_task_text(cfg)]
+    # `aider` can't be the raw entrypoint: under --yes-always its
+    # explicit-yes gate answers "n" to "Run shell command?" — the only
+    # flagged prompt — so the suggested `/usr/local/bin/done` would never
+    # run. adapters.aider.launcher clears that gate before delegating to
+    # aider.main:main.
+    return [
+        sys.executable,
+        "-m",
+        "adapters.aider.launcher",
+        "--yes-always",
+        "--message",
+        build_task_text(cfg),
+    ]
 
 
 def main() -> int:

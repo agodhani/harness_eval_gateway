@@ -3,8 +3,10 @@
 The sandbox runs the Python shim (``python3 -m adapters.aider``) which
 writes ``$HOME/.aider.conf.yml`` (openai provider → gateway
 ``/v1/chat/completions``, headless flags, ``weak-model`` pinned to the run
-model), then spawns ``aider --yes-always --message "<task>"`` and
-translates its plain-text status lines via ``translate.py``.
+model), then spawns ``aider --yes-always --message "<task>"`` — through
+``adapters.aider.launcher``, which lifts aider's explicit-yes gate on
+suggested shell commands so ``done`` stays reachable — and translates its
+plain-text status lines via ``translate.py``.
 """
 
 from __future__ import annotations

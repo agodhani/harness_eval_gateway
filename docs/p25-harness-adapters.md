@@ -230,12 +230,20 @@ Event mapping conventions across CLI harnesses:
   failures→error). JSON-looking lines are dropped by `translate_obj`
   (they can only be echoed command output — translating them would let
   candidate files forge events).
-- `agent_done` works because aider runs suggested shell commands under
-  `--yes-always` → the prompt footer's `/usr/local/bin/done` call POSTs
-  `/internal/done` like every other adapter.
+- `agent_done` works because aider runs suggested shell commands → the
+  prompt footer's `/usr/local/bin/done` call POSTs `/internal/done` like
+  every other adapter. One upstream wrinkle: aider 0.86.2 marks "Run
+  shell command?" `explicit_yes_required`, which resolves to "n" under
+  `--yes-always` (`io.py` — the gate protects interactive users from
+  running suggested commands sight-unseen). The shim therefore spawns
+  `adapters.aider.launcher` instead of the `aider` script: it clears the
+  flag on `InputOutput.confirm_ask` only while `yes` is set, then
+  delegates to `aider.main:main` — `--yes-always` keeps its documented
+  "say yes to every confirmation" meaning in a headless context.
 - Verified argv basis: `aider --yes-always --message` is the documented
-  headless form; headless flag set cross-checked against GitHub's gh-aw
-  aider engine manifest (0.86.2).
+  headless form (spawned via the `adapters.aider.launcher` entrypoint);
+  headless flag set cross-checked against GitHub's gh-aw aider engine
+  manifest (0.86.2).
 
 ## Version pins (reproducible images)
 

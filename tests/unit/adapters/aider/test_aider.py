@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType, SimpleNamespace
+
 import yaml
 
-from adapters.aider import adapter, config
+from adapters.aider import adapter, config, launcher
 from adapters.aider.__main__ import _argv
 from adapters.aider.translate import translate_events, translate_obj, translate_text
 from adapters.common.runner import ShimConfig
@@ -94,10 +97,110 @@ class TestEnvLaunch:
 class TestArgv:
     def test_headless(self, tmp_path):
         argv = _argv(_cfg(tmp_path))
-        assert argv[:3] == ["aider", "--yes-always", "--message"]
+        # The `aider` script can't be the entrypoint: --yes-always answers
+        # "n" to explicit-yes prompts ("Run shell command?" is the only
+        # one), which made `done` unreachable. The launcher lifts that
+        # gate before delegating to aider.main:main.
+        assert argv[:5] == [
+            sys.executable,
+            "-m",
+            "adapters.aider.launcher",
+            "--yes-always",
+            "--message",
+        ]
         assert "build a thing" in argv[-1]
         # build_task_text footer keeps agent_done reachable via /usr/local/bin/done.
         assert "/usr/local/bin/done" in argv[-1]
+
+
+class TestLauncher:
+    """The confirm_ask patch that restores the done path under --yes-always.
+
+    Oracle: aider 0.86.2's io.confirm_ask resolves "n" for
+    explicit_yes_required prompts whenever self.yes is True — the patch
+    must clear that flag only in that state.
+    """
+
+    @staticmethod
+    def _orig():
+        # Fake io.confirm_ask: returns the explicit_yes_required value it
+        # received so tests observe exactly what aider would gate on.
+        def confirm_ask(self, question, **kwargs):
+            return kwargs.get("explicit_yes_required", False)
+
+        return confirm_ask
+
+    def test_clears_explicit_yes_only_when_yes_always(self):
+        wrapped = launcher.patched_confirm_ask(self._orig())
+        yes_io = SimpleNamespace(yes=True)
+        assert wrapped(yes_io, "Run shell command?", explicit_yes_required=True) is False
+        # Unflagged prompts pass through untouched.
+        assert wrapped(yes_io, "Add file to the chat?") is False
+        # Interactive path (yes unset → real prompt loop) keeps the gate.
+        interactive_io = SimpleNamespace(yes=None)
+        assert (
+            wrapped(interactive_io, "Run shell command?", explicit_yes_required=True)
+            is True
+        )
+
+    def test_forwards_signature_kwargs(self):
+        seen = {}
+
+        def orig(self, question, **kwargs):
+            seen.update(kwargs)
+            return True
+
+        wrapped = launcher.patched_confirm_ask(orig)
+        wrapped(
+            SimpleNamespace(yes=None),
+            "Q?",
+            default="n",
+            subject="cmd",
+            group="g",
+            allow_never=True,
+        )
+        assert seen == {
+            "default": "n",
+            "subject": "cmd",
+            "explicit_yes_required": False,
+            "group": "g",
+            "allow_never": True,
+        }
+
+    def test_main_patches_then_delegates(self, monkeypatch):
+        """main() installs the patch on InputOutput then runs aider's entry."""
+        io_mod = ModuleType("aider.io")
+        main_mod = ModuleType("aider.main")
+        pkg = ModuleType("aider")
+
+        class FakeIO:
+            yes = True
+
+            def confirm_ask(self, question, **kwargs):
+                return kwargs.get("explicit_yes_required", False)
+
+        io_mod.InputOutput = FakeIO
+        seen = {}
+
+        def aider_main():
+            seen["argv"] = sys.argv[1:]
+            return 7
+
+        main_mod.main = aider_main
+        pkg.io = io_mod
+        pkg.main = main_mod
+        monkeypatch.setitem(sys.modules, "aider", pkg)
+        monkeypatch.setitem(sys.modules, "aider.io", io_mod)
+        monkeypatch.setitem(sys.modules, "aider.main", main_mod)
+        monkeypatch.setattr(
+            sys, "argv", ["aider", "--yes-always", "--message", "build a thing"]
+        )
+
+        assert launcher.main() == 7  # aider's return is the exit status
+        assert seen["argv"] == ["--yes-always", "--message", "build a thing"]
+        # The class attr was wrapped: explicit-yes now auto-confirms under
+        # yes=True, which is what lets `done` run in the sandbox.
+        assert FakeIO().confirm_ask("Run shell command?", explicit_yes_required=True) is False
 
 
 class TestTranslateText:
