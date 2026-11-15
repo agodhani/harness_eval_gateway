@@ -268,6 +268,14 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `phase="eval_failed"`) which the results API surfaces as per-sandbox
   `eval_error` — distinguishable from "not yet scored" (F8). Judge per-request
   output cap is `EVAL_JUDGE_MAX_TOKENS` (default 8192; thinking judges).
+  Judge-output reliability: retries feed the last `eval_scores_failed`
+  detail back via `prior_error` in EVAL_PROMPT.md; `parse_scores_json`
+  repairs single-quoted Python-literal pseudo-JSON (`ast.literal_eval`); a
+  control-plane direct-completion fallback (`evaluator/judge_direct.py`,
+  `response_format=json_object`, `EVAL_DIRECT_MAX_TOKENS` 4096,
+  `EVAL_DIRECT_FALLBACK=0` disables) writes scores back and lands through
+  the normal path with `eval_scored` `mode="direct_fallback"` (failures add
+  `fallback_detail` to `eval_scores_failed`).
   **Objective signals (PR6+PR7):** before staging, the candidate workspace
   is measured by the `scoring` package's signal collectors —
   `static_analysis` runs lizard (multi-language, parse-only, no code
@@ -324,7 +332,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `TESTGEN_MAX_FILES` (8), `TESTGEN_MAX_TOKENS` (4096),
   `TESTGEN_TIMEOUT_SECONDS` (240).
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
-  `prompts.py`, `testgen.py` — PR8 suite generation + exec orchestration),
+  `prompts.py`, `judge_direct.py` — direct-completion fallback,
+  `testgen.py` — PR8 suite generation + exec orchestration),
   `scoring/` (`models.py` — analysis.json/API pydantic
   contract, `collectors.py` — SignalCollector protocol + registry,
   `static.py` — lizard collector, `exec.py` — exec collector,
@@ -337,7 +346,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Verify:**
   - Unit: `tests/unit/evaluator/` (`test_evaluate.py`, `test_scores.py`,
     `test_prompts.py`) — mocked runtime; staging, timeout salvage, malformed
-    scores covered; `tests/unit/evaluator/test_testgen.py` — fake gateway
+    scores covered; `tests/unit/evaluator/test_judge_direct.py` — fake
+    gateway client: request contract, 4xx response_format retry, bounded
+    prompt gather, error mapping; `tests/unit/evaluator/test_testgen.py` — fake gateway
     client + fake exec runner: skip/error semantics, deterministic
     containment of bad output (fences/markers/syntax/no-test rejection),
     provenance layout, pass-rate metrics, cap knobs;
