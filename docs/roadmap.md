@@ -39,6 +39,13 @@ append-mostly; rebase on main before merge.
 - **PR6 — static-analysis signals** (`scoring/` package, see below).
 - **PR7 — exec + coverage signals** (`exec` collector in `scoring/` +
   `sandbox/exec.py` ExecRunner + `heg-exec` image, see below).
+- **PR8 — Automated test-suite generation**: `evaluator/testgen.py` writes
+  a pytest suite via the gateway (eval cred, metered), persists it to
+  `<artifact>/generated_tests/`, runs it via `ExecRunner` `test_target`
+  (`EXEC_TEST_TARGET` env → `/srv/test_target` ro mount in `heg-exec`),
+  and folds pass rate into the `generated_tests` `SignalReport` →
+  `ANALYSIS.md`/judge brief/results API flat summary. `SCORING_TESTGEN=0`
+  opts out; `TESTGEN_*` knobs bound prompt budget, files, tokens, timeout.
 - **PR11 — Graphical analysis + cross-run dashboards** (F13): recharts,
   `GET /api/analytics/runs`, results-matrix totals row.
 - **OpenAI + Anthropic providers + per-model routing** (PR12):
@@ -81,15 +88,14 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR3, PR9,
-  PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
-  PR17 (soft ←13 satisfied — PR13 landed).
-- **Depth 1:** PR4 (←3), PR8 (←7), PR10 (←9), PR14 (←1), PR16 (←15),
+- **Depth 0 (start immediately):** PR1, PR3,
+  PR15, PR19 — plus PR17 (soft ←13 satisfied — PR13 landed).
+- **Depth 1:** PR4 (←3), PR10 (←9), PR14 (←1), PR16 (←15),
   PR18 (←12).
 - **Floating:** PR20 (soft ←15).
 
 Critical path depth = 1 remaining (`3→4`; was 3 via `6→7→8` before
-PR2, PR6, and PR7 landed). Max safe concurrency ≈ 9 lanes.
+PR2, PR6, PR7, and PR8 landed). Max safe concurrency ≈ 9 lanes.
 
 ## Shared-file hotspots (merge-conflict risk)
 
@@ -165,11 +171,10 @@ result channel). `analysis.json` gains the exec signal, `ANALYSIS.md` an
 ran, and `GET /api/runs/{id}/results` exposes a flat `exec` ExecSummary.
 `SCORING_EXEC=0` disables. Paths + tests: FEATURE_MAP F7.
 
-### PR8 — Automated test-suite generation
-- **Scope:** LLM-generated tests as the eval target — generate suite via
-  gateway, run via PR7 exec infra, fold pass-rate into scoring.
-- **Touch:** `evaluator/` (gen + exec orchestration), prompts.
-- **Depends on:** PR7.
+### PR8 — Automated test-suite generation — ✅ landed
+See "Already landed" — `evaluator/testgen.py` + `ExecRunner` `test_target`
+(`EXEC_TEST_TARGET`), `generated_tests` SignalReport → judge brief,
+`SCORING_TESTGEN`/`TESTGEN_*` flags.
 
 ### PR9 — Timeline-side analytics — ✅ landed
 - **Scope:** per-sandbox metrics (cost/tokens/latency) rendered alongside

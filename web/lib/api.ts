@@ -292,7 +292,8 @@ export interface DimensionScore {
 /** PR6 — objective scoring signals (scoring/ AnalysisReport).
  * Measured on the workspace before judging; analysis.json is re-validated
  * server-side and embedded on SandboxResult.analysis. Collector-agnostic:
- * PR7's exec/coverage collector adds another SignalReport to `signals`. */
+ * PR7's exec/coverage collector and PR8's evaluator-appended
+ * `generated_tests` signal add further SignalReports to `signals`. */
 export interface FunctionMetric {
   name: string;
   file: string;
@@ -315,7 +316,7 @@ export interface FileMetric {
 }
 
 export interface SignalReport {
-  name: string; // e.g. "static_analysis"; PR7 adds exec-derived signals
+  name: string; // e.g. "static_analysis", "exec", "generated_tests"
   status: "ok" | "error" | "skipped" | string;
   metrics: Record<string, unknown>;
   files: FileMetric[];

@@ -70,6 +70,14 @@ services:
       # heg-exec container. 0 disables; the image is repo-built, never pulled.
       SCORING_EXEC: ${SCORING_EXEC:-1}
       EXEC_IMAGE: ${EXEC_IMAGE:-heg-exec:latest}
+      # PR8 generated-test signal: 0 disables suite generation + exec.
+      SCORING_TESTGEN: ${SCORING_TESTGEN:-1}
+      # Testgen tuning knobs — evaluator/testgen.py defaults apply when unset.
+      TESTGEN_MODEL: ${TESTGEN_MODEL:-}
+      TESTGEN_SOURCE_BUDGET_BYTES: ${TESTGEN_SOURCE_BUDGET_BYTES:-}
+      TESTGEN_MAX_FILES: ${TESTGEN_MAX_FILES:-}
+      TESTGEN_MAX_TOKENS: ${TESTGEN_MAX_TOKENS:-}
+      TESTGEN_TIMEOUT_SECONDS: ${TESTGEN_TIMEOUT_SECONDS:-}
     ports:
       - "8001:8000"
     volumes:

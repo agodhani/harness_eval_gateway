@@ -1,8 +1,10 @@
-"""Locked exec sandbox (PR7) — run candidate build/tests/coverage.
+"""Locked exec sandbox (PR7/PR8) — run candidate build/tests/coverage.
 
 Executes a candidate workspace inside a one-shot ``heg-exec`` container and
 returns the measured outcome. Used by ``scoring.exec.ExecSandboxCollector``
-(the ``exec`` signal) and reusable by PR8's generated-test-suite runner.
+(the ``exec`` signal) and by PR8's generated-test-suite runner
+(``evaluator.testgen``), which passes ``test_target=`` to point pytest at an
+externally supplied suite instead of the workspace's own tests.
 
 Isolation posture (same family as ``sandbox/preview.py``'s desktop runner,
 tightened — exec needs NO network at all, not even the gateway):
@@ -21,7 +23,9 @@ tightened — exec needs NO network at all, not even the gateway):
   them on daemons that reject the mount opts.
 - Candidate workspace bind-mounted **read-only** at ``/srv/src``; the
   in-image runner copies it to the container-local ``/work`` (byte-capped)
-  before executing — the artifact on disk is never written to.
+  before executing — the artifact on disk is never written to. An optional
+  ``test_target`` suite (PR8) mounts read-only at ``/srv/test_target`` and
+  is likewise staged to a writable dir by the in-image runner.
 - Detached lifecycle — ``docker run -d`` → ``docker wait`` → bounded
   ``docker logs --tail`` → ``docker rm -f``. Container output NEVER
   streams into api memory: an attached ``docker run`` buffers ALL stdout+
@@ -103,6 +107,10 @@ CONTAINER_SRC = "/srv/src"
 CONTAINER_WORK = "/work"
 CONTAINER_OUT = "/out"
 CONTAINER_TMP = "/tmp"
+#: Read-only mount for an external test suite (PR8 ``test_target=``) — the
+#: in-image runner copies it to a writable dir and runs pytest against it
+#: instead of auto-detecting workspace test files.
+CONTAINER_TEST_TARGET = "/srv/test_target"
 
 
 def _default_exec_image() -> str:
@@ -246,7 +254,12 @@ class ExecRunner:
         return f"{mib}m"
 
     def _build_args(
-        self, *, name: str, workspace: Path, bounded: bool = True
+        self,
+        *,
+        name: str,
+        workspace: Path,
+        test_target: Path | None = None,
+        bounded: bool = True,
     ) -> list[str]:
         """``docker run`` argv for one exec container (testable, no side effects).
 
@@ -325,8 +338,19 @@ class ExecRunner:
             # ``docker cp`` once the container has exited.
             "-v",
             f"{self._rt.to_host_path(workspace)}:{CONTAINER_SRC}:ro",
-            self.image,
         ]
+        if test_target is not None:
+            # PR8: an externally supplied suite (e.g. generated_tests) —
+            # mounted read-only like /srv/src; EXEC_TEST_TARGET switches the
+            # in-image runner's pytest phase from workspace autodetect to
+            # this directory. Coverage stays --source=/work (candidate code).
+            args += [
+                "-e",
+                f"EXEC_TEST_TARGET={CONTAINER_TEST_TARGET}",
+                "-v",
+                f"{self._rt.to_host_path(test_target)}:{CONTAINER_TEST_TARGET}:ro",
+            ]
+        args.append(self.image)
         return args
 
     # -- result parsing -------------------------------------------------------
@@ -407,15 +431,31 @@ class ExecRunner:
     # -- lifecycle -------------------------------------------------------------
 
     def execute(
-        self, workspace: Path | str, *, timeout_seconds: float | None = None
+        self,
+        workspace: Path | str,
+        *,
+        timeout_seconds: float | None = None,
+        test_target: Path | str | None = None,
     ) -> ExecOutcome:
         """Run the exec container over ``workspace`` (never modifies it).
+
+        ``test_target`` (PR8) is a host directory holding an externally
+        supplied pytest suite — mounted read-only at
+        :data:`CONTAINER_TEST_TARGET` and run INSTEAD of the workspace's own
+        detected tests. A non-directory target is a caller bug: fail fast on
+        the outcome rather than let ``docker -v`` auto-create a stray dir.
 
         Never raises for docker problems — failures land on the outcome so a
         missing daemon/image can't break evaluation.
         """
         ws = Path(workspace).resolve()
         outcome = ExecOutcome(image=self.image)
+        target_dir: Path | None = None
+        if test_target is not None:
+            target_dir = Path(test_target).resolve()
+            if not target_dir.is_dir():
+                outcome.error = f"exec test target is not a directory: {target_dir}"
+                return outcome
         if not self.docker_available():
             outcome.error = "docker daemon unavailable"
             outcome.unavailable = True
@@ -439,7 +479,7 @@ class ExecRunner:
         started = time.monotonic()
         spawned = False
         try:
-            spawned = self._spawn(name, ws, outcome)
+            spawned = self._spawn(name, ws, outcome, test_target=target_dir)
         except (OSError, subprocess.SubprocessError) as exc:
             outcome.error = f"docker run failed: {type(exc).__name__}: {exc}"
 
@@ -453,14 +493,22 @@ class ExecRunner:
         shutil.rmtree(work_dir, ignore_errors=True)
         return outcome
 
-    def _spawn(self, name: str, ws: Path, outcome: ExecOutcome) -> bool:
+    def _spawn(
+        self,
+        name: str,
+        ws: Path,
+        outcome: ExecOutcome,
+        test_target: Path | None = None,
+    ) -> bool:
         """``docker run -d`` the exec container; True when it started.
 
         On a failure whose stderr points at the tmpfs/mount opts, retries
         once WITHOUT the disk bounds — a degraded-but-working exec beats a
         hard failure on a daemon that doesn't support them.
         """
-        args = self._build_args(name=name, workspace=ws)
+        args = self._build_args(
+            name=name, workspace=ws, test_target=test_target
+        )
         proc = self._rt._docker(
             args, check=False, timeout=_SPAWN_TIMEOUT_SECONDS
         )
@@ -472,7 +520,12 @@ class ExecRunner:
             outcome.warnings.append(
                 "daemon rejected tmpfs disk bounds — retrying without them"
             )
-            args = self._build_args(name=name, workspace=ws, bounded=False)
+            args = self._build_args(
+                name=name,
+                workspace=ws,
+                test_target=test_target,
+                bounded=False,
+            )
             proc = self._rt._docker(
                 args, check=False, timeout=_SPAWN_TIMEOUT_SECONDS
             )
