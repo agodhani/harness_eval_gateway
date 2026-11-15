@@ -112,6 +112,10 @@ export default function PreviewControls({
     ref: ThumbRef;
   } | null>(null);
   const [capturing, setCapturing] = useState(false);
+  // Cache-bust key for thumbs whose ref lacks captured_at (bare
+  // thumbnail.png / tolerated meta-write failure) — mount-unique and
+  // bumped per capture so a recapture never reuses a cached URL.
+  const [thumbBust, setThumbBust] = useState(() => String(Date.now()));
   // The capture response shadows the `thumbnail` prop it superseded only —
   // a results refresh delivering a different ref (newer capture, or none
   // after a delete) wins over the stale local override.
@@ -178,8 +182,14 @@ export default function PreviewControls({
     setCapturing(true);
     setError(null);
     try {
-      const t = await captureThumbnail(runId, sandboxId);
+      const opt = options.find((o) => o.key === pick);
+      const t = await captureThumbnail(
+        runId,
+        sandboxId,
+        opt ? { entry: opt.entry, type: opt.type } : undefined,
+      );
       setThumbOverride({ superseded: thumbnail, ref: t });
+      setThumbBust(String(Date.now()));
     } catch (e) {
       setError(
         e instanceof ApiError ? e.detail : "thumbnail capture failed",
@@ -190,12 +200,12 @@ export default function PreviewControls({
   }
 
   /** Thumbnail click → full live preview: open the running one, else
-   *  spawn the default plan (start() opens the URL on success). */
+   *  spawn the selected plan (start() opens the URL on success). */
   function openFull() {
     if (phase === "active" && preview?.url) {
       window.open(preview.url, "_blank", "noopener,noreferrer");
     } else {
-      void start();
+      void start(options.find((o) => o.key === pick));
     }
   }
 
@@ -223,7 +233,7 @@ export default function PreviewControls({
               for it */}
           <img
             className="thumb-img"
-            src={thumbnailUrl(runId, sandboxId, thumb.captured_at)}
+            src={thumbnailUrl(runId, sandboxId, thumb.captured_at ?? thumbBust)}
             alt={`artifact screenshot${thumb.type ? ` — ${thumb.type}` : ""}`}
           />
         </button>

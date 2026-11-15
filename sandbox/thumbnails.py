@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -327,9 +328,9 @@ class Thumbnailer:
             "-e",
             f"THUMB_BUDGET_MS={budget}",
             "-e",
-            f"THUMB_READY_SECONDS={int(self.ready_seconds)}",
+            f"THUMB_READY_SECONDS={math.ceil(self.ready_seconds)}",
             "-e",
-            f"THUMB_TIMEOUT_SECONDS={int(self.capture_seconds)}",
+            f"THUMB_TIMEOUT_SECONDS={math.ceil(self.capture_seconds)}",
             "-e",
             "HOME=/tmp",
             "-v",
@@ -353,7 +354,9 @@ class Thumbnailer:
         except subprocess.TimeoutExpired as exc:
             self._previews._docker(["rm", "-f", name], check=False)
             raise ThumbnailError(
-                f"chromium capture exceeded {self.capture_seconds:.0f}s"
+                "capture exceeded the "
+                f"{self.ready_seconds + self.capture_seconds + 30:.0f}s bound "
+                "(ready wait + chromium run)"
             ) from exc
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-5:]
