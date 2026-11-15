@@ -64,6 +64,7 @@ from orchestrator import runner
 from orchestrator.events import emit
 from sandbox.preview import (
     PURPOSE_PREVIEW,
+    PURPOSE_THUMB,
     Preview,
     PreviewManager,
     plan_for_entry,
@@ -278,6 +279,15 @@ def _jail() -> Path:
     return Path(get_settings().ARTIFACT_ROOT).resolve()
 
 
+def _capture_in_flight(preview: Preview) -> bool:
+    """A live ``purpose=thumb`` stack belongs to an in-flight capture —
+    interactive endpoints coexist with it (unique names, ephemeral ports)
+    rather than killing the capture mid-flight. The capture's own cleanup
+    and the TTL reaper own its removal; a *dead* thumb stack is a stale
+    leftover and stays sweepable."""
+    return preview.live and preview.purpose == PURPOSE_THUMB
+
+
 def _resolve_plan(workspace: Path, body: PreviewStart | None):
     """Shared ``entry``/``type`` → plan resolution for the POST bodies."""
     entry = body.entry if body else None
@@ -312,8 +322,7 @@ async def start_preview(
 
     existing = await asyncio.to_thread(mgr.list, sandbox_id=str(sandbox_id))
     # A live *interactive* preview is returned as-is — thumbnail capture
-    # stacks (purpose=thumb, PR4) never satisfy the reuse check; the
-    # clear-stale loop below stops them like any other replaced stack.
+    # stacks (purpose=thumb, PR4) never satisfy the reuse check.
     live = next(
         (p for p in existing if p.live and p.purpose == PURPOSE_PREVIEW), None
     )
@@ -356,8 +365,11 @@ async def start_preview(
     if live is not None and live.type == plan.type and live.entry == plan.entry:
         return _out(live)
     # Clear stale containers — dead ones always, and a live one whose plan
-    # doesn't match the explicit request.
+    # doesn't match the explicit request — except a live capture stack:
+    # killing it mid-capture would fail that POST .../thumbnail.
     for preview in existing:
+        if _capture_in_flight(preview):
+            continue
         await asyncio.to_thread(mgr.stop, preview.preview_id)
 
     try:
@@ -423,11 +435,15 @@ async def stop_preview(run_id: UUID, sandbox_id: UUID, session: DbSession) -> No
     _find_sandbox(session, run_id, sandbox_id)
     mgr = get_preview_manager()
     existing = await asyncio.to_thread(mgr.list, sandbox_id=str(sandbox_id))
-    if not existing:
+    # A live purpose=thumb stack is an in-flight capture, not "the
+    # preview" — invisible to GET and unstoppable here (a sandbox with
+    # only a capture running 404s, same as GET).
+    stoppable = [p for p in existing if not _capture_in_flight(p)]
+    if not stoppable:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="no preview for this sandbox"
         )
-    for preview in existing:
+    for preview in stoppable:
         await asyncio.to_thread(mgr.stop, preview.preview_id)
     try:
         emit(
@@ -437,7 +453,7 @@ async def stop_preview(run_id: UUID, sandbox_id: UUID, session: DbSession) -> No
             event_type="checkpoint",
             payload={
                 "stage": "preview_stopped",
-                "preview_ids": [p.preview_id for p in existing],
+                "preview_ids": [p.preview_id for p in stoppable],
             },
         )
         session.commit()

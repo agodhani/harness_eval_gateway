@@ -244,6 +244,7 @@ export default function PreviewControls({
             className="thumb-img"
             src={thumbnailUrl(runId, sandboxId, thumb.captured_at ?? thumbBust)}
             alt={`artifact screenshot${thumb.type ? ` — ${thumb.type}` : ""}`}
+            onError={() => setThumbOverride(null)}
           />
         </button>
       ) : (

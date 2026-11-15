@@ -425,14 +425,31 @@ def test_results_thumbnail_meta_symlink_ignored(
 def test_start_preview_ignores_thumb_purpose(
     client: TestClient, run, artifact_root, fake_manager: FakeManager
 ) -> None:
-    """A live purpose=thumb stack does NOT satisfy the reuse check — the
-    interactive POST replaces it (stop + fresh spawn)."""
+    """A live purpose=thumb stack does NOT satisfy the reuse check — and
+    the spawn must NOT kill it: the stack belongs to an in-flight capture
+    whose POST .../thumbnail would 502 if the sweep removed it mid-flight."""
     thumb = replace(_preview(run["run_id"], run["sb1"]), purpose="thumb")
     fake_manager.previews.append(thumb)
     _workspace(artifact_root, run["run_id"], run["sb1"], {"index.html": "x"})
     resp = client.post(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
     assert resp.status_code == 201
     assert resp.json()["preview_id"] != thumb.preview_id
+    assert thumb.preview_id not in fake_manager.stop_calls
+    assert len(fake_manager.spawn_calls) == 1
+
+
+def test_start_preview_sweeps_dead_thumb_stack(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """A *dead* purpose=thumb stack is a stale leftover — the clear-stale
+    sweep still removes it alongside dead interactive containers."""
+    thumb = replace(
+        _preview(run["run_id"], run["sb1"], status="exited"), purpose="thumb"
+    )
+    fake_manager.previews.append(thumb)
+    _workspace(artifact_root, run["run_id"], run["sb1"], {"index.html": "x"})
+    resp = client.post(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
+    assert resp.status_code == 201
     assert thumb.preview_id in fake_manager.stop_calls
     assert len(fake_manager.spawn_calls) == 1
 
@@ -446,3 +463,42 @@ def test_get_preview_ignores_thumb_purpose(
     fake_manager.previews.append(thumb)
     resp = client.get(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
     assert resp.status_code == 404
+
+
+def test_stop_preview_skips_live_thumb_stack(
+    client: TestClient, run, fake_manager: FakeManager
+) -> None:
+    """DELETE stops interactive previews but must not kill a live
+    purpose=thumb stack — same in-flight capture POST .../preview spares."""
+    live = _preview(run["run_id"], run["sb1"])
+    thumb = replace(_preview(run["run_id"], run["sb1"]), purpose="thumb")
+    fake_manager.previews.extend([live, thumb])
+    resp = client.delete(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
+    assert resp.status_code == 204
+    assert live.preview_id in fake_manager.stop_calls
+    assert thumb.preview_id not in fake_manager.stop_calls
+
+
+def test_stop_preview_only_live_thumb_stack_404s(
+    client: TestClient, run, fake_manager: FakeManager
+) -> None:
+    """A sandbox with only an in-flight capture has 'no preview' — DELETE
+    404s like GET instead of stopping the capture's stack."""
+    thumb = replace(_preview(run["run_id"], run["sb1"]), purpose="thumb")
+    fake_manager.previews.append(thumb)
+    resp = client.delete(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
+    assert resp.status_code == 404
+    assert thumb.preview_id not in fake_manager.stop_calls
+
+
+def test_stop_preview_sweeps_dead_thumb_stack(
+    client: TestClient, run, fake_manager: FakeManager
+) -> None:
+    """A *dead* thumb stack is sweepable stale state — DELETE removes it."""
+    thumb = replace(
+        _preview(run["run_id"], run["sb1"], status="exited"), purpose="thumb"
+    )
+    fake_manager.previews.append(thumb)
+    resp = client.delete(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
+    assert resp.status_code == 204
+    assert thumb.preview_id in fake_manager.stop_calls
