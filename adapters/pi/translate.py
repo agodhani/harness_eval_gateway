@@ -125,6 +125,8 @@ def translate_obj(obj: dict[str, Any]) -> list[dict[str, Any]]:
         return []  # partial results — the end record carries the outcome
     if rec_type == "tool_execution_end":
         if obj.get("isError"):
+            # Thin signal only — the extension hook's tool_result carries the
+            # result payload, same as the success path's thin checkpoint.
             return [
                 {
                     "type": "error",
@@ -132,7 +134,6 @@ def translate_obj(obj: dict[str, Any]) -> list[dict[str, Any]]:
                         "stage": "tool_execution",
                         "tool": obj.get("toolName"),
                         "tool_call_id": obj.get("toolCallId"),
-                        "message": _truncate(obj.get("result"), 2000),
                     },
                 }
             ]
@@ -225,8 +226,8 @@ def translate_hook(obj: dict[str, Any]) -> list[dict[str, Any]]:
     Envelope (``config._EXTENSION_TS``):
     ``{"hook_event_name": <pi event name>, "event": <event object>}``.
     ``tool_execution_end`` → ``tool_result`` — the result payload the ``--mode
-    json`` translation drops into a thin checkpoint to avoid double-counting
-    the matching ``tool_execution_start`` event.
+    json`` translation drops into a thin checkpoint (or a bare ``error`` event
+    on ``isError``) to avoid double-counting the outcome.
     """
     if obj.get("hook_event_name") != "tool_execution_end":
         return []

@@ -50,6 +50,16 @@ class TestConfig:
         assert '"-m", "adapters.common.hooks", "pi"' in text
         assert "tool_execution_end" in text
 
+    def test_extension_write_failure_not_fatal(self, tmp_path):
+        # Telemetry add-on: a failed extension write must not kill setup —
+        # models.json (the startup-critical file) is still returned.
+        agent = tmp_path / "agent"
+        agent.mkdir(parents=True)
+        (agent / "extensions").write_text("blocking file")
+        path = config.write_config(_cfg(tmp_path))
+        assert path == agent / "models.json"
+        assert json.loads(path.read_text())["providers"]["heg"]
+
 
 class TestEnvLaunch:
     def test_env(self):

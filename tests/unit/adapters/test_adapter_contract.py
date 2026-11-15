@@ -229,6 +229,11 @@ def test_cli_hook_declaration(name: str) -> None:
         )
         for ev in translate_hook({}):
             assert ev["type"] in VALID_TYPES, f"{name}: bad hook type {ev['type']!r}"
+    else:
+        assert translate_hook is None, (
+            f"{name}: translate.translate_hook exists but manifest lacks "
+            "'hooks' — the receiver would dispatch it unannounced"
+        )
 
 
 def test_adapter_image_resolution() -> None:

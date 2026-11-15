@@ -11,6 +11,7 @@ Stdlib-only (runs inside the sandbox).
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -99,5 +100,8 @@ def write_config(cfg: ShimConfig) -> Path:
     agent_dir.mkdir(parents=True, exist_ok=True)
     path = agent_dir / "models.json"
     path.write_text(json.dumps(models_json(cfg), indent=2), encoding="utf-8")
-    write_extension(cfg)
+    try:
+        write_extension(cfg)
+    except OSError as exc:
+        print(f"heg-pi: extension write failed; hook telemetry off: {exc}", file=sys.stderr)
     return path
