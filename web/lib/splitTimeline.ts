@@ -113,11 +113,6 @@ export function laneEventCounts(
   return { left, right, shared };
 }
 
-/** Default lane assignment: first two sandbox ids, either may be absent. */
-export function defaultLanes(sandboxIds: string[]): LaneSelection {
-  return { left: sandboxIds[0] ?? "", right: sandboxIds[1] ?? "" };
-}
-
 /**
  * Metrics-chip click semantics in split mode (mirrors the merged view's
  * "click to toggle" contract):

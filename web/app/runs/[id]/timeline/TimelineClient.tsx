@@ -88,10 +88,13 @@ export default function TimelineClient({ runId }: { runId: string }) {
   const [viewMode, setViewMode] = useState<ViewMode>(() =>
     searchParams.get("view") === "split" ? "split" : "merged",
   );
-  const [lanes, setLanes] = useState<LaneSelection>(() => ({
-    left: searchParams.get("left") ?? "",
-    right: searchParams.get("right") ?? "",
-  }));
+  const [lanes, setLanes] = useState<LaneSelection>(() =>
+    pickLane(
+      pickLane({ left: "", right: "" }, "left", searchParams.get("left") ?? ""),
+      "right",
+      searchParams.get("right") ?? "",
+    ),
+  );
   const laneTouchedRef = useRef(
     searchParams.get("left") != null && searchParams.get("right") != null,
   );
@@ -288,28 +291,14 @@ export default function TimelineClient({ runId }: { runId: string }) {
   // PR10 — split-view lanes. Default to the first two discovered sandboxes
   // until the user picks explicitly (laneTouchedRef latches on first touch);
   // the right lane never duplicates the left.
-  //
-  // Lanes are per-run: on client-side navigation to another run's timeline
-  // the component instance is reused, so re-seed from the URL and unlatch
-  // auto-default — foreign sandbox ids must not carry over.
-  const prevRunIdRef = useRef(runId);
-  useEffect(() => {
-    if (prevRunIdRef.current === runId) return;
-    prevRunIdRef.current = runId;
-    laneTouchedRef.current =
-      searchParams.get("left") != null && searchParams.get("right") != null;
-    setLanes({
-      left: searchParams.get("left") ?? "",
-      right: searchParams.get("right") ?? "",
-    });
-  }, [runId, searchParams]);
-
   useEffect(() => {
     if (laneTouchedRef.current || sandboxIds.length === 0) return;
     setLanes((prev) => {
-      if (prev.left && prev.right) return prev;
       const left = prev.left || sandboxIds[0];
-      const right = prev.right || sandboxIds.find((id) => id !== left) || "";
+      const right =
+        prev.right && prev.right !== left
+          ? prev.right
+          : sandboxIds.find((id) => id !== left) || "";
       if (left === prev.left && right === prev.right) return prev;
       return { left, right };
     });
@@ -346,7 +335,9 @@ export default function TimelineClient({ runId }: { runId: string }) {
     // point — existing lane picks are never overwritten, and the auto-
     // default still fills whichever lane stays empty.
     if (mode === "split" && filterSandbox && filterSandbox !== "__none__") {
-      setLanes((prev) => ({ ...prev, left: prev.left || filterSandbox }));
+      setLanes((prev) =>
+        prev.left ? prev : pickLane(prev, "left", filterSandbox),
+      );
     }
   }
 

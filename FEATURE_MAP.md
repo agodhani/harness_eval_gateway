@@ -195,8 +195,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   enums), db `events`, `web/app/runs/[id]/timeline/` (`TimelineClient.tsx`,
   `SandboxMetricsBar.tsx` — PR9 strip, `SplitTimeline.tsx` + `EventRow.tsx`
   — PR10 split view, see F9), `web/lib/splitTimeline.ts` (`buildSplitRows`
-  merged-ordering transform, `pickLane`/`toggleLane`/`laneEventCounts`/
-  `defaultLanes`) + `splitTimeline.test.ts`
+  merged-ordering transform, `pickLane`/`toggleLane`/`laneEventCounts`)
+  + `splitTimeline.test.ts`
 - **Run-detail console:** `web/components/RunConsoleLive.tsx` — per-sandbox
   event lanes on the run detail page (backlog + SSE + `after_id` poll, same
   merge as the timeline; evaluator/orchestrator traffic routed to a bottom

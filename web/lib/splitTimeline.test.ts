@@ -17,7 +17,6 @@ import { describe, test } from "node:test";
 import type { EventOut } from "./api.ts";
 import {
   buildSplitRows,
-  defaultLanes,
   laneEventCounts,
   pickLane,
   toggleLane,
@@ -138,16 +137,6 @@ describe("laneEventCounts", () => {
       right: 0,
       shared: 6,
     });
-  });
-});
-
-describe("defaultLanes", () => {
-  test("picks the first two ids", () => {
-    assert.deepEqual(defaultLanes([A, B, C]), { left: A, right: B });
-  });
-  test("degrades gracefully with fewer than two ids", () => {
-    assert.deepEqual(defaultLanes([A]), { left: A, right: "" });
-    assert.deepEqual(defaultLanes([]), { left: "", right: "" });
   });
 });
 

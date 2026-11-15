@@ -200,7 +200,7 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
   `(ts,id)` ordering as two-column rows — each event fills only its lane's
   cell, so sync scroll + time alignment are structural and a quiet lane
   reads as gaps (diff-tool idiom). `buildSplitRows`/`pickLane`/`toggleLane`/
-  `laneEventCounts`/`defaultLanes` in `web/lib/splitTimeline.ts` (+
+  `laneEventCounts` in `web/lib/splitTimeline.ts` (+
   node:test); `SplitTimeline.tsx` sticky lane heads (picker swap on
   collision, status badge, per-lane counts); `EventRow.tsx` extraction
   shares row markup/summaries/colors across both views; run-level +
