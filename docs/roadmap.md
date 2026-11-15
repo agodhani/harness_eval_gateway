@@ -11,8 +11,8 @@ append-mostly; rebase on main before merge.
 ## Already landed (do not redo)
 
 - F0–F12 (see FEATURE_MAP.md): orchestrator, gateway w/ metering+budgets,
-  sandbox runtime + egress lockdown, miniloop + 4 CLI adapters (codex,
-  claude_code, pi, deepseek), evaluator w/ judge retries, results UI,
+  sandbox runtime + egress lockdown, miniloop + 5 CLI adapters (codex,
+  claude_code, pi, deepseek, aider), evaluator w/ judge retries, results UI,
   analytics (F9), skillpack import (F11), artifact preview static+desktop
   (F12).
 - **PR2 preview fixes**: `type=` POST-body override on the artifact preview
@@ -20,19 +20,43 @@ append-mostly; rebase on main before merge.
   the plan — `static` serves any jailed file, `desktop` requires `.py`) and a
   `ScanCache`'d results-GET probe (`PREVIEW_SCAN_TTL_SECONDS`, default 30s).
   Details: `FEATURE_MAP.md` F12.
+- **PR9 timeline-side analytics**: per-sandbox metrics strip on
+  `web/app/runs/[id]/timeline/` (turns/tokens/latency/cost/errors chips +
+  judge line; chips double as sandbox-filter selectors; `sandboxStrips`
+  transform in `web/lib/timelineAnalytics.ts` + `node --test` unit tests).
+  Leftover idea: on-event-hover cumulative stats.
 - **OpenRouter provider** (commit 8014338): `UPSTREAM_PROVIDER=ollama|openrouter`
   in `gateway/config.py`; client base normalizes to `/api/` (httpx
   concatenates base+request paths); Ollama-only body params
   (`think`/`num_ctx`/`keep_alive`/`options`) stripped for hosted providers;
   tests pin `UPSTREAM_PROVIDER=ollama` in `tests/conftest.py`. OpenRouter
   only serves `/v1/chat/completions` + `/v1/models` — `/v1/messages` and
-  `/v1/responses` 404 there (claude_code/codex need ollama). Verified free
+  `/v1/responses` 404 there (claude_code/codex needed ollama until PR12
+  routing). Verified free
   ids: `particle-ai/particle-1:free`, `inclusionai/ling-3.2-flash:free`,
   `dots-studio/dots-3-note-preview:free`. Mandatory-reasoning models (ernie,
   lfm) 400 on miniloop's `reasoning_effort:"none"`.
 - **PR6 — static-analysis signals** (`scoring/` package, see below).
 - **PR11 — Graphical analysis + cross-run dashboards** (F13): recharts,
   `GET /api/analytics/runs`, results-matrix totals row.
+- **OpenAI + Anthropic providers + per-model routing** (PR12):
+  `UPSTREAM_PROVIDER` gains `openai` (chat/completions + responses + models;
+  no /v1/messages) and `anthropic` (/v1/messages + count_tokens + models;
+  no chat-completions) — Anthropic auth is `x-api-key` + `anthropic-version`.
+  `PROVIDER_ROUTES` (JSON `{model-glob: provider}`, first match wins)
+  overrides the process-wide provider per request model, so one gateway can
+  e.g. route `claude-*` to Anthropic while the rest stays on Ollama. Every
+  provider a request may resolve to must have its key (boot-time check).
+  An `x-heg-provider` request header forces the provider outright on
+  service creds (`sandbox_id=None`; unknown or unkeyed values 400) and is
+  silently ignored on sandbox-scoped creds — agent code can't retarget
+  onto paid upstreams; caller `anthropic-beta`/`anthropic-version` headers
+  forward to the anthropic upstream. Emitted `llm_*`/`error` events record
+  the resolved provider.
+- **PR5 — Eval iteration** (F14): re-score on stored artifacts
+  (`POST /api/runs/{id}/rescore` → `lifecycle.rescore_run`), versioned
+  post-run rubric edits (`parent_id` chain, `Score.rubric_version`/`seq`
+  provenance, `?rubric_version=` results filter). See FEATURE_MAP.md F14.
 
 ## Dependency DAG
 
@@ -48,8 +72,6 @@ PR1  Submit UX ────────▶ PR14 Model-vs-model ◀╌╌╌╌ P
 PR2  Preview fixes ────▶ PR3  Preview types ──▶ PR4  Thumbnails
 
 PR6  Static analysis ──▶ PR7  Exec+coverage ──▶ PR8  Test-suite-gen
-                            ▲
-PR5  Re-score/rub-edits ╌╌╌╌┘
 
 PR15 Queue/mem-aware ──▶ PR16 Add-next-prompt ╌╌▶ PR20 K8s
 PR19 Auth/templates/share — independent
@@ -57,11 +79,11 @@ PR19 Auth/templates/share — independent
 
 ## Topological levels
 
-- **Depth 0 (start immediately):** PR1, PR3, PR5, PR9, PR12,
+- **Depth 0 (start immediately):** PR1, PR3, PR9,
   PR15, PR19 — plus PR7 (hard dep PR6 landed; only soft ←5 remains) and
-  PR13/PR17 if soft-only deps are acceptable.
-- **Depth 1:** PR4 (←3), PR8 (←7), PR10 (←9), PR14 (←1, +12 soft),
-  PR16 (←15), PR18 (←12).
+  PR17 (soft ←13 satisfied — PR13 landed).
+- **Depth 1:** PR4 (←3), PR8 (←7), PR10 (←9), PR14 (←1), PR16 (←15),
+  PR18 (←12).
 - **Floating:** PR20 (soft ←15).
 
 Critical path depth = 1 remaining (`7→8`, `3→4`; was 3 via `6→7→8` before
@@ -71,9 +93,9 @@ PR2 and PR6 landed). Max safe concurrency ≈ 9 lanes.
 
 - `api/schemas.py`, `web/lib/api.ts` — most PRs append here.
 - `AGENTS.md`, `FEATURE_MAP.md` — every PR updates docs; rebase.
-- `db/migrations/` — PR1 + PR5 add migrations; renumber revisions at merge.
-- `orchestrator/` — PR5 (re-score trigger) vs PR15/PR16 (state machine);
-  stagger C and I lanes or coordinate.
+- `db/migrations/` — PR1 adds a migration; renumber revisions at merge.
+- `orchestrator/` — PR15 vs PR16 both touch the state machine;
+  coordinate.
 - `sandbox/preview.py` + `api/routers/preview.py` + `PreviewControls.tsx` —
   all of lane B; strictly sequential.
 
@@ -117,16 +139,14 @@ landed" and `FEATURE_MAP.md` F12.
 - **Touch:** `sandbox/preview.py` or new `sandbox/thumbnails.py`, artifact
   store layout (`data/artifacts/<run>/<sandbox>/`), results API + UI.
 
-### PR5 — Eval iteration: re-score + rubric edits
-- **Scope:** re-score runs (re-run evaluator on stored artifacts — trigger
-  endpoint + orchestrator hook); post-run rubric edits (versioned rubrics —
-  `rubrics` get a version/parent, scores keep `rubric_version` provenance so
-  old vs new scores stay distinguishable).
-- **Touch:** `orchestrator/` (eval trigger — likely `runner.py`/`lifecycle.py`),
-  `api/routers/results.py`, `evaluator/`, db `rubrics`/`scores` (migration),
-  results UI (re-score button + version selector).
-- **Verify:** `tests/unit/evaluator/`, orchestrator unit tests; re-score on a
-  stored run end-to-end.
+### PR5 — Eval iteration: re-score + rubric edits — ✅ landed
+Landed as F14: `POST /api/runs/{id}/rubrics` appends immutable rubric
+versions (`parent_id` chain, previous approved → `superseded`,
+`uq_rubrics_run_version`), `POST /api/runs/{id}/rescore` re-runs the
+evaluator on stored artifacts via `orchestrator.lifecycle.rescore_run`
+(terminal runs only, `rescore` task-kind dedup), and Score rows carry
+`rubric_version`/`seq` provenance for the newest-wins matrix merge.
+Paths + tests: FEATURE_MAP F14.
 
 ### PR6 — Objective scoring I: static analysis — ✅ landed
 Landed as the `scoring/` collector registry (lizard, parse-only): the
@@ -140,7 +160,7 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
   patterns (egress lockdown, resource bounds).
 - **Touch:** `evaluator/` (exec staging), `sandbox/runtime.py` or a new
   exec sandbox spec, `api/routers/results.py`.
-- **Depends on:** PR6 (signal plumbing), PR5 soft (evaluator wiring settles).
+- **Depends on:** PR6 (signal plumbing), PR5 (evaluator wiring) — both landed.
 - **Verify:** integration test executing a trivial artifact.
 
 ### PR8 — Automated test-suite generation
@@ -149,13 +169,15 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
 - **Touch:** `evaluator/` (gen + exec orchestration), prompts.
 - **Depends on:** PR7.
 
-### PR9 — Timeline-side analytics
+### PR9 — Timeline-side analytics — ✅ landed
 - **Scope:** per-sandbox metrics (cost/tokens/latency) rendered alongside
   the timeline or on event hover — F9 already computes everything; mostly
   UI placement.
 - **Touch:** `web/app/runs/[id]/timeline/`, `web/lib/api.ts`
   (`getRunAnalytics` exists).
 - **Verify:** visual + a unit test on any new transform.
+- **Landed:** metrics strip between toolbar and stream (`SandboxMetricsBar`
+  + `sandboxStrips`); see "Already landed" + `FEATURE_MAP.md` F9.
 
 ### PR10 — Split-view trace comparison
 - **Scope:** side-by-side, time-aligned event streams for two sandboxes on
@@ -175,16 +197,25 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
   component, `api/routers/analytics.py` if new aggregates needed.
 - **Verify:** renders on real run data; totals match matrix sums.
 
-### PR12 — Providers (remainder)
+### PR12 — Providers (remainder) ✅ landed
 - **Scope:** remaining upstreams — direct Anthropic + OpenAI adapters
   (OpenRouter already landed); per-request/per-model provider routing if
   wanted (today's switch is process-wide).
+- **Landed:** `openai` + `anthropic` providers; `PROVIDER_ROUTES` JSON
+  model-glob → provider overrides resolved per request `model`;
+  `x-heg-provider` request header override (service creds only); caller
+  `anthropic-beta`/`anthropic-version` headers forward to the anthropic
+  upstream; provider recorded on emitted `llm_*`/`error` events.
 - **Touch:** `gateway/config.py`, `gateway/deps.py`,
   `gateway/main.py` (body transforms if APIs differ), `api/config.py`
   (key plumbing), `.env.example`.
 - **Verify:** `tests/unit/gateway/test_upstream_provider.py` pattern.
 
 ### PR13 — Aider adapter (+ dsh helpers if needed)
+
+> **Status: landed** — `adapters/aider/` shipped; dsh native helpers
+> skipped (no TTY-dependent evals — see `docs/p25-harness-adapters.md`).
+
 - **Scope:** Aider CLI adapter following the F10 shim pattern; dsh native
   helpers (spawn-helper, node-pty via `--allow-scripts`) ONLY if evals hit
   TTY-dependent tasks — otherwise skip.

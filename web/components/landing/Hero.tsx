@@ -63,7 +63,7 @@ export default function Hero() {
           <Reveal delay={260}>
             <dl className="lp-stats">
               {[
-                ["5", "harness adapters"],
+                ["6", "harness adapters"],
                 ["3", "gateway protocols"],
                 ["∞", "events captured"],
               ].map(([v, l]) => (
@@ -74,7 +74,7 @@ export default function Hero() {
               ))}
             </dl>
             <p className="lp-hero__note">
-              miniloop · codex · claude_code · pi · deepseek
+              miniloop · codex · claude_code · pi · deepseek · aider
               <br />
               /v1/chat/completions · /v1/messages · /v1/responses
             </p>

@@ -22,10 +22,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F7 | Evaluator sandbox (rubric scoring + objective signals) | ✅ | `evaluator/`, `scoring/` | `tests/unit/evaluator/`, `tests/unit/scoring/` |
 | F8 | Results UI (matrix, scores, artifacts) | ✅ | `web/app/runs/`, `api/routers/results.py` | `tests/unit/api/test_results.py` |
 | F9 | Run analytics (per-sandbox metrics + cost) | ✅ | `api/routers/analytics.py`, `api/pricing.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx` | `tests/unit/api/test_analytics.py` |
-| F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
+| F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek, Aider) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek,aider}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
 | F11 | Skillpack import from GitHub | ✅ | `skillpack_import/`, `api/routers/skillpacks.py`, `web/app/submit/ImportSkillPackDialog.tsx` | `tests/unit/api/test_skillpacks.py`, `test_skillpack_import.py` |
 | F12 | Artifact preview (static html + desktop/pygame via noVNC, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
 | F13 | Graphical analysis page + cross-run trends (recharts) | ✅ | `web/app/runs/[id]/analysis/`, `api/routers/analytics.py` (`GET /api/analytics/runs`), `web/app/runs/[id]/results/ResultsClient.tsx` (totals row) | `tests/unit/api/test_analytics.py` (trends section) |
+| F14 | Eval iteration (re-score + versioned rubrics) | ✅ | `api/routers/results.py`, `orchestrator/lifecycle.py` (`rescore_run`), `orchestrator/rubric.py` (`create_rubric_version`), `web/app/runs/[id]/results/RescoreControls.tsx` | `tests/unit/orchestrator/test_rescore.py`, `tests/unit/api/test_results.py`, `tests/unit/evaluator/test_evaluate.py` |
 
 ## Feature details
 
@@ -58,7 +59,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 ### F1 — Submission form → run spec
 
 - **What:** form captures task prompt, model, harness configs (adapter +
-  skill pack selections — five adapters available, F10), evaluator model;
+  skill pack selections — six adapters available, F10), evaluator model;
   `POST /api/runs` persists spec with status `submitted`. The adapter
   dropdown is populated live from `GET /api/harnesses` (static fallback list
   when the API is unreachable); model inputs use the ComboInput suggestion
@@ -95,8 +96,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 ### F3 — AI gateway ✅
 
-- **What:** OpenAI-compatible `/v1/chat/completions` endpoint → Ollama
-  upstream — non-streaming by default, metered SSE pass-through when the
+- **What:** OpenAI-compatible `/v1/chat/completions` endpoint → configurable
+  upstream (Ollama default) — non-streaming by default, metered SSE pass-through when the
   caller sets `stream: true` (pi and other OpenAI-compatible CLIs stream
   unconditionally); Anthropic Messages `/v1/messages` +
   `/v1/messages/count_tokens` (Claude Code, dsh) and OpenAI Responses
@@ -104,13 +105,30 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   tee; `GET /v1/models` for CLI probes; per-run/sandbox HMAC credentials
   (`heg.<b64>.<sig>`); records tokens in/out, latency, failures; token
   budgets (429 + `error` event); emits `llm_request`/`llm_response`/`error`
-  events. `/internal/events` (harness-event proxy, cred or ingest-token
-  auth) + `/internal/done` (done_signal) for sandbox egress.
+  events carrying the resolved upstream provider. `/internal/events`
+  (harness-event proxy, cred or ingest-token auth) + `/internal/done`
+  (done_signal) for sandbox egress.
+- **Upstreams:** `UPSTREAM_PROVIDER` picks the default provider —
+  `ollama` (default), `openrouter`, `openai`, `anthropic` — and
+  `PROVIDER_ROUTES` (JSON `{"model-glob": provider}`) overrides it per
+  request model (first match wins, case-insensitive); an `x-heg-provider`
+  request header forces the provider outright on service creds
+  (`sandbox_id=None`; unknown/unkeyed values 400, ignored on
+  sandbox-scoped creds). Each
+  provider gets its own key/base-URL/headers (Anthropic sends `x-api-key` +
+  `anthropic-version`; caller `anthropic-beta`/`anthropic-version` headers
+  forward to the anthropic provider); endpoints a provider doesn't
+  implement return its native 404; Ollama-only body params are stripped
+  for hosted providers.
 - **Where:** `gateway/` (`main.py`, `creds.py`, `metering.py`, `deps.py`,
   `config.py`, `mint_cred.py` CLI), compose service `gateway` (:8081→8080)
 - **Verify:**
   - Unit: `tests/unit/gateway/` (creds, metering, proxy — hermetic; protocol
-    pass-throughs + SSE usage normalization covered)
+    pass-throughs + SSE usage normalization covered),
+    `test_upstream_provider.py` (provider selection, key validation,
+    PROVIDER_ROUTES resolution, `x-heg-provider` override, per-provider
+    client base/headers, ollama-param stripping, anthropic protocol-header
+    forwarding, provider attribution on emitted events)
   - Manual: mint cred (`uv run python -m gateway.mint_cred`) →
     `curl localhost:8081/v1/chat/completions` → completion + event rows
   - M2 e2e proven: sandbox→gateway→Ollama→events (see run
@@ -159,7 +177,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   timestamps. API side (`api/routers/events.py`: ingest batch/single,
   query w/ filters+pagination, SSE tail) + timeline UI both landed.
 - **Where:** `api/routers/events.py`, `api/schemas.py` (EventSource/EventType
-  enums), db `events`, `web/app/runs/[id]/timeline/`
+  enums), db `events`, `web/app/runs/[id]/timeline/` (`TimelineClient.tsx` +
+  `SandboxMetricsBar.tsx` — the PR9 metrics strip lives here; see F9)
 - **Run-detail console:** `web/components/RunConsoleLive.tsx` — per-sandbox
   event lanes on the run detail page (backlog + SSE + `after_id` poll, same
   merge as the timeline; evaluator/orchestrator traffic routed to a bottom
@@ -251,14 +270,28 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   and reported under `evaluator` rather than polluting participant numbers.
   Results page gains an "Analytics" section — side-by-side comparison table +
   price-model dropdown that recomputes cost client-side (no refetch).
+  Timeline page (PR9) hosts the same numbers in-context: a per-sandbox
+  metrics strip between the filter toolbar and the event stream — compact
+  chips (turns · tokens in→out · avg latency · est. cost · errors, plus a
+  judge-traffic line once the evaluator runs). Chips double as
+  sandbox-filter selectors (same state as the toolbar dropdown, whose
+  options gain adapter labels), and the strip refreshes every 15s while the
+  run is non-terminal.
 - **Where:** `api/pricing.py`, `api/routers/analytics.py`, response schemas
   in `api/schemas.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx`,
-  `web/lib/api.ts` (`getRunAnalytics`, `estimateCostUsd`)
+  `web/lib/api.ts` (`getRunAnalytics`, `estimateCostUsd`),
+  `web/lib/timelineAnalytics.ts` (`sandboxStrips` transform) +
+  `timelineAnalytics.test.ts`, `web/lib/format.ts` (`formatNum`/`formatUsd`),
+  `web/app/runs/[id]/timeline/SandboxMetricsBar.tsx` + `.tl-metric*` in
+  `web/app/globals.css`
 - **Verify:**
   - Unit: `tests/unit/api/test_analytics.py` (aggregation math, eval-phase
-    split, cost at known price model, defaults, 404/422, zero-event run)
+    split, cost at known price model, defaults, 404/422, zero-event run);
+    `cd web && npm test` (node --test — `sandboxStrips` chip transform)
   - API: `curl localhost:8001/api/runs/<id>/analytics?price_model=gpt-4o`
-  - UI: results page → "Analytics" card → switch price model → cost updates
+  - UI: results page → "Analytics" card → switch price model → cost updates;
+    timeline page → strip shows per-sandbox stats live → click a chip →
+    stream filters to that sandbox
 - **Depends on:** F6 (events), F8 (results page)
 
 ### F10 — Multi-harness adapters ✅
@@ -266,22 +299,26 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **What:** pluggable adapter registry so runs can compare real harness CLIs,
   not just miniloop configs. Registered adapters: `miniloop`, `codex`
   (@openai/codex), `claude_code` (@anthropic-ai/claude-code), `pi`
-  (@mariozechner/pi-coding-agent), `deepseek` (@deepseek-ai/dsh). A shared
-  stdlib-only shim (`adapters/common/`) runs inside each image: writes the
-  harness's native config pointing at the gateway, launches the CLI in
-  machine-readable JSONL mode, translates native records → normalized
-  events, posts them to `/internal/events`, emits `terminal_state` + prints
-  `HEG_RESULT {…}`. Per-adapter Docker images pin the npm CLI version;
+  (@mariozechner/pi-coding-agent), `deepseek` (@deepseek-ai/dsh), `aider`
+  (aider-chat, PR13). A shared stdlib-only shim (`adapters/common/`) runs
+  inside each image: writes the harness's native config pointing at the
+  gateway, launches the CLI in machine-readable JSONL mode (aider emits
+  plain text only — the shim's `translate_text` hook maps its status lines
+  heuristically instead), translates records → normalized events, posts
+  them to `/internal/events`, emits `terminal_state` + prints
+  `HEG_RESULT {…}`. Per-adapter Docker images pin the CLI version;
   `orchestrator/provision.py` resolves each config's image from
   `image_spec()["image"]` (miniloop keeps the `SANDBOX_IMAGE` fallback).
   `GET /api/harnesses` serves adapter manifests (display name, LLM protocol,
   CLI, image) for the submit form; `HarnessConfigIn.adapter` validates
   against the registry. Design doc: `docs/p25-harness-adapters.md`.
 - **Where:** `adapters/common/` (`runner.py`, `contract.py`),
-  `adapters/{codex,claude_code,pi,deepseek}/` (`adapter.py`, `config.py`,
-  `translate.py`, `__main__.py`), `orchestrator/adapters.py`,
+  `adapters/{codex,claude_code,pi,deepseek,aider}/` (`adapter.py`, `config.py`,
+  `translate.py`, `__main__.py`; aider also `launcher.py` — the patched
+  entrypoint that lifts aider's explicit-yes gate on suggested shell
+  commands), `orchestrator/adapters.py`,
   `orchestrator/provision.py`, `sandbox/images/{codex,claude_code,pi,
-  deepseek}.Dockerfile`, `api/routers/harnesses.py`
+  deepseek,aider}.Dockerfile`, `api/routers/harnesses.py`
 - **Verify:**
   - Unit: `tests/unit/adapters/test_adapter_contract.py` (contract across all
     adapters: manifest, image_spec, env, launch, translation → valid
@@ -523,6 +560,71 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     scored run; cost dropdown reprices the cost + split charts client-side.
 - **Depends on:** F6 (events), F7 (scores), F8 (results page), F9
   (analytics aggregation)
+
+### F14 — Eval iteration: re-score + versioned rubrics ✅
+
+- **What:** iterate on evaluation after a run finishes — without touching
+  participant sandboxes:
+  - **Post-run rubric edits** (`POST /api/runs/{id}/rubrics`): edits to a
+    completed run's rubric are persisted as a NEW `Rubric` row
+    (`version = max+1`, `parent_id` → the edited row, `status="approved"`);
+    the previous approved version is marked `superseded`, never mutated.
+    Old `Score` rows keep pointing at their original rubric version.
+  - **Re-score** (`POST /api/runs/{id}/rescore`): re-runs the evaluator on
+    stored artifact snapshots for terminal (`done`/`failed`) runs —
+    `done|failed → evaluating → done|failed` via the dedicated
+    `orchestrator.lifecycle.rescore_run` task (registered as `rescore` in
+    the runner task registry; a concurrent trigger → 409). Optional
+    `rubric_id` pin, `sandbox_ids` subset, and judge `model` override.
+    `POST …/rubrics` with `rescore=true` creates the version and queues
+    the re-score in one request. `_rescore_run` itself refuses non-
+    terminal runs (defense-in-depth — `evaluating` is admitted only with
+    a rescore marker, i.e. the API pre-transition), and the empty-pass
+    retry checks the score-count DELTA over the pre-pass baseline so
+    stale rows don't satisfy it; `rescore_finished` is always emitted
+    (error included on crash).
+  - **Score provenance:** every `Score` carries `rubric_id` +
+    denormalized `rubric_version` (stamped at write time, survives rubric
+    lookups). `GET /api/runs/{id}/results?rubric_version=N` filters the
+    matrix to one version's scores; the default view is per-sandbox
+    newest-wins (created_at, seq insertion-order tiebreak). `GET
+    /api/runs/{id}/rubrics`
+    lists versions + score counts; `GET /api/rubrics/{id}` returns one
+    version incl. content (prefills the editor).
+  - **Events stay append-only:** `rescore_requested` /
+    `rescore_started` / `rescore_finished` / `rubric_version_created`
+    checkpoints; eval `started`/`scored` payloads carry
+    `rubric_id`+`rubric_version`.
+  - **UI:** results page gains a "Re-score & rubric versions" card —
+    version selector (latest = newest-wins), re-score button, JSON rubric
+    editor that saves as the next version (+ optional re-score); per-
+    sandbox "judged: rubric vN" provenance in the matrix header.
+  - **Crash semantics:** an api restart mid-re-score keeps the startup-
+    sweep rule — an `evaluating` run carrying a `rescore_requested`/
+    `rescore_started` checkpoint with ≥1 Score row recovers to `done`
+    (a first-pass eval has no marker and still fails), so an
+    interrupted re-score doesn't demote a previously-done run.
+- **Where:** `db/models.py` (`Rubric.parent_id`, `Score.rubric_version`,
+  `uq_rubrics_run_version` unique constraint) +
+  migration `b3e7a1c9d2f4`; `orchestrator/rubric.py`
+  (`create_rubric_version`), `orchestrator/lifecycle.py` (`rescore_run`,
+  `_evaluate_all` refactor), `orchestrator/runner.py`
+  (`start_rescore_task`, `_track` coroutine-factory dedup),
+  `orchestrator/state_machine.py` (`done|failed → evaluating`);
+  `evaluator/evaluate.py` (`rubric_version` kwarg → Score rows + event
+  payloads); `api/routers/results.py` (rubrics/rescore endpoints, version
+  filter); `web/lib/api.ts`,
+  `web/app/runs/[id]/results/RescoreControls.tsx` + `ResultsClient.tsx`.
+- **Verify:**
+  - Unit: `tests/unit/orchestrator/test_rescore.py` (rescore_run paths,
+    task dedup, sweep rescue), `tests/unit/api/test_results.py`
+    (endpoints, guards, version filter), `tests/unit/evaluator/
+    test_evaluate.py` (provenance stamping), `test_state_machine.py`.
+  - API: `POST /api/runs/<id>/rescore` on a finished run → 202 → new
+    Score rows with the pinned `rubric_version`.
+  - UI: results page → pick an older version → matrix shows that pass's
+    scores; edit rubric → save & re-score → run returns to `evaluating`.
+- **Depends on:** F7 (evaluator), F8 (results page), F4 (artifact store)
 
 ## Implementation sequence
 

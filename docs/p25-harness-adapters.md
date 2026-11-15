@@ -7,7 +7,7 @@ these can be the defaults for now."
 This document captures the research + decisions so reviewers don't have to
 redo them. Where the ask was ambiguous the call made is recorded and flagged.
 
-## What the four harnesses are
+## What the harnesses are
 
 | Adapter name | Upstream | Install | Non-interactive mode | Wire protocol |
 |---|---|---|---|---|
@@ -16,6 +16,7 @@ redo them. Where the ask was ambiguous the call made is recorded and flagged.
 | `codex` | `codex` (OpenAI, `@openai/codex` npm) | `npm i -g` | `codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox` | OpenAI **Responses** (`/v1/responses`) |
 | `pi` | `pi` (`@mariozechner/pi-coding-agent`, badlogic/pi-mono) | `npm i -g` | `pi --mode json --provider heg --model <id>` | OpenAI chat completions (`openai-completions`) |
 | `deepseek` | `dsh` (`@deepseek-ai/dsh`, deepseek-ai/deepseek-harness) | `npm i -g` | `dsh --profile headless --json <task>` | DeepSeek "Messages" API (Anthropic-compatible per its docs) |
+| `aider` (PR13) | `aider` (`aider-chat` pip, Aider-AI/aider) | `pip install` | `aider --yes-always --message <task>` | OpenAI chat completions via litellm's `openai` provider |
 
 Ambiguities resolved:
 
@@ -44,7 +45,9 @@ base URL:
 
 So the gateway stays a **pure pass-through with metering** — no protocol
 translation. Each new endpoint gets: cred auth → run-budget gate → forward to
-`OLLAMA_UPSTREAM_URL` verbatim → `llm_request`/`llm_response`/`error` events.
+the resolved upstream verbatim (`OLLAMA_UPSTREAM_URL` by default;
+`PROVIDER_ROUTES` model globs or — for service creds — an `x-heg-provider`
+header can route to a hosted provider) → `llm_request`/`llm_response`/`error` events.
 For `stream: true` bodies the response is an SSE stream that is tee'd to the
 client while usage is scraped from the terminal SSE events
 (`message_start`/`message_delta` for Anthropic, `response.completed` for
@@ -102,12 +105,13 @@ docker CMD: python3 -m adapters.<name>
          TASK_PROMPT, WORKSPACE, SKILLPACKS_ROOT, EVENTS_INGEST_URL,
          SYSTEM_PROMPT_EXTRA)
       2. write harness-native config (codex config.toml, pi models.json,
-         claude .claude.json, dsh cordis.patch.yml)
+         claude .claude.json, dsh cordis.patch.yml, aider .aider.conf.yml)
       3. emit run_started
       4. spawn CLI argv (cwd=/workspace, stderr merged into stdout)
-      5. per JSONL stdout line: echo raw line to stderr (transcript) +
-         translate → normalized events → stdout JSONL + POST /internal/events
-         (cred auth → run/sandbox ids stamped)
+      5. per stdout line: echo raw line to stderr (transcript) + translate
+         → normalized events → stdout JSONL + POST /internal/events (cred
+         auth → run/sandbox ids stamped); JSONL CLIs feed translate(obj),
+         aider's plain text feeds translate_text (see the aider section)
       6. on exit: emit terminal_state + print `HEG_RESULT {json}` marker;
          exit 0, or 2 on error
 ```
@@ -197,20 +201,71 @@ Event mapping conventions across CLI harnesses:
   `tool_result`(error)→error, `final`→terminal (reason.kind=="completed"
   →harness_complete else error), `error`→error.
 
+### aider (`heg-sandbox-aider:latest`) — PR13
+
+- First Python-CLI adapter: `python:3.12-slim` + `pip install
+  aider-chat==0.86.2` (not the npm pattern) + `git` (aider auto-initializes
+  the workspace repo and auto-commits applied edits — the commits double
+  as `Commit <sha>` checkpoint events and a reviewable git log in the
+  artifact). `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env supplies identity.
+- Shim writes `$HOME/.aider.conf.yml` — configargparse merges conf files
+  home → git-root → CWD, so a conf in the workspace would actually
+  *override* the shim's; relying on HOME is only safe because the sandbox
+  workspace starts conf-free (and it keeps the file out of the artifact).
+  Contents: `openai-api-base: <gw>/v1`, `model`/`weak-model:
+  openai/<model>` (the `openai/` prefix is aider's litellm route to
+  OpenAI-compatible endpoints; weak-model covers commit messages +
+  history summarization — pinning it to the run model keeps the
+  comparison axis clean), `yes-always`, `auto-commits`, `dirty-commits`,
+  `suggest-shell-commands` + `edit-format: diff` (how `done` gets
+  invoked — aider 0.86.2 falls back to `whole` for unrecognized
+  `openai/*` model names, and WholeFileCoder never extracts suggested
+  shell commands; the suggestion's ``` fence also makes the whole reply
+  fail edit parsing), `detect-urls:
+  false`, `check-update: false`, `show-release-notes: false`,
+  `analytics-disable: true`, `pretty: false`, `stream: false`,
+  `fancy-input: false`, and history-file relocation into `$HOME`.
+  Cred stays in env (`OPENAI_API_KEY`), never on
+  disk; `OPENAI_API_BASE` + `OPENAI_BASE_URL` both set (litellm ≥1.68
+  renamed the canonical var and briefly broke `openai-api-base`).
+- **No JSONL mode** — aider prints a human transcript only. The shim
+  gains a `translate_text(line)` hook in `run_shim` (and
+  `contract.cli_translate_events`): an ordered regex table maps status
+  lines → events (`Applied edit to`→file_op, `Running`→shell_command,
+  `Tokens:`→checkpoint llm_usage, `Commit`→checkpoint commit,
+  `Finished summarizing`→context_compacted, `did not conform`/litellm
+  failures→error). JSON-looking lines are dropped by `translate_obj`
+  (they can only be echoed command output — translating them would let
+  candidate files forge events).
+- `agent_done` works because aider runs suggested shell commands → the
+  prompt footer's `/usr/local/bin/done` call POSTs `/internal/done` like
+  every other adapter. One upstream wrinkle: aider 0.86.2 marks "Run
+  shell command?" `explicit_yes_required`, which resolves to "n" under
+  `--yes-always` (`io.py` — the gate protects interactive users from
+  running suggested commands sight-unseen). The shim therefore spawns
+  `adapters.aider.launcher` instead of the `aider` script: it clears the
+  flag on `InputOutput.confirm_ask` only while `yes` is set, then
+  delegates to `aider.main:main` — `--yes-always` keeps its documented
+  "say yes to every confirmation" meaning in a headless context.
+- Verified argv basis: `aider --yes-always --message` is the documented
+  headless form (spawned via the `adapters.aider.launcher` entrypoint);
+  headless flag set cross-checked against GitHub's gh-aw aider engine
+  manifest (0.86.2).
+
 ## Version pins (reproducible images)
 
 `@openai/codex@0.169.0` · `@anthropic-ai/claude-code@2.1.325` ·
 `@mariozechner/pi-coding-agent@0.73.1` · `@deepseek-ai/dsh@0.2.2-rc.1`
-(dsh only ships rc tags — latest at write time). Each Dockerfile records the
-pin + the research URL.
+(dsh only ships rc tags — latest at write time) · `aider-chat==0.86.2`
+(pip — the Python CLI). Each Dockerfile records the pin + the research URL.
 
 ## Egress / creds
 
 All harness traffic goes through the gateway with the per-sandbox `heg.*`
 cred — each adapter maps it onto the CLI's expected credential env
-(`HEG_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `DEEPSEEK_API_KEY`, models.json
-`apiKey`). Sandboxes stay on the `--internal` `heg-sandbox` network; the only
-egress is `http://gateway:8080`.
+(`HEG_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`,
+models.json `apiKey`). Sandboxes stay on the `--internal` `heg-sandbox`
+network; the only egress is `http://gateway:8080`.
 
 ## Known gaps / follow-ups
 
@@ -227,5 +282,16 @@ egress is `http://gateway:8080`.
 - npm >=11 blocks postinstall scripts by default; dsh's
   `@deepseek-ai/dsh-subprocess-local` spawn-helper install script is
   skipped — the CLI still runs (verified live) but native subprocess/pty
-  helpers are unbuilt. If dsh needs them later, add `--allow-scripts` for
-  its package set in the Dockerfile.
+  helpers are unbuilt. **PR13 decision: skip `--allow-scripts`.** The
+  roadmap only sanctions enabling it if evals hit TTY-dependent tasks —
+  none have (every shipped adapter runs end-to-end on the portable
+  fallbacks), and allowing postinstall scripts widens the supply-chain
+  surface for zero demonstrated need. Revisit the moment an eval fails on
+  dsh's pty/native-subprocess path; enabling = `--allow-scripts` for dsh's
+  package set in `sandbox/images/deepseek.Dockerfile`.
+- aider emits no JSONL stream (PR13) — mid-run events come from the
+  heuristic `translate_text` line table, so its timeline is coarser than
+  the JSONL adapters' (no per-turn tool_call ids, no assistant-text
+  events; the raw transcript still lands in `docker logs`). If aider ever
+  ships a machine-readable mode, switch `adapters/aider` to it and retire
+  the regex table.

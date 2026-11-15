@@ -23,6 +23,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
     func,
 )
@@ -122,15 +123,30 @@ class Event(Base):
 
 
 class Rubric(Base):
-    """Scoring spec for a run; frozen (status=approved) before launch."""
+    """Scoring spec for a run; frozen (status=approved) before launch.
+
+    Post-run edits append NEW rows (PR5): ``version`` increments,
+    ``parent_id`` points at the version the edit was based on, and the
+    previous approved row is marked ``superseded`` — the old row stays so
+    scores written against it keep their provenance.
+    """
 
     __tablename__ = "rubrics"
+    __table_args__ = (
+        # One row per (run, version) — concurrent version-creating POSTs
+        # must collide on this, not silently duplicate a version number.
+        UniqueConstraint("run_id", "version", name="uq_rubrics_run_version"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     run_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("runs.id"), index=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
+    # Self-FK: the rubric version this one was edited from (null for v1).
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("rubrics.id"), index=True
+    )
     content: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
-    # draft | approved
+    # draft | approved | superseded
     status: Mapped[str] = mapped_column(String(16), default="draft")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -146,6 +162,14 @@ class Score(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     sandbox_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("sandboxes.id"), index=True)
     rubric_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("rubrics.id"), index=True)
+    # Denormalized copy of rubrics.version at insert time (PR5) — keeps old
+    # vs new re-score rows distinguishable without a join.
+    rubric_version: Mapped[int | None] = mapped_column(Integer)
+    # Durable insertion order (PR5) — the evaluator stamps max(seq)+1 per
+    # pass so the newest-wins merge can break created_at ties (sqlite
+    # stores seconds) without guessing from rubric_version. NULL = legacy
+    # or unstamped rows; sorted first.
+    seq: Mapped[int | None] = mapped_column(BigInteger)
     dimension: Mapped[str] = mapped_column(String(128))
     score: Mapped[float] = mapped_column(Float)
     rationale: Mapped[str] = mapped_column(Text, default="")
