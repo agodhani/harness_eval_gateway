@@ -1575,22 +1575,14 @@ def test_resolve_artifact_dir_outside_jail(tmp_path: Path) -> None:
     )
 
 
-def test_resolve_artifact_dir_must_exist(tmp_path: Path) -> None:
-    """Missing dir → None by default; must_exist=False returns the path."""
+def test_resolve_artifact_dir_missing(tmp_path: Path) -> None:
+    """Missing dir → None."""
     assert (
         resolve_artifact_dir(
             jail=tmp_path, run_id="r1", sandbox_id="s1", artifact_path=None
         )
         is None
     )
-    got = resolve_artifact_dir(
-        jail=tmp_path,
-        run_id="r1",
-        sandbox_id="s1",
-        artifact_path=None,
-        must_exist=False,
-    )
-    assert got == (tmp_path / "r1" / "s1").resolve()
 
 
 def test_resolve_artifact_dir_artifact_path_fallback(tmp_path: Path) -> None:

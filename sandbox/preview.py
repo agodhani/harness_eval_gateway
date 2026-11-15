@@ -289,18 +289,15 @@ def resolve_artifact_dir(
     run_id: str,
     sandbox_id: str,
     artifact_path: str | None,
-    must_exist: bool = True,
 ) -> Path | None:
     """Return the sandbox's artifact dir, jailed under ARTIFACT_ROOT.
 
     ``Sandbox.artifact_path`` is tried first (it's where the snapshot actually
     landed), then the conventional ``<jail>/<run_id>/<sandbox_id>`` layout —
-    both must resolve inside ``jail``. The artifact dir holds ``workspace/``
-    plus sidecar files (``analysis.json``, ``thumbnail.png`` — PR4) that are
-    jailed reads/writes for the api, never bind-mounted themselves.
-
-    ``must_exist`` (default) requires the dir to exist on disk; pass False
-    when the caller only needs the would-be location.
+    both must resolve inside ``jail`` and exist on disk. The artifact dir
+    holds ``workspace/`` plus sidecar files (``analysis.json``,
+    ``thumbnail.png`` — PR4) that are jailed reads/writes for the api,
+    never bind-mounted themselves.
     """
     try:
         jail = jail.resolve()
@@ -318,7 +315,7 @@ def resolve_artifact_dir(
             continue
         if not _within(resolved, jail):
             continue
-        if must_exist and not resolved.is_dir():
+        if not resolved.is_dir():
             continue
         return resolved
     return None
