@@ -58,6 +58,11 @@ services:
       HOST_DATA_ROOT: ${PWD}/data
       # Optional: pin a different rubric-drafting model (default: run's model).
       RUBRIC_MODEL: ${RUBRIC_MODEL:-}
+      # Per-request output caps for the rubric draft + eval judge calls —
+      # thinking models burn tokens on <think> blocks; small caps truncate
+      # rubric JSON / scores.json into unparseable output.
+      RUBRIC_MAX_TOKENS: ${RUBRIC_MAX_TOKENS:-8192}
+      EVAL_JUDGE_MAX_TOKENS: ${EVAL_JUDGE_MAX_TOKENS:-8192}
       # Optional GitHub PAT for skillpack import (F11) — private repos +
       # higher rate limits; public repos work without it.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
@@ -121,9 +126,20 @@ services:
       INGEST_TOKEN: dev-ingest-token
       GATEWAY_CRED_SECRET: dev-secret-change-me
       DEFAULT_RUN_TOKEN_BUDGET: "200000"
+      # PR18 — opt-in response cache for deterministic replay (dev/CI aid;
+      # keep off for real runs). Path lives under the ./data mount below so
+      # the store survives container rebuilds.
+      GATEWAY_CACHE_ENABLED: ${GATEWAY_CACHE_ENABLED:-false}
+      GATEWAY_CACHE_PATH: ${GATEWAY_CACHE_PATH:-/data/gateway_cache.sqlite3}
+      GATEWAY_CACHE_MAX_ENTRIES: ${GATEWAY_CACHE_MAX_ENTRIES:-10000}
+      GATEWAY_CACHE_NAMESPACE: ${GATEWAY_CACHE_NAMESPACE:-v1}
       LOG_LEVEL: INFO
     ports:
       - "8081:8080"
+    volumes:
+      # Only needed when the replay cache is enabled — persists the sqlite
+      # store (same ./data tree the api mounts).
+      - ./data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

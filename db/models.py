@@ -44,7 +44,8 @@ class Run(Base):
     __tablename__ = "runs"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    # submitted | rubric_review | provisioning | running | evaluating | done | failed
+    # submitted | rubric_review | queued (PR15 pacing: parked behind the
+    # active run) | provisioning | running | evaluating | done | failed
     status: Mapped[str] = mapped_column(String(32), default="submitted", index=True)
     task_prompt: Mapped[str] = mapped_column(Text)
     model_name: Mapped[str] = mapped_column(String(255))
@@ -116,9 +117,9 @@ class Event(Base):
     seq: Mapped[int | None] = mapped_column(BigInteger)
     # gateway | harness | sandbox | evaluator | orchestrator
     source: Mapped[str] = mapped_column(String(32))
-    # llm_request | llm_response | tool_call | shell_command | file_op |
-    # test_execution | checkpoint | skill_invocation | done_signal | error |
-    # run_started | terminal_state | context_compacted | miniloop_result
+    # llm_request | llm_response | tool_call | tool_result | shell_command |
+    # file_op | test_execution | checkpoint | skill_invocation | done_signal |
+    # error | run_started | terminal_state | context_compacted | miniloop_result
     # (authoritative list: api/schemas.py EventType — keep in sync)
     type: Mapped[str] = mapped_column(String(64))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)

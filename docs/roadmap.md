@@ -20,6 +20,11 @@ append-mostly; rebase on main before merge.
   the plan — `static` serves any jailed file, `desktop` requires `.py`) and a
   `ScanCache`'d results-GET probe (`PREVIEW_SCAN_TTL_SECONDS`, default 30s).
   Details: `FEATURE_MAP.md` F12.
+- **PR3 preview types**: `python-server` (web apps via `heg-preview-server`
+  + listen-socket relay runner) and desktop GUI stacks beyond pygame
+  (pyglet/arcade/tkinter — baked deps, zero-egress preview nets). Shared
+  `_spawn_isolated` runner+sidecar topology; `_PROXIED_PORTS` per-type port
+  resolution. Details: `FEATURE_MAP.md` F12.
 - **PR9 timeline-side analytics**: per-sandbox metrics strip on
   `web/app/runs/[id]/timeline/` (turns/tokens/latency/cost/errors chips +
   judge line; chips double as sandbox-filter selectors; `sandboxStrips`
@@ -53,6 +58,15 @@ append-mostly; rebase on main before merge.
   onto paid upstreams; caller `anthropic-beta`/`anthropic-version` headers
   forward to the anthropic upstream. Emitted `llm_*`/`error` events record
   the resolved provider.
+- **Gateway response cache / deterministic replay** (PR18): opt-in
+  `GATEWAY_CACHE_ENABLED` (off by default); sqlite store
+  (`gateway/cache.py`, `GATEWAY_CACHE_PATH`) keyed on
+  `namespace+path+provider+outgoing-body` — hits replay byte-verbatim with
+  `x-heg-cache: hit`, emit `llm_*` events marked `payload.cached: true`,
+  and still count toward the run budget (gate runs before lookup). Only
+  complete 2xx bodies stored; `count_tokens`/`/v1/models` bypass;
+  `GATEWAY_CACHE_NAMESPACE` bump invalidates; `GATEWAY_CACHE_MAX_ENTRIES`
+  LRU bound.
 - **PR5 — Eval iteration** (F14): re-score on stored artifacts
   (`POST /api/runs/{id}/rescore` → `lifecycle.rescore_run`), versioned
   post-run rubric edits (`parent_id` chain, `Score.rubric_version`/`seq`
@@ -63,6 +77,19 @@ append-mostly; rebase on main before merge.
   NDJSON progress (control-plane creds only), named harness configs
   (`sandboxes.name`, default `<adapter>-<shortid>`). Details:
   `FEATURE_MAP.md` F15.
+- **PR17 — hook/plugin telemetry lane**: shared receiver
+  `adapters/common/hooks.py` (`python3 -m adapters.common.hooks <adapter>`)
+  wired to claude_code `settings.json` hooks (stdin), codex `notify`
+  (argv), and pi's generated `heg-events.ts` extension (stdin); per-adapter
+  `translate_hook` normalizes payloads stamped `via: "hook"`; new
+  `tool_result` EventType carries tool outcomes. Details: FEATURE_MAP.md
+  F10 + docs/p25-harness-adapters.md §PR17.
+- **PR15 — Run pacing** (`queued` run status + `orchestrator/pacing.py`):
+  `place_run`/`claim_next_queued` FIFO promotion via
+  `runner._lifecycle_then_promote` + `startup_sweep` re-kick; `spawn_one`
+  waits on `SPAWN_MIN_FREE_MEM_MB` headroom capped by
+  `SPAWN_MEM_WAIT_SECONDS` (timeout fails that sandbox, siblings fail
+  fast). Details: `FEATURE_MAP.md` F2.
 
 ## Dependency DAG
 
@@ -128,15 +155,21 @@ PR2 and PR6 landed). Max safe concurrency ≈ 9 lanes.
 `type=` POST-body override + `ScanCache`'d results-GET probe — see "Already
 landed" and `FEATURE_MAP.md` F12.
 
-### PR3 — Preview types
+### PR3 — Preview types — ✅ landed
 - **Scope:** `python-server` preview type (run candidate code like desktop —
   needs the runner+socat-proxy topology, zero-egress internal net);
   more desktop types: pyglet/arcade/tkinter (baked deps or wheelhouse mount —
   no egress in preview nets).
-- **Touch:** `sandbox/preview.py` (`scan_preview` candidates, `_spawn_*`),
-  `api/routers/preview.py`, `sandbox/images/*-preview.Dockerfile`,
-  `PreviewControls.tsx`, `api/config.py` `PREVIEW_*`.
-- **Verify:** `tests/integration/test_preview.py` (@pytest.mark.docker).
+- **Landed:** `python-server` spawns `heg-preview-server` (baked flask/
+  fastapi/django/aiohttp/bottle/tornado/gunicorn) + `server-preview-runner.py`
+  which detects the app's first LISTEN socket via `/proc/net/tcp{,6}` and
+  relays `:8000` → actual port (direct when the app already binds non-loopback
+  `:8000`; `manage.py` → `runserver 0.0.0.0:8000 --noreload`). Desktop image
+  gained pyglet/arcade/tkinter (multi-stage wheels build — pymunk has no
+  aarch64 wheel; system `tk` + mesa GL libs). `_spawn_desktop`/`_spawn_server`
+  share `_spawn_isolated`; `_PROXIED_PORTS` resolves sidecar ports per type.
+  `PREVIEW_TYPES` = {static, desktop, python-server}; `templates/` skipped in
+  scans (flask render dir). Details: `FEATURE_MAP.md` F12.
 
 ### PR4 — Artifact thumbnails
 - **Scope:** lightweight screenshots of produced artifacts for at-a-glance
@@ -248,13 +281,9 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
   PR12 (needs >1 usable provider to be interesting). **Stacked on
   `feat/pr1-submit-ux` @ `4d1e12d`.**
 
-### PR15 — Run pacing: submission queue + memory-aware scheduling
-- **Scope:** serialize runs so a new submission queues behind the active
-  one; gate `spawn_one` on host memory pressure (docker info/cgroup stats)
-  and queue pending sandboxes until headroom exists (matters at 8x).
-- **Touch:** `orchestrator/runner.py`, `orchestrator/provision.py`,
-  `orchestrator/monitor.py`, run state machine (queued state?).
-- **Verify:** unit tests with stubbed memory readings + queue ordering.
+### PR15 — Run pacing: submission queue + memory-aware scheduling — ✅ landed
+`queued` run status + `orchestrator/pacing.py` — see "Already landed" and
+`FEATURE_MAP.md` F2.
 
 ### PR16 — "Add next prompt" (multi-turn runs)
 - **Scope:** continue a finished sandbox with a follow-up prompt on the
@@ -264,15 +293,30 @@ results API embeds `SandboxResult.analysis`. Paths + tests: FEATURE_MAP F7.
   sandbox runtime (resume semantics), run detail UI.
 - **Depends on:** PR15 (same files; pacing settles first).
 
-### PR17 — Higher-fidelity instrumentation via hooks/plugins
-- **Scope:** richer agent-level events via harness hooks/plugins where the
-  CLIs support them (beyond adapter-translated output).
-- **Touch:** `adapters/common/` shim, `api/schemas.py` EventType (maybe new
-  types — contract test AST-scans emitters), adapter translate fns.
+### PR17 — Higher-fidelity instrumentation via hooks/plugins — ✅ landed
+Landed as the hook/plugin telemetry lane: `adapters/common/hooks.py` shared
+receiver (right-to-left argv dict-JSON scan → select-gated bounded stdin,
+always exit 0, JSONL mirror to stderr only) + per-adapter `translate_hook`
+paired with `MANIFEST["hooks"]` (contract-tested). claude_code
+`settings.json` hooks (`PostToolUse` → `tool_result`; lifecycle /
+notification → `checkpoint`), codex `notify` (`agent-turn-complete` →
+`checkpoint` + `last-assistant-message`), pi generated
+`extensions/heg-events.ts` (`tool_execution_end` → `tool_result`);
+deepseek/miniloop stay translated-only. New `tool_result` EventType carries
+tool outcomes; `via: "hook"` stamped on every hook payload. Details:
+FEATURE_MAP F10, docs/p25-harness-adapters.md §PR17.
 
-### PR18 — Gateway response caching / deterministic replay
+### PR18 — Gateway response caching / deterministic replay ✅ landed
 - **Scope:** cache upstream responses keyed on request for deterministic
   replay (dev/CI aid — cheap reruns).
+- **Landed:** `gateway/cache.py` sqlite store keyed on
+  `namespace + path + provider + outgoing-body`; opt-in
+  `GATEWAY_CACHE_*` flags (off by default); hits replay byte-verbatim
+  (`x-heg-cache: hit`), still emit `llm_*` events with `payload.cached:
+  true`, re-meter stored usage against the run budget, and the budget gate
+  runs before lookup — replays accrue + 429 identically to live runs. Only
+  complete 2xx bodies stored; unmetered probes bypass; failures degrade to
+  miss. Details: `FEATURE_MAP.md` F3.
 - **Touch:** `gateway/` (cache layer in proxy path, config flags).
 - **Depends on:** PR12 (gateway churn settles).
 

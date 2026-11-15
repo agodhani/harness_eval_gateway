@@ -92,16 +92,18 @@ finished_at, sandbox_count). `same_model_eval` =
 | `GET /api/runs/{id}` | `RunOut` incl. sandboxes + latest rubric. 404. |
 | `GET /api/runs/{id}/rubric` | Latest `Rubric` by version. 404 if none. |
 | `PUT /api/runs/{id}/rubric` | Body `{"content": RubricContent}` — only when `run.status=="rubric_review"` **and** `rubric.status=="draft"`; replaces `content` in place (version stays 1). Else 409. 422 on schema violation. |
-| `POST /api/runs/{id}/approve` | Same preconditions as PUT; sets `rubric.status="approved"`, transitions run → `provisioning`, sets `started_at`, emits orchestrator event, `runner.start_lifecycle_task(run_id)`. → `RunOut`. |
+| `POST /api/runs/{id}/approve` | Same preconditions as PUT; sets `rubric.status="approved"`, sets `started_at`, emits orchestrator event, `pacing.place_run` → `provisioning` + `runner.start_lifecycle_task(run_id)`, or parks in `queued` when another run holds the execution slot (FIFO promotion on lifecycle end / startup sweep — PR15). → `RunOut`. |
 
 Submit-time validation → 422: `adapter ∈ ADAPTERS`, every `skill_packs[]` entry
 is a dir under `./skillpacks/`, non-empty `task_prompt`/`model_name`,
 `evaluator_model` defaults to `model_name` when omitted.
 
 Statuses (db comment `models.py:46`): run =
-`submitted → rubric_review → provisioning → running → evaluating → done | failed`;
+`submitted → rubric_review → [queued →] provisioning → running → evaluating → done | failed`;
 sandbox = `provisioning | running | terminating | done | failed`
-(+ `terminal_reason`).
+(+ `terminal_reason`). `queued` (PR15 pacing) parks an approved run while
+another run holds the single execution slot; promotion is FIFO by approval
+time.
 
 ## 2. Rubric generation — `orchestrator/rubric.py`
 
@@ -137,9 +139,12 @@ LLM call can take minutes on a 3B model).
 
 ## 3. Provisioning — `orchestrator/provision.py` + `lifecycle.py`
 
-`run_lifecycle(run_id)` (the approve-triggered task) does, sequentially:
+`run_lifecycle(run_id)` (the approve/promotion-triggered task) does,
+sequentially:
 
-1. `run.status="provisioning"` (already set at approve; emit `checkpoint`).
+1. `run.status="provisioning"` (set by `place_run` at approve, or by
+   `claim_next_queued` when a parked run is promoted — PR15; emit
+   `checkpoint`).
 2. **Per `harness_config`** (N ≤ 8, sequential `to_thread` calls — docker run
    ≈1 s each):
    - `sid = uuid4()`; insert `Sandbox(id=sid, run_id, harness_config=cfg,
@@ -148,6 +153,12 @@ LLM call can take minutes on a 3B model).
    - Stage skillpacks: `shutil.copytree` each selected pack dir into
      `{rt.state_dir}/{sid}/skillpacks/` (empty list → empty dir). This dir is
      bind-mounted, so it must live under the host-visible state dir.
+   - Mem gate (PR15): `await pacing.wait_for_headroom(...)` — bounded wait
+     for `SPAWN_MIN_FREE_MEM_MB` host headroom before cred mint/`docker run`
+     (probe chain `/proc/meminfo` → `sysconf` → `docker info`+`stats`;
+     unreadable → proceed ungated). Expiry (`SPAWN_MEM_WAIT_SECONDS`) fails
+     THIS sandbox like a spawn error; the recorded `spawn_mem_timeout`
+     collapses remaining configs' waits to a single probe each.
    - Mint cred: `ttl_seconds = wall_clock + 3600`, `max_tokens = token_budget`.
    - `env = adapter.env(gateway_url="http://gateway:8080",
      cred, task_prompt, model_name, events_ingest_url=
@@ -191,10 +202,13 @@ Each iteration (DB reads via short-lived sessions on the event-loop thread):
 
 1. **Deadline:** `now > sandbox.started_at + wall_clock_seconds` → terminate
    `timeout`.
-2. **Budget:** any `error` event for this sandbox with
-   `payload.reason=="budget_exceeded"` or `http_status==429` → terminate
-   `budget_exceeded`. Also `metering.tokens_used(run_id) >= token_budget` →
-   terminate `budget_exceeded` (run-wide; all monitors trip ~together — the
+2. **Budget/provider:** gateway `error` events for this sandbox —
+   `payload.reason=="budget_exceeded"` / `stage=="budget"` (the gateway's own
+   run-budget 429 signature, NOT a bare `http_status==429`) → terminate
+   `budget_exceeded`; `stage=="upstream"` provider failures (rate-limit 429s,
+   5xx, unreachable) ≥ `UPSTREAM_ERROR_THRESHOLD` (3) → terminate `error`.
+   Also `metering.tokens_used(run_id) >= token_budget` → terminate
+   `budget_exceeded` (run-wide; all monitors trip ~together — the
    gateway will 429 stragglers anyway).
 3. **Container state** (`to_thread(rt.status, sid)`):
    - `running` → check `done_signal` event seen; if older than
@@ -224,7 +238,8 @@ Mapping table (first match wins; `MINILOOP_RESULT` carries `terminal_state`):
 | result=`stuck_loop` | `stuck_loop` | done |
 | result=`error`, exit 2, other nonzero, missing | `error` | failed |
 | wall-clock deadline | `timeout` | failed |
-| gateway 429 / budget event | `budget_exceeded` | failed |
+| gateway budget-gate event (`reason=budget_exceeded`) | `budget_exceeded` | failed |
+| ≥3 gateway upstream-failure events (`stage=upstream`: provider 429/5xx/outage) | `error` | failed |
 
 ## 5. Evaluation trigger + contract — `orchestrator/lifecycle.py` tail, `evaluator/`
 
@@ -265,14 +280,17 @@ total `Score` rows for the run == 0 → `run.status="failed"` + error event
 ## 6. Concurrency & edge cases
 
 - **N sandboxes parallel:** monitor tasks via `asyncio.gather`; provisioning
-  sequential (cheap, simpler DB handling).
+  sequential (cheap, simpler DB handling). Runs themselves serialize — one
+  execution slot, excess approvals park `queued` (PR15, §1).
 - **Partial failure:** spawn/eval failures are per-sandbox; run still reaches
   `done` if ≥1 sandbox produced scores. All-spawn-fail or zero-score → `failed`.
 - **api restart:** lifespan `startup_sweep` (`orchestrator/runner.py`):
   `submitted` runs with no rubric → respawn rubric task; `provisioning`/
   `running`/`evaluating` → `failed` (+ sandboxes `failed`/`error`, best-effort
   `docker rm -f` by `heg.run_id` label). `rubric_review` untouched (human
-  gate). In-process tasks die with the process — accepted MVP limitation,
+  gate); `queued` untouched too (no in-process task to lose) — the sweep
+  finishes by promoting the oldest queued run (`promote_next_queued`).
+  In-process tasks die with the process — accepted MVP limitation,
   documented.
 - **Duplicate submit:** no idempotency for MVP — each POST creates a run;
   UI disables double-submit. Note for post-MVP.
@@ -303,7 +321,11 @@ orchestrator/
   lifecycle.py       # run_lifecycle(run_id): provision -> gather monitors ->
                      #   evaluate -> done/failed
   runner.py          # _TASKS registry {run_id: Task}; start_rubric_task,
-                     #   start_lifecycle_task, startup_sweep, shutdown
+                     #   start_lifecycle_task, promote_next_queued,
+                     #   startup_sweep, shutdown
+  pacing.py          # PR15: place_run/claim_next_queued (queued status =
+                     #   the queue, FIFO by started_at); wait_for_headroom
+                     #   spawn mem gate (SPAWN_MIN_FREE_MEM_MB / *_WAIT_SECONDS)
 api/routers/runs.py  # §1 endpoints (thin: validate -> db -> runner calls)
 api/main.py          # include runs.router; lifespan -> runner.startup_sweep /
                      #   shutdown (use @asynccontextmanager lifespan)
@@ -349,15 +371,20 @@ Unit (`tests/unit/orchestrator/`, sqlite via `tests/conftest.py` pattern —
   SYSTEM_PROMPT_EXTRA); skillpack staging copies only selected packs;
   cred claims (`max_tokens`, `ttl`); `SandboxSpec.skillpacks_host_path` set.
 - `test_monitor.py` — verdict mapping table (fake runtime: status/logs/
-  events); deadline→`timeout`; 429 event→`budget_exceeded`; exit-code
+  events); deadline→`timeout`; budget-gate event→`budget_exceeded`;
+  upstream 429/5xx events→`error` at threshold (not budget); exit-code
   fallbacks; done-grace.
 - `test_lifecycle.py` — `FakeRuntime` (scripted statuses/logs) + fake
   evaluator: happy path 2 sandboxes→`done`+scores; one spawn fails→still
   `done`; all fail→`failed`; evaluator raises→`failed` only if zero scores.
+- `test_pacing.py` — `place_run`/`claim_next_queued` FIFO + single-slot
+  gate; `wait_for_headroom` probe chain, wait cap, sibling fail-fast on a
+  recorded `spawn_mem_timeout`; `promote_next_queued` claim retries.
 - `tests/unit/api/test_runs.py` — POST 201/422s (bad adapter, bad pack,
   empty configs); GET list/detail; PUT rubric guards (wrong status→409,
-  bad content→422); approve guards + transition to `provisioning`
-  (mock `runner.start_lifecycle_task`).
+  bad content→422); approve guards + `place_run` (`→ provisioning`, or
+  parked `queued` behind an active run) — mock
+  `runner.start_lifecycle_task`.
 
 Integration (`tests/integration/test_orchestrator.py`, `@pytest.mark.docker`):
 build `heg-testapp` + `heg-sandbox` images; run lifecycle with

@@ -81,8 +81,9 @@ adapters are added.
    flag when evaluator model == any participant model.
 2. **Control API + Orchestrator (FastAPI, async)** — validates submissions,
    expands run matrix, generates rubric via gateway, drives run state machine
-   (`submitted → rubric_review → provisioning → running → evaluating →
-   done | failed`), manages sandbox lifecycle, enforces termination policy.
+   (`submitted → rubric_review → [queued →] provisioning → running →
+   evaluating → done | failed`), manages sandbox lifecycle, enforces
+   termination policy, paces run/sandbox admission (below).
 3. **AI gateway (Python, custom)** — exposes an OpenAI-compatible
    (`/v1/chat/completions`) endpoint, translates to upstream providers
    (**Ollama is the default upstream for MVP** — small local models, e.g.
@@ -109,7 +110,17 @@ adapters are added.
 1. **Submit** — form → run spec (`POST /api/runs`).
 2. **Rubric draft** — orchestrator calls LLM via gateway → draft rubric →
    UI displays; user edits → approves → **frozen**, shared across sandboxes.
+   **Pacing (PR15):** runs serialize — one active run at a time; an approval
+   landing while a run executes (or is already queued) parks in `queued`
+   and promotes FIFO by approval when the slot frees (lifecycle end or the
+   next startup sweep). `started_at` = approval/queue-entry time.
 3. **Provision** — prepare identical initial repo; build/launch N sandboxes.
+   `spawn_one` additionally gates each `docker run` on host memory headroom
+   (`SPAWN_MIN_FREE_MEM_MB`, probed via `/proc/meminfo` → `sysconf` →
+   `docker info`+`stats`; unreadable probe = gate off). The wait is capped
+   by `SPAWN_MEM_WAIT_SECONDS` — expiry fails that one sandbox and makes
+   the remaining configs fail fast (one probe each), so sustained pressure
+   can't hold the run's slot for N×cap.
 4. **Execute** — agent loops; all model calls via gateway; adapter streams
    normalized events; UI shows live timeline.
 5. **Terminate** — each sandbox reaches a terminal state (below); workspace
@@ -128,7 +139,12 @@ Terminal states per sandbox:
 | `timeout` | Wall-clock cap hit |
 | `budget_exceeded` | Token/cost budget hit (enforced at gateway) |
 | `stuck_loop` | Repeated identical actions / retry cap hit |
-| `error` | Crash / unrecoverable failure |
+| `error` | Crash / unrecoverable failure / upstream provider outage |
+
+`budget_exceeded` keys on the gateway's own budget-gate event
+(`stage="budget"` + `reason="budget_exceeded"`) — a bare 429 from the
+*upstream provider* is NOT budget exhaustion: ≥3 `stage="upstream"` error
+events terminate the sandbox `error` instead.
 
 Provisional defaults (confirm with user): 60 min wall clock, $2 spend cap,
 stuck-loop = 3 consecutive identical tool calls.
@@ -143,8 +159,9 @@ done skill pack) that signals the orchestrator — `agent_done` is distinct from
 
 - **sources**: `gateway`, `harness`, `sandbox`, `evaluator`, `orchestrator`
 - **types**: `llm_request`, `llm_response` (tokens in/out, cache r/w, latency,
-  cost, model), `tool_call`, `shell_command`, `file_op`, `test_execution`,
-  `checkpoint`, `skill_invocation`, `done_signal`, `error`, `run_started`,
+  cost, model), `tool_call`, `tool_result` (hook-sourced tool outcomes),
+  `shell_command`, `file_op`, `test_execution`, `checkpoint`,
+  `skill_invocation`, `done_signal`, `error`, `run_started`,
   `terminal_state`, `context_compacted`, `miniloop_result` (authoritative
   list: `api/schemas.py::EventType` — a contract test AST-scans emitters)
 
@@ -152,6 +169,21 @@ Gateway events are captured passively from the request/response stream.
 Agent-level events (tool calls, shell, file ops) are produced by the harness
 adapter translating native output (e.g. Claude Code `--output-format
 stream-json`, Aider logs) or harness hooks where available.
+
+**Hook events (PR17):** harnesses with a native hook/plugin surface register
+the shared receiver `python3 -m adapters.common.hooks <adapter>` — payload
+JSON arrives on stdin (Claude Code `settings.json` hooks, pi's generated
+`heg-events.ts` extension) or argv (Codex `notify`), the adapter's
+`translate_hook` normalizes it, and events POST to `/internal/events` with
+`via: "hook"` stamped into the payload. The receiver always exits 0 and
+mirrors JSONL to stderr only (Claude injects SessionStart/UserPromptSubmit
+hook stdout into agent context). Hooked today: `claude_code` (PostToolUse →
+`tool_result`; session lifecycle → `checkpoint`), `codex`
+(agent-turn-complete → `checkpoint` incl. `last-assistant-message`), `pi`
+(tool_execution_end → `tool_result`). `deepseek` (no stable observer/plugin
+API — cordis loader internals only) and `miniloop` (our own agent, already
+first-class) stay on the translated path; new adapters opt in by adding
+`translate_hook` + a `MANIFEST["hooks"]` line (contract-tested pairing).
 
 ## Harness adapter contract
 
@@ -163,6 +195,9 @@ Each adapter provides:
 - `launch(task_prompt)` — start the agent loop (non-interactive mode)
 - `translate_events(stream)` → normalized `Event[]`
 - `completion_signal()` — how `done` / loop-completion is detected
+- *(optional)* `translate_hook` in `adapters/<name>/translate.py` + a
+  `MANIFEST["hooks"]` descriptor — wires the harness's native hook/plugin
+  surface into `adapters.common.hooks` (see Event model § hook events)
 
 **MVP adapter:** `miniloop` — our custom minimal coding agent (tool-call
 loop: shell exec, file read/write, `done`). Shipped CLI adapters (F10 +
@@ -204,7 +239,8 @@ applied identically to all sandboxes.
 ## Repo layout (proposed)
 
 ```
-gateway/       # LLM proxy: providers, metering, budgets, event emission
+gateway/       # LLM proxy: providers, metering, budgets, event emission,
+               # opt-in response cache (PR18 replay)
 orchestrator/  # run state machine, matrix expansion, rubric gen, lifecycle
 api/           # control-plane HTTP API (FastAPI app)
 adapters/      # harness adapters (miniloop + shipped CLI adapters)
@@ -241,7 +277,7 @@ or tests change.
 | F9 | Run analytics: per-sandbox metrics + estimated cost |
 | F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek, Aider) |
 | F11 | Skillpack import from GitHub (discover → select → import) |
-| F12 | Artifact preview (static html + desktop/pygame via noVNC) |
+| F12 | Artifact preview (static html + desktop GUI via noVNC + python-server web apps) |
 | F13 | Graphical analysis page + cross-run trends (recharts) |
 | F14 | Eval iteration: re-score runs + versioned rubric edits |
 | F15 | Submit UX: live model picker + install, named harness configs |
@@ -259,13 +295,6 @@ or tests change.
 - Higher-fidelity instrumentation via harness hooks/plugins
 - Gateway response caching / deterministic replay
 - Multi-host / K8s sandbox scaling
-- Memory-aware spawn scheduling — gate `spawn_one` on host memory pressure
-  (docker info / cgroup stats) and queue pending sandboxes until headroom
-  exists, instead of launching all N configs at once (matters at 8x)
-- Run submission queue — pace/serialize whole runs so a new submission waits
-  behind the active run instead of overlapping; combined with memory-aware
-  spawn scheduling this bounds concurrent sandboxes when >2 would exceed
-  headroom for the loaded model
 - Auth, saved run templates, share links
 - ~~Dynamic model picker~~ + ~~named harness configs~~ — **landed as F15**
 - Cross-run analytics & cost dashboards
@@ -278,13 +307,18 @@ or tests change.
   with a single-sandbox filter dropdown); scrolling/diff-alignment UX TBD
 - Lightweight artifact thumbnails — capture screenshots of produced artifacts
   for at-a-glance review before spawning a full live preview sandbox
-- Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.
-  (executes candidate code → needs hardened isolation; approved direction)
+- ~~Desktop/GUI artifact previews — noVNC-style streaming for pygame etc.~~
+  — landed (F12; extended to pyglet/arcade/tkinter + python-server in PR3)
 - "Add next prompt" — continue a finished sandbox with a follow-up prompt
   on the same workspace (multi-turn runs: new phase in the event stream +
   artifact re-snapshotted; resume-in-place vs respawn-from-snapshot TBD)
-- More desktop preview types (pyglet/arcade/tkinter — needs baked deps or
-  a wheelhouse mount — no egress in preview nets), python-server previews
+- ~~More desktop preview types~~ + ~~python-server previews~~ — **landed
+  as PR3/F12 extension**: desktop covers pygame/pyglet/arcade/tkinter
+  (deps baked into `heg-preview-desktop`, incl. a wheels stage for
+  pymunk's missing aarch64 wheel); `python-server` executes web apps via
+  `heg-preview-server` + `server-preview-runner.py` (detects the app's
+  listen socket in `/proc/net/tcp`, relays :8000 → actual port; `manage.py`
+  gets the django runserver contract).
 - dsh native helpers (spawn-helper, node-pty) — npm ≥11 blocks their
   postinstall scripts; CLI works without them, but revisit `--allow-scripts`
   for the dsh package set if evals hit TTY-dependent tasks
@@ -336,8 +370,23 @@ or tests change.
   npm install happens before COPY so dependency layers cache. DeepSeek's
   `dsh` needs node >=24.9 → `node:24-slim` (others stay on 22). Aider is a
   Python CLI → `python:3.12-slim` + `pip install aider-chat` (PR13).
+- **PR15 pacing is DB-driven, not in-memory**: `queued` is a run status, so
+  the submission queue survives api restarts (startup sweep re-promotes).
+  Queue order = `started_at` (approval time). Spawn admission is a bounded
+  wait *inside* `spawn_one` (per-sandbox failure on timeout) rather than a
+  scheduler loop — sequential provisioning already makes spawns the unit of
+  queuing. `run.status` stays `String` — no migration needed for `queued`.
 - **`done` invocation**: bare `done` is a shell keyword in sh/bash — prompts
   instruct harnesses to run `/usr/local/bin/done` (or `command done`).
+- **PR17 — hook/plugin telemetry lane**: `adapters/common/hooks.py` is the
+  shared receiver (`python3 -m adapters.common.hooks <adapter> [json]`) for
+  native hooks — claude_code `settings.json` hooks (stdin), codex `notify`
+  (argv), pi's generated extension forwarder (stdin). Normalization stays in
+  Python via each adapter's `translate_hook` (contract-tested); events carry
+  `via: "hook"`. New `tool_result` EventType reports tool *outcomes* — the
+  detail translated streams drop to avoid double-counting tool calls. Hook
+  choice per CLI follows documented surfaces only (dsh/miniloop untranslated
+  paths unchanged).
 - **Imported skill packs (F11) live under `data/skillpacks/`**, not the
   vendored `skillpacks/` tree — vendored packs are committed and baked into
   the api image (ephemeral FS in compose), while `data/` is gitignored and
@@ -355,43 +404,72 @@ or tests change.
   for provenance + import pinning. `GITHUB_TOKEN` (env) is sent as a Bearer
   token when set — private repos work best-effort; proper token UX is a
   follow-up.
-- **Artifact preview (F12) ships static + desktop** — `PreviewPlan.type` +
-  `PreviewOut.type` leave room for `python-server` next. Static = serve
-  files; desktop = execute pygame under Xvnc/noVNC.
+- **Artifact preview (F12) ships static + desktop + python-server** —
+  `PreviewPlan.type` + `PreviewOut.type` carry `"static"` (serve files),
+  `"desktop"` (execute GUI under Xvnc/noVNC), `"python-server"` (execute
+  a web app, published on localhost). `PREVIEW_TYPES` is the single
+  validation set; `PreviewManager.spawn` dispatches per type.
 - Preview containers get their **own dedicated bridge `heg-preview`**, not
   `heg-sandbox` and not `--internal` — Docker silently drops published ports
   on internal networks (verified), so "isolated + host-reachable" is
   impossible; port binds `127.0.0.1` only, masquerade disabled (Linux),
   container hardened (nobody/read-only/cap-drop/no-new-priv).
-- **Desktop previews isolate the runner, not the serving hop**: the
-  executed artifact runs alone on `--internal` `heg-desktop` (zero egress —
-  api-side proxying was rejected: the api would join the runner's net,
-  giving candidate code a path to the control plane) with
-  `--cpus`/`--memory`/`--pids-limit` bounds. A pinned `alpine/socat` sidecar
-  (`heg.preview_role=proxy`, dumb TCP pipe — nothing for the artifact to
-  exploit) straddles both nets and publishes the noVNC port on localhost.
+- **Executed-code previews isolate the runner, not the serving hop**:
+  desktop + python-server runners share `--internal` `heg-desktop` (zero
+  egress — api-side proxying was rejected: the api would join the
+  runner's net, giving candidate code a path to the control plane) with
+  `--cpus`/`--memory`/`--pids-limit` bounds (`PREVIEW_DESKTOP_*`). A
+  pinned `alpine/socat` sidecar (`heg.preview_role=proxy`, dumb TCP pipe —
+  nothing for the artifact to exploit) straddles both nets and publishes
+  the runner's port on localhost — `:6080` websockify/noVNC for desktop,
+  `:8000` for python-server (the runner's `server-preview-runner.py`
+  bridges whatever port the app binds). GUI stacks (pygame-ce, pyglet,
+  arcade, tkinter) and web frameworks (flask/fastapi/django/aiohttp/
+  bottle/tornado/gunicorn) are baked into the images — preview nets have
+  zero egress so deps can NEVER pip-install at spawn.
 - **Detection produces a typed candidate list, not a hidden pick** —
   `scan_preview` returns every runnable entry (`.html` → static, evidenced
-  `.py` → desktop) ordered default-first; `plan`/`candidates[0]` is only
-  the dropdown's default. `.py` candidates need pygame evidence (file
-  imports pygame, OR entry-shaped + a non-comment requirements.txt line);
-  scanned at root + ≤3 nested levels with hidden/`_DESKTOP_SKIP_DIRS`/
-  symlinks skipped. `entry=` POST picks any workspace-relative file —
-  `.py` overrides evidence (the pick IS the disambiguation). Zero
-  candidates → UI shows disabled "not supported". Deps beyond baked-in
-  pygame-ce can't install (no egress) — the app fails at import and the
-  runner exits visibly. Static defaults when both match. `type=` POST
+  `.py` → desktop GUI or python-server) ordered default-first;
+  `plan`/`candidates[0]` is only the dropdown's default. Executed `.py`
+  candidates share `_py_candidates`: file imports a stack (pygame/
+  pyglet/arcade/tkinter → desktop; flask/fastapi/django/http.server/… →
+  python-server — line-anchored, comments can't match), OR entry-shaped +
+  a non-comment requirements.txt line naming it (bare `tk` in
+  requirements is NOT tkinter evidence — unrelated package, tkinter is
+  stdlib). Scanned at root + ≤3 nested levels with hidden/
+  `_DESKTOP_SKIP_DIRS`/`templates`/symlinks skipped. `entry=` POST picks
+  any workspace-relative file — `.py` bypasses evidence (the pick IS the
+  disambiguation; `manage.py` alone maps to python-server — only it
+  publishes the app port). Zero candidates → UI shows disabled "not
+  supported". Deps beyond the baked stacks can't install (no egress) —
+  the app fails at import and the runner exits visibly. Static defaults
+  when both match. `type=` POST
   overrides the pick: alone it selects the first detected candidate of
   that type (a both-matching workspace defaults to static —
   `{type:"desktop"}` reaches the game); with `entry=` it forces the plan —
   `static` serves any jailed file (the entry is only the URL opened —
-  view a `.py`'s source instead of executing it), `desktop` still
-  requires a `.py` entry. A live preview is returned as-is unless an
+  view a `.py`'s source instead of executing it), `desktop`/
+  `python-server` still require a `.py` entry. A live preview is returned
+  as-is unless an
   explicit different plan is requested, then it's stopped and respawned.
   The results-GET probe is memoized by `sandbox.preview.ScanCache`
   (`PREVIEW_SCAN_TTL_SECONDS`, default 30s) keyed on
   (jail, run, sandbox, artifact_path) — workspaces only change on
   re-snapshot.
+- **Gateway response caching / deterministic replay (PR18)**: opt-in
+  `GATEWAY_CACHE_ENABLED` — OFF by default so real runs hit the live
+  upstream. Metered generation calls replay from a sqlite store
+  (`gateway/cache.py`, `GATEWAY_CACHE_PATH`) keyed on
+  `namespace + path + provider + outgoing-body` (post-transform, so
+  stream/buffered variants and PROVIDER_ROUTES targets can't collide;
+  bump `GATEWAY_CACHE_NAMESPACE` to invalidate). Semantics: hits still emit
+  `llm_request`/`llm_response` with `payload.cached: true`, usage is
+  re-metered from the stored body so cached spend counts toward the run
+  budget, and the budget gate runs before the lookup — a replayed run
+  accrues tokens and 429s identically to the live one. Only complete 2xx
+  bodies are stored; unmetered probes (`count_tokens`, `/v1/models`) bypass
+  the cache; cache failures degrade to a miss, never a proxy 5xx (same
+  doctrine as event emission).
 - **Preview registry lives on docker labels**, not in memory or Postgres —
   restart-safe discovery + the TTL reaper (default 15 min) works
   out-of-process; runner+proxy share `heg.preview_id`, stop removes all.
@@ -403,6 +481,11 @@ or tests change.
   judge models flake ~1-in-3 evals (observed modes: flat dimension-map JSON,
   paged-read stuck loops, grep-loop wander, unescaped quotes in rationale) —
   `EVAL_PROMPT.md` carries targeted counter-hints (paging, no inner `"`).
+  When all attempts produce no Score rows the orchestrator emits a final
+  `error` event (`stage="evaluation"`, `phase="eval_failed"`) for the
+  sandbox; the results API surfaces it as per-sandbox `eval_error` so the UI
+  shows "eval failed" rather than an empty score matrix — a sandbox can be
+  `done` with failed eval, so check `eval_error`, not score-null alone.
 - One live preview per sandbox (POST is idempotent — re-clicking returns the
   existing preview); dead containers are cleared on respawn.
 - **Charts: recharts** (F13) — picked over visx/chart.js: smallest fit for

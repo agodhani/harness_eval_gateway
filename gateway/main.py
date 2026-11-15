@@ -36,6 +36,13 @@ Endpoints
                                     ``done_signal`` event for the cred's
                                     run/sandbox.
 
+Response cache (PR18): when ``GATEWAY_CACHE_ENABLED``, metered generation
+calls are replayed from a local sqlite store keyed on
+path+provider+outgoing-body — hits skip the upstream entirely, still emit
+``llm_request``/``llm_response`` (payload ``cached: true``), and still count
+against the run budget, so a replayed run meters identically to the live one.
+Hits carry an ``x-heg-cache: hit`` response header. See gateway/cache.py.
+
 Upstream providers: ``UPSTREAM_PROVIDER`` (``ollama`` default, ``openrouter``,
 ``openai``, ``anthropic``) is the process-wide default; ``PROVIDER_ROUTES``
 maps model globs → provider for per-request overrides resolved from the
@@ -59,6 +66,8 @@ this matches the ingest token sandboxes may be configured with.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import time
 import uuid
 from collections.abc import Mapping
@@ -73,6 +82,7 @@ from pydantic import BaseModel, Field
 
 from api.schemas import EventSource, EventType
 from gateway import metering
+from gateway.cache import CachedResponse, ResponseCache
 from gateway.config import ProviderName, get_settings
 from gateway.creds import CredClaims
 from gateway.deps import (
@@ -80,9 +90,12 @@ from gateway.deps import (
     get_events_auth,
     get_ollama_client,
     get_provider,
+    get_response_cache,
     get_session_factory,
     get_upstream_client,
 )
+
+log = logging.getLogger("gateway.main")
 
 router = APIRouter()
 
@@ -173,6 +186,47 @@ def _forward_protocol_headers(
     return fwd or None
 
 
+# ---------------------------------------------------------------------------
+# PR18 — response cache helpers (opt-in via GATEWAY_CACHE_*; see
+# gateway/cache.py). Lookups/stores are best-effort like event emission —
+# a broken cache must degrade to a miss, never a proxy 5xx.
+# ---------------------------------------------------------------------------
+
+
+async def _cache_get(
+    cache: ResponseCache | None, key: str | None
+) -> CachedResponse | None:
+    if cache is None or key is None:
+        return None
+    try:
+        return await asyncio.to_thread(cache.get, key)
+    except Exception:  # best-effort; degrade to miss
+        log.warning("cache lookup failed; treating as miss", exc_info=True)
+        return None
+
+
+async def _cache_store(
+    cache: ResponseCache | None,
+    key: str | None,
+    *,
+    status: int,
+    content_type: str,
+    body: bytes,
+) -> None:
+    if cache is None or key is None:
+        return
+    try:
+        await asyncio.to_thread(
+            cache.store, key, status=status, content_type=content_type, body=body
+        )
+    except Exception:  # best-effort; dropping the entry is ok
+        log.warning("cache store failed", exc_info=True)
+
+
+def _cache_hit_headers(content_type: str) -> dict[str, str]:
+    return {"content-type": content_type, "x-heg-cache": "hit"}
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
@@ -180,6 +234,7 @@ async def chat_completions(
     claims: Annotated[CredClaims, Depends(get_cred)],
     upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
     provider: Annotated[ProviderName, Depends(get_provider)],
+    cache: Annotated[ResponseCache | None, Depends(get_response_cache)],
 ) -> Response:
     # --- streaming callers (pi and other OpenAI-compatible CLIs always set
     # stream:true and parse SSE — a forced non-streamed JSON body reads as an
@@ -204,6 +259,7 @@ async def chat_completions(
             upstream=upstream,
             provider=provider,
             request_headers=request.headers,
+            cache=cache,
         )
 
     # --- budget gate (before any upstream traffic) ---
@@ -218,7 +274,41 @@ async def chat_completions(
         out.setdefault("num_ctx", 32_768)
         out.setdefault("keep_alive", "30m")
 
-    await metering.emit_llm_request(claims, out, provider=provider)
+    # --- replay cache (PR18): lookup AFTER the budget gate so a replayed
+    # run 429s at the same point as the live one. Hits emit llm_request +
+    # llm_response with payload.cached=true and the stored body meters the
+    # recorded usage, keeping the run's token accrual deterministic.
+    cache_key = (
+        cache.key_for(path="/v1/chat/completions", provider=provider, body=out)
+        if cache is not None
+        else None
+    )
+    started = time.monotonic()
+    hit = await _cache_get(cache, cache_key)
+    latency_ms = int((time.monotonic() - started) * 1000)
+
+    await metering.emit_llm_request(
+        claims, out, provider=provider, cached=hit is not None
+    )
+    if hit is not None:
+        try:
+            cached_json = json.loads(hit.body)
+        except ValueError:
+            cached_json = None
+        await metering.emit_llm_response(
+            claims,
+            model=out.get("model"),
+            usage=metering.usage_from_response(cached_json),
+            latency_ms=latency_ms,
+            http_status=hit.status,
+            provider=provider,
+            cached=True,
+        )
+        return Response(
+            content=hit.body,
+            status_code=hit.status,
+            headers=_cache_hit_headers(hit.content_type),
+        )
 
     started = time.monotonic()
     try:
@@ -269,6 +359,16 @@ async def chat_completions(
             http_status=upstream_resp.status_code,
             latency_ms=latency_ms,
             provider=provider,
+        )
+    else:
+        await _cache_store(
+            cache,
+            cache_key,
+            status=upstream_resp.status_code,
+            content_type=upstream_resp.headers.get(
+                "content-type", "application/json"
+            ),
+            body=upstream_resp.content,
         )
 
     return Response(
@@ -339,6 +439,7 @@ async def _passthrough(
     provider: ProviderName,
     request_headers: Mapping[str, str] | None = None,
     meter: bool = True,
+    cache: ResponseCache | None = None,
 ) -> Response:
     """Forward ``body`` to ``upstream`` ``path`` verbatim; meter the outcome.
 
@@ -353,13 +454,52 @@ async def _passthrough(
     emitted events); ``request_headers`` are the inbound headers — protocol
     headers the resolved provider honors (``anthropic-beta``/
     ``anthropic-version`` for ``anthropic``) are forwarded.
+
+    ``cache`` (PR18) replays metered calls from the store on a key hit —
+    the replayed body is tee'd the same way, so usage extraction and the
+    emitted events are identical to a live call (payload ``cached: true``).
+    Only fully-captured 2xx responses are stored; ``meter=False`` callers
+    (e.g. count_tokens preflight) bypass the cache entirely.
     """
     body = _strip_ollama_only(body, provider)
     if meter:
         gated = await _budget_gate(claims, body, provider)
         if gated is not None:
             return gated
-        await metering.emit_llm_request(claims, body, provider=provider)
+        cache_key = (
+            cache.key_for(path=path, provider=provider, body=body)
+            if cache is not None
+            else None
+        )
+        started = time.monotonic()
+        hit = await _cache_get(cache, cache_key)
+        lookup_ms = int((time.monotonic() - started) * 1000)
+        await metering.emit_llm_request(
+            claims, body, provider=provider, cached=hit is not None
+        )
+        if hit is not None:
+            # Replay the stored bytes as a stream — content_type drives the
+            # client's parser (SSE vs JSON), so the replay is byte-faithful.
+            await metering.emit_llm_response(
+                claims,
+                model=body.get("model"),
+                usage=metering.usage_from_sse(hit.body, api=api),
+                latency_ms=lookup_ms,
+                http_status=hit.status,
+                provider=provider,
+                cached=True,
+            )
+
+            async def _replay():
+                yield hit.body
+
+            return StreamingResponse(
+                _replay(),
+                status_code=hit.status,
+                headers=_cache_hit_headers(hit.content_type),
+            )
+    else:
+        cache_key = None
 
     started = time.monotonic()
     try:
@@ -392,11 +532,13 @@ async def _passthrough(
 
     async def _aiter():
         chunks: list[bytes] = []
+        complete = False
         try:
             async for chunk in upstream_resp.aiter_bytes():
                 if meter:
                     chunks.append(chunk)
                 yield chunk
+            complete = True
         finally:
             latency_ms = int((time.monotonic() - started) * 1000)
             try:
@@ -420,6 +562,19 @@ async def _passthrough(
                             latency_ms=latency_ms,
                             provider=provider,
                         )
+                    elif complete:
+                        # Cache only fully-captured 2xx bodies — partial
+                        # streams (client abort, transport error) would
+                        # replay truncated output.
+                        await _cache_store(
+                            cache,
+                            cache_key,
+                            status=upstream_resp.status_code,
+                            content_type=upstream_resp.headers.get(
+                                "content-type", "application/json"
+                            ),
+                            body=captured,
+                        )
             finally:
                 await upstream_resp.aclose()
 
@@ -441,6 +596,7 @@ async def anthropic_messages(
     claims: Annotated[CredClaims, Depends(get_cred)],
     upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
     provider: Annotated[ProviderName, Depends(get_provider)],
+    cache: Annotated[ResponseCache | None, Depends(get_response_cache)],
 ) -> Response:
     """Anthropic Messages API → the resolved upstream's /v1/messages."""
     return await _passthrough(
@@ -451,6 +607,7 @@ async def anthropic_messages(
         upstream=upstream,
         provider=provider,
         request_headers=request.headers,
+        cache=cache,
     )
 
 
@@ -482,6 +639,7 @@ async def openai_responses(
     claims: Annotated[CredClaims, Depends(get_cred)],
     upstream: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
     provider: Annotated[ProviderName, Depends(get_provider)],
+    cache: Annotated[ResponseCache | None, Depends(get_response_cache)],
 ) -> Response:
     """OpenAI Responses API → the resolved upstream's /v1/responses."""
     return await _passthrough(
@@ -492,6 +650,7 @@ async def openai_responses(
         upstream=upstream,
         provider=provider,
         request_headers=request.headers,
+        cache=cache,
     )
 
 

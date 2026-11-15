@@ -1,7 +1,8 @@
 """F12 — artifact preview endpoints: serve a sandbox's snapshot in a browser.
 
 - ``POST /api/runs/{run_id}/sandboxes/{sandbox_id}/preview`` — detect a
-  previewable artifact (static html entry, or a pygame app for desktop) and
+  previewable artifact (static html entry, a GUI app for desktop, or a
+  web app for python-server) and
   spawn a locked-down serving container; returns ``{preview_id, url, type,
   status, entry, expires_at}``. Idempotent per sandbox: an already-live
   preview is returned as-is — unless an explicit ``entry``/``type``
@@ -9,13 +10,14 @@
   and replaced. Optional body ``{"entry": "rel/path"}`` picks an explicit
   entry — for ambiguous scans (the 422 detail lists candidates) or
   artifacts detection missed; ``.html``/``.htm`` → static, ``.py`` →
-  desktop, jailed to the workspace. ``{"type": "static"|"desktop"}``
+  desktop, ``manage.py`` → python-server, jailed to the workspace.
+  ``{"type": "static"|"desktop"|"python-server"}``
   overrides the pick: alone it selects the first detected candidate of
   that type (a both-matching workspace defaults to static, so
   ``{"type": "desktop"}`` reaches the game); combined with ``entry`` it
   overrides the suffix-derived type — ``{"entry": "x.py", "type":
   "static"}`` serves the file instead of executing it, while ``desktop``
-  still requires a ``.py`` entry.
+  and ``python-server`` still require a ``.py`` entry.
 - ``GET .../preview`` — current preview state (newest container), 404 when
   none exists.
 - ``DELETE .../preview`` — stop the preview container(s) for the sandbox.
@@ -26,11 +28,12 @@ restart of the api loses nothing; ``start_reaper`` (wired into the FastAPI
 lifespan) enforces the TTL for expired/orphaned containers.
 
 Extensibility: ``PreviewOut.type`` mirrors :class:`sandbox.preview.PreviewPlan`.
-Implemented spawners: ``static`` (http.server) and ``desktop`` (pygame executed
-under Xvnc, streamed via noVNC through a socat sidecar — the runner sits on an
-``--internal`` net with zero egress). ``python-server`` plugs into
-``PreviewManager.spawn`` + ``detect_preview`` later without changing this
-contract.
+Implemented spawners: ``static`` (http.server), ``desktop`` (GUI executed
+under Xvnc, streamed via noVNC through a socat sidecar), and
+``python-server`` (a web app executed by a relay runner — whatever port it
+binds is made reachable on :8000, published through the same socat sidecar
+topology). All executed-code types run on the ``--internal``
+``heg-desktop`` net with zero egress.
 """
 
 from __future__ import annotations
@@ -77,18 +80,20 @@ class PreviewStart(BaseModel):
 
     ``entry`` is a workspace-relative path (``game/main.py``, ``index.html``)
     jailed to the artifact workspace: must exist, not be a symlink, and —
-    without ``type`` — end in ``.html``/``.htm`` (→ static) or ``.py`` (→
-    desktop). It both picks one of several detected candidates and reaches
-    artifacts auto-detection missed — an explicit ``.py`` bypasses pygame
-    evidence (the pick IS the disambiguation; isolation is identical either
-    way).
+    without ``type`` — end in ``.html``/``.htm`` (→ static), ``.py`` (→
+    desktop), or ``manage.py`` (→ python-server). It both picks one of
+    several detected candidates and reaches
+    artifacts auto-detection missed — an explicit ``.py`` bypasses
+    framework evidence (the pick IS the disambiguation; isolation is
+    identical either way).
 
     ``type`` overrides how the artifact is previewed. Alone (no ``entry``)
     it selects the first detected candidate of that type — a both-matching
     workspace defaults to static, so ``{"type": "desktop"}`` reaches the
     game. With ``entry`` it forces the plan type: ``"static"`` serves any
     jailed file (view a ``.py``'s source instead of executing it — the
-    entry is only the URL opened), ``"desktop"`` requires a ``.py`` entry.
+    entry is only the URL opened), ``"desktop"`` and ``"python-server"``
+    require a ``.py`` entry.
     """
 
     entry: str | None = None
@@ -99,7 +104,7 @@ class PreviewOut(BaseModel):
     preview_id: UUID
     run_id: UUID
     sandbox_id: UUID
-    type: str  # static | desktop; future: python-server
+    type: str  # static | desktop | python-server
     status: str  # docker container status: created|running|exited|...
     url: str | None = None
     entry: str | None = None
@@ -142,6 +147,7 @@ def get_preview_manager() -> PreviewManager:
             bind_host=settings.PREVIEW_BIND_HOST,
             ttl_seconds=settings.PREVIEW_TTL_SECONDS,
             desktop_image=settings.PREVIEW_DESKTOP_IMAGE,
+            server_image=settings.PREVIEW_SERVER_IMAGE,
             proxy_image=settings.PREVIEW_PROXY_IMAGE,
             desktop_network=settings.PREVIEW_DESKTOP_NETWORK,
             desktop_cpus=settings.PREVIEW_DESKTOP_CPUS,
@@ -279,8 +285,9 @@ async def start_preview(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=(
-                "no previewable artifact: expected a .html/.htm entry or "
-                "a pygame app (.py entry with pygame evidence)"
+                "no previewable artifact: expected a .html/.htm entry, "
+                "a GUI app (.py with pygame/pyglet/arcade/tkinter evidence), "
+                "or a web app (.py with a web-framework evidence)"
             ),
         )
 
