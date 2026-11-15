@@ -380,6 +380,10 @@ or tests change.
   view a `.py`'s source instead of executing it), `desktop` still
   requires a `.py` entry. A live preview is returned as-is unless an
   explicit different plan is requested, then it's stopped and respawned.
+  The results-GET probe is memoized by `sandbox.preview.ScanCache`
+  (`PREVIEW_SCAN_TTL_SECONDS`, default 30s) keyed on
+  (jail, run, sandbox, artifact_path) — workspaces only change on
+  re-snapshot.
 - **Gateway response caching / deterministic replay (PR18)**: opt-in
   `GATEWAY_CACHE_ENABLED` — OFF by default so real runs hit the live
   upstream. Metered generation calls replay from a sqlite store
@@ -394,10 +398,6 @@ or tests change.
   bodies are stored; unmetered probes (`count_tokens`, `/v1/models`) bypass
   the cache; cache failures degrade to a miss, never a proxy 5xx (same
   doctrine as event emission).
-  The results-GET probe is memoized by `sandbox.preview.ScanCache`
-  (`PREVIEW_SCAN_TTL_SECONDS`, default 30s) keyed on
-  (jail, run, sandbox, artifact_path) — workspaces only change on
-  re-snapshot.
 - **Preview registry lives on docker labels**, not in memory or Postgres —
   restart-safe discovery + the TTL reaper (default 15 min) works
   out-of-process; runner+proxy share `heg.preview_id`, stop removes all.
