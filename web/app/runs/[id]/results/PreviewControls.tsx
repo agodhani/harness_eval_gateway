@@ -134,12 +134,21 @@ export default function PreviewControls({
       ? thumbOverride.ref
       : thumbnail;
 
+  // Non-previewable artifacts can't host a preview — skip the state probe
+  // entirely (it only 404s and logs console noise per row).
+  const canPreview = previewable || options.length > 0;
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       // Defer to a microtask: state updates land in async context
       // (react-hooks/set-state-in-effect forbids sync setState in effects).
       await Promise.resolve();
+      if (cancelled) return;
+      if (!canPreview) {
+        setPhase("idle");
+        return;
+      }
       try {
         const p = await getPreview(runId, sandboxId);
         if (cancelled) return;
@@ -153,7 +162,7 @@ export default function PreviewControls({
     return () => {
       cancelled = true;
     };
-  }, [runId, sandboxId]);
+  }, [runId, sandboxId, canPreview]);
 
   async function start(opt?: Option) {
     setPhase("starting");
@@ -219,7 +228,7 @@ export default function PreviewControls({
   }
 
   const busy = phase === "starting" || phase === "stopping";
-  const canCapture = previewable || options.length > 0;
+  const canCapture = canPreview;
 
   /** PR4 thumbnail block — heads the cell in both idle and active
    *  states; the shot itself is the "open full preview" affordance. */
@@ -391,8 +400,14 @@ export default function PreviewControls({
           </>
         )}
         {preview && !LIVE_STATUSES.has(preview.status) ? (
-          <span className="faint" style={{ fontSize: "0.75rem" }}>
-            ({preview.status})
+          <span
+            className="faint"
+            style={{ fontSize: "0.75rem" }}
+            title={preview.logs ?? preview.detail ?? undefined}
+          >
+            ({preview.status}
+            {preview.exit_code != null ? ` · exit ${preview.exit_code}` : ""})
+            {preview.detail ? ` — ${preview.detail}` : null}
           </span>
         ) : null}
         {error ? (

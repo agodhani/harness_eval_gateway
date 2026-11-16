@@ -25,6 +25,7 @@ import {
   type SandboxOut,
 } from "@/lib/api";
 import { shortId, truncate } from "@/lib/format";
+import { evalBoundaries, isJudgeEvent } from "@/lib/evalPhase";
 import { Badge, statusTone } from "@/components/ui";
 
 const POLL_MS = 6_000;
@@ -233,11 +234,14 @@ export default function RunConsoleLive({ run }: { run: RunOut }) {
 
   const lanes = useMemo(() => {
     const ids = new Set(run.sandboxes.map((s) => s.id));
+    const bounds = evalBoundaries(events);
     const perSandbox = new Map<string, EventOut[]>();
     const system: EventOut[] = [];
     for (const e of events) {
-      // evaluator traffic shares participant creds — route by source, not id
-      if (e.source === "evaluator" || e.sandbox_id === null || !ids.has(e.sandbox_id)) {
+      // Judge-phase rows (eval-sandbox miniloop included — it emits as
+      // "harness" on participant creds) route to the bottom lane, not the
+      // candidate's: eval creds share the participant sandbox_id.
+      if (isJudgeEvent(e, bounds) || e.sandbox_id === null || !ids.has(e.sandbox_id)) {
         system.push(e);
       } else {
         const list = perSandbox.get(e.sandbox_id);

@@ -35,6 +35,7 @@ import {
   type SandboxOut,
 } from "@/lib/api";
 import { shortId } from "@/lib/format";
+import { effectiveSource, evalBoundaries } from "@/lib/evalPhase";
 import {
   buildSplitRows,
   laneEventCounts,
@@ -291,12 +292,25 @@ export default function TimelineClient({ runId }: { runId: string }) {
     return [...set].sort();
   }, [events]);
 
+  // Judge-phase boundaries (api/routers/analytics.py rule): the first
+  // evaluator-sourced event per sandbox marks the eval spawn — everything
+  // at/after it is judge activity. Eval-sandbox miniloop rows arrive with
+  // source="harness" on participant creds; effectiveSource re-tags them so
+  // judge file reads / scores.json writes aren't mistaken for candidate
+  // activity.
+  const evalBounds = useMemo(() => evalBoundaries(events), [events]);
+  const displaySourceOf = useCallback(
+    (ev: EventOut) => effectiveSource(ev, evalBounds),
+    [evalBounds],
+  );
+
   const filtered = useMemo(
     () =>
       events.filter((e) => {
         // Same run_id guard as sandboxIds — only this run's events may render.
         if (e.run_id.toLowerCase() !== runId.toLowerCase()) return false;
-        if (filterSource && e.source !== filterSource) return false;
+        if (filterSource && effectiveSource(e, evalBounds) !== filterSource)
+          return false;
         if (filterType && e.type !== filterType) return false;
         // The sandbox dropdown is a merged-view control — in split mode the
         // lane pickers govern which sandboxes appear (their events stay in
@@ -308,7 +322,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
         }
         return true;
       }),
-    [events, filterSource, filterType, filterSandbox, viewMode, runId],
+    [events, filterSource, filterType, filterSandbox, viewMode, runId, evalBounds],
   );
 
   // PR9 metrics strip data + adapter labels for the sandbox filter dropdown.
@@ -432,11 +446,16 @@ export default function TimelineClient({ runId }: { runId: string }) {
   // ---- render ------------------------------------------------------------
 
   const live = sseState === "open";
+  const terminal =
+    TERMINAL_RUN_STATUSES.includes(runStatus ?? "") || runStatus === "cancelled";
   const counts = useMemo(() => {
     const m = new Map<string, number>();
-    for (const e of events) m.set(e.source, (m.get(e.source) ?? 0) + 1);
+    for (const e of events) {
+      const src = effectiveSource(e, evalBounds);
+      m.set(src, (m.get(src) ?? 0) + 1);
+    }
     return m;
-  }, [events]);
+  }, [events, evalBounds]);
 
   return (
     <main className="container" style={{ maxWidth: "1280px" }}>
@@ -449,8 +468,14 @@ export default function TimelineClient({ runId }: { runId: string }) {
               {shortId(runId, 13)}…
             </span>
             {runStatus ? <Badge tone={statusTone(runStatus)}>{runStatus}</Badge> : null}
-            <Badge tone={live ? "green" : sseState === "reconnecting" ? "amber" : "gray"}>
-              {live ? "live · SSE" : sseState === "reconnecting" ? "SSE reconnecting · polling" : "loading…"}
+            <Badge tone={terminal ? "gray" : live ? "green" : sseState === "reconnecting" ? "amber" : "gray"}>
+              {terminal
+                ? "replay"
+                : live
+                  ? "live · SSE"
+                  : sseState === "reconnecting"
+                    ? "SSE reconnecting · polling"
+                    : "loading…"}
             </Badge>
           </div>
           <p className="subtitle">
@@ -589,6 +614,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
               onToggle={toggleExpand}
               onPickLane={onPickLane}
               names={sandboxNames}
+              displaySourceOf={displaySourceOf}
             />
           ) : (
             filtered.map((ev, i) => {
@@ -605,6 +631,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
                     sandboxName={
                       ev.sandbox_id ? sandboxNames.get(ev.sandbox_id) : undefined
                     }
+                    displaySource={displaySourceOf(ev)}
                   />
                 </div>
               );

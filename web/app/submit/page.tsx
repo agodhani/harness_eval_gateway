@@ -35,8 +35,12 @@ import {
   type SkillpackImportResult,
 } from "@/lib/api";
 import { modelsPayload, participantModels } from "@/lib/modelRows";
+import {
+  consumeResubmit,
+  stageRunWarnings,
+} from "@/lib/resubmit";
 import { ComboInput } from "@/components/ComboInput";
-import { Badge, Card, ErrorNote, InfoNote } from "@/components/ui";
+import { Badge, Card, ErrorNote, InfoNote, WarnNote } from "@/components/ui";
 import { ImportSkillPackDialog } from "./ImportSkillPackDialog";
 
 // Offline fallback for the model pickers — the live list comes from
@@ -54,6 +58,9 @@ interface ConfigRow {
   adapter: string;
   skill_packs: string[];
   system_prompt_extra: string;
+  /** PR14 per-config model pin — no picker UI, but preserved on resubmit so
+   * re-submitting a run doesn't silently drop pins from the payload. */
+  model?: string | null;
 }
 
 interface ModelRow {
@@ -92,9 +99,14 @@ export default function SubmitPage() {
 
   const [taskPrompt, setTaskPrompt] = useState("");
   // Participant-model rows — row 1 is the required primary (→ model_name);
-  // extra rows are the PR14 additional models (→ models, deduped).
+  // extra rows are the PR14 additional models (→ models, deduped). Model
+  // starts EMPTY: prefilling a provider-specific name (e.g. an ollama tag)
+  // before the mount catalog resolves the gateway's default provider
+  // guarantees a provider/model mismatch (provider realigns, the name
+  // doesn't). The row's provider is also a placeholder — the mount fetch
+  // re-aligns every unpicked row to the gateway default.
   const [modelRows, setModelRows] = useState<ModelRow[]>(() => [
-    { key: nextKey++, provider: "ollama", model: "qwen3:8b" },
+    { key: nextKey++, provider: "ollama", model: "" },
   ]);
   const [evalRow, setEvalRow] = useState<ModelRow>(() =>
     blankModelRow("ollama"),
@@ -112,6 +124,10 @@ export default function SubmitPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  // Advisory warnings on the run-create response (new backend field —
+  // absent on older backends). Stashed for the run detail page before we
+  // navigate; also rendered here while the push is in flight.
+  const [warnings, setWarnings] = useState<string[]>([]);
   // Harness registry from GET /api/harnesses; static ADAPTERS is the fallback
   // when the API isn't running (page convention: degrade gracefully).
   const [harnesses, setHarnesses] = useState<HarnessManifest[]>([]);
@@ -178,6 +194,50 @@ export default function SubmitPage() {
       .catch(() => {
         /* offline fallback: static MODEL_SUGGESTIONS */
       });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Resubmit handoff: run detail/results "Resubmit" stages the spec in
+  // sessionStorage (too big for query params); consume it once on mount so
+  // later plain visits to /submit open empty. Providers stay unpicked — the
+  // catalog effect above realigns them to the gateway default.
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      const spec = consumeResubmit();
+      if (!spec) return;
+      setTaskPrompt(spec.task_prompt);
+      setModelRows(
+        spec.models.length
+          ? spec.models.map((m) => ({
+              key: nextKey++,
+              provider: "ollama",
+              model: m,
+            }))
+          : [blankModelRow("ollama")],
+      );
+      setEvalRow({
+        key: nextKey++,
+        provider: "ollama",
+        model: spec.evaluator_model ?? "",
+      });
+      setConfigs(
+        spec.harness_configs.length
+          ? spec.harness_configs.map((c) => ({
+              key: nextKey++,
+              name: c.name ?? "",
+              adapter: c.adapter,
+              skill_packs: [...c.skill_packs],
+              system_prompt_extra: c.system_prompt_extra ?? "",
+              model: c.model ?? null,
+            }))
+          : [blankConfig()],
+      );
+      if (spec.budgets) setBudgets({ ...spec.budgets });
+    });
     return () => {
       cancelled = true;
     };
@@ -436,6 +496,9 @@ export default function SubmitPage() {
       skill_packs: c.skill_packs,
       system_prompt_extra: c.system_prompt_extra.trim() || null,
       name: c.name.trim() || null,
+      // Per-config model pin (PR14) — only ever set by a resubmit restore;
+      // the form itself has no pin UI.
+      model: c.model ?? null,
     }));
     // Row 1 → model_name; remaining deduped rows → models (null when
     // single-model). Providers stay client-side — RunCreate has no
@@ -452,6 +515,16 @@ export default function SubmitPage() {
         evaluator_model: evalRow.model.trim() || null,
         budgets,
       });
+      // Run-create warnings (new backend field — absent on older backends):
+      // stash them so the run detail page can surface them once we land,
+      // and keep them on screen here while the navigation is in flight.
+      const w = Array.isArray(run.warnings)
+        ? run.warnings.filter((x): x is string => typeof x === "string")
+        : [];
+      if (w.length) {
+        setWarnings(w);
+        stageRunWarnings(run.id, w);
+      }
       router.push(`/runs/${run.id}`);
     } catch (err) {
       setSubmitting(false);
@@ -877,6 +950,16 @@ export default function SubmitPage() {
         </Card>
 
         {error ? <ErrorNote title="Submit failed">{error}</ErrorNote> : null}
+        {warnings.length > 0 ? (
+          <WarnNote>
+            <strong>Run created with warnings:</strong>
+            <ul style={{ margin: "0.35rem 0 0 1.1rem", padding: 0 }}>
+              {warnings.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          </WarnNote>
+        ) : null}
 
         <div className="row">
           <button type="submit" className="btn btn--primary" disabled={submitting || !isValid}>

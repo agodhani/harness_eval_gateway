@@ -13,6 +13,7 @@
  * re-score / edit-rubric controls ({@link RescoreControls}).
  */
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ApiError,
@@ -22,14 +23,17 @@ import {
   getRunResults,
   getSandboxScores,
   harnessConfigLabel,
+  listEvents,
   runModels,
   TERMINAL_RUN_STATUSES,
   type DimensionScore,
+  type EventOut,
   type RunOut,
   type RunResults,
   type SandboxResult,
 } from "@/lib/api";
 import { formatTs, shortId } from "@/lib/format";
+import { specFromRun, stageResubmit } from "@/lib/resubmit";
 import {
   Badge,
   Card,
@@ -50,6 +54,44 @@ function errMsg(err: unknown, fallback: string): string {
   if (err instanceof ApiError) return err.detail;
   if (err instanceof Error) return err.message;
   return fallback;
+}
+
+function isTerminal(status: string): boolean {
+  return TERMINAL_RUN_STATUSES.includes(status) || status === "cancelled";
+}
+
+/** `eval_scored` checkpoint payload → judge pipeline mode. Backend modes:
+ * "agentic" (eval-sandbox miniloop wrote scores.json) vs "direct_fallback"
+ * (single control-plane completion). */
+function evalScoredMode(ev: EventOut): string | null {
+  const p = ev.payload ?? {};
+  if (p.phase !== "eval_scored" || typeof p.mode !== "string") return null;
+  return p.mode;
+}
+
+function evalScoredVersion(ev: EventOut): number | null {
+  const v = (ev.payload ?? {}).rubric_version;
+  return typeof v === "number" ? v : null;
+}
+
+/** Badge label/tone for a judge mode string. */
+function modeBadge(mode: string): { label: string; tone: "teal" | "amber" | "gray"; title: string } {
+  switch (mode) {
+    case "agentic":
+      return {
+        label: "agentic",
+        tone: "teal",
+        title: "Scored by the agentic judge — a miniloop sandbox read the workspace and wrote scores.json",
+      };
+    case "direct_fallback":
+      return {
+        label: "fallback",
+        tone: "amber",
+        title: "Scored by the direct fallback — a single control-plane LLM call (the eval sandbox failed or was disabled)",
+      };
+    default:
+      return { label: mode, tone: "gray", title: `Judge mode: ${mode}` };
+  }
 }
 
 function scoreTone(score: number): "good" | "mid" | "bad" {
@@ -106,6 +148,7 @@ async function fetchResultsViaScores(run: RunOut): Promise<RunResults> {
 }
 
 export default function ResultsClient({ runId }: { runId: string }) {
+  const router = useRouter();
   const [runData, setRunData] = useState<RunOut | null>(null);
   const [loadedRunId, setLoadedRunId] = useState<string | null>(null);
   const [results, setResults] = useState<RunResults | null>(null);
@@ -123,6 +166,9 @@ export default function ResultsClient({ runId }: { runId: string }) {
     v: null,
   });
   const selectedVersion = versionSel.id === runId ? versionSel.v : null;
+  // `eval_scored` checkpoint events — source of the per-sandbox judge-mode
+  // badge when the results payload doesn't carry `eval_mode` yet.
+  const [scoredEvents, setScoredEvents] = useState<EventOut[]>([]);
 
   // Scope loaded data to the current runId — survives client-side navigation
   // between /runs/A/results and /runs/B/results without a remount.
@@ -206,6 +252,57 @@ export default function ResultsClient({ runId }: { runId: string }) {
     const t = setInterval(() => refresh(true), POLL_MS);
     return () => clearInterval(t);
   }, [status, refresh]);
+
+  // Judge-mode badges: pull checkpoint events once results exist; re-pull
+  // while evaluating so `eval_scored` lands without a reload. One query
+  // total (type=checkpoint is a small stream), not per-sandbox.
+  useEffect(() => {
+    if (!["evaluating", "done", "failed"].includes(status)) return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const evs = await listEvents(runId, { type: "checkpoint", limit: 1000 });
+        if (!cancelled) setScoredEvents(evs.filter((e) => evalScoredMode(e)));
+      } catch {
+        /* events endpoint down — mode badges just don't render */
+      }
+    };
+    void load();
+    if (status !== "evaluating") {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const t = setInterval(load, POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [runId, status]);
+
+  /** sandbox_id → judge mode. `sb.eval_mode` (new results field) wins;
+   * else the latest `eval_scored` checkpoint — preferring the pinned rubric
+   * version's pass when a version is selected. */
+  const modeBySandbox = useMemo(() => {
+    const pinned =
+      selectedVersion != null
+        ? scoredEvents.filter((e) => evalScoredVersion(e) === selectedVersion)
+        : scoredEvents;
+    const pool = pinned.length ? pinned : scoredEvents;
+    const m = new Map<string, string>();
+    for (const e of pool) {
+      // ascending event id → the latest scoring pass wins per sandbox
+      if (e.sandbox_id) m.set(e.sandbox_id, evalScoredMode(e)!);
+    }
+    return m;
+  }, [scoredEvents, selectedVersion]);
+
+  /** Resubmit — stage this run's spec and open /submit prefilled. */
+  function resubmit() {
+    if (!run) return;
+    stageResubmit(specFromRun(run));
+    router.push("/submit");
+  }
 
   function selectVersion(v: number | null) {
     setVersionSel({ id: runId, v });
@@ -378,6 +475,18 @@ export default function ResultsClient({ runId }: { runId: string }) {
             {run?.task_prompt ? <> · {run.task_prompt.slice(0, 80)}{run.task_prompt.length > 80 ? "…" : ""}</> : null}
           </p>
         </div>
+        {run && isTerminal(status) ? (
+          <div className="row">
+            <button
+              type="button"
+              className="btn btn--sm"
+              onClick={resubmit}
+              title="Open the submit form prefilled with this run's spec"
+            >
+              ↻ Resubmit
+            </button>
+          </div>
+        ) : null}
       </div>
 
       <div className="stack">
@@ -459,6 +568,28 @@ export default function ResultsClient({ runId }: { runId: string }) {
                               </Badge>
                             </div>
                           ) : null}
+                          {sb.empty_workspace ? (
+                            <div className="dim-desc">
+                              <Badge
+                                tone="amber"
+                                title="The snapshot workspace was empty — the agent wrote nothing to score"
+                              >
+                                empty workspace
+                              </Badge>
+                            </div>
+                          ) : null}
+                          {(() => {
+                            const mode = sb.eval_mode ?? modeBySandbox.get(sb.sandbox_id) ?? null;
+                            if (!mode) return null;
+                            const b = modeBadge(mode);
+                            return (
+                              <div className="dim-desc">
+                                <Badge tone={b.tone} title={b.title}>
+                                  {b.label}
+                                </Badge>
+                              </div>
+                            );
+                          })()}
                           {sb.rubric_version != null ? (
                             <div className="dim-desc">judged: rubric v{sb.rubric_version}</div>
                           ) : null}

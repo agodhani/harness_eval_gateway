@@ -16,6 +16,7 @@
  * expansion, filters) lives in TimelineClient.
  */
 import { shortId } from "@/lib/format";
+import type { EventOut } from "@/lib/api";
 import type { SplitRow, LaneSelection, LaneSide } from "@/lib/splitTimeline";
 import type { SandboxStrip } from "@/lib/timelineAnalytics";
 import { Badge, statusTone } from "@/components/ui";
@@ -39,6 +40,7 @@ export default function SplitTimeline({
   onToggle,
   onPickLane,
   names,
+  displaySourceOf,
 }: {
   rows: SplitRow[];
   lanes: LaneSelection;
@@ -54,6 +56,9 @@ export default function SplitTimeline({
   onPickLane: (side: LaneSide, sandboxId: string) => void;
   /** PR1 named harness configs — shared-row chips + lane picker labels. */
   names?: Map<string, string>;
+  /** Judge-phase re-tagging (lib/evalPhase.ts) — same source labels the
+   * merged stream shows. */
+  displaySourceOf?: (ev: EventOut) => string;
 }) {
   const stripById = new Map(strips.map((s) => [s.sandboxId, s]));
   return (
@@ -100,6 +105,7 @@ export default function SplitTimeline({
               expanded={expanded.has(ev.id)}
               onToggle={onToggle}
               sandboxName={ev.sandbox_id ? names?.get(ev.sandbox_id) : undefined}
+              displaySource={displaySourceOf?.(ev)}
             />
           );
         }
@@ -112,6 +118,7 @@ export default function SplitTimeline({
                   expanded={expanded.has(row.left.id)}
                   onToggle={onToggle}
                   showSandbox={false}
+                  displaySource={displaySourceOf?.(row.left)}
                 />
               ) : null}
             </div>
@@ -122,6 +129,7 @@ export default function SplitTimeline({
                   expanded={expanded.has(row.right.id)}
                   onToggle={onToggle}
                   showSandbox={false}
+                  displaySource={displaySourceOf?.(row.right)}
                 />
               ) : null}
             </div>
