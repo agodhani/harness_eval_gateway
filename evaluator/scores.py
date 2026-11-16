@@ -49,6 +49,10 @@ OVERALL_DIMENSION = "overall"
 MAX_DIMENSION_LEN = 128
 #: Sanity cap on rationale text (db Text is unbounded; keep payloads sane).
 MAX_RATIONALE_LEN = 10_000
+#: Byte cap on the scores document itself — the file is written by the
+#: judge sandbox, so the host-side read stays bounded (a real scores.json
+#: is a few KB; 1 MiB is far past legitimate).
+SCORES_FILE_MAX_BYTES = 1_048_576
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
@@ -305,9 +309,13 @@ def load_scores_file(path: Path) -> ParsedScores:
     (``open()`` on a FIFO would block forever waiting for a writer).
     """
     try:
-        if not stat.S_ISREG(Path(path).lstat().st_mode):
+        p = Path(path)
+        if not stat.S_ISREG(p.lstat().st_mode):
             raise ScoresFileError(f"{path} is not a regular file")
-        text = Path(path).read_text(encoding="utf-8", errors="replace")
+        with p.open("rb") as fh:
+            raw = fh.read(SCORES_FILE_MAX_BYTES + 1)
     except OSError as exc:
         raise ScoresFileError(f"cannot read {path}: {exc}") from exc
-    return parse_scores_json(text)
+    if len(raw) > SCORES_FILE_MAX_BYTES:
+        raise ScoresFileError(f"{path} exceeds {SCORES_FILE_MAX_BYTES} bytes")
+    return parse_scores_json(raw.decode("utf-8", errors="replace"))

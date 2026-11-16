@@ -142,6 +142,8 @@ def _gather_sources(
                 continue
             path = Path(dirpath) / name
             try:
+                if path.is_symlink() or not path.is_file():
+                    continue
                 candidates.append((path.stat().st_size, path))
             except OSError:
                 continue
@@ -149,19 +151,20 @@ def _gather_sources(
 
     out: list[tuple[str, str]] = []
     remaining = budget_bytes
-    for _size, path in candidates:
+    for size, path in candidates:
         if remaining <= 0:
             break
         rel = path.relative_to(workspace).as_posix()
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            with path.open("rb") as fh:
+                raw = fh.read(min(size, remaining))
         except OSError:
             continue
-        if len(text.encode("utf-8", errors="replace")) > remaining:
-            # Byte-accurate truncation is overkill — char slice, mark it.
-            text = text[:remaining] + "\n# ... [truncated — source budget]\n"
+        text = raw.decode("utf-8", errors="replace")
+        if size > len(raw):
+            text += "\n# ... [truncated — source budget]\n"
         out.append((rel, text))
-        remaining -= len(text.encode("utf-8", errors="replace"))
+        remaining -= len(raw)
     return out
 
 

@@ -369,6 +369,9 @@ async def _evaluate_all(
             "timeout_seconds": timeout,
             # F7 DI knobs (accepted extras beyond the §5 contract):
             "eval_root": eval_root,
+            # Same slack the outer wait_for grants — lets the evaluator
+            # bound its direct-judge fallback inside the attempt deadline.
+            "deadline_margin_seconds": _EVAL_TIMEOUT_MARGIN_SECONDS,
             "image": settings.SANDBOX_IMAGE,
             # Judge per-request output cap — thinking judges burn tokens on
             # reasoning before scores.json; the 4096 default truncates.

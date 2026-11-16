@@ -189,6 +189,36 @@ async def test_binary_and_generated_tests_skipped(eval_ws: Path) -> None:
     assert "test_x.py" not in user
 
 
+async def test_gather_sources_skips_symlinks(eval_ws: Path, tmp_path: Path) -> None:
+    """Workspace symlinks survive staging — the host-side gather must not
+    follow them or files outside the workspace land in the prompt."""
+    secret = tmp_path / "host_secret.txt"
+    secret.write_text("HOST-SECRET-DEADBEEF\n")
+    (eval_ws / "leak.txt").symlink_to(secret)
+    (eval_ws / "dangling.txt").symlink_to(tmp_path / "nonexistent")
+    client = _FakeClient()
+    await _judge(eval_ws, client=client)
+    user = client.calls[0]["json"]["messages"][1]["content"]
+    sources_section = user.split("# Submission files")[-1]
+    assert "HOST-SECRET-DEADBEEF" not in user
+    assert "leak.txt" not in sources_section
+    assert "dangling.txt" not in sources_section
+
+
+async def test_symlinked_staged_files_not_read(eval_ws: Path, tmp_path: Path) -> None:
+    """ANALYSIS.md / EVAL_TRANSCRIPT.log live in the judge-writable staged
+    workspace — a planted symlink must not leak host files either."""
+    secret = tmp_path / "host_secret.txt"
+    secret.write_text("HOST-SECRET-CAFEBABE\n")
+    (eval_ws / "EVAL_TRANSCRIPT.log").unlink()
+    for name in ("ANALYSIS.md", "EVAL_TRANSCRIPT.log"):
+        (eval_ws / name).symlink_to(secret)
+    client = _FakeClient()
+    await _judge(eval_ws, client=client)
+    user = client.calls[0]["json"]["messages"][1]["content"]
+    assert "HOST-SECRET-CAFEBABE" not in user
+
+
 async def test_prior_error_and_terminal_reason_in_prompt(eval_ws: Path) -> None:
     client = _FakeClient()
     await _judge(

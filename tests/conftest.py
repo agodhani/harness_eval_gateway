@@ -35,6 +35,10 @@ os.environ.setdefault("SCORING_EXEC", "0")
 # PR8: same for LLM test-suite generation — the evaluator's testgen step is
 # pinned off so unit tests never call a model or spawn exec containers.
 os.environ.setdefault("SCORING_TESTGEN", "0")
+# The direct-judge fallback defaults ON and the fallback tests rely on it —
+# a dev's EVAL_DIRECT_FALLBACK=0 must not leak in (forced, like the cache
+# pin above); the disable test monkeypatches explicitly.
+os.environ["EVAL_DIRECT_FALLBACK"] = "1"
 
 from fastapi.testclient import TestClient
 

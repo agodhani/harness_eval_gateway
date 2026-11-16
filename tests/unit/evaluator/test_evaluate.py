@@ -8,6 +8,7 @@ exposes (spawn/status/stop/remove).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -747,6 +748,60 @@ async def test_direct_fallback_disabled_by_env(
         e for e in events if e.payload.get("phase") == "eval_scores_failed"
     ]
     assert "disabled" in err[0].payload["fallback_detail"]
+
+
+async def test_direct_fallback_bounded_by_attempt_deadline(
+    seeded, session_factory
+) -> None:
+    """A fallback that would outlive the attempt's deadline is cancelled
+    instead — expiry lands in fallback_detail so the orchestrator's retry
+    loop stays in charge (an outer wait_for cancellation would break out
+    of it as a deterministic failure)."""
+
+    class SlowClient(_FakeClient):
+        async def post(self, url, json=None, headers=None):
+            await asyncio.sleep(30)
+            return _FakeResponse({})
+
+    rows = await _eval(
+        seeded,
+        session_factory,
+        FakeRuntime(scores_obj=None),
+        direct_client=SlowClient(),
+        timeout_seconds=6.0,
+        deadline_margin_seconds=0.5,
+    )
+    assert rows == []
+    err = [
+        e
+        for e in _events_in_db(session_factory)
+        if e.payload.get("phase") == "eval_scores_failed"
+    ]
+    assert len(err) == 1
+    assert "deadline" in err[0].payload["fallback_detail"]
+
+
+async def test_direct_fallback_skipped_when_budget_exhausted(
+    seeded, session_factory
+) -> None:
+    """No attempt budget left → no gateway call at all."""
+    client = _FakeClient()
+    rows = await _eval(
+        seeded,
+        session_factory,
+        FakeRuntime(scores_obj=None),
+        direct_client=client,
+        timeout_seconds=0.0,
+        deadline_margin_seconds=0.0,
+    )
+    assert rows == []
+    assert client.calls == []
+    err = [
+        e
+        for e in _events_in_db(session_factory)
+        if e.payload.get("phase") == "eval_scores_failed"
+    ]
+    assert "deadline" in err[0].payload["fallback_detail"]
 
 
 async def test_eval_scored_mode_is_agentic_on_normal_path(

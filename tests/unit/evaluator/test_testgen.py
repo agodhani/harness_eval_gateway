@@ -400,6 +400,21 @@ async def test_source_budget_bounds_prompt(python_ws: Path, gen_dir: Path) -> No
     assert "calc.py" in prompt and "big.py" in prompt
 
 
+async def test_source_gather_skips_symlinks(
+    python_ws: Path, gen_dir: Path, tmp_path: Path
+) -> None:
+    """A candidate-planted symlink must not leak host files into the
+    generation prompt — artifact workspaces preserve links."""
+    secret = tmp_path / "outside_secret.py"
+    secret.write_text("SECRET = 'cafef00d'\n")
+    (python_ws / "leak.py").symlink_to(secret)
+    client = _FakeClient()
+    await _gen(python_ws, gen_dir, client=client)
+    prompt = client.calls[0]["json"]["messages"][1]["content"]
+    assert "cafef00d" not in prompt
+    assert "leak.py" not in prompt
+
+
 # ----------------------------------------------------------------------
 # parse_test_files — pure parser unit tests
 # ----------------------------------------------------------------------
