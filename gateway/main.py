@@ -187,6 +187,156 @@ def _forward_protocol_headers(
 
 
 # ---------------------------------------------------------------------------
+# Transient upstream retry (bughunt): a saturated-but-alive upstream (Ollama
+# swapping a model, a proxy hiccup) surfaces connect/read timeouts or bare
+# 502/503/504s — failing the request straight to the harness kills the lane
+# on a transient. ``_upstream_post`` retries transport errors and those
+# statuses up to ``UPSTREAM_RETRY_ATTEMPTS`` extra times with exponential
+# backoff; 4xx/429s and failures once the response started streaming to the
+# client are NEVER retried. Each retry emits an ``upstream_retry``-staged
+# error event (kept distinct from ``stage="upstream"`` so the monitor's
+# error threshold still bounds the OUTER failure count).
+# ---------------------------------------------------------------------------
+
+_RETRYABLE_UPSTREAM_STATUSES = frozenset({502, 503, 504})
+_RETRYABLE_UPSTREAM_ERRORS = (
+    httpx.TimeoutException,  # connect/read/write/pool timeouts
+    httpx.NetworkError,  # refused, reset, EOF (ConnectError et al.)
+    httpx.RemoteProtocolError,  # server hung up without a response
+)
+
+# Bound on bytes teed off a streamed response for metering (usage + output
+# text + error frames). The client stream itself is unbounded — past this
+# cap metering degrades to the estimate path and the body is never cached.
+_STREAM_CAPTURE_LIMIT = 2 * 1024 * 1024
+
+
+async def _emit_upstream_retry(
+    claims: CredClaims,
+    *,
+    meter: bool,
+    provider: ProviderName,
+    attempt: int,
+    max_attempts: int,
+    delay: float,
+    message: str,
+    http_status: int | None = None,
+) -> None:
+    if not meter:
+        return
+    await metering.emit_error(
+        claims,
+        stage="upstream_retry",
+        message=message,
+        http_status=http_status,
+        attempt=attempt,
+        max_attempts=max_attempts,
+        retry_delay_seconds=delay,
+        provider=provider,
+    )
+
+
+async def _upstream_post(
+    *,
+    upstream: httpx.AsyncClient,
+    path: str,
+    body: dict[str, Any],
+    claims: CredClaims,
+    provider: ProviderName,
+    request_headers: Mapping[str, str] | None,
+    stream: bool,
+    started: float,
+    meter: bool = True,
+) -> httpx.Response | JSONResponse:
+    """POST ``body`` upstream, retrying transient failures before giving up.
+
+    Returns the upstream ``httpx.Response`` once a response is available
+    (headers-received when ``stream=True``) — INCLUDING final-failure
+    statuses, which callers meter and forward verbatim — or a 502
+    ``JSONResponse`` when every attempt died in transport (the historical
+    upstream-error path). The request body is identical across attempts.
+    """
+    settings = get_settings()
+    max_tries = 1 + max(0, settings.UPSTREAM_RETRY_ATTEMPTS)
+    backoff_base = settings.UPSTREAM_RETRY_BACKOFF_SECONDS
+    headers = _forward_protocol_headers(request_headers or {}, provider)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            if stream:
+                req = upstream.build_request(
+                    "POST", path, json=body, headers=headers
+                )
+                resp = await upstream.send(req, stream=True)
+            else:
+                resp = await upstream.post(path, json=body, headers=headers)
+        except httpx.HTTPError as exc:
+            if isinstance(exc, _RETRYABLE_UPSTREAM_ERRORS) and attempt < max_tries:
+                delay = backoff_base * (2 ** (attempt - 1))
+                await _emit_upstream_retry(
+                    claims,
+                    meter=meter,
+                    provider=provider,
+                    attempt=attempt,
+                    max_attempts=max_tries,
+                    delay=delay,
+                    message=f"{type(exc).__name__}: {exc}",
+                )
+                await asyncio.sleep(delay)
+                continue
+            # Terminal transport failure — the historical upstream error.
+            latency_ms = int((time.monotonic() - started) * 1000)
+            if meter:
+                await metering.emit_error(
+                    claims,
+                    stage="upstream",
+                    message=f"{type(exc).__name__}: {exc}",
+                    latency_ms=latency_ms,
+                    provider=provider,
+                )
+            return JSONResponse(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                content={
+                    "error": {
+                        "message": f"upstream request failed: {exc}",
+                        "type": "upstream_error",
+                    }
+                },
+            )
+        if resp.status_code in _RETRYABLE_UPSTREAM_STATUSES and attempt < max_tries:
+            # Drain the failed attempt before retrying — frees the
+            # connection and captures the upstream's own error text.
+            detail = ""
+            try:
+                detail = (await resp.aread()).decode("utf-8", errors="replace")[
+                    :500
+                ]
+            except Exception as exc:  # noqa: BLE001 — drain is best-effort
+                log.debug("upstream retry: error body drain failed: %s", exc)
+            try:
+                await resp.aclose()
+            except Exception as exc:  # noqa: BLE001 — response is dead anyway
+                log.debug("upstream retry: response close failed: %s", exc)
+            delay = backoff_base * (2 ** (attempt - 1))
+            await _emit_upstream_retry(
+                claims,
+                meter=meter,
+                provider=provider,
+                attempt=attempt,
+                max_attempts=max_tries,
+                delay=delay,
+                message=detail or f"HTTP {resp.status_code}",
+                http_status=resp.status_code,
+            )
+            await asyncio.sleep(delay)
+            continue
+        # 2xx, 4xx/429 (never retried), or an exhausted 502/503/504 — the
+        # caller's normal metering/error path handles all of these.
+        return resp
+
+
+# ---------------------------------------------------------------------------
 # PR18 — response cache helpers (opt-in via GATEWAY_CACHE_*; see
 # gateway/cache.py). Lookups/stores are best-effort like event emission —
 # a broken cache must degrade to a miss, never a proxy 5xx.
@@ -244,7 +394,12 @@ async def chat_completions(
     if body.get("stream"):
         out = _strip_ollama_only(dict(body), provider)
         # Ask the upstream for a terminal usage chunk so streamed calls stay
-        # metered (no-op for upstreams that ignore it).
+        # metered (no-op for upstreams that ignore it — the tee then falls
+        # back to a len/4 usage estimate flagged ``usage_estimated``). The
+        # resulting usage-only ``chat.completion.chunk`` frame passes
+        # through to the client verbatim: it's the same frame OpenAI emits
+        # when callers request ``include_usage`` themselves, so OpenAI-
+        # compatible SDKs parse it as a valid empty-choices chunk.
         stream_options = dict(out.get("stream_options") or {})
         stream_options.setdefault("include_usage", True)
         out["stream_options"] = stream_options
@@ -311,30 +466,19 @@ async def chat_completions(
         )
 
     started = time.monotonic()
-    try:
-        upstream_resp = await upstream.post(
-            "/v1/chat/completions",
-            json=out,
-            headers=_forward_protocol_headers(request.headers, provider),
-        )
-    except httpx.HTTPError as exc:
-        latency_ms = int((time.monotonic() - started) * 1000)
-        await metering.emit_error(
-            claims,
-            stage="upstream",
-            message=f"{type(exc).__name__}: {exc}",
-            latency_ms=latency_ms,
-            provider=provider,
-        )
-        return JSONResponse(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            content={
-                "error": {
-                    "message": f"upstream request failed: {exc}",
-                    "type": "upstream_error",
-                }
-            },
-        )
+    result = await _upstream_post(
+        upstream=upstream,
+        path="/v1/chat/completions",
+        body=out,
+        claims=claims,
+        provider=provider,
+        request_headers=request.headers,
+        stream=False,
+        started=started,
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    upstream_resp = result
     latency_ms = int((time.monotonic() - started) * 1000)
 
     # --- meter the outcome; always return upstream verbatim ---
@@ -447,8 +591,15 @@ async def _passthrough(
     ``stream`` flag is preserved — Anthropic/Responses clients (Claude Code,
     dsh, Codex) stream by default, and a rewritten content-type would break
     their SDK parsers. Streamed bodies are tee'd: chunks pass through as they
-    arrive and the captured bytes yield the final usage for the
-    ``llm_response`` event once the stream ends.
+    arrive and the captured bytes (bounded by ``_STREAM_CAPTURE_LIMIT``)
+    yield the final usage for the ``llm_response`` event once the stream
+    ends — provider usage when present, else a ``len/4`` estimate flagged
+    ``usage_estimated``, plus an ``error`` event for streamed
+    ``{"error": ...}`` frames.
+
+    Transient upstream failures (timeouts, refused/reset, 502/503/504) are
+    retried via ``_upstream_post`` before any bytes reach the client —
+    mid-stream failures are terminal.
 
     ``provider`` is the request's resolved upstream provider (recorded on the
     emitted events); ``request_headers`` are the inbound headers — protocol
@@ -480,14 +631,16 @@ async def _passthrough(
         if hit is not None:
             # Replay the stored bytes as a stream — content_type drives the
             # client's parser (SSE vs JSON), so the replay is byte-faithful.
+            parsed = metering.metered_stream_usage(hit.body, api=api)
             await metering.emit_llm_response(
                 claims,
                 model=body.get("model"),
-                usage=metering.usage_from_sse(hit.body, api=api),
+                usage=parsed["usage"],
                 latency_ms=lookup_ms,
                 http_status=hit.status,
                 provider=provider,
                 cached=True,
+                usage_estimated=parsed["estimated"],
             )
 
             async def _replay():
@@ -502,79 +655,111 @@ async def _passthrough(
         cache_key = None
 
     started = time.monotonic()
-    try:
-        req = upstream.build_request(
-            "POST",
-            path,
-            json=body,
-            headers=_forward_protocol_headers(request_headers or {}, provider),
-        )
-        upstream_resp = await upstream.send(req, stream=True)
-    except httpx.HTTPError as exc:
-        latency_ms = int((time.monotonic() - started) * 1000)
-        if meter:
-            await metering.emit_error(
-                claims,
-                stage="upstream",
-                message=f"{type(exc).__name__}: {exc}",
-                latency_ms=latency_ms,
-                provider=provider,
-            )
-        return JSONResponse(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            content={
-                "error": {
-                    "message": f"upstream request failed: {exc}",
-                    "type": "upstream_error",
-                }
-            },
-        )
+    result = await _upstream_post(
+        upstream=upstream,
+        path=path,
+        body=body,
+        claims=claims,
+        provider=provider,
+        request_headers=request_headers,
+        stream=True,
+        started=started,
+        meter=meter,
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    upstream_resp = result
 
     async def _aiter():
-        chunks: list[bytes] = []
+        # Bounded capture for metering: the client stream is unbounded, but
+        # usage/output text only needs the head — past the cap the emitted
+        # usage simply degrades to the estimate path.
+        captured = bytearray()
+        truncated = False
         complete = False
+        stream_error: Exception | None = None
         try:
             async for chunk in upstream_resp.aiter_bytes():
                 if meter:
-                    chunks.append(chunk)
+                    if len(captured) < _STREAM_CAPTURE_LIMIT:
+                        captured += chunk[
+                            : _STREAM_CAPTURE_LIMIT - len(captured)
+                        ]
+                    else:
+                        truncated = True
                 yield chunk
             complete = True
+        except Exception as exc:
+            # Mid-stream transport failure: the body already reached the
+            # client so retrying is impossible — terminal by definition.
+            stream_error = exc
+            raise
         finally:
             latency_ms = int((time.monotonic() - started) * 1000)
             try:
                 if meter:
-                    captured = b"".join(chunks)
-                    usage = metering.usage_from_sse(captured, api=api)
+                    captured_b = bytes(captured)
+                    parsed = metering.metered_stream_usage(
+                        captured_b, api=api
+                    )
                     await metering.emit_llm_response(
                         claims,
                         model=body.get("model"),
-                        usage=usage,
+                        usage=parsed["usage"],
                         latency_ms=latency_ms,
                         http_status=upstream_resp.status_code,
                         provider=provider,
+                        usage_estimated=parsed["estimated"],
                     )
-                    if not 200 <= upstream_resp.status_code < 300:
+                    if stream_error is not None:
                         await metering.emit_error(
                             claims,
                             stage="upstream",
-                            message=captured.decode("utf-8", errors="replace")[:500],
+                            message=(
+                                f"{type(stream_error).__name__}: "
+                                f"{stream_error}"
+                            ),
                             http_status=upstream_resp.status_code,
                             latency_ms=latency_ms,
                             provider=provider,
                         )
-                    elif complete:
-                        # Cache only fully-captured 2xx bodies — partial
-                        # streams (client abort, transport error) would
-                        # replay truncated output.
-                        await _cache_store(
-                            cache,
-                            cache_key,
-                            status=upstream_resp.status_code,
-                            content_type=upstream_resp.headers.get(
-                                "content-type", "application/json"
-                            ),
-                            body=captured,
+                    elif not 200 <= upstream_resp.status_code < 300:
+                        await metering.emit_error(
+                            claims,
+                            stage="upstream",
+                            message=captured_b.decode(
+                                "utf-8", errors="replace"
+                            )[:500],
+                            http_status=upstream_resp.status_code,
+                            latency_ms=latency_ms,
+                            provider=provider,
                         )
+                    else:
+                        # Provider-reported mid-stream failures (OpenRouter
+                        # et al. stream {"error": ...} frames under a 200).
+                        for err in parsed["errors"]:
+                            await metering.emit_error(
+                                claims,
+                                stage="upstream",
+                                message=err,
+                                http_status=upstream_resp.status_code,
+                                latency_ms=latency_ms,
+                                provider=provider,
+                            )
+                        if complete and not truncated:
+                            # Cache only fully-captured 2xx bodies —
+                            # partial streams (client abort, transport
+                            # error, capture cap) would replay truncated
+                            # output.
+                            await _cache_store(
+                                cache,
+                                cache_key,
+                                status=upstream_resp.status_code,
+                                content_type=upstream_resp.headers.get(
+                                    "content-type", "application/json"
+                                ),
+                                body=captured_b,
+                            )
             finally:
                 await upstream_resp.aclose()
 

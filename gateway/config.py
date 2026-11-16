@@ -128,6 +128,16 @@ class GatewaySettings(BaseSettings):
     UPSTREAM_TIMEOUT: float = 300.0
     INGEST_TIMEOUT: float = 10.0
 
+    # --- Transient upstream retry (bughunt) ---
+    # Retried INSIDE the gateway before an error reaches the client:
+    # connect/read timeouts, refused/reset connections, and bare
+    # 502/503/504s (e.g. a saturated-but-alive Ollama). 4xx/429s and
+    # failures once the response has started streaming to the client are
+    # never retried. Each retry emits an `upstream_retry`-staged error
+    # event; the final failure takes the normal upstream-error path.
+    UPSTREAM_RETRY_ATTEMPTS: int = 2  # extra attempts beyond the first
+    UPSTREAM_RETRY_BACKOFF_SECONDS: float = 5.0  # base, doubles per attempt
+
     # --- Response cache (PR18: deterministic replay — dev/CI aid) ---
     # OFF by default: real runs must hit the live upstream. When enabled,
     # metered generation calls (/v1/chat/completions, /v1/messages,
