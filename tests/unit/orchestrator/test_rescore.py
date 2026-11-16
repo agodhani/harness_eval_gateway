@@ -8,9 +8,12 @@ evaluator kwargs see real paths.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from sqlalchemy import select
 
 from db.models import Event, Rubric, Run, Sandbox, Score
@@ -776,3 +779,209 @@ async def test_sweep_fails_evaluating_run_without_scores(
     )
 
     assert _run(session_factory, run.id).status == "failed"
+
+
+async def test_rescore_cancelled_run_rejected(
+    session_factory, settings, artifact_root
+) -> None:
+    """``cancelled`` is terminal for sweep/delete semantics, but nothing
+    ever executed — a rescore must refuse instead of force-flipping the
+    run cancelled → evaluating → failed."""
+    run = make_run(session_factory, status="cancelled", config=run_config())
+    _rubric(session_factory, run.id, version=1)
+    _artifact_sandbox(session_factory, artifact_root, run.id)
+
+    calls: list = []
+    await rescore_run(
+        run.id,
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+
+    assert calls == []
+    assert _run(session_factory, run.id).status == "cancelled"
+    errs = [
+        e for e in _events(session_factory, run.id)
+        if e.type == "error" and e.payload.get("stage") == "rescore"
+    ]
+    assert errs and "cancelled" in errs[0].payload["message"]
+
+
+# ---------------------------------------------------------------------------
+# rescore slot discipline — same serialized lane as the submission queue
+# ---------------------------------------------------------------------------
+
+
+def _set_status(session_factory, run_id: uuid.UUID, status: str) -> None:
+    with session_factory() as s:
+        s.get(Run, run_id).status = status
+        s.commit()
+
+
+def _stages(session_factory, run_id: uuid.UUID) -> list[str]:
+    return [
+        e.payload.get("stage")
+        for e in _events(session_factory, run_id)
+        if e.type == "checkpoint"
+    ]
+
+
+def _mark_rescore_requested(session_factory, run_id: uuid.UUID) -> None:
+    """Stamp the checkpoint ``_prepare_rescore`` emits in the request tx —
+    makes an evaluating run a legitimate rescore pass, not a hijack."""
+    with session_factory() as s:
+        s.add(
+            Event(
+                run_id=run_id,
+                source="orchestrator",
+                type="checkpoint",
+                payload={"stage": "rescore_requested"},
+            )
+        )
+        s.commit()
+
+
+async def test_rescore_waits_for_slot_emits_rescore_queued(
+    session_factory, settings, artifact_root, monkeypatch
+) -> None:
+    """A rescore triggered while ANOTHER run executes must park until the
+    slot frees — same lane as the PR15 submission queue — emitting one
+    ``rescore_queued`` checkpoint while it waits."""
+    monkeypatch.setattr(lifecycle, "_RESCORE_SLOT_POLL_SECONDS", 0.01)
+    blocker = make_run(session_factory, status="running")
+    run = make_run(session_factory, status="evaluating", config=run_config())
+    _rubric(session_factory, run.id, version=1)
+    _artifact_sandbox(session_factory, artifact_root, run.id)
+    _mark_rescore_requested(session_factory, run.id)
+
+    calls: list = []
+    task = asyncio.create_task(
+        rescore_run(
+            run.id,
+            session_factory=session_factory,
+            runtime=FakeRuntime(artifact_root=artifact_root),
+            settings=settings,
+            evaluator_fn=_score_writing_evaluator(calls),
+        )
+    )
+    try:
+        for _ in range(200):
+            if "rescore_queued" in _stages(session_factory, run.id):
+                break
+            await asyncio.sleep(0.01)
+
+        # parked — the judge never started; the run still holds its claim
+        assert calls == []
+        assert "rescore_queued" in _stages(session_factory, run.id)
+        assert "rescore_started" not in _stages(session_factory, run.id)
+        assert _run(session_factory, run.id).status == "evaluating"
+
+        _set_status(session_factory, blocker.id, "done")
+        await asyncio.wait_for(task, timeout=5)
+    finally:
+        if not task.done():
+            task.cancel()
+
+    assert len(calls) == 1
+    assert _run(session_factory, run.id).status == "done"
+    assert _stages(session_factory, run.id).count("rescore_queued") == 1
+    assert "rescore_started" in _stages(session_factory, run.id)
+
+
+def _done_marking_lifecycle(calls: list[uuid.UUID]):
+    """Stub run_lifecycle: record the call, mark the run done (same stub
+    shape test_pacing uses for queue-promotion chains)."""
+
+    async def fake(run_id: uuid.UUID, *, session_factory, **_kwargs):
+        calls.append(run_id)
+        with session_factory() as s:
+            run = s.get(Run, run_id)
+            if run is not None:
+                run.status = "done"
+                s.commit()
+
+    return fake
+
+
+async def _wait_calls(calls: list, n: int) -> None:
+    for _ in range(500):
+        if len(calls) >= n:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"expected {n} lifecycle calls, got {calls}")
+
+
+def _queued_run(session_factory) -> Run:
+    run = make_run(session_factory, status="queued")
+    with session_factory() as s:
+        s.get(Run, run.id).started_at = datetime.now(UTC)
+        s.commit()
+    return run
+
+
+async def test_rescore_finish_promotes_queued_run(
+    session_factory, settings, fake_runtime, monkeypatch
+) -> None:
+    """A rescore holds the slot the same way a lifecycle does — so its
+    task exit must run the same promotion: the run queued behind it gets
+    the freed slot."""
+    calls: list[uuid.UUID] = []
+    monkeypatch.setattr(
+        lifecycle, "run_lifecycle", _done_marking_lifecycle(calls)
+    )
+
+    async def noop_rescore(run_id, **_kwargs):
+        pass
+
+    monkeypatch.setattr(lifecycle, "rescore_run", noop_rescore)
+
+    queued = _queued_run(session_factory)
+    done = make_run(session_factory, status="done", config=run_config())
+
+    task = runner.start_rescore_task(
+        done.id,
+        session_factory=session_factory,
+        settings=settings,
+        runtime=fake_runtime,
+    )
+    await task
+    await _wait_calls(calls, 1)
+
+    assert calls == [queued.id]
+    assert _run(session_factory, queued.id).status == "done"
+    assert "run_dequeued" in _stages(session_factory, queued.id)
+
+
+async def test_rescore_promotes_even_when_pass_raises(
+    session_factory, settings, fake_runtime, monkeypatch
+) -> None:
+    """The finally releases the slot on ANY task exit — a rescore that
+    raises must still let the queue advance (defensive wiring; the real
+    rescore_run never raises)."""
+    calls: list[uuid.UUID] = []
+    monkeypatch.setattr(
+        lifecycle, "run_lifecycle", _done_marking_lifecycle(calls)
+    )
+
+    async def boom(run_id, **_kwargs):
+        raise RuntimeError("rescore exploded")
+
+    monkeypatch.setattr(lifecycle, "rescore_run", boom)
+
+    queued = _queued_run(session_factory)
+    done = make_run(session_factory, status="done", config=run_config())
+
+    task = runner.start_rescore_task(
+        done.id,
+        session_factory=session_factory,
+        settings=settings,
+        runtime=fake_runtime,
+    )
+    with pytest.raises(RuntimeError, match="rescore exploded"):
+        await task
+    await _wait_calls(calls, 1)
+
+    assert calls == [queued.id]
+    assert _run(session_factory, queued.id).status == "done"

@@ -3,7 +3,7 @@
 Allowed transitions mirror the lifecycle in AGENTS.md / docs/orchestrator-plan.md:
 
     run:     submitted → rubric_review → [queued →] provisioning → running
-             → evaluating → done | failed
+             → evaluating → done | failed | cancelled
     sandbox: provisioning → running → terminating → done | failed
 
 ``queued`` (PR15 pacing) parks an approved run while another run holds the
@@ -13,6 +13,11 @@ exists so sweeps / a future cancel can retire parked runs.
 PR5 adds the re-score loop: a terminal run may re-enter ``evaluating``
 (done|failed → evaluating) so the evaluator can re-run on stored artifacts;
 it then closes back to ``done`` or ``failed`` by the usual score-count rule.
+
+``cancelled`` (DELETE /api/runs/{id}) is a user-initiated terminal state,
+reachable from the pre-spawn phases only — ``submitted``, ``rubric_review``,
+``queued``. In-flight phases (``provisioning``/``running``/``evaluating``)
+409 at the API instead; terminal runs hard-delete rather than transition.
 
 ``transition()`` is the ONLY sanctioned way to change ``status`` — it validates
 against the table, mutates the row, and emits an orchestrator ``checkpoint``
@@ -29,9 +34,9 @@ from db.models import Run, Sandbox
 from .events import emit
 
 RUN_TRANSITIONS: dict[str, frozenset[str]] = {
-    "submitted": frozenset({"rubric_review", "failed"}),
-    "rubric_review": frozenset({"provisioning", "queued", "failed"}),
-    "queued": frozenset({"provisioning", "failed"}),
+    "submitted": frozenset({"rubric_review", "failed", "cancelled"}),
+    "rubric_review": frozenset({"provisioning", "queued", "failed", "cancelled"}),
+    "queued": frozenset({"provisioning", "failed", "cancelled"}),
     "provisioning": frozenset({"running", "failed"}),
     "running": frozenset({"evaluating", "failed"}),
     "evaluating": frozenset({"done", "failed"}),
@@ -48,7 +53,7 @@ SANDBOX_TRANSITIONS: dict[str, frozenset[str]] = {
     "failed": frozenset(),
 }
 
-RUN_TERMINAL = frozenset({"done", "failed"})
+RUN_TERMINAL = frozenset({"done", "failed", "cancelled"})
 SANDBOX_TERMINAL = frozenset({"done", "failed"})
 
 # Sandbox terminal_reason values that still count as a *successful* outcome

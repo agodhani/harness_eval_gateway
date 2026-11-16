@@ -21,10 +21,11 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from api import modelcheck
 from api.deps import get_db
 from api.main import app
 from api.routers import runs as runs_router
-from db.models import Base, Event, Rubric, Run
+from db.models import Artifact, Base, Event, Rubric, Run, Sandbox, Score
 from db.session import make_engine, make_session_factory
 from orchestrator import lifecycle as lifecycle_mod
 from orchestrator import rubric as rubric_mod
@@ -163,6 +164,22 @@ def api(session_factory, packs_dir: Path, tmp_path: Path, monkeypatch):
         lifecycle_calls=lifecycle_calls,
     )
     app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.fixture(autouse=True)
+def _modelcheck_offline(monkeypatch):
+    """Submit validation never touches a real gateway/ollama in unit tests —
+    default the catalog fetch to "unreachable" (the offline-tolerance path);
+    tests exercising catalog checks re-patch ``_fetch_catalog`` themselves.
+    The ~60s module cache is reset so each test's stub is authoritative."""
+
+    async def _offline(settings, provider):
+        return None
+
+    monkeypatch.setattr(modelcheck, "_fetch_catalog", _offline)
+    modelcheck.reset_catalog_cache()
+    yield
+    modelcheck.reset_catalog_cache()
 
 
 def _wait_run(client: TestClient, run_id: uuid.UUID | str, **match) -> dict:
@@ -634,3 +651,300 @@ def test_rubric_endpoints_404_and_409(api) -> None:
         f"/api/runs/{bare_id}/rubric", json={"content": _rubric_content()}
     ).status_code == 409
     assert client.post(f"/api/runs/{bare_id}/approve").status_code == 409
+
+
+def test_approve_terminal_run_reports_real_reason(api) -> None:
+    """Approving a run already past the gate names the real condition —
+    "already approved or finished" — not the edit-path's "not editable"."""
+    run_id, _rubric_id = _run_with_draft_rubric(api)
+    with api.session_factory() as s:
+        s.get(Run, uuid.UUID(run_id)).status = "done"
+        s.commit()
+
+    resp = api.client.post(f"/api/runs/{run_id}/approve")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert "already approved or finished" in detail
+    assert "not editable" not in detail
+
+    # PUT rubric keeps its edit-path message — same guard, other phrasing.
+    resp = api.client.put(
+        f"/api/runs/{run_id}/rubric", json={"content": _rubric_content()}
+    )
+    assert resp.status_code == 409
+    assert "not editable" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# queue_position — parked runs expose their FIFO position
+# ---------------------------------------------------------------------------
+
+
+def _seed_run(api, **fields) -> uuid.UUID:
+    """Insert a bare Run row directly (bypasses submit/rubric machinery)."""
+    with api.session_factory() as s:
+        run = Run(task_prompt="x", model_name="m", config={}, **fields)
+        s.add(run)
+        s.commit()
+        return run.id
+
+
+def _stages(api, run_id: uuid.UUID) -> list[str]:
+    """Checkpoint stage names emitted for one run."""
+    with api.session_factory() as s:
+        return [
+            e.payload.get("stage")
+            for e in s.execute(select(Event).where(Event.run_id == run_id)).scalars()
+            if e.type == "checkpoint"
+        ]
+
+
+def test_queue_positions_on_list_and_detail(api) -> None:
+    """1-based position among queued runs, ordered by queue-entry
+    (started_at) — the same order claim_next_queued promotes. Non-queued
+    runs surface null."""
+    q1 = _seed_run(api, status="queued")
+    q2 = _seed_run(api, status="queued")
+    running = _seed_run(api, status="running")
+    with api.session_factory() as s:
+        s.get(Run, q1).started_at = datetime.now(UTC) - timedelta(minutes=5)
+        s.get(Run, q2).started_at = datetime.now(UTC) - timedelta(minutes=1)
+        s.commit()
+
+    rows = api.client.get("/api/runs", params={"status": "queued"}).json()
+    positions = {uuid.UUID(r["id"]): r["queue_position"] for r in rows}
+    assert positions[q1] == 1
+    assert positions[q2] == 2
+
+    detail = api.client.get(f"/api/runs/{q2}").json()
+    assert detail["queue_position"] == 2
+    assert api.client.get(f"/api/runs/{running}").json()["queue_position"] is None
+    rows = api.client.get("/api/runs", params={"status": "running"}).json()
+    assert all(r["queue_position"] is None for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# submit validation — whitespace + model catalog (api/modelcheck.py)
+# ---------------------------------------------------------------------------
+
+
+def _stub_catalog(monkeypatch, catalog_or_exc) -> None:
+    """One catalog for every provider the spec resolves to — an Exception
+    value simulates an unreachable gateway instead."""
+
+    async def fake_fetch(settings, provider):
+        if isinstance(catalog_or_exc, Exception):
+            raise catalog_or_exc
+        return catalog_or_exc
+
+    monkeypatch.setattr(modelcheck, "_fetch_catalog", fake_fetch)
+
+
+def test_create_run_whitespace_only_fields_422(api) -> None:
+    """Strip-before-validate: whitespace-only prompt/model 422s instead of
+    persisting a spec the rubric drafter can't use."""
+    resp = api.client.post("/api/runs", json=_valid_body(task_prompt="  \n\t  "))
+    assert resp.status_code == 422
+    resp = api.client.post("/api/runs", json=_valid_body(model_name="   "))
+    assert resp.status_code == 422
+
+
+def test_create_run_unknown_models_warn(api, monkeypatch) -> None:
+    """Models absent from the provider catalog → advisory warnings on the
+    201 response — never a 422 (the name may be pullable/renamed)."""
+    _stub_catalog(
+        monkeypatch,
+        {"qwen3:8b": frozenset({"tools"}), "eval-model": frozenset({"tools"})},
+    )
+    data = _post_run(api.client, _valid_body(models=["mystery:1"]))
+    warnings = data["warnings"]
+    assert len(warnings) == 1
+    assert "models[] 'mystery:1'" in warnings[0]
+    assert "ollama" in warnings[0]
+
+
+def test_create_run_no_tools_model_422(api, monkeypatch) -> None:
+    """Provider reports no ``tools`` + a tool-call harness → hard 422 with
+    the provider's capability report — the mid-run ollama failure, caught
+    at submit."""
+    _stub_catalog(
+        monkeypatch,
+        {
+            "qwen2.5vl:7b": frozenset({"completion", "vision"}),
+            "qwen3:8b": frozenset({"completion", "tools", "thinking"}),
+        },
+    )
+    resp = api.client.post(
+        "/api/runs",
+        json=_valid_body(model_name="qwen2.5vl:7b", evaluator_model="qwen3:8b"),
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "does not support tools" in detail
+    assert "qwen2.5vl:7b" in detail
+    assert "vision" in detail
+
+
+def test_create_run_no_tools_per_config_pin_422(api, monkeypatch) -> None:
+    """The same capability check applies to per-config model pins."""
+    _stub_catalog(
+        monkeypatch,
+        {
+            "qwen3:8b": frozenset({"tools"}),
+            "eval-model": frozenset({"tools"}),
+            "v-only": frozenset({"completion"}),
+        },
+    )
+    body = _valid_body(harness_configs=[{"adapter": "miniloop", "model": "v-only"}])
+    resp = api.client.post("/api/runs", json=body)
+    assert resp.status_code == 422
+    assert "harness_configs[0].model 'v-only'" in resp.json()["detail"]
+
+
+def test_create_run_catalog_offline_tolerated(api, monkeypatch) -> None:
+    """Catalog fetch failure skips validation entirely — submit still 201s
+    offline (no warnings, no 422)."""
+    _stub_catalog(monkeypatch, RuntimeError("gateway down"))
+    data = _post_run(api.client)
+    assert data["status"] == "submitted"
+    assert data["warnings"] == []
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/runs/{id} — cancel pre-spawn, hard-delete terminal
+# ---------------------------------------------------------------------------
+
+
+def test_delete_submitted_run_cancels(api) -> None:
+    """submitted → cancelled: status flip + checkpoint + finished_at; a
+    pending rubric-draft task is cancelled too."""
+    run_id = _seed_run(api, status="submitted")
+    cancelled: list[bool] = []
+
+    class _PendingTask:
+        def done(self) -> bool:
+            return False
+
+        def cancel(self) -> None:
+            cancelled.append(True)
+
+    runner._TASKS[(run_id, "rubric")] = _PendingTask()  # type: ignore[assignment]
+    try:
+        resp = api.client.delete(f"/api/runs/{run_id}")
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "cancelled"}
+        with api.session_factory() as s:
+            run = s.get(Run, run_id)
+            assert run.status == "cancelled"
+            assert run.finished_at is not None
+        assert "cancelled" in _stages(api, run_id)
+        assert cancelled == [True]
+    finally:
+        runner._TASKS.pop((run_id, "rubric"), None)
+
+
+def test_delete_rubric_review_run_cancels(api) -> None:
+    """rubric_review → cancelled; the draft rubric row is left behind
+    (hard delete is the terminal-path semantic, not cancel's)."""
+    run_id = _seed_run(api, status="rubric_review")
+    with api.session_factory() as s:
+        s.add(
+            Rubric(
+                run_id=run_id, version=1, status="draft",
+                content=_rubric_content(),
+            )
+        )
+        s.commit()
+
+    resp = api.client.delete(f"/api/runs/{run_id}")
+    assert resp.json() == {"status": "cancelled"}
+    with api.session_factory() as s:
+        assert s.get(Run, run_id).status == "cancelled"
+        assert (
+            s.execute(select(Rubric).where(Rubric.run_id == run_id)).scalar_one()
+            is not None
+        )
+
+
+def test_delete_queued_run_releases_slot(api) -> None:
+    """Cancelling a queued run frees its queue position — the next parked
+    run promotes through the same claim a lifecycle exit performs."""
+    first = _seed_run(api, status="queued")
+    nxt = _seed_run(api, status="queued")
+    with api.session_factory() as s:
+        s.get(Run, first).started_at = datetime.now(UTC) - timedelta(minutes=2)
+        s.get(Run, nxt).started_at = datetime.now(UTC) - timedelta(minutes=1)
+        s.commit()
+
+    resp = api.client.delete(f"/api/runs/{first}")
+    assert resp.json() == {"status": "cancelled"}
+    with api.session_factory() as s:
+        assert s.get(Run, first).status == "cancelled"
+        assert s.get(Run, nxt).status == "provisioning"
+    assert "run_dequeued" in _stages(api, nxt)
+
+
+def test_delete_inflight_run_409(api) -> None:
+    """provisioning/running/evaluating → 409: in-flight sandbox teardown is
+    out of scope, and the run is left untouched."""
+    for active in ("provisioning", "running", "evaluating"):
+        run_id = _seed_run(api, status=active)
+        resp = api.client.delete(f"/api/runs/{run_id}")
+        assert resp.status_code == 409, active
+        assert "in-flight" in resp.json()["detail"]
+        with api.session_factory() as s:
+            assert s.get(Run, run_id).status == active
+
+
+def test_delete_done_run_hard_deletes(api) -> None:
+    """Terminal runs hard-delete: every dependent row (scores, artifacts,
+    events, rubrics, sandboxes) plus the on-disk artifact dir."""
+    run_id = _seed_run(api, status="done")
+    with api.session_factory() as s:
+        sb = Sandbox(
+            run_id=run_id, harness_config={}, status="done",
+            artifact_path="/x/y",
+        )
+        s.add(sb)
+        s.flush()
+        s.add(Score(sandbox_id=sb.id, dimension="d", score=1.0))
+        s.add(Artifact(sandbox_id=sb.id, kind="workspace", path="/x/y", size_bytes=1))
+        s.add(
+            Event(
+                run_id=run_id, sandbox_id=sb.id, source="orchestrator",
+                type="checkpoint", payload={"stage": "done"},
+            )
+        )
+        s.add(Rubric(run_id=run_id, version=1, status="approved", content={}))
+        s.commit()
+
+    art_dir = api.settings.ARTIFACT_ROOT / str(run_id)
+    (art_dir / "sb").mkdir(parents=True)
+    (art_dir / "sb" / "hello.txt").write_text("hi")
+
+    resp = api.client.delete(f"/api/runs/{run_id}")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "deleted"}
+
+    with api.session_factory() as s:
+        assert s.get(Run, run_id) is None
+        assert s.execute(select(Sandbox)).scalars().all() == []
+        assert s.execute(select(Score)).scalars().all() == []
+        assert s.execute(select(Artifact)).scalars().all() == []
+        assert s.execute(select(Rubric)).scalars().all() == []
+        assert s.execute(select(Event)).scalars().all() == []
+    assert not art_dir.exists()
+    assert api.client.get(f"/api/runs/{run_id}").status_code == 404
+
+
+def test_delete_cancelled_run_hard_deletes(api) -> None:
+    """cancelled IS terminal — a second DELETE removes the row."""
+    run_id = _seed_run(api, status="cancelled")
+    resp = api.client.delete(f"/api/runs/{run_id}")
+    assert resp.json() == {"status": "deleted"}
+    with api.session_factory() as s:
+        assert s.get(Run, run_id) is None
+
+
+def test_delete_unknown_run_404(api) -> None:
+    assert api.client.delete(f"/api/runs/{uuid.uuid4()}").status_code == 404

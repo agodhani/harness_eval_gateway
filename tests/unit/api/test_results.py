@@ -707,6 +707,40 @@ def test_download_missing_and_unknown(client: TestClient, scored_run, session_fa
     assert client.get(f"/api/artifacts/{uuid.uuid4()}/download").status_code == 404
 
 
+def test_download_directory_zip_filters_noise(
+    client: TestClient, scored_run, session_factory, artifact_root
+) -> None:
+    """Workspace ZIPs drop VCS internals, python caches, vendored deps and
+    virtualenvs at ANY depth — download-side only; the raw files on disk
+    (and every other artifact kind) are untouched."""
+    d = artifact_root / "ws" / "proj"
+    for rel in (
+        "src/app.py",
+        "README.md",
+        ".env.local",
+        ".git/config",
+        ".git/objects/aa/bbccddee",
+        "__pycache__/app.cpython-312.pyc",
+        "src/__pycache__/util.cpython-312.pyc",
+        "node_modules/pkg/index.js",
+        ".venv/lib/python3.12/site.py",
+        "src/legacy.pyc",
+    ):
+        p = d / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+
+    art_id = _artifact(session_factory, scored_run["sb1"], str(d), kind="workspace")
+    resp = client.get(f"/api/artifacts/{art_id}/download")
+    assert resp.status_code == 200
+    names = set(zipfile.ZipFile(io.BytesIO(resp.content)).namelist())
+    assert names == {"src/app.py", "README.md", ".env.local"}
+
+    # the raw artifact tree is untouched by the download-side filter
+    assert (d / ".git" / "config").is_file()
+    assert (d / "node_modules" / "pkg" / "index.js").is_file()
+
+
 # ---------------------------------------------------------------------------
 # PR5 — rubric versions + re-score
 # ---------------------------------------------------------------------------
@@ -966,6 +1000,24 @@ def test_rescore_guards(client: TestClient, scored_run, session_factory, rescore
     finally:
         s.close()
     assert client.post(f"/api/runs/{bare_id}/rescore", json={}).status_code == 409
+
+
+def test_rescore_cancelled_run_409(
+    client: TestClient, scored_run, session_factory
+) -> None:
+    """Cancelled is terminal for delete/sweep, but nothing ever ran —
+    a rescore 409s with the cancelled-specific detail, not the generic
+    terminal-run guard or a bogus rubric/artifact failure."""
+    s = session_factory()
+    try:
+        run = s.get(Run, scored_run["run_id"])
+        run.status = "cancelled"
+        s.commit()
+    finally:
+        s.close()
+    resp = client.post(f"/api/runs/{scored_run['run_id']}/rescore", json={})
+    assert resp.status_code == 409
+    assert "cancelled" in resp.json()["detail"]
 
 
 def test_rescore_in_flight_conflict(client: TestClient, scored_run) -> None:

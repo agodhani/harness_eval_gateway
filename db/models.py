@@ -45,7 +45,8 @@ class Run(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     # submitted | rubric_review | queued (PR15 pacing: parked behind the
-    # active run) | provisioning | running | evaluating | done | failed
+    # active run) | provisioning | running | evaluating |
+    # done | failed | cancelled (user-cancelled pre-spawn; DELETE /api/runs)
     status: Mapped[str] = mapped_column(String(32), default="submitted", index=True)
     task_prompt: Mapped[str] = mapped_column(Text)
     model_name: Mapped[str] = mapped_column(String(255))

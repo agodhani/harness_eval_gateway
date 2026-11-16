@@ -176,8 +176,14 @@ MAX_MATRIX_CELLS = 32
 class RunCreate(BaseModel):
     """POST /api/runs body — one evaluation submission."""
 
-    task_prompt: str = Field(min_length=1, max_length=100_000)
-    model_name: str = Field(min_length=1, max_length=255)
+    # strip_whitespace applies BEFORE length checks — a whitespace-only
+    # prompt/model 422s instead of persisting a spec rubric-gen can't use.
+    task_prompt: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
+        min_length=1, max_length=100_000
+    )
+    model_name: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
+        min_length=1, max_length=255
+    )
     # PR14 model-vs-model: ADDITIONAL participant models — the matrix expands
     # to harness_configs × ([model_name] + models). Omitted/empty → the run
     # is single-model on model_name (pre-PR14 shape). A harness config's own
@@ -188,7 +194,9 @@ class RunCreate(BaseModel):
     ) = Field(default=None, max_length=8)
     harness_configs: list[HarnessConfigIn] = Field(min_length=1, max_length=8)
     # Defaults to model_name at submit (same-model eval is flagged, not banned).
-    evaluator_model: str | None = Field(default=None, max_length=255)
+    evaluator_model: Annotated[str, StringConstraints(strip_whitespace=True)] | None = (
+        Field(default=None, max_length=255)
+    )
     budgets: BudgetsIn = Field(default_factory=BudgetsIn)
 
     @model_validator(mode="after")
@@ -264,6 +272,13 @@ class RunOut(BaseModel):
     updated_at: datetime | None
     started_at: datetime | None
     finished_at: datetime | None
+    # 1-based position among ``queued`` runs (approval/queue-entry order) —
+    # set only while the run is parked; null in every other status.
+    queue_position: int | None = None
+    # Submit-time advisory warnings from the model-catalog check (e.g.
+    # "model not in provider catalog") — populated on POST /api/runs only;
+    # empty on reads (warnings are advisory, not persisted state).
+    warnings: list[str] = Field(default_factory=list)
     sandboxes: list[SandboxOut] = Field(default_factory=list)
     rubric: RubricOut | None = None
 
@@ -282,6 +297,19 @@ class RunSummary(BaseModel):
     created_at: datetime
     finished_at: datetime | None
     sandbox_count: int
+    # Same contract as RunOut.queue_position — null unless status=queued.
+    queue_position: int | None = None
+
+
+class RunDeleteOut(BaseModel):
+    """DELETE /api/runs/{id} outcome.
+
+    ``cancelled`` — a pre-spawn run (submitted/rubric_review/queued) was
+    marked cancelled; ``deleted`` — a terminal run and its rows were
+    hard-removed. In-flight phases (provisioning/running/evaluating) 409.
+    """
+
+    status: Literal["cancelled", "deleted"]
 
 
 # ---------------------------------------------------------------------------

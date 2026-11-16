@@ -82,8 +82,8 @@ adapters are added.
 2. **Control API + Orchestrator (FastAPI, async)** — validates submissions,
    expands run matrix, generates rubric via gateway, drives run state machine
    (`submitted → rubric_review → [queued →] provisioning → running →
-   evaluating → done | failed`), manages sandbox lifecycle, enforces
-   termination policy, paces run/sandbox admission (below).
+   evaluating → done | failed | cancelled`), manages sandbox lifecycle,
+   enforces termination policy, paces run/sandbox admission (below).
 3. **AI gateway (Python, custom)** — exposes an OpenAI-compatible
    (`/v1/chat/completions`) endpoint, translates to upstream providers
    (**Ollama is the default upstream for MVP** — small local models, e.g.
@@ -441,6 +441,36 @@ or tests change.
   wait *inside* `spawn_one` (per-sandbox failure on timeout) rather than a
   scheduler loop — sequential provisioning already makes spawns the unit of
   queuing. `run.status` stays `String` — no migration needed for `queued`.
+- **Rescoring holds the same single slot as a run**: `rescore_run` parks on
+  `_await_rescore_slot` (emitting `rescore_queued`) while any run is
+  active/queued, and `runner.start_rescore_task` wraps the pass in the same
+  promote-next-queued `finally` a lifecycle gets — an eval can never overlap
+  another run, and a crashed rescore still frees the lane.
+- **Cancel/delete**: `cancelled` is a terminal run status —
+  `DELETE /api/runs/{id}` cancels `submitted`/`rubric_review`/`queued`
+  runs (status flip + `cancelled` checkpoint + `finished_at`; a pending
+  rubric-draft task is cancelled, and a freed `queued` position promotes
+  the next parked run via `runner.release_run_slot`). Terminal runs
+  (`done`/`failed`/`cancelled`) hard-delete instead — bulk row removal
+  for scores/artifacts/events/rubrics/sandboxes then the run, plus
+  best-effort `data/artifacts/<run_id>/` removal (the append-only-events
+  rule is explicitly waived for junk-run removal). In-flight runs
+  (`provisioning`/`running`/`evaluating`) 409 — sandbox teardown is out
+  of scope. Lifecycle/provisioning bail on a vanished or `cancelled` run
+  mid-flight. A cancelled run can never be rescored — nothing executed.
+- **Submit validation (`api/modelcheck.py`)**: `POST /api/runs` strips +
+  rejects blank task prompts/models (422), then resolves each selected
+  model against the provider catalog the gateway would route it to (60s
+  per-model cache). Absent models land as advisory `warnings` on the 201
+  (the name may be pullable); a catalog fetch failure skips validation
+  entirely (offline tolerance). The one hard 422 is a provider-reported
+  `tools`-capability mismatch for a tool-call harness — checked for
+  participant AND evaluator models (the evaluator drives miniloop tool
+  calls), incl. per-config model pins.
+- **Workspace ZIP downloads are filtered**: `GET /api/artifacts/{id}/
+  download` on a directory drops `.git`, `__pycache__`, `*.pyc`,
+  `node_modules`, `.venv` at any depth (symlinks were already skipped);
+  the on-disk artifact is untouched.
 - **`done` invocation**: bare `done` is a shell keyword in sh/bash — prompts
   instruct harnesses to run `/usr/local/bin/done` (or `command done`).
 - **PR17 — hook/plugin telemetry lane**: `adapters/common/hooks.py` is the
