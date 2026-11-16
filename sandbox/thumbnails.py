@@ -34,13 +34,18 @@ Design notes:
   what chromium loads anyway.
 
   Desktop has no alternative: Xvnc binds loopback-only inside the runner,
-  so the noVNC page is the only window onto the framebuffer — a settle
-  delay (``desktop_settle_seconds``) gives the app time to boot and draw
-  before the browser connects, then ``--virtual-time-budget`` lets noVNC
-  attach and render before the shot. Going through the preview's own
-  serve path (rather than e.g. ``file://`` for static) keeps the capture
-  faithful to what a user sees — same server semantics, same relative
-  fetches.
+  so the websockify endpoint is the only window onto the framebuffer.
+  Chromium + ``--virtual-time-budget`` proved useless for it — virtual
+  time burns through the budget while real framebuffer updates are still
+  seconds away, so every shot landed on the "Connecting…" spinner or a
+  blank canvas. Instead ``THUMB_VNC_WS`` routes the capture container to
+  a tiny stdlib VNC-over-WebSocket client (``thumbnail-vnc.py``) that
+  polls the framebuffer until real content appears (then waits
+  ``THUMB_VNC_SETTLE_SECONDS`` for draw margin) and writes the pixels
+  straight to PNG — adaptive to slow apps, and the shot IS the screen.
+  Going through the preview's own serve path (rather than e.g.
+  ``file://`` for static) keeps the capture faithful to what a user sees
+  — same server semantics, same relative fetches.
 - **Threat posture.** Rendering candidate HTML/JS in headless chromium is
   the same trust boundary as the user's browser opening the preview URL:
   the *executed* artifact code still lives on the zero-egress
@@ -66,6 +71,7 @@ import logging
 import math
 import os
 import shutil
+import struct
 import subprocess
 import threading
 import time
@@ -80,6 +86,8 @@ from typing import Any
 from sandbox.preview import (
     _PROXIED_PORTS,
     CONTAINER_PORT,
+    DEAD_STATUSES,
+    DESKTOP_CONTAINER_PORT,
     PURPOSE_THUMB,
     Preview,
     PreviewManager,
@@ -102,9 +110,11 @@ PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 LABEL_THUMB = "heg.thumb"
 
 _OUT_DIR = "/out"  # scratch bind-mount inside the capture container
-_OUT_FILENAME = "capture.png"  # what chromium writes under /out
+_OUT_FILENAME = "capture.png"  # what the capture writes under /out
 
-_DEAD_STATUSES = frozenset({"exited", "dead", "removing"})
+# Exit codes of thumbnail-vnc.py (the desktop capture path — see the
+# thumbnail-capture.sh THUMB_VNC_WS branch).
+_VNC_EXIT_TIMEOUT = 4  # framebuffer stayed blank past the wait deadline
 
 
 class ThumbnailError(RuntimeError):
@@ -122,11 +132,12 @@ class ThumbResult:
     entry: str | None
 
 
-def _settle_for(preview_type: str, desktop: float, default: float) -> float:
-    """Pre-capture delay per type: desktop apps need boot+draw time; served
-    pages only get a short warmup beat (chromium's virtual-time budget does
-    the rest)."""
-    return desktop if preview_type == "desktop" else default
+def _pre_capture_settle(preview_type: str, settle_seconds: float) -> float:
+    """Pre-capture delay per type. Served pages get a short warmup beat
+    (chromium's virtual-time budget does the rest); desktop needs none —
+    its capture is adaptive (waits on framebuffer content in-container)
+    so a fixed api-side sleep would be pure latency."""
+    return 0.0 if preview_type == "desktop" else settle_seconds
 
 
 class Thumbnailer:
@@ -145,6 +156,11 @@ class Thumbnailer:
         ready_seconds: float = 30.0,
         capture_seconds: float = 45.0,
         preview_ttl_seconds: float = 300.0,
+        # Minimum render age for the desktop framebuffer capture — after
+        # first content the VNC client still lets the app draw until this
+        # much wall time has passed (env THUMB_VNC_SETTLE_SECONDS in the
+        # capture container). Not a fixed pre-sleep: slow apps wait for
+        # real content first, fast apps aren't held longer than this.
         desktop_settle_seconds: float = 8.0,
         settle_seconds: float = 0.5,
         width: int = 1280,
@@ -197,22 +213,28 @@ class Thumbnailer:
                 f"build it: docker build -f {THUMB_DOCKERFILE} "
                 f"-t {self.image} ."
             )
-        preview = self._previews.spawn(
-            run_id=run_id,
-            sandbox_id=sandbox_id,
-            serve_dir=workspace,
-            plan=plan,
-            ttl_seconds=self.preview_ttl_seconds,
-            purpose=PURPOSE_THUMB,
-        )
+        try:
+            preview = self._previews.spawn(
+                run_id=run_id,
+                sandbox_id=sandbox_id,
+                serve_dir=workspace,
+                plan=plan,
+                ttl_seconds=self.preview_ttl_seconds,
+                purpose=PURPOSE_THUMB,
+            )
+        except ValueError:
+            raise  # bad-plan errors keep their 422 mapping at the router
+        except Exception as exc:
+            # spawn's early-crash window raises RuntimeError carrying the
+            # app's exit code + log tail — re-raise as ThumbnailError so
+            # the 502 detail IS the app's reason (un-prefixed).
+            raise ThumbnailError(str(exc)) from exc
         scratch: Path | None = None
         try:
             live = self._wait_ready(preview.preview_id, plan)
-            self._sleep(
-                _settle_for(
-                    plan.type, self.desktop_settle_seconds, self.settle_seconds
-                )
-            )
+            settle = _pre_capture_settle(plan.type, self.settle_seconds)
+            if settle > 0:
+                self._sleep(settle)
             scratch = self._scratch_dir(artifact_dir)
             self._run_capture(
                 live, scratch, run_id=run_id, sandbox_id=sandbox_id, plan=plan
@@ -246,10 +268,12 @@ class Thumbnailer:
         while self._clock() < deadline:
             pv = self._previews.get(preview_id)
             if pv is not None:
-                if pv.status in _DEAD_STATUSES:
+                if pv.status in DEAD_STATUSES:
+                    tail = self._previews.logs(pv.container, tail=10)
                     raise ThumbnailError(
-                        f"{plan.type} preview exited before serving — the "
-                        "artifact likely crashed on startup"
+                        f"{plan.type} {pv.detail or 'preview app died'} "
+                        "before serving — the artifact likely crashed on "
+                        f"startup{f' — app logs: {tail}' if tail else ''}"
                     )
                 return pv
             self._sleep(0.25)
@@ -310,6 +334,12 @@ class Thumbnailer:
         in-container ready wait plus the chromium run), the entrypoint's
         own ``timeout`` wrap is the inner one. On timeout the CLI is
         killed but the container may still run → ``rm -f`` by name.
+
+        A watchdog thread polls the preview stack while the capture runs:
+        a runner that exits mid-capture means the artifact crashed, so the
+        capture container is removed immediately and the error carries the
+        app's exit code + log tail — instead of burning the full ready
+        budget on a URL that can never serve.
         """
         url = self._capture_url(preview, plan)
         name = f"{THUMB_CONTAINER_PREFIX}{uuid.uuid4().hex[:12]}"
@@ -349,6 +379,25 @@ class Thumbnailer:
             f"THUMB_TIMEOUT_SECONDS={math.ceil(self.capture_seconds)}",
             "-e",
             "HOME=/tmp",
+            *(
+                [
+                    # Desktop: skip the chromium/noVNC path entirely — a
+                    # stdlib VNC client waits on real framebuffer content
+                    # then writes the pixels straight to PNG (adaptive to
+                    # slow-to-render apps; no virtual-time-budget cliff).
+                    "-e",
+                    (
+                        f"THUMB_VNC_WS=ws://{preview.container}-proxy:"
+                        f"{DESKTOP_CONTAINER_PORT}/websockify"
+                    ),
+                    "-e",
+                    f"THUMB_VNC_WAIT_SECONDS={math.ceil(self.ready_seconds)}",
+                    "-e",
+                    f"THUMB_VNC_SETTLE_SECONDS={self.desktop_settle_seconds:g}",
+                ]
+                if plan.type == "desktop"
+                else []
+            ),
             "-v",
             f"{rt.to_host_path(scratch)}:{_OUT_DIR}",
             "--label",
@@ -361,21 +410,62 @@ class Thumbnailer:
             f"heg.sandbox_id={sandbox_id}",
             self.image,
         ]
+        stop_watch = threading.Event()
+
+        def _watch() -> None:
+            """Kill the capture container the moment the runner dies — the
+            app crashing mid-capture makes the target URL unservable, so
+            waiting out the ready budget would be pure latency."""
+            while not stop_watch.is_set():
+                pv = self._previews.get(preview.preview_id)
+                if pv is not None and pv.status in DEAD_STATUSES:
+                    self._previews._docker(["rm", "-f", name], check=False)
+                    return
+                stop_watch.wait(0.5)
+
+        watcher = threading.Thread(target=_watch, daemon=True)
+        watcher.start()
         try:
-            proc = self._previews._docker(
-                args,
-                check=False,
-                timeout=self.ready_seconds + self.capture_seconds + 30,
-            )
-        except subprocess.TimeoutExpired as exc:
-            self._previews._docker(["rm", "-f", name], check=False)
-            raise ThumbnailError(
-                "capture exceeded the "
-                f"{self.ready_seconds + self.capture_seconds + 30:.0f}s bound "
-                "(ready wait + chromium run)"
-            ) from exc
+            try:
+                proc = self._previews._docker(
+                    args,
+                    check=False,
+                    timeout=self.ready_seconds + self.capture_seconds + 30,
+                )
+            except subprocess.TimeoutExpired as exc:
+                self._previews._docker(["rm", "-f", name], check=False)
+                raise ThumbnailError(
+                    "capture exceeded the "
+                    f"{self.ready_seconds + self.capture_seconds + 30:.0f}s bound "
+                    "(ready wait + chromium run)"
+                ) from exc
+        finally:
+            stop_watch.set()
+            watcher.join(timeout=5)
         if proc.returncode != 0:
+            # A dead runner explains the failure better than the capture's
+            # own exit noise — report the app's exit code + log tail.
+            pv = self._previews.get(preview.preview_id)
+            if pv is not None and pv.status in DEAD_STATUSES:
+                tail = self._previews.logs(pv.container, tail=10)
+                raise ThumbnailError(
+                    f"{plan.type} {pv.detail or 'preview app died'} during "
+                    "capture — the artifact crashed before the screenshot "
+                    f"could be taken{f' — app logs: {tail}' if tail else ''}"
+                )
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-5:]
+            if plan.type == "desktop" and proc.returncode in (
+                _VNC_EXIT_TIMEOUT,
+                124,
+            ):
+                msg = (
+                    "timed out waiting for the app to render into the "
+                    f"framebuffer ({self.ready_seconds:.0f}s) — the runner "
+                    "is alive but produced no visible content"
+                )
+                if tail:
+                    msg += f" ({' | '.join(tail)})"
+                raise ThumbnailError(msg)
             raise ThumbnailError(
                 "capture container failed "
                 f"(exit {proc.returncode}): {' | '.join(tail) or 'no output'}"
@@ -389,19 +479,27 @@ class Thumbnailer:
         A non-PNG file is rejected — a poisoned artifact dir gets no
         thumbnail rather than a garbage one. The PNG is moved into place
         atomically (same filesystem); the meta sidecar is written by the
-        api (never the container).
+        api (never the container). Recorded dimensions come from the PNG's
+        own IHDR — the desktop framebuffer shot is Xvnc's geometry, not
+        the chromium viewport.
         """
         shot = scratch / _OUT_FILENAME
         try:
             with shot.open("rb") as fh:
-                head = fh.read(len(PNG_MAGIC))
+                head = fh.read(24)
             size = shot.stat().st_size
         except OSError as exc:
             raise ThumbnailError(f"capture produced no screenshot: {exc}") from exc
-        if head != PNG_MAGIC:
+        if head[: len(PNG_MAGIC)] != PNG_MAGIC:
             raise ThumbnailError(
                 "capture output is not a PNG — refusing to store it"
             )
+        # PNG IHDR: magic(8) len(4) "IHDR"(4) width(4) height(4).
+        width, height = self.width, self.height
+        try:
+            width, height = struct.unpack(">II", head[16:24])
+        except struct.error:
+            pass
         dest = artifact_dir / THUMB_FILENAME
         captured = datetime.now(UTC)
         meta: dict[str, Any] = {
@@ -409,9 +507,11 @@ class Thumbnailer:
             "captured_at": captured.isoformat(),
             "type": plan.type,
             "entry": plan.entry,
-            "generator": "chromium-headless",
-            "width": self.width,
-            "height": self.height,
+            "generator": (
+                "vnc-framebuffer" if plan.type == "desktop" else "chromium-headless"
+            ),
+            "width": width,
+            "height": height,
             "bytes": size,
         }
         meta_path = artifact_dir / THUMB_META_FILENAME

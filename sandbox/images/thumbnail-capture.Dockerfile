@@ -13,7 +13,14 @@
 # chromium's profile (runtime flags in sandbox/thumbnails.py).
 #
 # Env contract (injected by Thumbnailer._run_capture):
-#   CAPTURE_URL            required — the in-network URL to screenshot
+#   CAPTURE_URL            required for static/python-server — the
+#                          in-network URL chromium screenshots
+#   THUMB_VNC_WS           desktop captures bypass chromium entirely:
+#                          /vnc-shot.py connects ws://<proxy>:6080/websockify,
+#                          waits for real framebuffer content, writes the
+#                          screen pixels to /out/capture.png directly
+#   THUMB_VNC_WAIT_SECONDS framebuffer-content deadline (default 30)
+#   THUMB_VNC_SETTLE_SECONDS min render age before the shot (default 5)
 #   THUMB_WIDTH/HEIGHT     viewport, default 1280x800
 #   THUMB_BUDGET_MS        chromium --virtual-time-budget (post-load run
 #                          time before the shot), default 10000
@@ -34,7 +41,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY sandbox/images/thumbnail-capture.sh /capture.sh
-RUN chmod +x /capture.sh
+COPY sandbox/images/thumbnail-vnc.py /vnc-shot.py
+RUN chmod +x /capture.sh /vnc-shot.py
 
 ENV HOME=/tmp \
     PYTHONUNBUFFERED=1

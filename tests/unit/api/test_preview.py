@@ -57,6 +57,8 @@ class FakeManager:
         self.spawn_calls: list[dict] = []
         self.stop_calls: list[str] = []
         self.spawn_error: Exception | None = None
+        self.logs_text = "app log tail"
+        self.logs_calls: list[str] = []  # containers logs() was asked for
 
     def list(self, *, sandbox_id: str | None = None) -> list[Preview]:
         if sandbox_id is None:
@@ -105,6 +107,10 @@ class FakeManager:
     def reap_expired(self, now: float | None = None) -> int:
         return 0
 
+    def logs(self, container: str, *, tail: int = 15) -> str:
+        self.logs_calls.append(container)
+        return self.logs_text
+
 
 @pytest.fixture()
 def fake_manager(monkeypatch: pytest.MonkeyPatch) -> FakeManager:
@@ -138,7 +144,9 @@ def _workspace(root: Path, run_id, sandbox_id, files: dict[str, str]) -> Path:
     return ws
 
 
-def _preview(run_id, sandbox_id, *, status: str = "running") -> Preview:
+def _preview(
+    run_id, sandbox_id, *, status: str = "running", exit_code: int | None = None
+) -> Preview:
     return Preview(
         preview_id=str(uuid.uuid4()),
         run_id=str(run_id),
@@ -151,6 +159,7 @@ def _preview(run_id, sandbox_id, *, status: str = "running") -> Preview:
         url="http://localhost:49000/" if status == "running" else None,
         created_at=datetime.now(UTC),
         expires_at=datetime.now(UTC),
+        exit_code=exit_code,
     )
 
 
@@ -381,11 +390,54 @@ def test_get_preview_returns_state(
 def test_get_preview_reports_exited(
     client: TestClient, run, fake_manager: FakeManager
 ) -> None:
-    dead = _preview(run["run_id"], run["sb1"], status="exited")
+    """A crashed app surfaces its reason — status + exit_code + human
+    detail + the app's log tail — not a silent dead URL."""
+    fake_manager.logs_text = (
+        "Traceback (most recent call last):\nSyntaxError: invalid syntax"
+    )
+    dead = _preview(run["run_id"], run["sb1"], status="exited", exit_code=1)
     fake_manager.previews.append(dead)
     resp = client.get(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
     assert resp.status_code == 200
-    assert resp.json()["status"] == "exited"
+    body = resp.json()
+    assert body["status"] == "exited"
+    assert body["exit_code"] == 1
+    assert body["detail"] == "preview app exited with code 1"
+    assert "SyntaxError" in body["logs"]
+    assert fake_manager.logs_calls == ["heg-prev-abc"]
+
+
+def test_get_preview_running_skips_log_fetch(
+    client: TestClient, run, fake_manager: FakeManager
+) -> None:
+    """Live previews stay cheap — no per-GET `docker logs` call."""
+    fake_manager.previews.append(_preview(run["run_id"], run["sb1"]))
+    resp = client.get(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "running"
+    assert body["exit_code"] is None
+    assert body["detail"] is None
+    assert body["logs"] is None
+    assert fake_manager.logs_calls == []
+
+
+def test_start_preview_early_crash_502(
+    client: TestClient, run, artifact_root, fake_manager: FakeManager
+) -> None:
+    """An app dying inside the spawn readiness window → 502 carrying the
+    exit reason + log tail (the manager raises — the router maps it)."""
+    _workspace(
+        artifact_root, run["run_id"], run["sb1"], {"main.py": "import pygame\n"}
+    )
+    fake_manager.spawn_error = RuntimeError(
+        "desktop preview app exited with code 1 before it could serve — "
+        "the artifact likely crashed on startup: SyntaxError: invalid syntax"
+    )
+    resp = client.post(f"/api/runs/{run['run_id']}/sandboxes/{run['sb1']}/preview")
+    assert resp.status_code == 502
+    assert "exited with code 1" in resp.json()["detail"]
+    assert "SyntaxError" in resp.json()["detail"]
 
 
 def test_get_preview_wrong_run(

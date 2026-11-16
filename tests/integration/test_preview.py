@@ -354,6 +354,32 @@ def test_desktop_preview_pygame(
     )
 
 
+def test_desktop_preview_crash_reports_exit(
+    manager: PreviewManager, desktop_image: str, tmp_path: Path
+) -> None:
+    """A syntax-error app dies inside spawn's readiness window — the
+    RuntimeError carries the exit code + app log tail, and the dead stack
+    is removed (nothing left for the reaper)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "main.py").write_text("import pygame\nthis is not python\n")
+
+    before = _docker("ps", "-aq", "--filter", "name=heg-prev-").stdout.split()
+    with pytest.raises(RuntimeError) as ei:
+        manager.spawn(
+            run_id="r",
+            sandbox_id="s",
+            serve_dir=ws,
+            plan=PreviewPlan(type="desktop", entry="main.py"),
+            ttl_seconds=300,
+            ready_seconds=20,  # image start + Xvnc + app crash can lag
+        )
+    msg = str(ei.value)
+    assert "exited" in msg and "SyntaxError" in msg
+    after = _docker("ps", "-aq", "--filter", "name=heg-prev-").stdout.split()
+    assert set(after) <= set(before), "crashed stack was not cleaned up"
+
+
 # ---------------------------------------------------------------------------
 # PR3 — more desktop GUI stacks (pyglet / arcade / tkinter, baked deps)
 # ---------------------------------------------------------------------------

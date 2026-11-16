@@ -517,6 +517,7 @@ class FakeRuntime:
         self.internal = internal
         self.run_calls = 0
         self.fail_run_at: int | None = None  # raise on the Nth `docker run`
+        self.logs_text = "app log tail\n"  # `docker logs` reply
 
     def to_host_path(self, path: str | Path) -> Path:
         return Path(path)
@@ -574,6 +575,8 @@ class FakeRuntime:
                 out = self.run_container_id + "\n"
         elif args[0] == "rm":
             pass
+        elif args[0] == "logs":
+            out = self.logs_text
         if check and rc != 0:
             raise RuntimeError(f"docker {' '.join(args)} failed")
         return subprocess.CompletedProcess(args, rc, out, err)
@@ -584,6 +587,7 @@ def _inspect_row(
     container_id: str = "cid123",
     name: str = "/heg-prev-abc",
     status: str = "running",
+    exit_code: int = 0,
     port: str | None = "49152",
     labels: dict[str, str] | None = None,
     created: str = "2026-01-01T00:00:00.000000000Z",
@@ -592,7 +596,7 @@ def _inspect_row(
         "Id": container_id,
         "Name": name,
         "Created": created,
-        "State": {"Status": status},
+        "State": {"Status": status, "ExitCode": exit_code},
         "Config": {"Labels": labels or {}},
         "NetworkSettings": {
             "Ports": (
@@ -620,6 +624,13 @@ def _labels(**over: str) -> dict[str, str]:
 
 def _manager(fake: FakeRuntime, **kw) -> PreviewManager:
     return PreviewManager(runtime=fake, **kw)  # type: ignore[arg-type]
+
+
+def _clock_sleep() -> tuple:
+    """(clock, sleep) pair — fake sleep advances the fake clock so spawn's
+    executed-code readiness window elapses without real waiting."""
+    now = [0.0]
+    return (lambda: now[0], lambda s: now.__setitem__(0, now[0] + s))
 
 
 def test_ensure_network_creates_dedicated_bridge() -> None:
@@ -900,11 +911,14 @@ def _desktop_fake() -> FakeRuntime:
 
 def test_spawn_desktop_runner_args(tmp_path: Path) -> None:
     fake = _desktop_fake()
+    clock, sleep = _clock_sleep()
     mgr = _manager(
         fake,
         desktop_cpus="1.5",
         desktop_memory="256m",
         desktop_pids=64,
+        clock=clock,
+        sleep=sleep,
     )
     mgr.spawn(
         run_id="r1",
@@ -952,7 +966,8 @@ def test_spawn_desktop_runner_args(tmp_path: Path) -> None:
 
 def test_spawn_desktop_resolves_port_and_url(tmp_path: Path) -> None:
     fake = _desktop_fake()
-    preview = _manager(fake).spawn(
+    clock, sleep = _clock_sleep()
+    preview = _manager(fake, clock=clock, sleep=sleep).spawn(
         run_id="r1",
         sandbox_id="s1",
         serve_dir=tmp_path,
@@ -1470,7 +1485,8 @@ def test_spawn_server_runner_args(tmp_path: Path) -> None:
     socat sidecar, resource bounds — but the SERVER image + PORT/HOST env
     and the sidecar publishes the app port (:8000)."""
     fake = _server_fake()
-    mgr = _manager(fake)
+    clock, sleep = _clock_sleep()
+    mgr = _manager(fake, clock=clock, sleep=sleep)
     mgr.spawn(
         run_id="r1",
         sandbox_id="s1",
@@ -1515,7 +1531,8 @@ def test_spawn_server_runner_args(tmp_path: Path) -> None:
 
 def test_spawn_server_resolves_port_and_url(tmp_path: Path) -> None:
     fake = _server_fake()
-    preview = _manager(fake).spawn(
+    clock, sleep = _clock_sleep()
+    preview = _manager(fake, clock=clock, sleep=sleep).spawn(
         run_id="r1",
         sandbox_id="s1",
         serve_dir=tmp_path,
@@ -1678,3 +1695,202 @@ def test_get_for_sandbox_filters_purpose() -> None:
     assert anyp is not None and anyp.preview_id == PID_B  # newest first
     # list() itself is unfiltered — the reaper/stop see every purpose.
     assert {p.preview_id for p in mgr.list()} == {PID_A, PID_B}
+
+
+# ---------------------------------------------------------------------------
+# exit_code / detail / logs — crash diagnostics (bughunt batch)
+# ---------------------------------------------------------------------------
+
+
+def test_exit_code_only_populated_for_dead_status() -> None:
+    """docker reports ExitCode=0 while running — the field only means
+    something for dead statuses, so a live preview surfaces None."""
+    fake = FakeRuntime(
+        inspect_rows=[
+            _inspect_row(container_id="a", labels=_labels()),
+            _inspect_row(
+                container_id="b",
+                name="/heg-prev-dead",
+                status="exited",
+                exit_code=1,
+                labels=_labels(
+                    **{
+                        "heg.preview_id": PID_B,
+                        "heg.preview_expires_at": f"{time.time() + 600:.0f}",
+                    }
+                ),
+            ),
+        ]
+    )
+    fake.ps_ids = ["a", "b"]
+    by_id = {p.container: p for p in _manager(fake).list()}
+    assert by_id["heg-prev-abc"].exit_code is None
+    assert by_id["heg-prev-abc"].detail is None
+    dead = by_id["heg-prev-dead"]
+    assert dead.exit_code == 1
+    assert dead.detail == "preview app exited with code 1"
+
+
+def test_detail_for_dead_and_live() -> None:
+    base = {
+        "preview_id": "p",
+        "run_id": "r",
+        "sandbox_id": "s",
+        "type": "desktop",
+        "container": "c",
+        "port": 1,
+        "entry": "main.py",
+        "url": "u",
+        "created_at": None,
+        "expires_at": None,
+    }
+    assert (
+        Preview(status="exited", exit_code=1, **base).detail
+        == "preview app exited with code 1"
+    )
+    assert Preview(status="exited", **base).detail == "preview app exited"
+    assert Preview(status="dead", **base).detail == "preview app container died"
+    assert Preview(status="running", **base).detail is None
+
+
+def test_logs_tail_bounded() -> None:
+    fake = FakeRuntime()
+    fake.logs_text = "traceback\nSyntaxError: invalid syntax\n"
+    mgr = _manager(fake)
+    out = mgr.logs("heg-prev-abc", tail=10)
+    assert "SyntaxError" in out
+    call = next(c for c in fake.calls if c[0] == "logs")
+    assert call == ["logs", "--tail", "10", "heg-prev-abc"]
+
+
+def _dead_desktop_fake() -> FakeRuntime:
+    """A desktop stack whose runner exited (app crashed at start)."""
+    runner = _inspect_row(
+        container_id="cid123",
+        name="/heg-prev-dead",
+        status="exited",
+        exit_code=1,
+        port=None,
+        labels=_labels(
+            **{
+                "heg.preview_id": PID_DESK,
+                "heg.preview_type": "desktop",
+                "heg.preview_entry": "main.py",
+                "heg.preview_role": "runner",
+            }
+        ),
+    )
+    proxy = _inspect_row(
+        container_id="cidproxy",
+        name="/heg-prev-dead-proxy",
+        port=None,
+        labels=_labels(
+            **{"heg.preview_id": PID_DESK, "heg.preview_role": "proxy"}
+        ),
+    )
+    fake = FakeRuntime()
+    fake.rows_by_id = {"cid123": runner, "cidproxy": proxy}
+    fake.ps_ids = ["cid123", "cidproxy"]
+    fake.proxy_ps_ids = ["cidproxy"]
+    fake.images.add("heg-preview-desktop:latest")
+    fake.logs_text = (
+        "Traceback (most recent call last):\n"
+        '  File "/work/main.py", line 3\n'
+        "SyntaxError: invalid syntax"
+    )
+    return fake
+
+
+def test_spawn_desktop_early_crash_fails_with_reason(tmp_path: Path) -> None:
+    """An app exiting inside the readiness window fails the spawn — the
+    error carries the exit code + app log tail, and the dead stack is
+    removed (not left for the TTL reaper)."""
+    fake = _dead_desktop_fake()
+    clock, sleep = _clock_sleep()
+    mgr = _manager(fake, clock=clock, sleep=sleep)
+    with pytest.raises(RuntimeError) as ei:
+        mgr.spawn(
+            run_id="r1",
+            sandbox_id="s1",
+            serve_dir=tmp_path,
+            plan=PreviewPlan(type="desktop", entry="main.py"),
+        )
+    msg = str(ei.value)
+    assert "exited with code 1" in msg
+    assert "SyntaxError" in msg  # app's log tail rides the failure
+    # dead runner + proxy force-removed before raising
+    rm = next(c for c in fake.calls if c[0] == "rm")
+    assert rm[:2] == ["rm", "-f"]
+    assert {"cid123", "cidproxy"} <= set(rm[2:])
+
+
+def test_spawn_desktop_window_returns_survivor(tmp_path: Path) -> None:
+    """A runner still alive at the deadline returns normally — the window
+    only catches crashes, it doesn't require a serve probe."""
+    fake = _desktop_fake()
+    clock, sleep = _clock_sleep()
+    preview = _manager(fake, clock=clock, sleep=sleep).spawn(
+        run_id="r1",
+        sandbox_id="s1",
+        serve_dir=tmp_path,
+        plan=PreviewPlan(type="desktop", entry="main.py"),
+    )
+    assert preview.status == "running" and preview.live
+
+
+def test_spawn_desktop_ready_seconds_zero_skips_window(tmp_path: Path) -> None:
+    """ready_seconds=0 opts out — spawn returns whatever inspect shows."""
+    fake = _desktop_fake()
+    preview = _manager(fake).spawn(
+        run_id="r1",
+        sandbox_id="s1",
+        serve_dir=tmp_path,
+        plan=PreviewPlan(type="desktop", entry="main.py"),
+        ready_seconds=0,
+    )
+    assert preview.status == "running"
+
+
+def test_spawn_static_no_readiness_window(tmp_path: Path) -> None:
+    """Static spawns never poll — no candidate code executes to crash."""
+    fake = FakeRuntime(inspect_rows=[_inspect_row(labels=_labels())])
+    fake.ps_ids = ["cid123"]
+    _manager(fake).spawn(
+        run_id="r1",
+        sandbox_id="s1",
+        serve_dir=tmp_path,
+        plan=PreviewPlan(type="static", entry="index.html"),
+    )
+    # Exactly one inspect round (the post-spawn get), no poll loop.
+    ps = [c for c in fake.calls if c[:2] == ["ps", "-aq"]]
+    assert len(ps) == 2  # name-collision probe + get's label query
+
+
+def test_spawn_desktop_python_server_also_windowed(tmp_path: Path) -> None:
+    """python-server runners exec the app too — same early-crash path."""
+    runner = _inspect_row(
+        container_id="cid123",
+        name="/heg-prev-web",
+        status="exited",
+        exit_code=2,
+        port=None,
+        labels=_labels(
+            **{
+                "heg.preview_id": PID_SERVER,
+                "heg.preview_type": "python-server",
+                "heg.preview_role": "runner",
+            }
+        ),
+    )
+    fake = FakeRuntime()
+    fake.rows_by_id = {"cid123": runner}
+    fake.ps_ids = ["cid123"]
+    fake.images.add("heg-preview-server:latest")
+    clock, sleep = _clock_sleep()
+    with pytest.raises(RuntimeError, match="exited with code 2"):
+        _manager(fake, clock=clock, sleep=sleep).spawn(
+            run_id="r1",
+            sandbox_id="s1",
+            serve_dir=tmp_path,
+            plan=PreviewPlan(type="python-server", entry="app.py"),
+        )
