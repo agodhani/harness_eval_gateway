@@ -86,7 +86,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   provisioning → running → evaluating → done | failed`); matrix expansion
   (harness configs × model); rubric draft generated via gateway → frozen on
   user approval; termination policy watcher (timeout, budget, stuck-loop,
-  done signal).
+  done signal). Rubric drafting is fault-tolerant — bounded retries
+  (`RUBRIC_GEN_RETRIES`, default 2) cover transient upstream errors +
+  validation failures (error fed back into the prompt), and lenient
+  normalization coerces scalar `generated_by` + numeric-string fields.
 - **Pacing (PR15):** one active run at a time — approvals while a run
   executes (or is queued) park in `queued` and promote FIFO by approval
   (`pacing.place_run` / `claim_next_queued`; promotion is wired into
@@ -330,7 +333,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `SCORING_TESTGEN=0` disables (conftest pins it); knobs:
   `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
   `TESTGEN_MAX_FILES` (8), `TESTGEN_MAX_TOKENS` (4096),
-  `TESTGEN_TIMEOUT_SECONDS` (240).
+  `TESTGEN_TIMEOUT_SECONDS` (240, the one raised-cap retry gets 2×),
+  `TESTGEN_MAX_TOKENS_RETRY` (8192) — retries cover empty content,
+  zero-runnable-file output, and timeouts. A scores doc missing
+  `overall` gets it synthesized as the mean of dimension scores +
+  warning (`parse_scores_json`).
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
   `prompts.py`, `judge_direct.py` — direct-completion fallback,
   `testgen.py` — PR8 suite generation + exec orchestration),

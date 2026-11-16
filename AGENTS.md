@@ -115,7 +115,10 @@ adapters are added.
    (`prior_error`), and a control-plane direct-completion fallback
    (`evaluator/judge_direct.py` — one chat call on the eval cred,
    `response_format=json_object`; `EVAL_DIRECT_FALLBACK=0` disables) lands
-   scores when the agentic judge's output is unusable.
+   scores when the agentic judge's output is unusable. Testgen retries the
+   generation call once at raised caps on empty/timed-out/zero-file output
+   (`TESTGEN_MAX_TOKENS_RETRY`, 2× `TESTGEN_TIMEOUT_SECONDS`); a scores doc
+   missing `overall` gets it synthesized as the dimension mean + a warning.
 7. **Artifact store** — `./data/artifacts/<run_id>/<sandbox_id>/` — repo
    tarballs, transcripts, event exports.
 
@@ -264,7 +267,11 @@ pins it); `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
 ExecRunner→runner env contract for the suite mount.
 
 Flow: auto-generated from task spec → HITL review/edit in UI → frozen →
-applied identically to all sandboxes.
+applied identically to all sandboxes. Generation is fault-tolerant —
+`RUBRIC_GEN_RETRIES` (default 2) covers transient upstream errors and
+validation failures (the error is fed back into the retry prompt), and
+lenient normalization coerces scalar `generated_by` + numeric-string
+score/weight fields before validation; structural problems still fail.
 
 ## Stack
 

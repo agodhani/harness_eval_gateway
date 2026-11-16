@@ -6,8 +6,18 @@ task → :func:`draft_rubric` mints a run-level gateway cred (``sandbox_id=None`
 its own allowance), calls
 ``{GATEWAY_URL}/v1/chat/completions``, parses + validates the JSON rubric, and
 in ONE transaction inserts a ``draft`` Rubric row, moves the run to
-``rubric_review``, and emits orchestrator checkpoint events. Any failure marks
-the run ``failed`` — resubmit is the recovery (no retry endpoint in MVP).
+``rubric_review``, and emits orchestrator checkpoint events. Failure marks the
+run ``failed`` — resubmit is the recovery (no retry endpoint in MVP).
+
+The generation call is fault-tolerant at two levels (live-observed flake
+modes: a 429/5xx upstream, thinking-model output truncation, ``generated_by``
+emitted as a bare string): a bounded retry loop (``RUBRIC_GEN_RETRIES``
+extra attempts, default 2) covers transient HTTP/timeout failures with the
+same prompt AND parse/validation failures with the validation error fed
+back into the prompt (judge ``prior_error`` pattern); and small lenient
+coercions before validation (``generated_by`` non-dict → ``{"source": ...}``,
+numeric strings in dimension/criterion number fields). Structural problems
+— missing/extra/dup dimensions — still hard-fail.
 
 The rubric's ``dimensions`` must cover exactly the four canonical names the
 evaluator (F7) scores against; LLM variants are normalized by name-match.
@@ -15,8 +25,10 @@ evaluator (F7) scores against; LLM variants are normalized by name-match.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import re
 import uuid
 from datetime import UTC, datetime
@@ -144,6 +156,66 @@ class RubricParseError(ValueError):
     """Raised when LLM output can't be massaged into RubricContent."""
 
 
+#: Extra attempts beyond the first generation call (``RUBRIC_GEN_RETRIES``
+#: env override) — covers transient upstream failures (429/5xx, timeouts)
+#: and parse/validation failures alike. Total attempts = 1 + retries.
+DEFAULT_GEN_RETRIES = 2
+#: Base seconds of the linear backoff between transient-failure retries.
+_RETRY_BACKOFF_SECONDS = 1.0
+#: Cap on the validation-error detail echoed back into the retry prompt —
+#: the same bound the judge's ``prior_error`` feedback uses.
+_RETRY_ERROR_CAP = 300
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+#: Number fields a small model may emit as quoted strings — coerced, not
+#: rejected (the "small coercions only" half of lenient normalization).
+_NUMERIC_FIELDS = ("weight", "min_score", "max_score")
+
+
+def _normalize_rubric_dict(data: dict[str, Any]) -> dict[str, Any]:
+    """Lenient pre-validation coercions on the parsed rubric dict.
+
+    Only shape-preserving fixes for observed small-model quirks — the
+    structural contract (exactly the four canonical dimensions) is still
+    enforced by :class:`RubricContent` validation:
+
+    - ``generated_by`` emitted as a scalar (live: the string
+      ``"rubric_generator"``) wraps as ``{"source": <value>}``; a null
+      drops to the field default (it's optional provenance metadata).
+    - ``dimensions[]``/``criteria[]`` ``weight``/``min_score``/
+      ``max_score`` arriving as numeric strings coerce to float; genuinely
+      non-numeric values pass through untouched for validation to reject.
+    """
+    if "generated_by" in data:
+        generated_by = data["generated_by"]
+        if generated_by is None:
+            del data["generated_by"]
+        elif not isinstance(generated_by, dict):
+            data["generated_by"] = {"source": str(generated_by)}
+    for key in ("dimensions", "criteria"):
+        items = data.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for field in _NUMERIC_FIELDS:
+                value = item.get(field)
+                if isinstance(value, str):
+                    try:
+                        item[field] = float(value.strip())
+                    except ValueError:
+                        pass  # leave it — schema validation reports it
+    return data
+
+
 def create_rubric_version(
     session: Session,
     run: Run,
@@ -233,10 +305,18 @@ SYSTEM_PROMPT = (
 )
 
 _USER_TEMPLATE = "Task prompt:\n{task_prompt}\n\nReturn JSON only."
-_RETRY_NUDGE = (
-    "Your previous reply was not valid rubric JSON. Respond with ONLY the "
-    "JSON object described in your instructions — no prose, no code fences."
-)
+
+
+def _retry_feedback(error: Exception) -> str:
+    """User-turn content for a parse/validation retry — the error echoes
+    back so the model sees exactly which contract its output broke (the
+    same ``prior_error`` feedback the eval judge's retry carries)."""
+    detail = f"{type(error).__name__}: {error}"[:_RETRY_ERROR_CAP]
+    return (
+        f"The previous output failed validation: {detail}\n"
+        "Emit only valid JSON matching the schema in your instructions — "
+        "no prose, no code fences."
+    )
 
 
 def _extract_json(text: str) -> str:
@@ -260,14 +340,16 @@ def _extract_json(text: str) -> str:
 def parse_rubric_json(text: str) -> RubricContent:
     """Parse + validate rubric JSON from model output.
 
-    Tolerates ``` fences and leading/trailing prose. Raises
+    Tolerates ``` fences and leading/trailing prose, plus the small
+    coercions in :func:`_normalize_rubric_dict`. Raises
     :class:`RubricParseError` (no JSON) or pydantic ``ValidationError``
-    (schema/canonical-dimension violations) — callers retry once on either.
+    (schema/canonical-dimension violations) — the caller retries on either
+    with the failure fed back into the prompt.
     """
     data = json.loads(_extract_json(text))
     if not isinstance(data, dict):
         raise RubricParseError("rubric JSON is not an object")
-    return RubricContent.model_validate(data)
+    return RubricContent.model_validate(_normalize_rubric_dict(data))
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +361,20 @@ def _chat_url(gateway_url: str) -> str:
     return f"{gateway_url.rstrip('/')}/v1/chat/completions"
 
 
+def _is_transient_call_error(exc: Exception) -> bool:
+    """Upstream failures worth a same-prompt retry.
+
+    429 + 5xx are capacity/availability failures the upstream may clear;
+    ``httpx.TransportError`` covers timeouts (``TimeoutException``) and
+    connect/read errors. Other 4xx are deterministic rejections — a retry
+    would replay an identically-bad request.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status == 429 or status >= 500
+    return isinstance(exc, httpx.TransportError)
+
+
 async def _request_rubric(
     client: httpx.AsyncClient,
     *,
@@ -287,8 +383,28 @@ async def _request_rubric(
     model: str,
     task_prompt: str,
     max_tokens: int,
+    retries: int | None = None,
 ) -> RubricContent:
-    """One chat-completions call → RubricContent; one JSON-only retry."""
+    """Chat-completions → RubricContent with a bounded retry.
+
+    ``retries`` = extra attempts beyond the first (``None`` → env
+    ``RUBRIC_GEN_RETRIES``, default 2 → up to 3 calls total).
+
+    - Parse/validation failures (``ValueError`` — RubricParseError,
+      JSONDecodeError, pydantic ValidationError) retry with the failure
+      detail fed back into the prompt, judge ``prior_error`` style.
+    - Transient call failures (429/5xx, timeouts, transport errors) retry
+      the SAME messages after a short linear backoff — a live 429 failed
+      the whole run when drafting had no retry budget.
+    - Anything else propagates immediately (``draft_rubric`` marks the run
+      failed with the final error).
+    """
+    attempts = 1 + max(
+        0,
+        retries
+        if retries is not None
+        else _env_int("RUBRIC_GEN_RETRIES", DEFAULT_GEN_RETRIES),
+    )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": _USER_TEMPLATE.format(task_prompt=task_prompt)},
@@ -304,27 +420,49 @@ async def _request_rubric(
     headers = {"Authorization": f"Bearer {cred}"}
 
     last_error: Exception | None = None
-    for attempt in range(2):
-        resp = await client.post(
-            _chat_url(gateway_url),
-            json={**body_base, "messages": messages},
-            headers=headers,
-        )
-        resp.raise_for_status()
+    for attempt in range(attempts):
         try:
+            resp = await client.post(
+                _chat_url(gateway_url),
+                json={**body_base, "messages": messages},
+                headers=headers,
+            )
+            resp.raise_for_status()
             content = _message_content(resp.json())
             return parse_rubric_json(content)
         except ValueError as exc:
             # RubricParseError, JSONDecodeError, and pydantic ValidationError
-            # are all ValueErrors — one JSON-only retry covers them.
+            # are all ValueErrors — the retry carries the failure detail
+            # back so the model can correct the specific violation.
             last_error = exc
-            log.warning("rubric parse attempt %d failed: %s", attempt + 1, exc)
-            if attempt == 0:
+            log.warning(
+                "rubric generation attempt %d/%d failed validation: %s",
+                attempt + 1,
+                attempts,
+                exc,
+            )
+            if attempt + 1 < attempts:
                 messages = [
                     *messages,
-                    {"role": "assistant", "content": "(invalid rubric JSON)"},
-                    {"role": "user", "content": _RETRY_NUDGE},
+                    {"role": "assistant", "content": "(invalid rubric output)"},
+                    {"role": "user", "content": _retry_feedback(exc)},
                 ]
+                continue
+        except Exception as exc:
+            if not _is_transient_call_error(exc):
+                raise
+            last_error = exc
+            log.warning(
+                "rubric generation attempt %d/%d failed transiently: %s",
+                attempt + 1,
+                attempts,
+                exc,
+            )
+            if attempt + 1 < attempts:
+                await asyncio.sleep(
+                    min(_RETRY_BACKOFF_SECONDS * (attempt + 1), 4.0)
+                )
+                continue
     assert last_error is not None
     raise last_error
 

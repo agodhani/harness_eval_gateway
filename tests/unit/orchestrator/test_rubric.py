@@ -138,6 +138,67 @@ def test_duplicate_dimension_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
+# lenient normalization — small coercions before validation
+# ---------------------------------------------------------------------------
+
+
+def test_parse_coerces_generated_by_string() -> None:
+    """Live-observed gemma4 output: ``generated_by`` emitted as the bare
+    STRING ``"rubric_generator"`` — coerced to ``{"source": ...}`` instead
+    of failing validation and killing the run."""
+    payload = _valid_rubric_payload()
+    payload["generated_by"] = "rubric_generator"
+    content = parse_rubric_json(json.dumps(payload))
+    assert content.generated_by == {"source": "rubric_generator"}
+
+
+def test_parse_drops_null_generated_by() -> None:
+    """``generated_by: null`` falls back to the optional field default."""
+    payload = _valid_rubric_payload()
+    payload["generated_by"] = None
+    assert parse_rubric_json(json.dumps(payload)).generated_by == {}
+
+
+def test_parse_keeps_generated_by_dict() -> None:
+    payload = _valid_rubric_payload()
+    payload["generated_by"] = {"model": "gemma4:latest"}
+    assert parse_rubric_json(json.dumps(payload)).generated_by == {
+        "model": "gemma4:latest"
+    }
+
+
+def test_parse_coerces_numeric_strings() -> None:
+    """``weight``/``min_score``/``max_score`` as numeric strings coerce —
+    quoted numbers are a common small-model emission."""
+    payload = _valid_rubric_payload()
+    payload["dimensions"][0]["weight"] = "2.5"
+    payload["dimensions"][0]["min_score"] = "1"
+    payload["dimensions"][0]["max_score"] = "9"
+    payload["criteria"][0]["weight"] = "3"
+    content = parse_rubric_json(json.dumps(payload))
+    dim = content.dimensions[0]
+    assert (dim.weight, dim.min_score, dim.max_score) == (2.5, 1.0, 9.0)
+    assert content.criteria[0].weight == 3.0
+
+
+def test_parse_non_numeric_strings_still_rejected() -> None:
+    """Normalization is small coercions only — a genuinely non-numeric
+    ``weight`` still fails validation."""
+    payload = _valid_rubric_payload()
+    payload["dimensions"][0]["weight"] = "heavy"
+    with pytest.raises(ValidationError):
+        parse_rubric_json(json.dumps(payload))
+
+
+def test_parse_missing_dimensions_still_rejected() -> None:
+    """Structural problems are never normalized away — no invented dims."""
+    payload = _valid_rubric_payload()
+    payload["dimensions"] = payload["dimensions"][:2]
+    with pytest.raises(ValidationError):
+        parse_rubric_json(json.dumps(payload))
+
+
+# ---------------------------------------------------------------------------
 # draft_rubric (mocked gateway)
 # ---------------------------------------------------------------------------
 
@@ -230,13 +291,123 @@ async def test_draft_rubric_retries_once_on_bad_json(session_factory) -> None:
     client = _mock_client(handler)
     await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=SETTINGS, client=client)
     assert len(calls) == 2
-    # second call carries the nudge
-    assert "ONLY the JSON" in calls[1]["messages"][-1]["content"]
+    # second call carries the validation feedback (judge prior_error style)
+    assert "failed validation" in calls[1]["messages"][-1]["content"]
     with session_factory() as s:
         assert s.get(Run, run.id).status == "rubric_review"
 
 
-async def test_draft_rubric_failure_marks_run_failed(session_factory) -> None:
+async def test_draft_rubric_retry_feeds_validation_error(session_factory) -> None:
+    """The retry prompt carries the actual error — the model sees exactly
+    which contract its output broke."""
+    run = make_run(session_factory, status="submitted")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        if len(calls) == 1:
+            bad = _valid_rubric_payload()
+            bad["dimensions"] = bad["dimensions"][:2]  # missing canonicals
+            return _chat_response(json.dumps(bad))
+        return _chat_response(json.dumps(_valid_rubric_payload()))
+
+    client = _mock_client(handler)
+    await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=SETTINGS, client=client)
+    assert len(calls) == 2
+    retry_user = calls[1]["messages"][-1]["content"]
+    assert "failed validation" in retry_user
+    assert "missing dimensions" in retry_user
+
+
+async def test_draft_rubric_retries_transient_http_error(session_factory, monkeypatch) -> None:
+    """A 429 upstream response earns a same-prompt retry instead of failing
+    the run outright (live-observed flake)."""
+    monkeypatch.setattr(rubric_mod, "_RETRY_BACKOFF_SECONDS", 0.0)
+    run = make_run(session_factory, status="submitted")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        if len(calls) == 1:
+            return httpx.Response(429, json={"error": "rate limited"})
+        return _chat_response(json.dumps(_valid_rubric_payload()))
+
+    client = _mock_client(handler)
+    await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=SETTINGS, client=client)
+    assert len(calls) == 2
+    with session_factory() as s:
+        assert s.get(Run, run.id).status == "rubric_review"
+
+
+async def test_draft_rubric_retries_5xx_then_succeeds(session_factory, monkeypatch) -> None:
+    monkeypatch.setattr(rubric_mod, "_RETRY_BACKOFF_SECONDS", 0.0)
+    run = make_run(session_factory, status="submitted")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        if len(calls) == 1:
+            return httpx.Response(503, json={"error": "upstream unavailable"})
+        return _chat_response(json.dumps(_valid_rubric_payload()))
+
+    client = _mock_client(handler)
+    await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=SETTINGS, client=client)
+    assert len(calls) == 2
+    with session_factory() as s:
+        assert s.get(Run, run.id).status == "rubric_review"
+
+
+async def test_draft_rubric_client_error_not_retried(session_factory) -> None:
+    """A deterministic 4xx (not 429) fails fast — replaying an identically
+    bad request only burns budget."""
+    run = make_run(session_factory, status="submitted")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        return httpx.Response(400, json={"error": "bad request"})
+
+    client = _mock_client(handler)
+    await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=SETTINGS, client=client)
+    assert len(calls) == 1
+    with session_factory() as s:
+        assert s.get(Run, run.id).status == "failed"
+
+
+async def test_draft_rubric_retry_budget_env(session_factory, monkeypatch) -> None:
+    """RUBRIC_GEN_RETRIES bounds total attempts: 0 => a single call."""
+    monkeypatch.setenv("RUBRIC_GEN_RETRIES", "0")
+    run = make_run(session_factory, status="submitted")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        return _chat_response("not json at all")
+
+    client = _mock_client(handler)
+    await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=SETTINGS, client=client)
+    assert len(calls) == 1
+    with session_factory() as s:
+        assert s.get(Run, run.id).status == "failed"
+
+
+async def test_draft_rubric_tolerates_generated_by_string(session_factory) -> None:
+    """The live failure end-to-end: generated_by="rubric_generator" used to
+    ValidationError the run — lenient normalization saves it."""
+    run = make_run(session_factory, status="submitted")
+    payload = _valid_rubric_payload()
+    payload["generated_by"] = "rubric_generator"
+    client = _mock_client(lambda r: _chat_response(json.dumps(payload)))
+    await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=SETTINGS, client=client)
+    with session_factory() as s:
+        assert s.get(Run, run.id).status == "rubric_review"
+        rubric = s.execute(select(Rubric).where(Rubric.run_id == run.id)).scalar_one()
+        assert rubric.content["generated_by"]["source"] == "rubric_generator"
+        assert rubric.content["generated_by"]["model"] == "test-model"
+
+
+async def test_draft_rubric_failure_marks_run_failed(session_factory, monkeypatch) -> None:
+    monkeypatch.setattr(rubric_mod, "_RETRY_BACKOFF_SECONDS", 0.0)
     run = make_run(session_factory, status="submitted")
 
     def handler(request: httpx.Request) -> httpx.Response:

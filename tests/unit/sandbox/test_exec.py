@@ -53,8 +53,15 @@ class _FakeRuntime:
         image_ok: bool = True,
         docker_ok: bool = True,
         write_result: dict | None = None,
+        artifact_root: Path | None = None,
+        host_data_root: Path | None = None,
     ) -> None:
-        self.artifact_root = tmp_path / "artifacts"
+        self.artifact_root = (
+            Path(artifact_root) if artifact_root is not None else tmp_path / "artifacts"
+        )
+        #: Compose simulation: when set, paths under the data root rebase
+        #: onto it — the same contract SandboxRuntime.to_host_path exposes.
+        self.host_data_root = Path(host_data_root) if host_data_root else None
         self.run_proc = run_proc
         self.run_exc = run_exc
         #: Queue for sequential ``run`` results (tmpfs-retry coverage);
@@ -70,7 +77,16 @@ class _FakeRuntime:
         self.calls: list[list[str]] = []
 
     def to_host_path(self, path: str | Path) -> Path:
-        return Path(path)
+        p = Path(path)
+        if self.host_data_root is None:
+            return p
+        # Mirror SandboxRuntime._data_roots: paths under the artifact
+        # root's parent (the "data" dir) rebase onto host_data_root.
+        try:
+            rel = p.relative_to(self.artifact_root.parent)
+        except ValueError:
+            return p
+        return self.host_data_root / rel
 
     def _docker(
         self,
@@ -511,6 +527,51 @@ def test_execute_spawn_failure_is_error(tmp_path: Path) -> None:
     assert outcome.ok is False
     assert "docker run failed" in (outcome.error or "")
     # no retry without bounds — the failure wasn't mount-opt related
+
+
+def test_execute_compose_cp_dest_is_container_side_path(tmp_path: Path) -> None:
+    """Under compose (HOST_DATA_ROOT set) the ``docker cp`` destination must
+    be the CONTAINER-side ``<data>/exec/<name>/out`` path — the CLI extracts
+    in the calling client's filesystem, so ``/data/...`` exists via the
+    ``./data`` bind mount while the host path (``/Users/...``) does not
+    (live-observed ``invalid output path: directory ... does not exist``).
+
+    ``-v`` mount sources DO still get the host translation — the daemon
+    resolves those.
+    """
+    data_root = tmp_path / "data"
+    host_root = tmp_path / "host-data"  # stand-in for the host's ./data
+    payload = {"version": 1, "phases": {"build": {"ok": True}}}
+    rt = _FakeRuntime(
+        tmp_path,
+        artifact_root=data_root / "artifacts",
+        host_data_root=host_root,
+        write_result=payload,
+    )
+    runner = ExecRunner(
+        runtime=rt,  # type: ignore[arg-type]
+        work_root=data_root / "exec",
+    )
+    # The workspace lives under the data tree so -v translation is
+    # exercised in the same run.
+    ws = data_root / "ws"
+    ws.mkdir(parents=True)
+    (ws / "app.py").write_text("x = 1\n")
+
+    outcome = runner.execute(ws)
+    assert outcome.ok is True
+    # The result file actually landed at the container-side path and parsed.
+    assert outcome.result == payload
+
+    cp_call = next(c for c in rt.calls if c[0] == "cp")
+    assert cp_call[:2] == ["cp", f"{outcome.container}:/out/{RESULT_FILENAME}"]
+    dest = cp_call[-1]
+    assert dest == str(data_root / "exec" / outcome.container / "out")
+    assert not dest.startswith(str(host_root))
+
+    # -v sources still translate to the daemon-visible host path.
+    run_call = next(c for c in rt.calls if c[0] == "run")
+    assert f"{host_root}/ws:/srv/src:ro" in run_call
     run_calls = [c for c in rt.calls if c[0] == "run"]
     assert len(run_calls) == 1
     # rm -f still ran (defensive cleanup of a possibly-created container)

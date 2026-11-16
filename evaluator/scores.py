@@ -76,7 +76,10 @@ class ParsedScores:
 
     ``entries`` are the valid per-dimension scores (invalid entries are
     dropped and described in ``warnings``). ``overall``/``summary`` come from
-    the top-level fields when present and valid.
+    the top-level fields when present and valid; when ``overall`` is missing
+    or unusable but entries exist, it is synthesized as the mean of the
+    dimension scores (flagged in ``warnings``) so the results surface never
+    shows a silent null.
     """
 
     entries: list[ScoreEntry] = field(default_factory=list)
@@ -233,7 +236,10 @@ def parse_scores_json(text: str) -> ParsedScores:
     """Parse scores.json content into :class:`ParsedScores`.
 
     Raises :class:`ScoresFileError` when the document is not a JSON object,
-    lacks a ``scores`` list, or yields zero valid entries.
+    lacks a ``scores`` list, or yields zero valid entries. A missing or
+    non-numeric ``overall`` is synthesized as the mean of the valid entries
+    (with a warning) — a null headline score is never emitted for a usable
+    document.
     """
     obj = _loads_lenient(text)
     if obj is None:
@@ -294,6 +300,18 @@ def parse_scores_json(text: str) -> ParsedScores:
         parsed.overall = overall
     elif "overall" in obj:
         parsed.warnings.append("'overall' is not numeric — ignored")
+    if parsed.overall is None:
+        # A judge that scored every dimension but omitted `overall` must not
+        # leave the field null — the results matrix reads it as the headline
+        # score. Synthesize the dimension mean and flag it as derived so the
+        # eval_scored event's warnings show where the number came from.
+        parsed.overall = round(
+            sum(entry.score for entry in parsed.entries) / len(parsed.entries),
+            1,
+        )
+        parsed.warnings.append(
+            "overall missing — computed as mean of dimension scores"
+        )
 
     summary = obj.get("summary")
     if isinstance(summary, str):

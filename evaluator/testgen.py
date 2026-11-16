@@ -36,7 +36,15 @@ Env knobs (all optional):
   the prompt (default 24000).
 - ``TESTGEN_MAX_FILES`` — cap on written test files (default 8).
 - ``TESTGEN_MAX_TOKENS`` — request ``max_tokens`` (default 4096).
-- ``TESTGEN_TIMEOUT_SECONDS`` — generation HTTP timeout (default 240).
+- ``TESTGEN_MAX_TOKENS_RETRY`` — ``max_tokens`` for the single retry
+  (default 8192). Thinking models (live: qwen3:8b) burn the whole output
+  budget on reasoning and return EMPTY content; output that parses to zero
+  usable test files and httpx timeouts (slow big models, live: a 35B judge
+  hitting ReadTimeout at the 240s cap) also earn ONE retry with the raised
+  cap and a doubled timeout — the degraded ``skipped``/``error`` outcomes
+  apply unchanged when the retry fails too.
+- ``TESTGEN_TIMEOUT_SECONDS`` — generation HTTP timeout PER ATTEMPT
+  (default 240); the raised-budget retry gets 2× this value.
 
 Status semantics mirror ``scoring.exec``: ``skipped`` = declined (disabled,
 non-python workspace, gateway/image unavailable, model produced no runnable
@@ -79,7 +87,14 @@ MANIFEST_FILENAME = "_manifest.json"
 DEFAULT_SOURCE_BUDGET_BYTES = 24_000
 DEFAULT_MAX_FILES = 8
 DEFAULT_MAX_TOKENS = 4096
+#: Raised ``max_tokens`` for the single retry (``TESTGEN_MAX_TOKENS_RETRY``)
+#: — thinking models burn the base cap on reasoning and return empty
+#: content; 8192 leaves headroom for <think> + the suite.
+DEFAULT_MAX_TOKENS_RETRY = 8192
 DEFAULT_TIMEOUT_SECONDS = 240.0
+#: The raised-budget retry also gets a longer wall clock — slow big models
+#: (live: a 35B judge) hit ReadTimeout at the base cap.
+RETRY_TIMEOUT_MULTIPLIER = 2.0
 #: Per-file cap — one giant output chunk is almost certainly a model rant.
 MAX_FILE_BYTES = 64_000
 
@@ -280,8 +295,16 @@ async def _request_suite(
     model: str,
     user_prompt: str,
     max_tokens: int,
+    timeout_seconds: float | None = None,
 ) -> str:
-    """One chat-completions call → raw model output (retries live upstream)."""
+    """One chat-completions call → raw model output.
+
+    ``timeout_seconds`` overrides the client default for this request —
+    the raised-budget retry gets a longer wall clock than the first call.
+    """
+    kwargs: dict[str, Any] = {}
+    if timeout_seconds is not None:
+        kwargs["timeout"] = timeout_seconds
     resp = await client.post(
         f"{gateway_base_url.rstrip('/')}/v1/chat/completions",
         json={
@@ -295,6 +318,7 @@ async def _request_suite(
             ],
         },
         headers={"Authorization": f"Bearer {cred}"},
+        **kwargs,
     )
     resp.raise_for_status()
     return _message_content(resp.json())
@@ -379,9 +403,15 @@ async def generate_tests_signal(
     )
     file_cap = max_files or _env_int("TESTGEN_MAX_FILES", DEFAULT_MAX_FILES)
     tok_cap = max_tokens or _env_int("TESTGEN_MAX_TOKENS", DEFAULT_MAX_TOKENS)
+    retry_tok_cap = _env_int(
+        "TESTGEN_MAX_TOKENS_RETRY", DEFAULT_MAX_TOKENS_RETRY
+    )
     timeout = timeout_seconds or _env_float(
         "TESTGEN_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS
     )
+    # The retry's wall clock doubles the per-attempt timeout — the call it
+    # replaces timed out BECAUSE the base budget was too tight for the model.
+    retry_timeout = timeout * RETRY_TIMEOUT_MULTIPLIER
     gen_model = (os.environ.get("TESTGEN_MODEL") or "").strip() or (model or "")
 
     sources = _gather_sources(ws, budget_bytes=budget)
@@ -400,29 +430,68 @@ async def generate_tests_signal(
     )
 
     # ---- generate (metered gateway call) ------------------------------------
+    # ONE retry at raised caps covers the live-observed thinking/slow-model
+    # modes: empty content (reasoning burned the output budget), a response
+    # that yields zero runnable test files, and httpx timeouts — the retry
+    # uses TESTGEN_MAX_TOKENS_RETRY and 2x TESTGEN_TIMEOUT_SECONDS. Every
+    # degraded outcome (``skipped``/``error``) applies unchanged when the
+    # retry also fails.
     prompt = build_testgen_prompt(rubric, sources)
     own_client = client is None
     if client is None:
         client = httpx.AsyncClient(timeout=timeout)
+    raw: str | None = None
+    valid: list[tuple[str, str]] = []
+    rejected: list[dict[str, str]] = []
     try:
-        raw = await _request_suite(
-            client,
-            gateway_base_url=gateway_base_url,
-            cred=cred,
-            model=gen_model,
-            user_prompt=prompt,
-            max_tokens=tok_cap,
-        )
-    except Exception as exc:  # noqa: BLE001 — transport/HTTP/contract failures
-        report.status = "error"
-        report.error = f"test generation call failed: {type(exc).__name__}: {exc}"
-        return report
+        for attempt in range(2):
+            retrying = attempt > 0
+            metrics["retried"] = retrying
+            try:
+                raw = await _request_suite(
+                    client,
+                    gateway_base_url=gateway_base_url,
+                    cred=cred,
+                    model=gen_model,
+                    user_prompt=prompt,
+                    max_tokens=retry_tok_cap if retrying else tok_cap,
+                    timeout_seconds=retry_timeout if retrying else timeout,
+                )
+            except (TestgenError, httpx.TimeoutException) as exc:
+                # Empty/no-choice content and timeouts earn the one raised-
+                # budget retry; a second failure degrades like before.
+                if retrying:
+                    report.status = "error"
+                    report.error = (
+                        "test generation call failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    return report
+                report.warnings.append(
+                    f"generation attempt failed ({exc}) — retrying once "
+                    "with raised max_tokens"
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 — transport/HTTP failures
+                report.status = "error"
+                report.error = (
+                    f"test generation call failed: {type(exc).__name__}: {exc}"
+                )
+                return report
+            valid, rejected = parse_test_files(raw)
+            if valid:
+                break
+            if not retrying:
+                report.warnings.append(
+                    "first generation produced no runnable test files — "
+                    "retrying once with raised max_tokens"
+                )
     finally:
         if own_client:
             await client.aclose()
 
     # ---- parse + validate (deterministic containment) -----------------------
-    valid, rejected = parse_test_files(raw)
+    # ``valid``/``rejected`` already hold the FINAL attempt's parse results.
     metrics["files_returned"] = len(valid) + len(rejected)
     if len(valid) > file_cap:
         report.warnings.append(
