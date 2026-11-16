@@ -20,6 +20,14 @@
 Every path ends in :func:`finalize_sandbox`: snapshot artifacts FIRST, then
 DB rows, then ``docker rm``. The function never raises — unexpected errors
 finalize the sandbox as ``error`` so ``asyncio.gather`` always completes.
+
+Empty-workspace flagging: when the snapshot workspace has no real files
+(nothing, or only dot-entries like ``.git``), finalize stamps
+``empty_workspace: true`` onto the ``sandbox_finalized`` checkpoint payload,
+and — for the done-ish reasons (``agent_done``/``harness_complete``/
+``stuck_loop``, where a clean exit producing nothing is anomalous) — emits a
+``stage="empty_workspace"`` warning checkpoint. Analytics surfaces the flag
+per sandbox (``empty_workspace`` on the results row).
 """
 
 from __future__ import annotations
@@ -226,6 +234,29 @@ def _snapshot_sizes(snapshot: Any) -> dict[str, int]:
     }
 
 
+def _workspace_is_empty(path: Path) -> bool:
+    """True when the snapshot workspace holds no real files.
+
+    "Empty" = no entries at all, or only dot-entries (``.git``,
+    ``.gitignore``, ``.env`` …) — harness/agent scaffolding doesn't count
+    as produced work. Dot-directories are pruned so ``.git`` internals
+    can't count either; a non-dot subdirectory is produced structure and
+    counts as non-empty. ``os.walk`` doesn't follow symlinked dirs, so a
+    candidate-planted symlink can't pull the scan outside the artifact
+    tree. Runs on a worker thread (same FS walk cost as sizing).
+    """
+    if not path.is_dir():
+        return True
+    for _root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        if dirs:
+            return False
+        for name in files:
+            if not name.startswith("."):
+                return False
+    return True
+
+
 def _finalize_db(
     session_factory: sessionmaker[Session],
     *,
@@ -234,6 +265,7 @@ def _finalize_db(
     snapshot: Any,
     sizes: dict[str, int],
     reason: str,
+    empty_workspace: bool = False,
 ) -> None:
     """DB half of finalize: artifact rows + sandbox terminal fields + event."""
     with session_factory() as session:
@@ -266,18 +298,42 @@ def _finalize_db(
             sb.status = to_status
         sb.terminal_reason = reason
         sb.finished_at = _now()
+        payload: dict[str, Any] = {
+            "stage": "sandbox_finalized",
+            "terminal_reason": reason,
+            "sandbox_status": sb.status,
+            "artifact_path": sb.artifact_path,
+        }
+        if empty_workspace:
+            # Distinguishes "finished cleanly" from "finished cleanly but
+            # produced nothing" — the terminal_reason itself is unchanged.
+            payload["empty_workspace"] = True
         emit(
             session,
             run_id=run_id,
             sandbox_id=sandbox_id,
             event_type="checkpoint",
-            payload={
-                "stage": "sandbox_finalized",
-                "terminal_reason": reason,
-                "sandbox_status": sb.status,
-                "artifact_path": sb.artifact_path,
-            },
+            payload=payload,
         )
+        if empty_workspace and reason in state_machine.DONE_REASONS:
+            # A done-ish exit on an empty workspace is anomalous (e.g. a
+            # CLI exiting 0 without ever touching files) — warn so the
+            # timeline shows it isn't a normal completion.
+            emit(
+                session,
+                run_id=run_id,
+                sandbox_id=sandbox_id,
+                event_type="checkpoint",
+                payload={
+                    "stage": "empty_workspace",
+                    "severity": "warning",
+                    "terminal_reason": reason,
+                    "detail": (
+                        f"{reason} but the snapshotted workspace has no "
+                        "files (nothing, or only dot-entries)"
+                    ),
+                },
+            )
         session.commit()
 
 
@@ -300,11 +356,22 @@ async def finalize_sandbox(
         log.warning("finalize: snapshot failed for %s: %s", sid, exc)
 
     sizes: dict[str, int] = {}
+    empty_workspace = False
     if snapshot is not None:
         try:
             sizes = await asyncio.to_thread(_snapshot_sizes, snapshot)
         except Exception:
             log.warning("finalize: artifact sizing failed for %s", sid, exc_info=True)
+        try:
+            empty_workspace = await asyncio.to_thread(
+                _workspace_is_empty, Path(snapshot.workspace_dir)
+            )
+        except Exception:
+            log.warning(
+                "finalize: workspace emptiness probe failed for %s",
+                sid,
+                exc_info=True,
+            )
 
     # 2) DB rows (artifacts + terminal fields + checkpoint event).
     try:
@@ -315,6 +382,7 @@ async def finalize_sandbox(
             snapshot=snapshot,
             sizes=sizes,
             reason=reason,
+            empty_workspace=empty_workspace,
         )
     except Exception:
         log.exception("finalize: DB update failed for sandbox %s", sid)

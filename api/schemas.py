@@ -455,6 +455,10 @@ class SandboxAnalytics(BaseModel):
     price_model: str = ""
     status: str
     terminal_reason: str | None = None
+    # Monitor flagged a done-ish terminal state on an empty workspace
+    # (agent claimed completion but produced no files) — see the
+    # ``stage="empty_workspace"`` warning / ``sandbox_finalized`` payload.
+    empty_workspace: bool = False
     llm_turns: int = 0
     tokens: TokenUsage = Field(default_factory=TokenUsage)
     latency_ms: LatencyStats = Field(default_factory=LatencyStats)

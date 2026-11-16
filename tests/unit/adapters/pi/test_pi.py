@@ -142,6 +142,39 @@ class TestTranslate:
         )
         assert ev[0]["type"] == "error"
         assert ev[0]["payload"]["tool"] == "bash"
+        # Result content is surfaced — a bare {"tool": "bash"} error is
+        # impossible to diagnose.
+        assert ev[0]["payload"]["message"] == "exit 127"
+
+    def test_tool_execution_error_fallback_detail(self):
+        """No stderr/message/result → the detail still names the tool (and
+        its exit code when pi reports one) rather than being opaque."""
+        ev = translate_obj(
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "c2",
+                "toolName": "bash",
+                "isError": True,
+                "exitCode": 127,
+            }
+        )
+        p = ev[0]["payload"]
+        assert p["tool"] == "bash"
+        assert "bash" in p["detail"]
+        assert "127" in p["detail"]
+        assert p["exit_code"] == 127
+
+    def test_tool_execution_error_string_result(self):
+        ev = translate_obj(
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "c3",
+                "toolName": "read",
+                "isError": True,
+                "result": "permission denied",
+            }
+        )
+        assert ev[0]["payload"]["message"] == "permission denied"
 
     def test_tool_execution_ok_is_checkpoint(self):
         ev = translate_obj(
@@ -232,6 +265,21 @@ class TestHooks:
         p = ev[0]["payload"]
         assert p["is_error"] is True
         assert p["output"] == "exit 127"
+        assert p["message"] == "exit 127"
+
+    def test_tool_execution_end_error_no_detail(self):
+        """isError with no result/message → fallback message names the tool."""
+        ev = translate_hook(
+            {
+                "hook_event_name": "tool_execution_end",
+                "event": {"toolName": "bash", "isError": True, "exitCode": 2},
+            }
+        )
+        p = ev[0]["payload"]
+        assert p["is_error"] is True
+        assert "bash" in p["message"]
+        assert "2" in p["message"]
+        assert p["exit_code"] == 2
 
     def test_other_hooks_dropped(self):
         assert (

@@ -214,6 +214,41 @@ class TestProviderRoutes:
         with pytest.raises(ValidationError, match="unknown provider"):
             _settings(PROVIDER_ROUTES='{"x-*": "bogus"}')
 
+    def test_local_glob_does_not_hijack_namespaced_id(self) -> None:
+        """A glob with no "/" is a local-name pattern: ``qwen*`` routes
+        ``qwen3:8b`` to ollama but must NOT swallow the OpenRouter-style
+        ``qwen/qwen3-8b:free`` — namespaced ids fall to the default."""
+        s = _settings(
+            UPSTREAM_PROVIDER="openrouter",
+            OPENROUTER_API_KEY="k",
+            PROVIDER_ROUTES='{"qwen*": "ollama"}',
+        )
+        assert s.provider_for_model("qwen3:8b") == "ollama"
+        assert s.provider_for_model("qwen/qwen3-8b:free") == "openrouter"
+        # Case-insensitivity applies to the namespace guard too.
+        assert s.provider_for_model("Qwen/Qwen3-8B:free") == "openrouter"
+
+    def test_vendor_prefix_glob_matches_namespaced_id(self) -> None:
+        """Opting in is explicit: a pattern containing "/" — ``qwen/*`` —
+        matches the vendor prefix; a non-namespaced name does not."""
+        s = _settings(
+            UPSTREAM_PROVIDER="openrouter",
+            OPENROUTER_API_KEY="k",
+            PROVIDER_ROUTES='{"qwen/*": "ollama"}',
+        )
+        assert s.provider_for_model("qwen/qwen3-8b:free") == "ollama"
+        assert s.provider_for_model("qwen3:8b") == "openrouter"
+
+    def test_exact_namespaced_id_still_matches(self) -> None:
+        """Exact strings with slashes keep working — they pin one id."""
+        s = _settings(
+            UPSTREAM_PROVIDER="openrouter",
+            OPENROUTER_API_KEY="k",
+            PROVIDER_ROUTES='{"qwen/qwen3-8b:free": "ollama"}',
+        )
+        assert s.provider_for_model("qwen/qwen3-8b:free") == "ollama"
+        assert s.provider_for_model("qwen/qwen3-7b:free") == "openrouter"
+
     def test_routes_parsed_once_cached(self) -> None:
         """provider_for_model resolves per request — the JSON parse must be
         cached, not re-run per call (identical dict object returned)."""

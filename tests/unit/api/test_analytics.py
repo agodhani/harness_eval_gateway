@@ -763,3 +763,156 @@ def test_trends_multimodel_prices_each_cell_at_its_own_rate(
     assert pt["price_model"] == "gpt-4o-mini"
     # 2 cells × (100*0.15 + 50*0.6)/1e6 = 0.00009
     assert pt["estimated_cost_usd"] == pytest.approx(0.00009)
+
+
+# ---------------------------------------------------------------------------
+# Cross-source tool-call mix (CLI harness lanes) + empty_workspace flag
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def mixed_signal_run(session_factory: sessionmaker[Session]):
+    """One run whose sandboxes each carry a different event mix — exercises
+    the layered tool-call aggregation:
+    - sb_hook: pi/claude-style lane — tool_result (hook) + shell_command /
+      file_op translations of the SAME calls (no proxy double counting).
+    - sb_mixed: tool_call + tool_result names overlapping — per-name max.
+    - sb_coarse: codex/aider-style lane — only shell_command/file_op/
+      test_execution events; proxies fold into the mix.
+    - sb_empty: monitor flagged an empty workspace.
+    """
+    s = session_factory()
+    try:
+        run = Run(task_prompt="build", model_name="qwen3:8b", config={}, status="done")
+        s.add(run)
+        s.flush()
+        sbs = {}
+        for key, adapter in (
+            ("hook", "pi"),
+            ("mixed", "claude_code"),
+            ("coarse", "codex"),
+            ("empty", "pi"),
+        ):
+            sb = Sandbox(
+                run_id=run.id,
+                harness_config={"adapter": adapter},
+                status="done",
+                terminal_reason="harness_complete",
+            )
+            s.add(sb)
+            sbs[key] = sb
+        s.flush()
+
+        evs: list[Event] = []
+        # sb_hook: 5 bash + 2 read calls — stream gave shell_command×5 /
+        # file_op×2, the extension gave tool_result for every call.
+        for i in range(5):
+            evs.append(_ev(run.id, sandbox_id=sbs["hook"].id, type_="shell_command",
+                           ts=T0 + timedelta(minutes=i), payload={"command": "ls", "tool": "bash"}))
+            evs.append(_ev(run.id, sandbox_id=sbs["hook"].id, type_="tool_result",
+                           ts=T0 + timedelta(minutes=i, seconds=1),
+                           source="harness",
+                           payload={"name": "bash", "is_error": False, "via": "hook"}))
+        for i in range(2):
+            evs.append(_ev(run.id, sandbox_id=sbs["hook"].id, type_="file_op",
+                           ts=T0 + timedelta(minutes=10 + i),
+                           payload={"op": "read", "tool": "read"}))
+            evs.append(_ev(run.id, sandbox_id=sbs["hook"].id, type_="tool_result",
+                           ts=T0 + timedelta(minutes=10 + i, seconds=1),
+                           payload={"name": "read", "via": "hook"}))
+
+        # sb_mixed: 1 WebSearch tool_call (stream) + tool_results for it and
+        # other tools (hook covers every call → dedup per name).
+        evs.append(_ev(run.id, sandbox_id=sbs["mixed"].id, type_="tool_call",
+                       ts=T0, payload={"name": "WebSearch"}))
+        for name, n in (("WebSearch", 1), ("Bash", 4), ("Read", 2)):
+            for _ in range(n):
+                evs.append(_ev(run.id, sandbox_id=sbs["mixed"].id, type_="tool_result",
+                               ts=T0, payload={"name": name, "via": "hook"}))
+
+        # sb_coarse: no per-tool events at all — coarse activity only.
+        for i in range(4):
+            evs.append(_ev(run.id, sandbox_id=sbs["coarse"].id, type_="shell_command",
+                           ts=T0 + timedelta(minutes=i),
+                           payload={"command": f"cmd{i}", "exit_code": 0}))
+        for i in range(2):
+            evs.append(_ev(run.id, sandbox_id=sbs["coarse"].id, type_="file_op",
+                           ts=T0 + timedelta(minutes=5 + i),
+                           payload={"status": "completed", "paths": [f"f{i}.py"]}))
+        evs.append(_ev(run.id, sandbox_id=sbs["coarse"].id, type_="test_execution",
+                       ts=T0 + timedelta(minutes=8),
+                       payload={"command": "pytest", "exit_code": 0}))
+
+        # sb_empty: monitor's empty-workspace markers (finalized payload +
+        # dedicated warning checkpoint).
+        evs.append(_ev(run.id, sandbox_id=sbs["empty"].id, type_="shell_command",
+                       ts=T0, payload={"command": "ls"}))
+        evs.append(_ev(run.id, sandbox_id=sbs["empty"].id, source="orchestrator",
+                       type_="checkpoint", ts=T0 + timedelta(minutes=1),
+                       payload={"stage": "empty_workspace", "severity": "warning"}))
+        evs.append(_ev(run.id, sandbox_id=sbs["empty"].id, source="orchestrator",
+                       type_="checkpoint", ts=T0 + timedelta(minutes=1),
+                       payload={"stage": "sandbox_finalized",
+                                "terminal_reason": "harness_complete",
+                                "empty_workspace": True}))
+        s.add_all(evs)
+        s.commit()
+        return {"run_id": run.id, "sbs": {k: sb.id for k, sb in sbs.items()}}
+    finally:
+        s.close()
+
+
+def _row(body: dict, sandbox_id) -> dict:
+    return next(x for x in body["sandboxes"] if x["sandbox_id"] == str(sandbox_id))
+
+
+def test_tool_result_events_feed_tool_mix(
+    client: TestClient, mixed_signal_run
+) -> None:
+    """Hook-sourced tool_result counts by tool name — the pi/claude lane's
+    mix is non-zero and does NOT double-count its translated shell/file rows."""
+    body = _get(client, mixed_signal_run["run_id"])
+    row = _row(body, mixed_signal_run["sbs"]["hook"])
+    assert row["tool_calls"] == {"total": 7, "by_tool": {"bash": 5, "read": 2}}
+    # the same calls still report under their own counters
+    assert row["shell_commands"] == 5
+    assert row["file_ops"] == 2
+
+
+def test_tool_call_and_tool_result_dedup_per_name(
+    client: TestClient, mixed_signal_run
+) -> None:
+    """A call that produced both a stream tool_call AND a hook tool_result
+    counts once — per-name the larger count wins, names union."""
+    body = _get(client, mixed_signal_run["run_id"])
+    row = _row(body, mixed_signal_run["sbs"]["mixed"])
+    assert row["tool_calls"] == {
+        "total": 7,
+        "by_tool": {"WebSearch": 1, "Bash": 4, "Read": 2},
+    }
+
+
+def test_coarse_activity_falls_back_to_proxies(
+    client: TestClient, mixed_signal_run
+) -> None:
+    """No tool_call/tool_result at all (codex/aider-style) → shell_command/
+    file_op/test_execution fold into the mix as proxies."""
+    body = _get(client, mixed_signal_run["run_id"])
+    row = _row(body, mixed_signal_run["sbs"]["coarse"])
+    assert row["tool_calls"] == {
+        "total": 7,
+        "by_tool": {"shell_command": 4, "file_op": 2, "test_execution": 1},
+    }
+    # proxy fold doesn't suppress the standalone counters
+    assert row["shell_commands"] == 4
+    assert row["file_ops"] == 2
+    assert row["test_executions"] == 1
+
+
+def test_empty_workspace_surfaced_on_row(
+    client: TestClient, mixed_signal_run
+) -> None:
+    body = _get(client, mixed_signal_run["run_id"])
+    assert _row(body, mixed_signal_run["sbs"]["empty"])["empty_workspace"] is True
+    for key in ("hook", "mixed", "coarse"):
+        assert _row(body, mixed_signal_run["sbs"][key])["empty_workspace"] is False

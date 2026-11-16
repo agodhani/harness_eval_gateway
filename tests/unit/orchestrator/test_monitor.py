@@ -150,6 +150,89 @@ async def test_missing_container_is_error(session_factory, settings, fake_runtim
 
 
 # ---------------------------------------------------------------------------
+# empty-workspace flagging
+# ---------------------------------------------------------------------------
+
+
+def _checkpoint_payloads(session_factory, sandbox_id) -> list[dict]:
+    with session_factory() as s:
+        return [
+            e.payload
+            for e in s.execute(
+                select(Event)
+                .where(
+                    Event.sandbox_id == sandbox_id,
+                    Event.type == "checkpoint",
+                )
+                .order_by(Event.id)
+            ).scalars()
+        ]
+
+
+async def test_harness_complete_empty_workspace_flagged(
+    session_factory, settings, fake_runtime
+) -> None:
+    """A clean exit on a dot-only workspace keeps `harness_complete` but is
+    flagged: `empty_workspace` on the finalized payload + a warning
+    checkpoint — it's not a normal completion."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    fake_runtime.status_map[str(sb.id)] = {"status": "exited", "exit_code": 0}
+    fake_runtime.logs_map[str(sb.id)] = "cli exited 0\n"
+    fake_runtime.empty_workspace_ids.add(str(sb.id))
+
+    reason = await _watch(session_factory, settings, fake_runtime, run.id, sb.id)
+    assert reason == "harness_complete"
+    assert _get_sandbox(session_factory, sb.id).status == "done"
+
+    payloads = _checkpoint_payloads(session_factory, sb.id)
+    finalized = next(p for p in payloads if p.get("stage") == "sandbox_finalized")
+    assert finalized["terminal_reason"] == "harness_complete"
+    assert finalized["empty_workspace"] is True
+    warning = next(p for p in payloads if p.get("stage") == "empty_workspace")
+    assert warning["severity"] == "warning"
+    assert warning["terminal_reason"] == "harness_complete"
+
+
+async def test_nonempty_workspace_not_flagged(
+    session_factory, settings, fake_runtime
+) -> None:
+    """Normal completion with files: no flag, no warning."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    fake_runtime.logs_map[str(sb.id)] = RESULT_LINE("agent_done") + "\n"
+
+    reason = await _watch(session_factory, settings, fake_runtime, run.id, sb.id)
+    assert reason == "agent_done"
+
+    payloads = _checkpoint_payloads(session_factory, sb.id)
+    finalized = next(p for p in payloads if p.get("stage") == "sandbox_finalized")
+    assert "empty_workspace" not in finalized
+    assert not any(p.get("stage") == "empty_workspace" for p in payloads)
+
+
+async def test_empty_workspace_error_reason_no_warning(
+    session_factory, settings, fake_runtime
+) -> None:
+    """The flag stamps for any reason (an errored lane producing nothing is
+    still informative), but the warning checkpoint is reserved for done-ish
+    exits — `error` already says it failed."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    fake_runtime.status_map[str(sb.id)] = {"status": "exited", "exit_code": 2}
+    fake_runtime.logs_map[str(sb.id)] = RESULT_LINE("error") + "\n"
+    fake_runtime.empty_workspace_ids.add(str(sb.id))
+
+    reason = await _watch(session_factory, settings, fake_runtime, run.id, sb.id)
+    assert reason == "error"
+
+    payloads = _checkpoint_payloads(session_factory, sb.id)
+    finalized = next(p for p in payloads if p.get("stage") == "sandbox_finalized")
+    assert finalized["empty_workspace"] is True
+    assert not any(p.get("stage") == "empty_workspace" for p in payloads)
+
+
+# ---------------------------------------------------------------------------
 # policy terminations
 # ---------------------------------------------------------------------------
 

@@ -171,11 +171,23 @@ class GatewaySettings(BaseSettings):
         ``PROVIDER_ROUTES`` globs are matched case-insensitively in
         declaration order; the first hit wins. No model / no hit falls back
         to the process-wide ``UPSTREAM_PROVIDER``.
+
+        Namespace rule: a glob containing no ``/`` is a LOCAL-name pattern
+        and never matches a ``vendor/model`` id — ``{"qwen*": "ollama"}``
+        routes ``qwen3:8b`` but must NOT hijack OpenRouter's namespaced
+        ``qwen/qwen3-8b:free``. To route namespaced ids, write a pattern
+        that contains ``/`` — ``qwen/*`` matches the vendor prefix, or an
+        exact ``qwen/qwen3-8b:free`` pins one id (exact strings keep
+        working for names with slashes).
         """
         if isinstance(model, str) and model:
             lowered = model.lower()
+            namespaced = "/" in lowered
             for glob, provider in self.provider_routes().items():
-                if fnmatch.fnmatchcase(lowered, glob.lower()):
+                pattern = glob.lower()
+                if namespaced and "/" not in pattern:
+                    continue  # local-name glob can't swallow a vendor/model id
+                if fnmatch.fnmatchcase(lowered, pattern):
                     return provider
         return self.UPSTREAM_PROVIDER
 

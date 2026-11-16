@@ -8,6 +8,10 @@ Terminal states (emitted on the final ``MINILOOP_RESULT`` stdout line):
 ``agent_done`` (done tool), ``harness_complete`` (MAX_ITERS reached),
 ``stuck_loop`` (3 consecutive identical tool-call signatures, or 4 consecutive
 text-only replies), ``error`` (unhandled exception / bad config).
+
+Text-only replies first get ``MINILOOP_NUDGE_RETRIES`` corrective nudges
+(default 2, ``stage="agent_nudge"`` checkpoints) that demand a tool call —
+only replies after the nudge budget is spent count toward the streak.
 """
 
 from __future__ import annotations
@@ -23,7 +27,12 @@ from typing import Any, Protocol
 import httpx
 
 from .events import EventEmitter
-from .prompts import NUDGE_TEXT_STREAK_2, NUDGE_TEXT_STREAK_3, build_system_prompt
+from .prompts import (
+    AGENT_NUDGE,
+    NUDGE_TEXT_STREAK_2,
+    NUDGE_TEXT_STREAK_3,
+    build_system_prompt,
+)
 from .skills import SkillCatalog
 from .tools import TOOL_IMPLS, ToolContext
 
@@ -69,6 +78,9 @@ class AgentConfig:
     # Optional harness-config axis (F2): extra instructions appended to the
     # system prompt verbatim — e.g. comparing skill packs vs. prompt tweaks.
     system_prompt_extra: str = ""
+    # Corrective nudges per tool-less spell before replies count toward the
+    # text-only stuck streak (MINILOOP_NUDGE_RETRIES).
+    nudge_retries: int = 2
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> AgentConfig:
@@ -96,6 +108,10 @@ class AgentConfig:
             max_tokens = max(1, int(env.get("MAX_TOKENS", "4096")))
         except ValueError:
             max_tokens = 4096
+        try:
+            nudge_retries = max(0, int(env.get("MINILOOP_NUDGE_RETRIES", "2")))
+        except ValueError:
+            nudge_retries = 2
 
         return cls(
             gateway_base_url=base,
@@ -108,6 +124,7 @@ class AgentConfig:
             max_iters=max_iters,
             max_tokens=max_tokens,
             system_prompt_extra=(env.get("SYSTEM_PROMPT_EXTRA") or "").strip(),
+            nudge_retries=nudge_retries,
         )
 
 
@@ -348,6 +365,7 @@ class Agent:
         max_iters: int = 50,
         num_ctx: int = 32768,
         compact_ratio: float = 0.7,
+        nudge_retries: int = 2,
     ) -> None:
         self.client = client
         self.ctx = ctx
@@ -356,6 +374,9 @@ class Agent:
         self.num_ctx = num_ctx
         self.compact_ratio = compact_ratio
         self.compact_threshold = int(num_ctx * compact_ratio)
+        # Corrective nudges per tool-less spell before replies count toward
+        # the text-only stuck streak (0 = pre-nudge behavior).
+        self.nudge_retries = max(0, nudge_retries)
 
     # -- public -------------------------------------------------------------
 
@@ -372,6 +393,9 @@ class Agent:
         }
         last_prompt_tokens = 0
         no_tool_streak = 0
+        # Corrective nudges spent on the current tool-less spell — reset when
+        # the model resumes calling tools (bounded per spell, not globally).
+        nudges_used = 0
         last_sig: str | None = None
         sig_streak = 0
         done_summary: str | None = None
@@ -400,6 +424,22 @@ class Agent:
                 tool_calls = msg.get("tool_calls") or []
 
                 if not tool_calls:
+                    # First defense: bounded corrective nudges demanding a
+                    # tool call. Replies under nudge don't count toward the
+                    # text-only streak — the model was never told prose is
+                    # invalid here, so give it explicit instruction first.
+                    if nudges_used < self.nudge_retries:
+                        nudges_used += 1
+                        self.emitter.emit(
+                            "checkpoint",
+                            {
+                                "stage": "agent_nudge",
+                                "iter": iters,
+                                "nudge": nudges_used,
+                            },
+                        )
+                        messages.append({"role": "user", "content": AGENT_NUDGE})
+                        continue
                     no_tool_streak += 1
                     if no_tool_streak >= TEXT_ONLY_STREAK:
                         return self._finish(
@@ -416,6 +456,7 @@ class Agent:
                     continue
 
                 no_tool_streak = 0
+                nudges_used = 0
                 sig = _tool_signature(tool_calls)
                 sig_streak = sig_streak + 1 if sig == last_sig else 1
                 last_sig = sig
@@ -600,6 +641,7 @@ def main(argv: list[str] | None = None) -> int:
             max_iters=cfg.max_iters,
             num_ctx=cfg.num_ctx,
             compact_ratio=cfg.compact_ratio,
+            nudge_retries=cfg.nudge_retries,
         )
         system_prompt = build_system_prompt(
             workspace=str(cfg.workspace),

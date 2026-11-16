@@ -201,7 +201,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   model `qwen3:8b` via Ollama; JSONL harness events on stdout + HTTP ingest;
   `MINILOOP_RESULT` terminator line; skill packs vendored under `skillpacks/`
   (51 SKILL.md: superpowers 14, mattpocock-skills 28, spec-kit 9 generated);
-  progressive-disclosure catalog in system prompt.
+  progressive-disclosure catalog in system prompt. Tool-less assistant
+  replies get `MINILOOP_NUDGE_RETRIES` corrective nudges (default 2,
+  `stage="agent_nudge"` checkpoints) before counting toward the text-only
+  `stuck_loop` streak.
 - **Where:** `adapters/miniloop/` (`agent.py`, `tools.py`, `events.py`,
   `skills.py`, `prompts.py`, `adapter.py`, `__main__.py`), `skillpacks/`
 - **Verify:**
@@ -405,7 +408,13 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (in/out/cache/total), latency (avg/p95/max), tool-call + skill-invocation
   breakdowns, shell/file/test/error counts, wall clock, estimated cost at a
   selectable price model (`api/pricing.py` `PRICE_TABLE`; local models
-  flagged `local` → $0). Judge (evaluator) traffic shares the participant
+  flagged `local` → $0). The tool-call mix merges `tool_call` events,
+  hook-sourced `tool_result` outcomes (per-name max — a call producing
+  both records counts once), and `shell_command`/`file_op`/`test_execution`
+  as proxies when a lane has no finer signal, so CLI adapters report a
+  non-zero mix; `empty_workspace` surfaces the monitor's file-less
+  workspace flag on the sandbox row. Judge (evaluator) traffic shares the
+  participant
   sandbox_id via its cred, so it's split out at the `eval_started` checkpoint
   and reported under `evaluator` rather than polluting participant numbers.
   Results page gains an "Analytics" section — side-by-side comparison table +
@@ -467,7 +476,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   generated `extensions/heg-events.ts` (`tool_execution_end` →
   `tool_result`). `deepseek`/`aider`/`miniloop` stay translated-only. The
   receiver always exits 0 and mirrors to stderr (stdout can feed back into
-  agent context for some claude hook events).
+  agent context for some claude hook events). Pi tool errors carry detail —
+  stderr/message/result text when reported, else a named-tool + exit-code
+  fallback — and `tool_result`/coarse events feed the F9 tool-call mix so
+  CLI lanes aren't all-zero.
 - **Where:** `adapters/common/` (`runner.py`, `contract.py`, `hooks.py`),
   `adapters/{codex,claude_code,pi,deepseek,aider}/` (`adapter.py`, `config.py`,
   `translate.py`, `__main__.py`; aider also `launcher.py` — the patched

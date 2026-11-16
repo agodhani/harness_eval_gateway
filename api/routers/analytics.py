@@ -6,10 +6,19 @@
 - ``llm_turns``/``tokens``/``latency_ms`` from ``llm_response`` payloads
   (``usage.{prompt,completion,total}_tokens``, ``latency_ms`` — see
   ``gateway/metering.py::emit_llm_response``).
-- ``tool_calls.by_tool`` / ``skill_calls.by_skill`` keyed on the miniloop
-  payload ``name`` (with fallbacks for other emitters).
+- ``tool_calls.by_tool`` merges every per-tool signal without double
+  counting: ``tool_call`` events (miniloop, translated streams) plus
+  hook-sourced ``tool_result`` outcomes (claude_code PostToolUse, pi's
+  extension — per name the larger count wins since one call produces
+  both records). Lanes with neither (codex ``command_execution``, aider's
+  text stream) fall back to the coarse ``shell_command`` / ``file_op`` /
+  ``test_execution`` counts as activity proxies so the mix is non-zero.
+  ``skill_calls.by_skill`` keys on the invocation payload ``name``.
 - plain counts for ``shell_command`` / ``file_op`` / ``test_execution`` /
   ``error``; ``wall_clock_seconds`` = max−min event ts for the sandbox.
+- ``empty_workspace`` flags sandboxes whose monitor-side finalize found a
+  workspace with no real files (``sandbox_finalized`` payload /
+  ``stage="empty_workspace"`` warning — see orchestrator/monitor.py).
 - ``estimated_cost_usd`` at the selected ``price_model`` (api/pricing.py
   ``PRICE_TABLE``); auto mode (no param) costs each sandbox at its own
   participant model's listed rate, falling back to the run's resolved rate
@@ -98,6 +107,9 @@ class _Agg:
         self.tokens = TokenUsage()
         self.latencies: list[int] = []
         self.tool_calls = ToolCallStats()
+        # Hook-sourced tool outcomes (claude_code PostToolUse, pi extension):
+        # name -> count, folded into resolved_tool_calls below.
+        self._tool_results: dict[str, int] = {}
         self.skill_calls = SkillCallStats()
         self.shell_commands = 0
         self.file_ops = 0
@@ -134,6 +146,16 @@ class _Agg:
                 self.tool_calls.by_tool[name] = (
                     self.tool_calls.by_tool.get(name, 0) + 1
                 )
+            case "tool_result":
+                # Outcome record for a call the stream may already have
+                # logged — dedup happens per-name in resolved_tool_calls.
+                name = str(
+                    payload.get("name")
+                    or payload.get("tool")
+                    or payload.get("tool_name")
+                    or "unknown"
+                )
+                self._tool_results[name] = self._tool_results.get(name, 0) + 1
             case "skill_invocation":
                 self.skill_calls.total += 1
                 name = str(
@@ -163,6 +185,31 @@ class _Agg:
             return 0.0
         return max(0.0, (self.last_ts - self.first_ts).total_seconds())
 
+    def resolved_tool_calls(self) -> ToolCallStats:
+        """The sandbox's tool-call mix across every agent-activity signal.
+
+        ``tool_call`` rows (miniloop, translated streams) are the base.
+        ``tool_result`` rows (PR17 hooks) describe the SAME calls' outcomes,
+        so per tool name the larger count wins — summing would double-count
+        a call that produced both records (e.g. pi's ``bash`` appears as a
+        ``shell_command`` at start and a ``tool_result`` at end). When a
+        lane has neither (codex ``command_execution`` only, aider's text
+        stream), the coarse shell/file/test events fold in as proxies so
+        CLI adapters don't report an all-zero mix.
+        """
+        by_tool = dict(self.tool_calls.by_tool)
+        for name, count in self._tool_results.items():
+            by_tool[name] = max(by_tool.get(name, 0), count)
+        if not by_tool:
+            for label, count in (
+                ("shell_command", self.shell_commands),
+                ("file_op", self.file_ops),
+                ("test_execution", self.test_executions),
+            ):
+                if count:
+                    by_tool[label] = count
+        return ToolCallStats(total=sum(by_tool.values()), by_tool=by_tool)
+
 
 def _eval_boundaries(events: list[Event]) -> dict[UUID, datetime]:
     """First evaluator-sourced event ts per sandbox — the judge boundary.
@@ -188,6 +235,28 @@ def _is_eval_event(ev: Event, boundary: datetime | None) -> bool:
     )
 
 
+def _empty_workspace_sandboxes(events: list[Event]) -> set[UUID]:
+    """Sandbox ids whose finalize flagged an empty workspace.
+
+    Two monitor-emitted markers (orchestrator/monitor.py): the
+    ``sandbox_finalized`` checkpoint's ``empty_workspace`` payload key and
+    the dedicated ``stage="empty_workspace"`` warning — either stamps the
+    flag on the analytics row. Collected phase-independently: the markers
+    are orchestrator events, not participant traffic.
+    """
+    out: set[UUID] = set()
+    for ev in events:
+        if ev.sandbox_id is None:
+            continue
+        payload = ev.payload if isinstance(ev.payload, dict) else {}
+        if payload.get("empty_workspace") or (
+            ev.type == "checkpoint"
+            and payload.get("stage") == "empty_workspace"
+        ):
+            out.add(ev.sandbox_id)
+    return out
+
+
 def _agg_metrics(agg: _Agg) -> dict:
     """Metric fields shared by SandboxAnalytics and ModelAnalytics."""
     lat = LatencyStats(
@@ -201,7 +270,7 @@ def _agg_metrics(agg: _Agg) -> dict:
         "llm_turns": agg.llm_turns,
         "tokens": agg.tokens,
         "latency_ms": lat,
-        "tool_calls": agg.tool_calls,
+        "tool_calls": agg.resolved_tool_calls(),
         "skill_calls": agg.skill_calls,
         "shell_commands": agg.shell_commands,
         "file_ops": agg.file_ops,
@@ -311,6 +380,7 @@ def get_run_analytics(
 
     # Eval boundary per sandbox (see _eval_boundaries).
     eval_start = _eval_boundaries(events)
+    empty_ws = _empty_workspace_sandboxes(events)
 
     participant: dict[UUID, _Agg] = {sb.id: _Agg() for sb in sandboxes}
     evaluator: dict[UUID, _Agg] = {}
@@ -353,6 +423,7 @@ def get_run_analytics(
                 # Row value wins; fall back to the harness-reported terminal
                 # state event when the column wasn't updated.
                 terminal_reason=sb.terminal_reason or agg.last_terminal_state,
+                empty_workspace=sb.id in empty_ws,
                 **_agg_metrics(agg),
                 estimated_cost_usd=round(
                     estimate_cost_usd(

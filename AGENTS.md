@@ -220,7 +220,11 @@ Each adapter provides:
 loop: shell exec, file read/write, `done`). Shipped CLI adapters (F10 +
 PR13): Claude Code, Codex, Pi, DeepSeek `dsh`, Aider — each runs against
 the same model via the gateway (paid accounts only needed if pointing at
-hosted providers; Ollama keeps everything free).
+hosted providers; Ollama keeps everything free). Miniloop retries a
+tool-less reply with a corrective `agent_nudge` message
+(`MINILOOP_NUDGE_RETRIES`, default 2) before it counts toward the
+text-only `stuck_loop` streak — small models answer in prose unless told
+prose is invalid.
 
 **Default skill packs** (named presets, vendored under `skillpacks/`):
 `superpowers`, `mattpocock-skills`, `spec-kit`.
@@ -626,6 +630,11 @@ or tests change.
   e2e `cd web && E2E_PORT=3100 npm run test:e2e`.
 - `GET /api/runs/{id}/analytics?price_model=` (F9) serves per-sandbox metrics
   + estimated cost; price table lives in `api/pricing.py` (`PRICE_TABLE`).
+  `tool_calls` merges every agent-activity signal without double counting —
+  `tool_call` events, hook-sourced `tool_result` outcomes (per-name max),
+  and `shell_command`/`file_op`/`test_execution` as proxies when a lane has
+  no finer signal — and carries `empty_workspace` when the monitor flagged
+  a done-ish exit on a file-less workspace.
 - `UPSTREAM_PROVIDER=ollama|openrouter|openai|anthropic` (gitignored `.env`
   keys `OPENROUTER_API_KEY`/`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`; compose
   `${VAR}` passthrough) picks the gateway's default upstream — every provider
@@ -633,7 +642,10 @@ or tests change.
   `PROVIDER_ROUTES` (JSON `{"glob": "provider"}`, first match wins,
   case-insensitive) overrides per request model — e.g.
   `{"claude-*": "anthropic"}` serves claude_code from Anthropic while the
-  rest stays on Ollama. Coverage differs: `openrouter` has chat/completions +
+  rest stays on Ollama. Namespace rule: a glob with no `/` is a local-name
+  pattern and never matches a `vendor/model` id (`qwen*` can't hijack
+  OpenRouter's `qwen/qwen3-8b:free`) — write `qwen/*` or an exact id to
+  route namespaced models. Coverage differs: `openrouter` has chat/completions +
   models only; `openai` adds `/v1/responses` but no `/v1/messages`
   (claude_code/dsh can't use it); `anthropic` has `/v1/messages`
   (+count_tokens) + models but no chat/completions/responses (miniloop,
