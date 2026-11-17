@@ -182,6 +182,9 @@ class FakeRuntime:
         self.logs_map = logs_map or {}
         self.default_logs = default_logs
         self.snapshot_raises = snapshot_raises
+        # sandbox_ids whose snapshot should produce a dot-only workspace
+        # (no real files) — exercises the monitor's empty_workspace flag.
+        self.empty_workspace_ids: set[str] = set()
         self.spawned: list[Any] = []
         self.stopped: list[str] = []
         self.removed: list[str] = []
@@ -239,7 +242,13 @@ class FakeRuntime:
         transcript_path = artifact_dir / "transcript.log"
         meta_path = artifact_dir / "meta.json"
         workspace_dir.mkdir(parents=True, exist_ok=True)
-        (workspace_dir / "hello.txt").write_text("hi\n")
+        if sandbox_id in self.empty_workspace_ids:
+            # Dot-only workspace — a .git skeleton still counts as empty.
+            git_dir = workspace_dir / ".git"
+            git_dir.mkdir(exist_ok=True)
+            (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+        else:
+            (workspace_dir / "hello.txt").write_text("hi\n")
         transcript_path.write_text(self.logs_map.get(sandbox_id, self.default_logs))
         meta_path.write_text(f'{{"sandbox_id": "{sandbox_id}"}}\n')
         self.snapshots.append((sandbox_id, run_id))

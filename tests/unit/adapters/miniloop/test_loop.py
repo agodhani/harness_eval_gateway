@@ -17,7 +17,11 @@ from adapters.miniloop.agent import (
     RunResult,
 )
 from adapters.miniloop.events import EventEmitter
-from adapters.miniloop.prompts import NUDGE_TEXT_STREAK_2, NUDGE_TEXT_STREAK_3
+from adapters.miniloop.prompts import (
+    AGENT_NUDGE,
+    NUDGE_TEXT_STREAK_2,
+    NUDGE_TEXT_STREAK_3,
+)
 from adapters.miniloop.skills import SkillCatalog
 from adapters.miniloop.tools import ToolContext
 
@@ -145,18 +149,112 @@ def test_different_tool_calls_not_stuck(harness) -> None:
 
 
 def test_text_only_streak_stuck(harness) -> None:
-    make, _ = harness
+    make, out = harness
+    # 2 corrective nudges (default MINILOOP_NUDGE_RETRIES) precede streak
+    # counting — stuck_loop needs 2 nudged + 4 counted text replies.
     agent, client, _ = make(
-        [_response(_assistant(content="thinking out loud")) for _ in range(4)]
+        [_response(_assistant(content="thinking out loud")) for _ in range(6)]
+    )
+    result = _run(agent)
+    assert result.terminal_state == "stuck_loop"
+    assert result.iters == 6
+    req_users = [
+        [m["content"] for m in call["messages"] if m["role"] == "user"]
+        for call in client.calls
+    ]
+    # agent_nudge corrective messages lead requests 2 and 3…
+    assert AGENT_NUDGE in req_users[1][-1]
+    assert AGENT_NUDGE in req_users[2][-1]
+    # …then streak counting starts: legacy nudges at streaks 2 and 3 land
+    # in requests 5 and 6.
+    assert NUDGE_TEXT_STREAK_2 in req_users[4][-1]
+    assert NUDGE_TEXT_STREAK_3 in req_users[5][-1]
+    nudges = [
+        e
+        for e in _events(out)
+        if e["type"] == "checkpoint"
+        and e["payload"].get("stage") == "agent_nudge"
+    ]
+    assert [n["payload"]["nudge"] for n in nudges] == [1, 2]
+
+
+def test_agent_nudge_recovers_before_streak(harness) -> None:
+    """A prose reply gets one corrective nudge; a tool call next turn ends
+    the spell — the text reply never counted toward stuck_loop."""
+    make, out = harness
+    agent, client, _ = make(
+        [
+            _response(_assistant(content="let me think about this")),
+            _response(
+                _assistant(
+                    tool_calls=[
+                        _tool_call("done", {"summary": "ok", "status": "success"}, "cd")
+                    ]
+                )
+            ),
+        ],
+        max_iters=10,
+    )
+    result = _run(agent)
+    assert result.terminal_state == "agent_done"
+    req_users = [
+        m["content"] for m in client.calls[1]["messages"] if m["role"] == "user"
+    ]
+    assert AGENT_NUDGE in req_users[-1]
+    nudges = [
+        e
+        for e in _events(out)
+        if e["type"] == "checkpoint"
+        and e["payload"].get("stage") == "agent_nudge"
+    ]
+    assert len(nudges) == 1
+
+
+def test_nudge_retries_bounded(harness) -> None:
+    """nudge_retries=1 → one agent_nudge, then the streak counter proceeds:
+    stuck at 1 nudged + 4 counted replies."""
+    make, out = harness
+    agent, client, _ = make(
+        [_response(_assistant(content="prose")) for _ in range(5)],
+        nudge_retries=1,
+    )
+    result = _run(agent)
+    assert result.terminal_state == "stuck_loop"
+    assert result.iters == 5
+    nudges = [
+        e
+        for e in _events(out)
+        if e["type"] == "checkpoint"
+        and e["payload"].get("stage") == "agent_nudge"
+    ]
+    assert len(nudges) == 1
+    # requests 2..5: only request 2 carries the corrective nudge; streak
+    # nudges land at counted streaks 2 and 3 (requests 4 and 5).
+    req_users = [
+        [m["content"] for m in call["messages"] if m["role"] == "user"]
+        for call in client.calls
+    ]
+    assert AGENT_NUDGE in req_users[1][-1]
+    assert NUDGE_TEXT_STREAK_2 in req_users[3][-1]
+    assert NUDGE_TEXT_STREAK_3 in req_users[4][-1]
+
+
+def test_nudge_retries_zero_disables(harness) -> None:
+    """nudge_retries=0 restores pre-nudge behavior: 4 text replies → stuck."""
+    make, out = harness
+    agent, _, _ = make(
+        [_response(_assistant(content="prose")) for _ in range(4)],
+        nudge_retries=0,
     )
     result = _run(agent)
     assert result.terminal_state == "stuck_loop"
     assert result.iters == 4
-    # nudges injected at streaks 2 and 3 → visible in requests 3 and 4
-    third_req_users = [m for m in client.calls[2]["messages"] if m["role"] == "user"]
-    fourth_req_users = [m for m in client.calls[3]["messages"] if m["role"] == "user"]
-    assert NUDGE_TEXT_STREAK_2 in third_req_users[-1]["content"]
-    assert NUDGE_TEXT_STREAK_3 in fourth_req_users[-1]["content"]
+    assert not [
+        e
+        for e in _events(out)
+        if e["type"] == "checkpoint"
+        and e["payload"].get("stage") == "agent_nudge"
+    ]
 
 
 def test_text_then_tools_recovers(harness) -> None:
@@ -378,6 +476,22 @@ def test_config_max_tokens_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     assert AgentConfig.from_env().max_tokens == 8192
     monkeypatch.setenv("MAX_TOKENS", "banana")
     assert AgentConfig.from_env().max_tokens == 4096
+
+
+def test_config_nudge_retries_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """MINILOOP_NUDGE_RETRIES bounds corrective nudges per tool-less spell."""
+    monkeypatch.setenv("GATEWAY_BASE_URL", "http://gw")
+    monkeypatch.setenv("MODEL_NAME", "m")
+    monkeypatch.setenv("TASK_PROMPT", "t")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    monkeypatch.delenv("MINILOOP_NUDGE_RETRIES", raising=False)
+    assert AgentConfig.from_env().nudge_retries == 2
+    monkeypatch.setenv("MINILOOP_NUDGE_RETRIES", "5")
+    assert AgentConfig.from_env().nudge_retries == 5
+    monkeypatch.setenv("MINILOOP_NUDGE_RETRIES", "banana")
+    assert AgentConfig.from_env().nudge_retries == 2
 
 
 # ---------------------------------------------------------------------------

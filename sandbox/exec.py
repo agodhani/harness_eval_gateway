@@ -637,6 +637,18 @@ class ExecRunner:
 
         The file lives in the container rootfs (root-owned) — cp works on
         stopped containers, so this only ever runs after a confirmed exit.
+
+        The destination is ``out_dir`` VERBATIM — not ``to_host_path``.
+        Unlike ``docker run -v`` sources (daemon-resolved), ``docker cp``'s
+        local destination is resolved in the CALLING CLIENT's filesystem —
+        the CLI streams the archive and extracts where it runs (same rule
+        ``SandboxRuntime.snapshot`` documents). Inside the api container
+        that means the container-side ``/data/exec/...`` path: it exists
+        via the ``./data:/data`` bind mount (created by the mkdir below)
+        and the extracted file lands on the host through the same mount.
+        Passing the host-translated path fails — ``/Users/...`` isn't
+        mounted inside the container (``invalid output path: directory
+        ... does not exist``).
         """
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -644,7 +656,7 @@ class ExecRunner:
                 [
                     "cp",
                     f"{name}:{CONTAINER_OUT}/{RESULT_FILENAME}",
-                    str(self._rt.to_host_path(out_dir)),
+                    str(out_dir),
                 ],
                 check=False,
                 timeout=_DOCKER_CALL_TIMEOUT_SECONDS,

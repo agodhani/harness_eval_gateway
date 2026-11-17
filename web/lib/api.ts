@@ -24,7 +24,8 @@ export type RunStatus =
   | "running"
   | "evaluating"
   | "done"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export const RUN_STATUSES: readonly RunStatus[] = [
   "submitted",
@@ -35,10 +36,15 @@ export const RUN_STATUSES: readonly RunStatus[] = [
   "evaluating",
   "done",
   "failed",
+  "cancelled",
 ];
 
 /** Statuses after which nothing changes — polling can stop. */
-export const TERMINAL_RUN_STATUSES: readonly string[] = ["done", "failed"];
+export const TERMINAL_RUN_STATUSES: readonly string[] = [
+  "done",
+  "failed",
+  "cancelled",
+];
 
 export type SandboxStatus =
   | "provisioning"
@@ -1251,4 +1257,64 @@ export async function pullModel(
     throw new ApiError(502, String(firstError.error), firstError);
   }
   return last;
+}
+
+// ---------------------------------------------------------------------------
+// BUGHUNT-BATCH ADDITIONS — fields/endpoints landing on a parallel backend
+// branch. Everything below is OPTIONAL (interface merging) or additive so
+// the UI compiles + degrades cleanly before the backend ships; when the
+// backend lands these fields simply light up.
+// ---------------------------------------------------------------------------
+
+export interface RunOut {
+  /** Position among queued runs (1-based) — present only while
+   *  status === "queued" once the queue endpoint lands. */
+  queue_position?: number | null;
+  /** Submit-time advisory warnings from run-create (e.g. "model not found
+   *  on the resolved upstream") — absent on older backends. */
+  warnings?: string[];
+}
+
+export interface RunSummary {
+  /** Queue position among queued runs (1-based); absent until the backend
+   *  queue work lands. */
+  queue_position?: number | null;
+  /** Optional adapter list when the list payload exposes it — drives the
+   *  runs-page text filter. */
+  adapters?: string[];
+}
+
+export interface SandboxResult {
+  /** Judge pipeline mode — "agentic" (eval-sandbox miniloop) or
+   *  "direct_fallback" (single control-plane completion). The results API
+   *  may not expose it yet; the page falls back to the `eval_scored`
+   *  checkpoint event's `mode`. */
+  eval_mode?: string | null;
+  /** True when the sandbox's snapshot workspace was empty (the agent wrote
+   *  nothing) — a 0-score outcome reads differently with it flagged. */
+  empty_workspace?: boolean | null;
+}
+
+export interface PreviewOut {
+  /** Dead/failed preview diagnostics landing with the preview backend work —
+   *  container logs tail, process exit code, and a human-readable detail. */
+  logs?: string | null;
+  exit_code?: number | null;
+  detail?: string | null;
+}
+
+/** DELETE /api/runs/{id} outcome — "cancelled" for pre-spawn runs
+ *  (submitted/rubric_review/queued), "deleted" for terminal runs that were
+ *  hard-removed. In-flight runs (provisioning/running/evaluating) 409. */
+export interface RunDeleteOut {
+  status: "cancelled" | "deleted";
+}
+
+/** DELETE /api/runs/{id} — cancel/remove a run (parallel backend work).
+ *  Non-terminal runs cancel; the backend may 409 for states it refuses
+ *  (running/evaluating) — callers surface `ApiError.detail`. */
+export function deleteRun(runId: string): Promise<RunDeleteOut> {
+  return request<RunDeleteOut>(`/api/runs/${encodeURIComponent(runId)}`, {
+    method: "DELETE",
+  });
 }

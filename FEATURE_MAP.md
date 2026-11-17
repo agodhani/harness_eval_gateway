@@ -24,12 +24,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F9 | Run analytics (per-sandbox metrics + cost) | ✅ | `api/routers/analytics.py`, `api/pricing.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx` | `tests/unit/api/test_analytics.py` |
 | F10 | Multi-harness adapters (Codex, Claude Code, Pi, DeepSeek, Aider) | ✅ | `adapters/common/`, `adapters/{codex,claude_code,pi,deepseek,aider}/`, `orchestrator/adapters.py`, `sandbox/images/*.Dockerfile` | `tests/unit/adapters/`, `tests/integration/test_adapter_images.py` |
 | F11 | Skillpack import from GitHub | ✅ | `skillpack_import/`, `api/routers/skillpacks.py`, `web/app/submit/ImportSkillPackDialog.tsx` | `tests/unit/api/test_skillpacks.py`, `test_skillpack_import.py` |
-| F12 | Artifact preview (static html + desktop GUI via noVNC + python-server web apps, locked-down containers) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `sandbox/images/server-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
+| F12 | Artifact preview (static html + desktop GUI via noVNC + python-server web apps, locked-down containers; crashed apps surface exit_code/detail/log tail and an early spawn crash → 502) | ✅ | `sandbox/preview.py`, `api/routers/preview.py`, `sandbox/images/desktop-preview.Dockerfile`, `sandbox/images/server-preview.Dockerfile`, `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_preview.py`, `tests/unit/api/test_preview.py`, `tests/integration/test_preview.py` |
 | F13 | Graphical analysis page + cross-run trends (recharts) | ✅ | `web/app/runs/[id]/analysis/`, `api/routers/analytics.py` (`GET /api/analytics/runs`), `web/app/runs/[id]/results/ResultsClient.tsx` (totals row) | `tests/unit/api/test_analytics.py` (trends section) |
 | F14 | Eval iteration (re-score + versioned rubrics) | ✅ | `api/routers/results.py`, `orchestrator/lifecycle.py` (`rescore_run`), `orchestrator/rubric.py` (`create_rubric_version`), `web/app/runs/[id]/results/RescoreControls.tsx` | `tests/unit/orchestrator/test_rescore.py`, `tests/unit/api/test_results.py`, `tests/unit/evaluator/test_evaluate.py` |
 | F15 | Submit UX: live model picker + install, named harness configs | ✅ | `api/routers/models.py`, `gateway/main.py` (`/v1/models/pull`), `web/app/submit/page.tsx`, `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`, `orchestrator/provision.py` | `tests/unit/api/test_models.py`, `tests/unit/gateway/test_proxy.py` (pull), `tests/unit/db/test_migrations.py`, `tests/unit/orchestrator/test_provision.py` (name) |
 | F16 | Model-vs-model matrix (config × model) + per-model analytics | ✅ | `orchestrator/matrix.py`, `orchestrator/lifecycle.py`, `orchestrator/provision.py`, `api/schemas.py`, `api/routers/runs.py`, `results.py`, `analytics.py`, `web/app/submit/page.tsx`, `web/lib/api.ts`, `web/app/runs/[id]/` (detail, results, analysis) | `tests/unit/orchestrator/test_matrix.py`, `test_lifecycle.py`, `test_provision.py`, `tests/unit/api/test_runs.py`, `test_results.py`, `test_analytics.py` |
-| F17 | Artifact thumbnails (headless screenshots via the preview stack) | ✅ | `sandbox/thumbnails.py`, `sandbox/images/thumbnail-capture.{Dockerfile,sh}`, `api/routers/preview.py` (`.../thumbnail`), `api/routers/results.py` (`SandboxResult.thumbnail`), `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_thumbnails.py`, `tests/unit/api/test_thumbnails.py`, `tests/integration/test_thumbnail.py` |
+| F17 | Artifact thumbnails (headless screenshots via the preview stack; desktop captures wait on real VNC framebuffer content, dead-app fast-fail with exit reason) | ✅ | `sandbox/thumbnails.py`, `sandbox/images/thumbnail-capture.{Dockerfile,sh}`, `sandbox/images/thumbnail-vnc.py`, `api/routers/preview.py` (`.../thumbnail`), `api/routers/results.py` (`SandboxResult.thumbnail`), `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_thumbnails.py`, `tests/unit/api/test_thumbnails.py`, `tests/integration/test_thumbnail.py` |
 
 ## Feature details
 
@@ -66,27 +66,45 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `POST /api/runs` persists spec with status `submitted`. The adapter
   dropdown is populated live from `GET /api/harnesses` (static fallback list
   when the API is unreachable); model inputs use the ComboInput suggestion
-  dropdown.
+  dropdown. Submit validation rejects blank task prompts/models (422) and
+  resolves each selected model against the provider catalog the gateway
+  would route it to (`api/modelcheck.py`, 60s per-model cache) — absent
+  models land as advisory `warnings` on the 201, a failed catalog fetch
+  skips validation entirely (offline tolerance), and a provider-reported
+  `tools`-capability mismatch under a tool-call harness is a hard 422
+  (participant + evaluator models, incl. per-config pins).
 - **Where:** `web/app/submit/page.tsx` + form components,
   `web/components/ComboInput.tsx` (model suggestion dropdown),
   `web/app/globals.css` (`.combo*`),
   `web/lib/api.ts` (`listHarnesses`, `HarnessManifest`, `ADAPTERS`),
   `api/routers/runs.py`, `api/routers/harnesses.py`, `api/schemas.py`,
-  db `runs` table
+  `api/modelcheck.py`, db `runs` table
 - **Verify:**
   - UI: fill form → submit → run appears with status `submitted`
-  - API: `POST /api/runs` → 201 + run id; invalid spec → 422
+  - API: `POST /api/runs` → 201 + run id; invalid spec → 422; unknown
+    model → 201 + `warnings`, unreachable catalog → 201, no-`tools`
+    model under a tool harness → 422
   - Tests: `tests/unit/api/test_runs.py` (incl. `test_create_run_multi_adapter`),
-    `tests/unit/api/test_harnesses.py`
+    `tests/unit/api/test_harnesses.py`, `tests/unit/api/test_modelcheck.py`
 - **Depends on:** F0
 
 ### F2 — Orchestrator ✅
 
 - **What:** run state machine (`submitted → rubric_review → [queued →]
-  provisioning → running → evaluating → done | failed`); matrix expansion
+  provisioning → running → evaluating → done | failed | cancelled`);
+  matrix expansion
   (harness configs × model); rubric draft generated via gateway → frozen on
   user approval; termination policy watcher (timeout, budget, stuck-loop,
-  done signal).
+  done signal). `DELETE /api/runs/{id}` cancels pre-spawn runs
+  (`submitted`/`rubric_review`/`queued` → `cancelled`; a pending rubric
+  task is cancelled and a freed `queued` position promotes the next
+  parked run), hard-deletes terminal runs (bulk row removal + best-effort
+  artifact-dir cleanup), and 409s in-flight runs (sandbox teardown out of
+  scope); lifecycle/provisioning bail on a vanished/cancelled run.
+  Rubric drafting is fault-tolerant — bounded retries
+  (`RUBRIC_GEN_RETRIES`, default 2) cover transient upstream errors +
+  validation failures (error fed back into the prompt), and lenient
+  normalization coerces scalar `generated_by` + numeric-string fields.
 - **Pacing (PR15):** one active run at a time — approvals while a run
   executes (or is queued) park in `queued` and promote FIFO by approval
   (`pacing.place_run` / `claim_next_queued`; promotion is wired into
@@ -100,12 +118,15 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `spawn_mem_wait`/`spawn_mem_release`/`spawn_mem_timeout` (sandbox scope).
 - **Where:** `orchestrator/` (`state_machine.py`, `lifecycle.py`,
   `provision.py`, `monitor.py`, `rubric.py`, `runner.py`, `pacing.py`,
-  `events.py`, `adapters.py`), db `runs`/`sandboxes`/`rubrics`
+  `events.py`, `adapters.py`), db `runs`/`sandboxes`/`rubrics`,
+  `api/routers/runs.py` (`DELETE /api/runs/{id}`)
 - **Verify:**
   - Unit: `tests/unit/orchestrator/` (`test_state_machine.py`,
     `test_lifecycle.py`, `test_monitor.py`, `test_provision.py`,
-    `test_rubric.py`, `test_pacing.py`), queue E2E in
-    `tests/unit/api/test_runs.py::test_approve_queues_behind_active_run`
+    `test_rubric.py`, `test_pacing.py`), queue E2E + cancel/delete in
+    `tests/unit/api/test_runs.py` (`test_approve_queues_behind_active_run`,
+    `test_delete_queued_run_releases_slot`, `test_delete_inflight_run_409`,
+    `test_delete_done_run_hard_deletes`)
   - Manual: submit → edit/approve rubric → sandboxes spawn → terminal states
     recorded correctly; approve a second run mid-flight → `queued` badge →
     promotes when the first finishes
@@ -198,7 +219,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   model `qwen3:8b` via Ollama; JSONL harness events on stdout + HTTP ingest;
   `MINILOOP_RESULT` terminator line; skill packs vendored under `skillpacks/`
   (51 SKILL.md: superpowers 14, mattpocock-skills 28, spec-kit 9 generated);
-  progressive-disclosure catalog in system prompt.
+  progressive-disclosure catalog in system prompt. Tool-less assistant
+  replies get `MINILOOP_NUDGE_RETRIES` corrective nudges (default 2,
+  `stage="agent_nudge"` checkpoints) before counting toward the text-only
+  `stuck_loop` streak.
 - **Where:** `adapters/miniloop/` (`agent.py`, `tools.py`, `events.py`,
   `skills.py`, `prompts.py`, `adapter.py`, `__main__.py`), `skillpacks/`
 - **Verify:**
@@ -330,7 +354,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `SCORING_TESTGEN=0` disables (conftest pins it); knobs:
   `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
   `TESTGEN_MAX_FILES` (8), `TESTGEN_MAX_TOKENS` (4096),
-  `TESTGEN_TIMEOUT_SECONDS` (240).
+  `TESTGEN_TIMEOUT_SECONDS` (240, the one raised-cap retry gets 2×),
+  `TESTGEN_MAX_TOKENS_RETRY` (8192) — retries cover empty content,
+  zero-runnable-file output, and timeouts. A scores doc missing
+  `overall` gets it synthesized as the mean of dimension scores +
+  warning (`parse_scores_json`).
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
   `prompts.py`, `judge_direct.py` — direct-completion fallback,
   `testgen.py` — PR8 suite generation + exec orchestration),
@@ -381,13 +409,17 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   renders per-sandbox score columns + an `overall` row once results exist
   (`RunDetailClient.tsx` `RubricView` + `getRunResults` poll while
   `evaluating`). Sandboxes whose eval failed surface an `eval failed` badge
-  (from `SandboxResult.eval_error`) instead of blank score cells.
+  (from `SandboxResult.eval_error`) instead of blank score cells. Directory
+  artifact downloads ship as ZIPs that filter `.git`, `__pycache__`,
+  `*.pyc`, `node_modules`, `.venv` at any depth (download-side only — the
+  raw workspace on disk is untouched).
 - **Where:** `web/app/runs/` (list, detail, `results/`), results components,
   `api/routers/results.py` (results + scores + artifact-download endpoints)
 - **Verify:**
   - UI: complete run → compare scores side-by-side → open timeline →
     download artifact
-  - Unit: `tests/unit/api/test_results.py` (matrix, scores, download jail);
+  - Unit: `tests/unit/api/test_results.py` (matrix, scores, download jail,
+    `test_download_directory_zip_filters_noise`);
     e2e: `tests/e2e/` (Playwright, post-MVP)
 - **Depends on:** F1, F6, F7
 
@@ -398,7 +430,13 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (in/out/cache/total), latency (avg/p95/max), tool-call + skill-invocation
   breakdowns, shell/file/test/error counts, wall clock, estimated cost at a
   selectable price model (`api/pricing.py` `PRICE_TABLE`; local models
-  flagged `local` → $0). Judge (evaluator) traffic shares the participant
+  flagged `local` → $0). The tool-call mix merges `tool_call` events,
+  hook-sourced `tool_result` outcomes (per-name max — a call producing
+  both records counts once), and `shell_command`/`file_op`/`test_execution`
+  as proxies when a lane has no finer signal, so CLI adapters report a
+  non-zero mix; `empty_workspace` surfaces the monitor's file-less
+  workspace flag on the sandbox row. Judge (evaluator) traffic shares the
+  participant
   sandbox_id via its cred, so it's split out at the `eval_started` checkpoint
   and reported under `evaluator` rather than polluting participant numbers.
   Results page gains an "Analytics" section — side-by-side comparison table +
@@ -460,7 +498,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   generated `extensions/heg-events.ts` (`tool_execution_end` →
   `tool_result`). `deepseek`/`aider`/`miniloop` stay translated-only. The
   receiver always exits 0 and mirrors to stderr (stdout can feed back into
-  agent context for some claude hook events).
+  agent context for some claude hook events). Pi tool errors carry detail —
+  stderr/message/result text when reported, else a named-tool + exit-code
+  fallback — and `tool_result`/coarse events feed the F9 tool-call mix so
+  CLI lanes aren't all-zero.
 - **Where:** `adapters/common/` (`runner.py`, `contract.py`, `hooks.py`),
   `adapters/{codex,claude_code,pi,deepseek,aider}/` (`adapter.py`, `config.py`,
   `translate.py`, `__main__.py`; aider also `launcher.py` — the patched
@@ -781,10 +822,16 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     `POST …/rubrics` with `rescore=true` creates the version and queues
     the re-score in one request. `_rescore_run` itself refuses non-
     terminal runs (defense-in-depth — `evaluating` is admitted only with
-    a rescore marker, i.e. the API pre-transition), and the empty-pass
+    a rescore marker, i.e. the API pre-transition; `cancelled` is always
+    rejected — nothing ever executed), and the empty-pass
     retry checks the score-count DELTA over the pre-pass baseline so
     stale rows don't satisfy it; `rescore_finished` is always emitted
-    (error included on crash).
+    (error included on crash). A rescore holds the same serialized pacing
+    slot as a run — `rescore_run` waits on `_await_rescore_slot`
+    (`rescore_queued` checkpoint) while another run is active/queued, and
+    `runner.start_rescore_task` wraps the pass in the same
+    promote-next-queued `finally` a lifecycle gets, so a rescore never
+    overlaps another run and always frees the lane on exit.
   - **Score provenance:** every `Score` carries `rubric_id` +
     denormalized `rubric_version` (stamped at write time, survives rubric
     lookups). `GET /api/runs/{id}/results?rubric_version=N` filters the

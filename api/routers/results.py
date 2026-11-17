@@ -762,6 +762,11 @@ def _prepare_rescore(
     ``evaluating`` (finished_at cleared) and emits a ``rescore_requested``
     checkpoint — the caller commits, then registers the background task.
     """
+    if run.status == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="run is 'cancelled' — nothing was ever executed to re-score",
+        )
     if run.status not in state_machine.RUN_TERMINAL:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -963,14 +968,27 @@ def _resolve_artifact_path(artifact: Artifact, jail: Path) -> Path | None:
     return None
 
 
+#: Names never shipped in workspace ZIPs — VCS internals, python caches,
+#: vendored deps, virtualenvs. Pruned at ANY depth (a vendored repo's own
+#: ``.git`` is as unwanted as the root one). Download-side only: raw
+#: artifact paths/files are untouched.
+_ZIP_EXCLUDED_DIRS = frozenset({".git", "__pycache__", "node_modules", ".venv"})
+
+
 def _zip_dir(dirpath: Path) -> bytes:
     # os.walk doesn't descend into symlinked dirs (followlinks=False) — the
     # snapshotted workspace is candidate-authored, so rglob could escape the
     # jail through a planted symlink. File symlinks are skipped outright.
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _dirs, files in os.walk(dirpath):
+        for root, dirs, files in os.walk(dirpath):
+            # Prune excluded dirs in-place so walk never descends into them.
+            dirs[:] = sorted(d for d in dirs if d not in _ZIP_EXCLUDED_DIRS)
             for name in sorted(files):
+                # A stray `.git` FILE (worktree/submodule pointer) + *.pyc
+                # bytecode are noise as much as the pruned dirs.
+                if name in _ZIP_EXCLUDED_DIRS or name.endswith(".pyc"):
+                    continue
                 p = Path(root) / name
                 if p.is_symlink() or not p.is_file():
                     continue

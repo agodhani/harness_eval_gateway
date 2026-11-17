@@ -17,13 +17,25 @@
 # (bind-mounted tmpfs) since docker's /dev/shm is tiny.
 set -u
 
-: "${CAPTURE_URL:?CAPTURE_URL is required}"
 OUT=/out/capture.png
+TIMEOUT_S="${THUMB_TIMEOUT_SECONDS:-45}"
+
+# Desktop previews: chromium+noVNC proved unusable for capture (the
+# virtual-time budget fires while the framebuffer is still blank — every
+# shot was "Connecting…" or a dark canvas). When THUMB_VNC_WS is set, a
+# stdlib VNC-over-WS client waits on real framebuffer content and writes
+# the pixels straight to /out/capture.png. A dead app drops the channel
+# → exit 3 fast; a never-rendering app → exit 4 at the wait deadline.
+if [ -n "${THUMB_VNC_WS:-}" ]; then
+    echo "[heg-thumb] vnc framebuffer capture via $THUMB_VNC_WS -> $OUT" >&2
+    exec timeout "$TIMEOUT_S" python3 /vnc-shot.py
+fi
+
+: "${CAPTURE_URL:?CAPTURE_URL is required}"
 WIDTH="${THUMB_WIDTH:-1280}"
 HEIGHT="${THUMB_HEIGHT:-800}"
 BUDGET="${THUMB_BUDGET_MS:-10000}"
 READY_S="${THUMB_READY_SECONDS:-30}"
-TIMEOUT_S="${THUMB_TIMEOUT_SECONDS:-45}"
 
 echo "[heg-thumb] capturing $CAPTURE_URL -> $OUT (${WIDTH}x${HEIGHT}, budget ${BUDGET}ms)" >&2
 

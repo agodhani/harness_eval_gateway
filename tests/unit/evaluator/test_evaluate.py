@@ -320,10 +320,39 @@ async def test_evaluate_partial_scores_keeps_valid(seeded, session_factory) -> N
         ]
     }
     rows = await _eval(seeded, session_factory, FakeRuntime(scores_obj=partial))
-    assert [r.dimension for r in rows] == ["functional_requirements"]
+    # no `overall` in the doc -> synthesized as the mean of the valid entries
+    assert [r.dimension for r in rows] == ["functional_requirements", "overall"]
+    assert rows[-1].score == 8.0
     events = _events_in_db(session_factory)
     scored = [e for e in events if e.payload.get("phase") == "eval_scored"]
     assert scored and scored[0].payload["warnings"]
+    assert "overall missing — computed as mean of dimension scores" in (
+        scored[0].payload["warnings"]
+    )
+    assert scored[0].payload["overall"] == 8.0
+
+
+async def test_evaluate_genuine_overall_no_synthesis_warning(
+    seeded, session_factory
+) -> None:
+    """A real `overall` lands verbatim — the eval_scored event carries no
+    synthesized-mean warning."""
+    fake = FakeRuntime()
+    rows = await _eval(seeded, session_factory, fake)
+    assert {r.dimension for r in rows} == {
+        "functional_requirements",
+        "code_quality",
+        "overall",
+    }
+    scored = [
+        e
+        for e in _events_in_db(session_factory)
+        if e.payload.get("phase") == "eval_scored"
+    ]
+    assert scored[0].payload["overall"] == 7.0
+    assert not any(
+        "computed as mean" in w for w in scored[0].payload["warnings"]
+    )
 
 
 async def test_evaluate_timeout_still_reads_scores(seeded, session_factory) -> None:

@@ -82,8 +82,8 @@ adapters are added.
 2. **Control API + Orchestrator (FastAPI, async)** — validates submissions,
    expands run matrix, generates rubric via gateway, drives run state machine
    (`submitted → rubric_review → [queued →] provisioning → running →
-   evaluating → done | failed`), manages sandbox lifecycle, enforces
-   termination policy, paces run/sandbox admission (below).
+   evaluating → done | failed | cancelled`), manages sandbox lifecycle,
+   enforces termination policy, paces run/sandbox admission (below).
 3. **AI gateway (Python, custom)** — exposes an OpenAI-compatible
    (`/v1/chat/completions`) endpoint, translates to upstream providers
    (**Ollama is the default upstream for MVP** — small local models, e.g.
@@ -115,7 +115,10 @@ adapters are added.
    (`prior_error`), and a control-plane direct-completion fallback
    (`evaluator/judge_direct.py` — one chat call on the eval cred,
    `response_format=json_object`; `EVAL_DIRECT_FALLBACK=0` disables) lands
-   scores when the agentic judge's output is unusable.
+   scores when the agentic judge's output is unusable. Testgen retries the
+   generation call once at raised caps on empty/timed-out/zero-file output
+   (`TESTGEN_MAX_TOKENS_RETRY`, 2× `TESTGEN_TIMEOUT_SECONDS`); a scores doc
+   missing `overall` gets it synthesized as the dimension mean + a warning.
 7. **Artifact store** — `./data/artifacts/<run_id>/<sandbox_id>/` — repo
    tarballs, transcripts, event exports.
 
@@ -217,7 +220,11 @@ Each adapter provides:
 loop: shell exec, file read/write, `done`). Shipped CLI adapters (F10 +
 PR13): Claude Code, Codex, Pi, DeepSeek `dsh`, Aider — each runs against
 the same model via the gateway (paid accounts only needed if pointing at
-hosted providers; Ollama keeps everything free).
+hosted providers; Ollama keeps everything free). Miniloop retries a
+tool-less reply with a corrective `agent_nudge` message
+(`MINILOOP_NUDGE_RETRIES`, default 2) before it counts toward the
+text-only `stuck_loop` streak — small models answer in prose unless told
+prose is invalid.
 
 **Default skill packs** (named presets, vendored under `skillpacks/`):
 `superpowers`, `mattpocock-skills`, `spec-kit`.
@@ -264,7 +271,11 @@ pins it); `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
 ExecRunner→runner env contract for the suite mount.
 
 Flow: auto-generated from task spec → HITL review/edit in UI → frozen →
-applied identically to all sandboxes.
+applied identically to all sandboxes. Generation is fault-tolerant —
+`RUBRIC_GEN_RETRIES` (default 2) covers transient upstream errors and
+validation failures (the error is fed back into the retry prompt), and
+lenient normalization coerces scalar `generated_by` + numeric-string
+score/weight fields before validation; structural problems still fail.
 
 ## Stack
 
@@ -430,6 +441,36 @@ or tests change.
   wait *inside* `spawn_one` (per-sandbox failure on timeout) rather than a
   scheduler loop — sequential provisioning already makes spawns the unit of
   queuing. `run.status` stays `String` — no migration needed for `queued`.
+- **Rescoring holds the same single slot as a run**: `rescore_run` parks on
+  `_await_rescore_slot` (emitting `rescore_queued`) while any run is
+  active/queued, and `runner.start_rescore_task` wraps the pass in the same
+  promote-next-queued `finally` a lifecycle gets — an eval can never overlap
+  another run, and a crashed rescore still frees the lane.
+- **Cancel/delete**: `cancelled` is a terminal run status —
+  `DELETE /api/runs/{id}` cancels `submitted`/`rubric_review`/`queued`
+  runs (status flip + `cancelled` checkpoint + `finished_at`; a pending
+  rubric-draft task is cancelled, and a freed `queued` position promotes
+  the next parked run via `runner.release_run_slot`). Terminal runs
+  (`done`/`failed`/`cancelled`) hard-delete instead — bulk row removal
+  for scores/artifacts/events/rubrics/sandboxes then the run, plus
+  best-effort `data/artifacts/<run_id>/` removal (the append-only-events
+  rule is explicitly waived for junk-run removal). In-flight runs
+  (`provisioning`/`running`/`evaluating`) 409 — sandbox teardown is out
+  of scope. Lifecycle/provisioning bail on a vanished or `cancelled` run
+  mid-flight. A cancelled run can never be rescored — nothing executed.
+- **Submit validation (`api/modelcheck.py`)**: `POST /api/runs` strips +
+  rejects blank task prompts/models (422), then resolves each selected
+  model against the provider catalog the gateway would route it to (60s
+  per-model cache). Absent models land as advisory `warnings` on the 201
+  (the name may be pullable); a catalog fetch failure skips validation
+  entirely (offline tolerance). The one hard 422 is a provider-reported
+  `tools`-capability mismatch for a tool-call harness — checked for
+  participant AND evaluator models (the evaluator drives miniloop tool
+  calls), incl. per-config model pins.
+- **Workspace ZIP downloads are filtered**: `GET /api/artifacts/{id}/
+  download` on a directory drops `.git`, `__pycache__`, `*.pyc`,
+  `node_modules`, `.venv` at any depth (symlinks were already skipped);
+  the on-disk artifact is untouched.
 - **`done` invocation**: bare `done` is a shell keyword in sh/bash — prompts
   instruct harnesses to run `/usr/local/bin/done` (or `command done`).
 - **PR17 — hook/plugin telemetry lane**: `adapters/common/hooks.py` is the
@@ -619,6 +660,11 @@ or tests change.
   e2e `cd web && E2E_PORT=3100 npm run test:e2e`.
 - `GET /api/runs/{id}/analytics?price_model=` (F9) serves per-sandbox metrics
   + estimated cost; price table lives in `api/pricing.py` (`PRICE_TABLE`).
+  `tool_calls` merges every agent-activity signal without double counting —
+  `tool_call` events, hook-sourced `tool_result` outcomes (per-name max),
+  and `shell_command`/`file_op`/`test_execution` as proxies when a lane has
+  no finer signal — and carries `empty_workspace` when the monitor flagged
+  a done-ish exit on a file-less workspace.
 - `UPSTREAM_PROVIDER=ollama|openrouter|openai|anthropic` (gitignored `.env`
   keys `OPENROUTER_API_KEY`/`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`; compose
   `${VAR}` passthrough) picks the gateway's default upstream — every provider
@@ -626,7 +672,10 @@ or tests change.
   `PROVIDER_ROUTES` (JSON `{"glob": "provider"}`, first match wins,
   case-insensitive) overrides per request model — e.g.
   `{"claude-*": "anthropic"}` serves claude_code from Anthropic while the
-  rest stays on Ollama. Coverage differs: `openrouter` has chat/completions +
+  rest stays on Ollama. Namespace rule: a glob with no `/` is a local-name
+  pattern and never matches a `vendor/model` id (`qwen*` can't hijack
+  OpenRouter's `qwen/qwen3-8b:free`) — write `qwen/*` or an exact id to
+  route namespaced models. Coverage differs: `openrouter` has chat/completions +
   models only; `openai` adds `/v1/responses` but no `/v1/messages`
   (claude_code/dsh can't use it); `anthropic` has `/v1/messages`
   (+count_tokens) + models but no chat/completions/responses (miniloop,

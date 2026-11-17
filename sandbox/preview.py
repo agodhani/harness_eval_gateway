@@ -144,6 +144,22 @@ PURPOSE_THUMB = "thumb"
 #: Container statuses where the preview is (or will shortly be) serving.
 LIVE_STATUSES = frozenset({"created", "running", "restarting", "paused"})
 
+#: Container statuses where the preview's runner is gone (or going) — the
+#: app can never serve again. Used for early-crash detection (spawn's
+#: readiness window, thumbnail capture's watchdog).
+DEAD_STATUSES = frozenset({"exited", "dead", "removing"})
+
+#: Default early-crash window for executed-code previews (desktop,
+#: python-server): the runner's entrypoint execs the artifact, so a
+#: crashed app means an exited runner. spawn() polls this long; a runner
+#: that exits inside the window fails the spawn with the exit code + log
+#: tail instead of returning a doomed "running" preview.
+DEFAULT_SPAWN_READY_SECONDS = 5.0
+
+#: Bounds on ``docker logs`` reads surfaced in errors/GET responses.
+LOG_TAIL_LINES = 15
+LOG_MAX_CHARS = 4000
+
 _HTML_SUFFIXES = frozenset({".html", ".htm"})
 _INDEX_NAMES = frozenset({"index.html", "index.htm"})
 
@@ -263,10 +279,25 @@ class Preview:
     # endpoints filter on this; unlabeled legacy containers read as
     # "preview".
     purpose: str = PURPOSE_PREVIEW
+    # Populated from State.ExitCode for dead statuses (None while live —
+    # docker reports ExitCode=0 for running containers, which is noise).
+    exit_code: int | None = None
 
     @property
     def live(self) -> bool:
         return self.status in LIVE_STATUSES
+
+    @property
+    def detail(self) -> str | None:
+        """Human-readable terminal reason — for GET payloads and 502
+        details. ``None`` while the preview is (or might still be) alive."""
+        if self.status == "exited":
+            if self.exit_code is None:
+                return "preview app exited"
+            return f"preview app exited with code {self.exit_code}"
+        if self.status == "dead":
+            return "preview app container died"
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -867,6 +898,9 @@ class PreviewManager:
         desktop_memory: str = DEFAULT_DESKTOP_MEMORY,
         desktop_pids: int = DEFAULT_DESKTOP_PIDS,
         server_image: str | None = None,
+        spawn_ready_seconds: float | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._rt = runtime or SandboxRuntime()
         self.image = (
@@ -883,6 +917,15 @@ class PreviewManager:
         self.desktop_memory = desktop_memory
         self.desktop_pids = desktop_pids
         self.server_image = server_image or DEFAULT_SERVER_IMAGE
+        if spawn_ready_seconds is None:
+            spawn_ready_seconds = float(
+                os.environ.get(
+                    "PREVIEW_SPAWN_READY_SECONDS", DEFAULT_SPAWN_READY_SECONDS
+                )
+            )
+        self.spawn_ready_seconds = spawn_ready_seconds
+        self._sleep = sleep
+        self._clock = clock
 
     # -- docker plumbing (delegates to the composed runtime) -----------------
 
@@ -983,6 +1026,7 @@ class PreviewManager:
         plan: PreviewPlan,
         ttl_seconds: float | None = None,
         purpose: str = PURPOSE_PREVIEW,
+        ready_seconds: float | None = None,
     ) -> Preview:
         """Spawn the container(s) for ``plan``; returns the live Preview.
 
@@ -999,6 +1043,16 @@ class PreviewManager:
         identical topology/isolation, hidden from the interactive
         endpoints. Unknown types raise ``ValueError`` — the router maps it
         to 422.
+
+        Executed-code types (``desktop``, ``python-server``) additionally
+        get an early-crash readiness window: their runner's entrypoint
+        execs the artifact, so an app dying inside ``ready_seconds``
+        (default ``self.spawn_ready_seconds`` — env
+        ``PREVIEW_SPAWN_READY_SECONDS``, ~5s; 0 skips the window) fails the
+        spawn with a RuntimeError carrying the exit code + app log tail —
+        the caller never sees a doomed ``running`` preview. A runner still
+        alive at the deadline is returned; later crashes surface via GET's
+        status/``exit_code``/``logs``.
         """
         self.ensure_network()
 
@@ -1041,6 +1095,19 @@ class PreviewManager:
             )
         else:
             raise ValueError(f"unsupported preview type {plan.type!r}")
+
+        if plan.type in _PROXIED_PORTS:
+            # Executed-code types: the runner IS the app — hold the spawn
+            # for the early-crash window so an immediate artifact crash
+            # fails here (with the app's logs) rather than surfacing later
+            # as a dead "running" preview.
+            ready = (
+                self.spawn_ready_seconds
+                if ready_seconds is None
+                else ready_seconds
+            )
+            if ready > 0:
+                return self._wait_app_alive(preview_id, plan.type, ready)
 
         preview = self.get(preview_id)
         if preview is not None:
@@ -1297,6 +1364,65 @@ class PreviewManager:
             out.append(arg)
         return out
 
+    # -- spawn readiness / logs ----------------------------------------------
+
+    def _wait_app_alive(
+        self, preview_id: str, preview_type: str, timeout: float
+    ) -> Preview:
+        """Early-crash window for executed-code previews (see ``spawn``).
+
+        Polls the runner until ``timeout`` — a dead status inside the
+        window means the artifact crashed: the exit code + app's log tail
+        are read, the stack is removed (a dead runner helps nobody), and a
+        RuntimeError with the details is raised. A runner still alive at
+        the deadline is returned — later crashes surface via GET.
+        """
+        deadline = self._clock() + timeout
+        last: Preview | None = None
+        while self._clock() < deadline:
+            pv = self.get(preview_id)
+            if pv is not None:
+                last = pv
+                if pv.status in DEAD_STATUSES:
+                    tail = self.logs(pv.container, tail=10)
+                    # A dead stack is useless to everyone — remove it (the
+                    # detail/log tail was captured above, so nothing is
+                    # lost) rather than leaving it for the TTL reaper.
+                    try:
+                        self.stop(preview_id)
+                    except Exception:
+                        logger.warning(
+                            "preview %s crashed; cleanup failed",
+                            preview_id,
+                            exc_info=True,
+                        )
+                    raise RuntimeError(
+                        f"{preview_type} {pv.detail or 'preview app died'} "
+                        "before it could serve — the artifact likely "
+                        f"crashed on startup{': ' + tail if tail else ''}"
+                    )
+            self._sleep(0.25)
+        if last is None:
+            # The runner row never materialized in inspect — treat as a
+            # spawn failure, not a healthy preview.
+            raise RuntimeError(
+                f"{preview_type} preview stack did not come up within "
+                f"{timeout:.0f}s"
+            )
+        return last
+
+    def logs(self, container: str, *, tail: int = LOG_TAIL_LINES) -> str:
+        """Last ``tail`` lines of a container's output — the runner IS the
+        app for executed-code previews (its traceback lands here). Bounded
+        to ``LOG_MAX_CHARS``; ``""`` when the container is gone."""
+        proc = self._docker(
+            ["logs", "--tail", str(tail), container], check=False
+        )
+        if proc.returncode != 0:
+            return ""
+        out = (proc.stdout + proc.stderr).strip()
+        return out[-LOG_MAX_CHARS:]
+
     # -- inspect / registry --------------------------------------------------
 
     def _row_to_preview(self, row: dict[str, Any]) -> Preview | None:
@@ -1312,6 +1438,13 @@ class PreviewManager:
             return None  # proxy sidecars aren't previews — the runner is
         state = row.get("State") or {}
         status = str(state.get("Status") or "unknown")
+        # docker reports ExitCode=0 while running — only meaningful dead.
+        exit_code: int | None = None
+        if status in DEAD_STATUSES and state.get("ExitCode") is not None:
+            try:
+                exit_code = int(state["ExitCode"])
+            except (TypeError, ValueError):
+                exit_code = None
 
         preview_type = labels.get(LABEL_TYPE) or "static"
         port: int | None = None
@@ -1358,6 +1491,7 @@ class PreviewManager:
             expires_at=expires,
             # Unlabeled legacy containers are interactive previews.
             purpose=labels.get(LABEL_PURPOSE) or PURPOSE_PREVIEW,
+            exit_code=exit_code,
         )
 
     def _proxy_port(self, preview_id: str, container_port: int) -> int | None:

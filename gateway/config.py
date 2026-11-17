@@ -128,6 +128,16 @@ class GatewaySettings(BaseSettings):
     UPSTREAM_TIMEOUT: float = 300.0
     INGEST_TIMEOUT: float = 10.0
 
+    # --- Transient upstream retry (bughunt) ---
+    # Retried INSIDE the gateway before an error reaches the client:
+    # connect/read timeouts, refused/reset connections, and bare
+    # 502/503/504s (e.g. a saturated-but-alive Ollama). 4xx/429s and
+    # failures once the response has started streaming to the client are
+    # never retried. Each retry emits an `upstream_retry`-staged error
+    # event; the final failure takes the normal upstream-error path.
+    UPSTREAM_RETRY_ATTEMPTS: int = 2  # extra attempts beyond the first
+    UPSTREAM_RETRY_BACKOFF_SECONDS: float = 5.0  # base, doubles per attempt
+
     # --- Response cache (PR18: deterministic replay — dev/CI aid) ---
     # OFF by default: real runs must hit the live upstream. When enabled,
     # metered generation calls (/v1/chat/completions, /v1/messages,
@@ -171,11 +181,23 @@ class GatewaySettings(BaseSettings):
         ``PROVIDER_ROUTES`` globs are matched case-insensitively in
         declaration order; the first hit wins. No model / no hit falls back
         to the process-wide ``UPSTREAM_PROVIDER``.
+
+        Namespace rule: a glob containing no ``/`` is a LOCAL-name pattern
+        and never matches a ``vendor/model`` id — ``{"qwen*": "ollama"}``
+        routes ``qwen3:8b`` but must NOT hijack OpenRouter's namespaced
+        ``qwen/qwen3-8b:free``. To route namespaced ids, write a pattern
+        that contains ``/`` — ``qwen/*`` matches the vendor prefix, or an
+        exact ``qwen/qwen3-8b:free`` pins one id (exact strings keep
+        working for names with slashes).
         """
         if isinstance(model, str) and model:
             lowered = model.lower()
+            namespaced = "/" in lowered
             for glob, provider in self.provider_routes().items():
-                if fnmatch.fnmatchcase(lowered, glob.lower()):
+                pattern = glob.lower()
+                if namespaced and "/" not in pattern:
+                    continue  # local-name glob can't swallow a vendor/model id
+                if fnmatch.fnmatchcase(lowered, pattern):
                     return provider
         return self.UPSTREAM_PROVIDER
 

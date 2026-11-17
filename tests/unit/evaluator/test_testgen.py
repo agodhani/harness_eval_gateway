@@ -72,20 +72,45 @@ class _FakeResponse:
 
 
 class _FakeClient:
-    """Duck-typed httpx.AsyncClient — records the call, returns canned text."""
+    """Duck-typed httpx.AsyncClient — records calls, returns canned text.
 
-    def __init__(self, text: str = GOOD_OUTPUT, exc: Exception | None = None) -> None:
+    ``texts`` queues per-call entries for the raised-cap retry path:
+    ``str`` → assistant content, ``Exception`` → raised, ``dict`` → the
+    whole response payload (e.g. ``{"choices": []}``). Falls back to
+    ``text`` once the queue is exhausted.
+    """
+
+    def __init__(
+        self,
+        text: str = GOOD_OUTPUT,
+        exc: Exception | None = None,
+        texts: list[Any] | None = None,
+    ) -> None:
         self._text = text
         self._exc = exc
+        self._texts = list(texts) if texts else []
         self.calls: list[dict[str, Any]] = []
 
     async def post(
-        self, url: str, json: dict | None = None, headers: dict | None = None
+        self,
+        url: str,
+        json: dict | None = None,
+        headers: dict | None = None,
+        **kwargs: Any,
     ) -> _FakeResponse:
-        self.calls.append({"url": url, "json": json, "headers": headers})
+        self.calls.append(
+            {"url": url, "json": json, "headers": headers, **kwargs}
+        )
         if self._exc is not None:
             raise self._exc
-        return _FakeResponse({"choices": [{"message": {"content": self._text}}]})
+        entry: Any = self._text
+        if self._texts:
+            entry = self._texts.pop(0)
+        if isinstance(entry, Exception):
+            raise entry
+        if isinstance(entry, dict):
+            return _FakeResponse(entry)
+        return _FakeResponse({"choices": [{"message": {"content": entry}}]})
 
     async def aclose(self) -> None:
         return None
@@ -256,7 +281,7 @@ async def test_http_failure_is_error(python_ws: Path, gen_dir: Path) -> None:
 
 async def test_empty_choices_is_error(python_ws: Path, gen_dir: Path) -> None:
     class EmptyClient(_FakeClient):
-        async def post(self, url, json=None, headers=None):
+        async def post(self, url, json=None, headers=None, **_kw):
             return _FakeResponse({"choices": []})
 
     report = await _gen(python_ws, gen_dir, client=EmptyClient())
@@ -292,6 +317,98 @@ async def test_partial_output_salvages_valid_files(
     assert report.metrics["files_rejected"] == 2
     written = {p.name for p in gen_dir.glob("test_*.py")}
     assert written == {"test_ok.py"}
+
+
+# ----------------------------------------------------------------------
+# raised-cap retry — thinking/slow model failure modes
+# ----------------------------------------------------------------------
+
+
+async def test_empty_content_retries_with_raised_caps(
+    python_ws: Path, gen_dir: Path
+) -> None:
+    """Live-observed qwen3:8b failure: reasoning burned the output budget
+    → empty content. ONE retry at TESTGEN_MAX_TOKENS_RETRY + 2x timeout."""
+    client = _FakeClient(texts=["", GOOD_OUTPUT])
+    report = await _gen(python_ws, gen_dir, client=client)
+    assert report.status == "ok"
+    assert len(client.calls) == 2
+    assert client.calls[0]["json"]["max_tokens"] == 4096
+    assert client.calls[1]["json"]["max_tokens"] == 8192  # raised cap
+    assert client.calls[1]["timeout"] == 480.0  # 2x TESTGEN_TIMEOUT_SECONDS
+    assert report.metrics["retried"] is True
+    assert any("retrying" in w for w in report.warnings)
+
+
+async def test_zero_test_files_retry(python_ws: Path, gen_dir: Path) -> None:
+    """A response that parses to zero runnable files retries the SAME
+    prompt once before degrading to skipped."""
+    garbage = "I cannot write tests for this code. Sorry!"
+    client = _FakeClient(texts=[garbage, GOOD_OUTPUT])
+    report = await _gen(python_ws, gen_dir, client=client)
+    assert report.status == "ok"
+    assert len(client.calls) == 2
+    # same prompt + model on both attempts — only the caps change
+    assert (
+        client.calls[0]["json"]["messages"]
+        == client.calls[1]["json"]["messages"]
+    )
+    assert report.metrics["retried"] is True
+
+
+async def test_zero_files_twice_still_skips(python_ws: Path, gen_dir) -> None:
+    """Both attempts yield garbage → the degraded skipped path applies."""
+    garbage = "no tests here, sorry"
+    client = _FakeClient(texts=[garbage, garbage])
+    report = await _gen(python_ws, gen_dir, client=client)
+    assert report.status == "skipped"
+    assert len(client.calls) == 2
+
+
+async def test_empty_content_twice_is_error(python_ws: Path, gen_dir) -> None:
+    """Empty content on BOTH attempts → error (the retry is exhausted)."""
+    client = _FakeClient(texts=["", ""])
+    report = await _gen(python_ws, gen_dir, client=client)
+    assert report.status == "error"
+    assert len(client.calls) == 2
+
+
+async def test_timeout_retries_once(python_ws: Path, gen_dir) -> None:
+    """Live-observed 35B judge failure: ReadTimeout at the base cap earns
+    the raised-cap + doubled-timeout retry."""
+    client = _FakeClient(texts=[httpx.ReadTimeout("slow model"), GOOD_OUTPUT])
+    report = await _gen(python_ws, gen_dir, client=client)
+    assert report.status == "ok"
+    assert len(client.calls) == 2
+    assert report.metrics["retried"] is True
+
+
+async def test_timeout_twice_is_error(python_ws: Path, gen_dir: Path) -> None:
+    client = _FakeClient(
+        texts=[httpx.ReadTimeout("t1"), httpx.ReadTimeout("t2")]
+    )
+    report = await _gen(python_ws, gen_dir, client=client)
+    assert report.status == "error"
+    assert len(client.calls) == 2
+
+
+async def test_retry_token_cap_env_override(
+    python_ws: Path, gen_dir: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TESTGEN_MAX_TOKENS_RETRY", "16384")
+    client = _FakeClient(texts=["", GOOD_OUTPUT])
+    report = await _gen(python_ws, gen_dir, client=client)
+    assert report.status == "ok"
+    assert client.calls[1]["json"]["max_tokens"] == 16384
+
+
+async def test_no_retry_on_first_success(python_ws: Path, gen_dir: Path) -> None:
+    """A usable first response makes exactly one call — no wasted spend."""
+    client = _FakeClient()
+    report = await _gen(python_ws, gen_dir, client=client)
+    assert report.status == "ok"
+    assert len(client.calls) == 1
+    assert report.metrics["retried"] is False
 
 
 # ----------------------------------------------------------------------

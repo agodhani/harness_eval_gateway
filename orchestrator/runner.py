@@ -250,14 +250,17 @@ def start_rescore_task(
     """Register a re-score task (PR5) — re-runs the evaluator on stored
     artifacts. Deduped by the ``rescore`` task kind: a second trigger while
     one is in flight returns the existing task."""
+    sf = session_factory or _session_factory()
+    st = settings or _settings()
+    rt = runtime or get_runtime()
     return _track(
         "rescore",
         run_id,
-        lambda: lifecycle.rescore_run(
+        lambda: _rescore_then_promote(
             run_id,
-            session_factory=session_factory or _session_factory(),
-            runtime=runtime or get_runtime(),
-            settings=settings or _settings(),
+            session_factory=sf,
+            settings=st,
+            runtime=rt,
             evaluator_fn=evaluator_fn,
             rubric_id=rubric_id,
             sandbox_ids=sandbox_ids,
@@ -266,10 +269,75 @@ def start_rescore_task(
     )
 
 
+async def _rescore_then_promote(
+    run_id: uuid.UUID,
+    *,
+    session_factory: sessionmaker[Session],
+    settings: Any,
+    runtime: SandboxRuntime,
+    evaluator_fn: Any | None,
+    rubric_id: uuid.UUID | None,
+    sandbox_ids: Collection[uuid.UUID] | None,
+    model: str | None,
+) -> None:
+    """Re-score a run's artifacts, then free the execution slot.
+
+    A rescore holds the slot the same way a lifecycle does (its run is
+    ``evaluating``, which ``pacing.claim_next_queued`` counts as active),
+    so its exit must attempt the same promotion — otherwise a run queued
+    behind it would wait forever. ``rescore_run`` never raises, but the
+    ``finally`` releases the slot on cancellation/teardown too.
+    """
+    try:
+        await lifecycle.rescore_run(
+            run_id,
+            session_factory=session_factory,
+            runtime=runtime,
+            settings=settings,
+            evaluator_fn=evaluator_fn,
+            rubric_id=rubric_id,
+            sandbox_ids=sandbox_ids,
+            model=model,
+        )
+    finally:
+        await promote_next_queued(
+            session_factory=session_factory,
+            settings=settings,
+            runtime=runtime,
+            evaluator_fn=evaluator_fn,
+        )
+
+
+async def release_run_slot() -> None:
+    """Free the execution slot from the DELETE-run cancel path — the same
+    promotion a lifecycle/rescore exit performs, on the runner's own
+    lazy wiring (session factory / settings / runtime)."""
+    await promote_next_queued(
+        session_factory=_session_factory(),
+        settings=_settings(),
+        runtime=get_runtime(),
+    )
+
+
 def in_flight(run_id: uuid.UUID, kind: str) -> bool:
     """True while a registered task of ``kind`` for ``run_id`` is running."""
     task = _TASKS.get((run_id, kind))
     return task is not None and not task.done()
+
+
+def cancel_task(run_id: uuid.UUID, kind: str) -> bool:
+    """Cancel a registered in-flight task (DELETE-run cancel path).
+
+    True when a live task was signalled. Cancellation lands at the task's
+    next await — already-committed DB writes stand, so a cancelled rubric
+    draft that finished first still leaves the run in ``rubric_review``
+    (the DELETE handler's status check tolerates both outcomes).
+    """
+    task = _TASKS.get((run_id, kind))
+    if task is not None and not task.done():
+        task.cancel()
+        return True
+    return False
 
 
 async def shutdown() -> None:

@@ -7,7 +7,10 @@
   status, entry, expires_at}``. Idempotent per sandbox: an already-live
   preview is returned as-is — unless an explicit ``entry``/``type``
   requests a different plan, in which case the live container is stopped
-  and replaced. Optional body ``{"entry": "rel/path"}`` picks an explicit
+  and replaced. Executed-code types get a short early-crash window: an
+  app exiting within ~5s of spawn fails the POST with a 502 carrying the
+  exit reason + log tail rather than returning a dead ``running`` URL.
+  Optional body ``{"entry": "rel/path"}`` picks an explicit
   entry — for ambiguous scans (the 422 detail lists candidates) or
   artifacts detection missed; ``.html``/``.htm`` → static, ``.py`` →
   desktop, ``manage.py`` → python-server, jailed to the workspace.
@@ -19,7 +22,9 @@
   "static"}`` serves the file instead of executing it, while ``desktop``
   and ``python-server`` still require a ``.py`` entry.
 - ``GET .../preview`` — current preview state (newest container), 404 when
-  none exists.
+  none exists. Terminal states (``exited``/``dead``) carry ``exit_code``,
+  a human ``detail``, and the app's last log lines (``logs``) so a crashed
+  artifact surfaces its reason instead of a silent dead URL.
 - ``DELETE .../preview`` — stop the preview container(s) for the sandbox.
 
 The workspace being served must resolve inside ``ARTIFACT_ROOT`` (same jail
@@ -128,9 +133,15 @@ class PreviewOut(BaseModel):
     container: str
     created_at: datetime | None = None
     expires_at: datetime | None = None
+    # Terminal diagnostics — populated for exited/dead runners so a
+    # crashed artifact surfaces its reason instead of a silent dead URL:
+    # exit_code + a human detail + the app's last log lines.
+    exit_code: int | None = None
+    detail: str | None = None
+    logs: str | None = None
 
 
-def _out(preview: Preview) -> PreviewOut:
+def _out(preview: Preview, *, logs: str | None = None) -> PreviewOut:
     return PreviewOut(
         preview_id=UUID(preview.preview_id),
         run_id=UUID(preview.run_id),
@@ -142,7 +153,22 @@ def _out(preview: Preview) -> PreviewOut:
         container=preview.container,
         created_at=preview.created_at,
         expires_at=preview.expires_at,
+        exit_code=preview.exit_code,
+        detail=preview.detail,
+        logs=logs,
     )
+
+
+async def _out_with_logs(mgr: PreviewManager, preview: Preview) -> PreviewOut:
+    """``_out`` plus the app's log tail when the runner is terminal.
+
+    Bounded (``LOG_TAIL_LINES`` × ``LOG_MAX_CHARS`` inside ``mgr.logs``)
+    and skipped for live statuses — every live GET stays a cheap inspect.
+    """
+    logs: str | None = None
+    if preview.detail is not None:
+        logs = await asyncio.to_thread(mgr.logs, preview.container)
+    return _out(preview, logs=logs or None)
 
 
 _manager: PreviewManager | None = None
@@ -332,7 +358,7 @@ async def start_preview(
     # entry/type was requested, in which case the resolved plan decides
     # below (same plan → return it, different plan → stop + respawn).
     if live is not None and not entry and not ptype:
-        return _out(live)
+        return await _out_with_logs(mgr, live)
 
     workspace = resolve_workspace_dir(
         jail=_jail(),
@@ -363,7 +389,7 @@ async def start_preview(
         )
 
     if live is not None and live.type == plan.type and live.entry == plan.entry:
-        return _out(live)
+        return await _out_with_logs(mgr, live)
     # Clear stale containers — dead ones always, and a live one whose plan
     # doesn't match the explicit request — except a live capture stack:
     # killing it mid-capture would fail that POST .../thumbnail.
@@ -409,7 +435,7 @@ async def start_preview(
         session.rollback()
         log.warning("preview_started event emit failed", exc_info=True)
 
-    return _out(preview)
+    return await _out_with_logs(mgr, preview)
 
 
 @router.get(
@@ -424,7 +450,7 @@ async def get_preview(run_id: UUID, sandbox_id: UUID, session: DbSession) -> Pre
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="no preview for this sandbox"
         )
-    return _out(preview)
+    return await _out_with_logs(mgr, preview)
 
 
 @router.delete(

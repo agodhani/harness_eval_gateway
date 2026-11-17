@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 import urllib.request
 from pathlib import Path
 
@@ -63,6 +64,11 @@ class ThumbFakeRuntime(FakeRuntime):
         self.write_shot: bool = True
         self.thumb_rc: int = 0
         self.thumb_timeout: bool = False
+        # Mid-capture crash simulation: the thumb `docker run` flips every
+        # inspect row to exited (the app died), and `thumb_block` makes the
+        # run hang until the capture watchdog force-removes the container.
+        self.runner_dies_on_capture: bool = False
+        self.thumb_block: bool = False
 
     def _docker(
         self,
@@ -77,6 +83,26 @@ class ThumbFakeRuntime(FakeRuntime):
             and args[args.index("--name") + 1].startswith("heg-thumb-")
         ):
             self.calls.append(args)
+            if self.runner_dies_on_capture:
+                for row in self.rows_by_id.values():
+                    row["State"]["Status"] = "exited"
+                    row["State"]["ExitCode"] = 1
+            if self.thumb_block:
+                # Block until the watchdog's `docker rm -f <thumb>` lands —
+                # proves the kill path, not just the post-failure message.
+                name = args[args.index("--name") + 1]
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if any(
+                        c[:2] == ["rm", "-f"] and name in c for c in self.calls
+                    ):
+                        return subprocess.CompletedProcess(
+                            args, 137, "", "killed"
+                        )
+                    time.sleep(0.02)
+                raise AssertionError(
+                    "watchdog never removed the capture container"
+                )
             if self.thumb_timeout:
                 raise subprocess.TimeoutExpired(["docker", *args], 10)
             if self.thumb_rc == 0 and self.write_shot:
@@ -162,6 +188,11 @@ def _isolated_manager(
         "px1": proxy_row,
     }
     fake.images.add(runner_image)
+    # Executed-code spawns poll a readiness window — fake sleep advancing a
+    # fake clock elapses it instantly instead of waiting ~5s real.
+    now = [0.0]
+    mgr_kw.setdefault("clock", lambda: now[0])
+    mgr_kw.setdefault("sleep", lambda s: now.__setitem__(0, now[0] + s))
     return PreviewManager(runtime=fake, **mgr_kw)  # type: ignore[arg-type]
 
 
@@ -320,12 +351,12 @@ def test_capture_static_nonindex_entry_path(
 # ---------------------------------------------------------------------------
 
 
-def test_capture_desktop_proxied_url(
+def test_capture_desktop_vnc_env(
     tmp_path: Path, urlopen_calls: list[str], sleeps: list[float]
 ) -> None:
-    """Desktop: shot goes through the socat sidecar's noVNC page; the app
-    gets the longer settle + virtual-time budget to draw into the VNC
-    framebuffer."""
+    """Desktop: the capture container gets a VNC-over-WS target, not a
+    chromium URL — the in-container client polls the framebuffer until it
+    has real content (no fixed settle, no virtual-time-budget cliff)."""
     ws, artifact_dir = _ws(tmp_path, {"main.py": "import pygame\n"})
     fake = ThumbFakeRuntime()
     mgr = _desktop_manager(fake)
@@ -340,12 +371,12 @@ def test_capture_desktop_proxied_url(
     assert urlopen_calls == []
 
     run = _thumb_run(fake)
-    assert _env(run, "CAPTURE_URL") == (
-        f"http://heg-prev-abc-proxy:{DESKTOP_CONTAINER_PORT}"
-        "/vnc.html?autoconnect=true&resize=scale"
+    assert _env(run, "THUMB_VNC_WS") == (
+        f"ws://heg-prev-abc-proxy:{DESKTOP_CONTAINER_PORT}/websockify"
     )
-    assert _env(run, "THUMB_BUDGET_MS") == "20000"
-    assert sleeps == [8.0]  # desktop settle
+    assert _env(run, "THUMB_VNC_WAIT_SECONDS") == "30"
+    assert _env(run, "THUMB_VNC_SETTLE_SECONDS") == "8"
+    assert sleeps == []  # desktop's wait is adaptive, in-container
 
     # Runner spawned on the internal net (executed-code isolation kept).
     runner = next(c for c in fake.calls if c[0] == "run")
@@ -482,14 +513,18 @@ def test_capture_timeout_removes_container(
 def test_wait_ready_dead_preview(
     tmp_path: Path, urlopen_calls: list[str], sleeps: list[float]
 ) -> None:
-    """A runner that exits before serving fails fast — no capture run."""
+    """A runner that exits before serving fails fast — with the exit code
+    + app log tail in the error, not a bare "did not serve" timeout."""
     ws, artifact_dir = _ws(tmp_path, {"index.html": "x"})
     fake = ThumbFakeRuntime(
-        inspect_rows=[_inspect_row(labels=_labels(), status="exited")]
+        inspect_rows=[
+            _inspect_row(labels=_labels(), status="exited", exit_code=1)
+        ]
     )
     fake.ps_ids = ["cid123"]
+    fake.logs_text = "SyntaxError: invalid syntax"
     mgr = PreviewManager(runtime=fake)  # type: ignore[arg-type]
-    with pytest.raises(ThumbnailError, match="exited before serving"):
+    with pytest.raises(ThumbnailError, match="exited with code 1") as ei:
         _thumbnailer(mgr, sleeps).capture(
             run_id="run1",
             sandbox_id="sb1",
@@ -497,10 +532,91 @@ def test_wait_ready_dead_preview(
             artifact_dir=artifact_dir,
             plan=PreviewPlan(type="static", entry="index.html"),
         )
+    assert "SyntaxError" in str(ei.value)  # app's log tail rides the 502
     assert not any(
         c[0] == "run" and "--name" in c and "heg-thumb-" in c[c.index("--name") + 1]
         for c in fake.calls
     )
+
+
+def test_capture_spawn_window_crash_is_thumbnail_error(
+    tmp_path: Path, urlopen_calls: list[str], sleeps: list[float]
+) -> None:
+    """An app dying inside spawn's readiness window surfaces as a
+    ThumbnailError carrying the exit code + log tail — the 502 detail is
+    the app's own reason, not a generic capture failure prefix."""
+    ws, artifact_dir = _ws(tmp_path, {"main.py": "import pygame\n"})
+    fake = ThumbFakeRuntime()
+    fake.logs_text = "SyntaxError: invalid syntax\n"
+    mgr = _desktop_manager(fake)
+    fake.rows_by_id["cid123"]["State"] = {"Status": "exited", "ExitCode": 1}
+    with pytest.raises(ThumbnailError, match="exited with code 1") as ei:
+        _thumbnailer(mgr, sleeps).capture(
+            run_id="run1",
+            sandbox_id="sb1",
+            workspace=ws,
+            artifact_dir=artifact_dir,
+            plan=PreviewPlan(type="desktop", entry="main.py"),
+        )
+    assert "SyntaxError" in str(ei.value)
+    # No capture container was launched for a dead-on-arrival app.
+    assert not any(
+        c[0] == "run"
+        and "--name" in c
+        and c[c.index("--name") + 1].startswith("heg-thumb-")
+        for c in fake.calls
+    )
+
+
+def test_capture_runner_dies_mid_capture(
+    tmp_path: Path, urlopen_calls: list[str], sleeps: list[float]
+) -> None:
+    """An app crashing while the capture container runs fails FAST — the
+    watchdog force-removes the capture (no burning the ready budget) and
+    the error reports the app's exit code + log tail, not a "did not
+    serve" timeout."""
+    ws, artifact_dir = _ws(tmp_path, {"main.py": "import pygame\n"})
+    fake = ThumbFakeRuntime()
+    fake.runner_dies_on_capture = True
+    fake.thumb_block = True  # capture "hangs" until the watchdog kills it
+    fake.logs_text = "pygame.error: display exploded\n"
+    mgr = _desktop_manager(fake)
+    with pytest.raises(ThumbnailError, match="exited with code 1") as ei:
+        _thumbnailer(mgr, sleeps).capture(
+            run_id="run1",
+            sandbox_id="sb1",
+            workspace=ws,
+            artifact_dir=artifact_dir,
+            plan=PreviewPlan(type="desktop", entry="main.py"),
+        )
+    assert "pygame.error" in str(ei.value)
+    # The capture container was force-removed by name mid-flight.
+    assert any(
+        c[:2] == ["rm", "-f"]
+        and any(n.startswith("heg-thumb-") for n in c)
+        for c in fake.calls
+    )
+
+
+def test_capture_desktop_render_timeout(
+    tmp_path: Path, urlopen_calls: list[str], sleeps: list[float]
+) -> None:
+    """Frame stayed blank past the in-container wait (vnc exit 4) → the
+    error says *why* — app alive but never rendered — not a bare
+    'capture failed'."""
+    ws, artifact_dir = _ws(tmp_path, {"main.py": "import pygame\n"})
+    fake = ThumbFakeRuntime()
+    fake.thumb_rc = 4  # thumbnail-vnc.py's blank-framebuffer deadline
+    mgr = _desktop_manager(fake)
+    with pytest.raises(ThumbnailError, match="timed out waiting.*render"):
+        _thumbnailer(mgr, sleeps).capture(
+            run_id="run1",
+            sandbox_id="sb1",
+            workspace=ws,
+            artifact_dir=artifact_dir,
+            plan=PreviewPlan(type="desktop", entry="main.py"),
+        )
+    assert not (artifact_dir / THUMB_FILENAME).exists()
 
 
 def test_wait_ready_timeout(

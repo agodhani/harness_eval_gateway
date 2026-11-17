@@ -8,10 +8,12 @@
  * is in `rubric_review`, and freezes it via POST /approve.
  */
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import {
   ApiError,
   approveRun,
+  deleteRun,
   getRun,
   getRunResults,
   runModels,
@@ -24,6 +26,11 @@ import {
   type RunResults,
 } from "@/lib/api";
 import { formatTs, shortId, truncate } from "@/lib/format";
+import {
+  consumeRunWarnings,
+  specFromRun,
+  stageResubmit,
+} from "@/lib/resubmit";
 import RunConsoleLive from "@/components/RunConsoleLive";
 import {
   Badge,
@@ -45,7 +52,9 @@ function errMsg(err: unknown, fallback: string): string {
 }
 
 function isTerminal(status: string): boolean {
-  return TERMINAL_RUN_STATUSES.includes(status);
+  // "cancelled" lands with the DELETE /api/runs/{id} backend work — treat it
+  // as terminal so polling stops once a cancel lands.
+  return TERMINAL_RUN_STATUSES.includes(status) || status === "cancelled";
 }
 
 function scoreTone(score: number): "good" | "mid" | "bad" {
@@ -261,6 +270,7 @@ function RubricView({
 // ---------------------------------------------------------------------------
 
 export default function RunDetailClient({ runId }: { runId: string }) {
+  const router = useRouter();
   const [runData, setRunData] = useState<RunOut | null>(null);
   // Which runId the loaded data belongs to — deriving `run`/`loading` from
   // this (instead of setState-in-effect) keeps the hooks lint clean and
@@ -281,6 +291,12 @@ export default function RunDetailClient({ runId }: { runId: string }) {
 
   // evaluator scores for the rubric table (null until results endpoint has data)
   const [results, setResults] = useState<RunResults | null>(null);
+
+  // Run-create warnings handed off from /submit (sessionStorage, consumed
+  // once) — the backend may attach advisories to the run-create response.
+  const [createWarnings, setCreateWarnings] = useState<string[]>([]);
+  // cancel/delete in-flight state
+  const [cancelling, setCancelling] = useState(false);
 
   const refresh = useCallback(
     async (silent = true) => {
@@ -346,9 +362,56 @@ export default function RunDetailClient({ runId }: { runId: string }) {
     };
   }, [runId, status]);
 
+  // Run-create warnings staged by /submit — read once (they're cleared).
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      const w = consumeRunWarnings(runId);
+      if (w.length) setCreateWarnings(w);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
+
   const rubric = run?.rubric ?? null;
   const rubricEditable =
     run?.status === "rubric_review" && rubric?.status === "draft";
+
+  /** Resubmit — stage this run's spec and open /submit prefilled. */
+  function resubmit() {
+    if (!run) return;
+    stageResubmit(specFromRun(run));
+    router.push("/submit");
+  }
+
+  /** Cancel — DELETE /api/runs/{id} (parallel backend work). The endpoint
+   * may 409 for states it refuses (e.g. running/evaluating); surface the
+   * server's message verbatim. A deleted row 404s the next refresh → head
+   * back to the list. */
+  async function cancel() {
+    if (!run || cancelling) return;
+    if (
+      !window.confirm(
+        `Cancel run ${shortId(run.id)}? Sandboxes are stopped and the run is marked cancelled.`,
+      )
+    ) {
+      return;
+    }
+    setCancelling(true);
+    setError(null);
+    try {
+      await deleteRun(run.id);
+      const refreshed = await refresh(true);
+      if (refreshed === null) router.push("/runs");
+      else setNotice("Run cancelled.");
+    } catch (err) {
+      setError(errMsg(err, "Cancel failed."));
+    } finally {
+      setCancelling(false);
+    }
+  }
 
   function startEdit() {
     if (!rubric) return;
@@ -459,7 +522,11 @@ export default function RunDetailClient({ runId }: { runId: string }) {
             <h1 className="mono" style={{ fontSize: "1.15rem" }} title={run.id}>
               {shortId(run.id, 13)}…
             </h1>
-            <Badge tone={statusTone(run.status)}>{run.status}</Badge>
+            <Badge tone={statusTone(run.status)}>
+              {run.status === "queued" && run.queue_position != null
+                ? `queued · #${run.queue_position}`
+                : run.status}
+            </Badge>
             {run.same_model_eval ? (
               <Badge tone="amber" title="evaluator model == a participant model">
                 same-model eval
@@ -492,6 +559,26 @@ export default function RunDetailClient({ runId }: { runId: string }) {
           <Link href={`/runs/${run.id}/analysis`} className="btn btn--sm">
             Analysis →
           </Link>
+          {isTerminal(run.status) ? (
+            <button
+              type="button"
+              className="btn btn--sm"
+              onClick={resubmit}
+              title="Open the submit form prefilled with this run's spec"
+            >
+              ↻ Resubmit
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn btn--sm btn--ghost"
+              onClick={() => void cancel()}
+              disabled={cancelling}
+              title="Cancel this run (stops its sandboxes)"
+            >
+              {cancelling ? "Cancelling…" : "Cancel run"}
+            </button>
+          )}
           <Link href="/runs" className="btn btn--sm btn--ghost">
             ← All runs
           </Link>
@@ -501,6 +588,16 @@ export default function RunDetailClient({ runId }: { runId: string }) {
       <div className="stack">
         {notice ? <InfoNote>{notice}</InfoNote> : null}
         {error ? <ErrorNote>{error}</ErrorNote> : null}
+        {createWarnings.length > 0 ? (
+          <WarnNote>
+            <strong>Run created with warnings:</strong>
+            <ul style={{ margin: "0.35rem 0 0 1.1rem", padding: 0 }}>
+              {createWarnings.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          </WarnNote>
+        ) : null}
 
         <Card title="Task">
           <p className="task-text">{run.task_prompt}</p>

@@ -136,6 +136,171 @@ def usage_from_responses_api(response_json: Any) -> dict[str, int]:
     )
 
 
+def _sse_data_frames(body: bytes) -> tuple[list[dict[str, Any]], bool]:
+    """Parse ``data:`` payloads from an SSE body → (objects, saw_sse).
+
+    ``saw_sse`` is True when at least one ``data:`` line was present — it
+    distinguishes a real event stream from a plain JSON body (which then
+    takes the non-SSE extraction path). Unparseable payloads are skipped.
+    """
+    import json as _json
+
+    objects: list[dict[str, Any]] = []
+    saw_sse = False
+    for line in body.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:") :].strip()
+        if not data or data == "[DONE]":
+            continue
+        saw_sse = True
+        try:
+            obj = _json.loads(data)
+        except _json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            objects.append(obj)
+    return objects, saw_sse
+
+
+def _stream_error_message(err: Any) -> str:
+    """Human string for a streamed ``error`` value (dict or bare string)."""
+    if isinstance(err, dict):
+        msg = err.get("message")
+        return str(msg) if msg else str(err)[:500]
+    return str(err)[:500]
+
+
+def _scan_metered_body(
+    body: bytes, api: str
+) -> tuple[dict[str, int] | None, int, list[str]]:
+    """Single pass over a captured response body.
+
+    Returns ``(usage, output_chars, errors)``:
+
+    - ``usage`` — the provider-reported token counts, or ``None`` when the
+      body carries no usage (provider ignored ``include_usage``, truncated
+      capture, error stream). ``None`` vs zeros is how callers decide to
+      estimate instead.
+    - ``output_chars`` — characters of generated output found in the body
+      (streamed deltas, or final message content for non-SSE bodies); the
+      token estimator divides by 4.
+    - ``errors`` — ``data: {"error": ...}`` stream frames (capped at 3);
+      providers like OpenRouter report failures this way mid-stream.
+    """
+    import json as _json
+
+    errors: list[str] = []
+
+    def _collect_error(obj: dict[str, Any]) -> None:
+        err = obj.get("error")
+        if err and len(errors) < 3:
+            errors.append(_stream_error_message(err))
+
+    objects, saw_sse = _sse_data_frames(body)
+    usage: dict[str, int] | None = None
+    chars = 0
+
+    if saw_sse:
+        anthropic_in = 0
+        anthropic_out = 0
+        anthropic_usage_seen = False
+        for obj in objects:
+            _collect_error(obj)
+            if api == "anthropic":
+                etype = obj.get("type")
+                if etype == "message_start":
+                    u = (obj.get("message") or {}).get("usage")
+                    if isinstance(u, dict):
+                        anthropic_usage_seen = True
+                        anthropic_in += _to_int(u.get("input_tokens")) + _to_int(
+                            u.get("cache_read_input_tokens")
+                        )
+                        anthropic_out += _to_int(u.get("output_tokens"))
+                elif etype == "message_delta":
+                    u = obj.get("usage")
+                    if isinstance(u, dict):
+                        anthropic_usage_seen = True
+                        anthropic_out = max(
+                            anthropic_out, _to_int(u.get("output_tokens"))
+                        )
+                elif etype == "content_block_delta":
+                    delta = obj.get("delta") or {}
+                    t = delta.get("text")
+                    if not isinstance(t, str):
+                        # tool-call args stream as input_json_delta partial_json
+                        t = delta.get("partial_json")
+                    if isinstance(t, str):
+                        chars += len(t)
+            elif api == "responses":
+                etype = obj.get("type")
+                if etype in ("response.completed", "response.incomplete"):
+                    resp = obj.get("response")
+                    if isinstance(obj.get("usage"), dict) or (
+                        isinstance(resp, dict)
+                        and isinstance(resp.get("usage"), dict)
+                    ):
+                        usage = usage_from_responses_api(obj)
+                elif etype in (
+                    "response.output_text.delta",
+                    "response.function_call_arguments.delta",
+                ):
+                    delta = obj.get("delta")
+                    if isinstance(delta, str):
+                        chars += len(delta)
+            elif api == "openai" and obj.get("object") == "chat.completion.chunk":
+                # Usage arrives on the final chunk (include_usage) — keep
+                # the last populated one; content chunks carry usage=null.
+                if isinstance(obj.get("usage"), dict):
+                    usage = usage_from_response(obj)
+                for choice in obj.get("choices") or []:
+                    if isinstance(choice, dict):
+                        delta = choice.get("delta") or {}
+                        t = delta.get("content")
+                        if isinstance(t, str):
+                            chars += len(t)
+        if api == "anthropic" and anthropic_usage_seen:
+            usage = _usage_dict(anthropic_in, anthropic_out)
+        return usage, chars, errors
+
+    # --- non-SSE body: buffered JSON response (or garbage) ---
+    try:
+        obj = _json.loads(body.decode("utf-8", errors="replace"))
+    except _json.JSONDecodeError:
+        return None, 0, errors
+    if not isinstance(obj, dict):
+        return None, 0, errors
+    _collect_error(obj)
+    if api == "anthropic":
+        if isinstance(obj.get("usage"), dict):
+            usage = usage_from_anthropic(obj)
+        for block in obj.get("content") or []:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                chars += len(block["text"])
+    elif api == "responses":
+        resp = obj.get("response")
+        if isinstance(obj.get("usage"), dict) or (
+            isinstance(resp, dict) and isinstance(resp.get("usage"), dict)
+        ):
+            usage = usage_from_responses_api(obj)
+        for item in obj.get("output") or []:
+            if isinstance(item, dict):
+                for part in item.get("content") or []:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        chars += len(part["text"])
+    else:
+        if isinstance(obj.get("usage"), dict):
+            usage = usage_from_response(obj)
+        for choice in obj.get("choices") or []:
+            if isinstance(choice, dict):
+                msg = choice.get("message") or {}
+                t = msg.get("content")
+                if isinstance(t, str):
+                    chars += len(t)
+    return usage, chars, errors
+
+
 def usage_from_sse(body: bytes, *, api: str) -> dict[str, int]:
     """Extract final usage from a captured SSE stream body.
 
@@ -145,72 +310,39 @@ def usage_from_sse(body: bytes, *, api: str) -> dict[str, int]:
     final ``response.usage``), or ``"openai"`` (chat-completions chunks: the
     terminal ``chat.completion.chunk`` carries ``usage`` when the request set
     ``stream_options.include_usage``). Non-SSE bodies fall back to the JSON
-    extractors.
+    extractors. Returns zeros when no usage is present — callers that need
+    to distinguish "no usage reported" use ``metered_stream_usage``.
     """
-    import json as _json
+    usage, _chars, _errors = _scan_metered_body(body, api)
+    return usage or _usage_dict(0, 0)
 
-    text = body.decode("utf-8", errors="replace")
-    anthropic_in = 0
-    anthropic_out = 0
-    responses_usage: dict[str, int] = {}
-    openai_usage: dict[str, int] = {}
-    saw_event = False
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        data = line[len("data:") :].strip()
-        if not data or data == "[DONE]":
-            continue
-        try:
-            obj = _json.loads(data)
-        except _json.JSONDecodeError:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        etype = obj.get("type")
-        if api == "anthropic":
-            if etype == "message_start":
-                saw_event = True
-                u = (obj.get("message") or {}).get("usage") or {}
-                anthropic_in += _to_int(u.get("input_tokens")) + _to_int(
-                    u.get("cache_read_input_tokens")
-                )
-                anthropic_out += _to_int(u.get("output_tokens"))
-            elif etype == "message_delta":
-                saw_event = True
-                u = obj.get("usage") or {}
-                anthropic_out = max(anthropic_out, _to_int(u.get("output_tokens")))
-        elif api == "responses":
-            if etype in ("response.completed", "response.incomplete"):
-                saw_event = True
-                responses_usage = usage_from_responses_api(obj)
-        elif api == "openai" and obj.get("object") == "chat.completion.chunk":
-            saw_event = True
-            # Usage arrives on the final chunk (include_usage) — keep the
-            # last populated one; content chunks carry usage=null.
-            if isinstance(obj.get("usage"), dict):
-                openai_usage = usage_from_response(obj)
-    if api == "anthropic":
-        if saw_event:
-            return _usage_dict(anthropic_in, anthropic_out)
-        try:
-            return usage_from_anthropic(_json.loads(text))
-        except _json.JSONDecodeError:
-            return _usage_dict(0, 0)
-    if api == "openai":
-        if saw_event:
-            return openai_usage
-        try:
-            return usage_from_response(_json.loads(text))
-        except _json.JSONDecodeError:
-            return _usage_dict(0, 0)
-    if saw_event:
-        return responses_usage
-    try:
-        return usage_from_responses_api(_json.loads(text))
-    except _json.JSONDecodeError:
-        return _usage_dict(0, 0)
+
+def metered_stream_usage(body: bytes, *, api: str) -> dict[str, Any]:
+    """Usage + stream-error frames for a captured response body.
+
+    Returns ``{"usage": {...}, "estimated": bool, "errors": [str, ...]}``.
+
+    Provider-reported usage wins. When the body carries none — the provider
+    ignored ``stream_options.include_usage``, the capture was truncated, or
+    the stream was an error/keep-alive only — ``completion_tokens`` is
+    ESTIMATED from the generated output text (``chars // 4``) with
+    ``prompt_tokens`` null and ``estimated=True``. The estimate still feeds
+    the run token budget (``payload.usage.total_tokens``) but is flagged so
+    analytics can tell it from provider numbers.
+    """
+    usage, chars, errors = _scan_metered_body(body, api)
+    if usage is not None:
+        return {"usage": usage, "estimated": False, "errors": errors}
+    est = chars // 4
+    return {
+        "usage": {
+            "prompt_tokens": None,
+            "completion_tokens": est,
+            "total_tokens": est,
+        },
+        "estimated": True,
+        "errors": errors,
+    }
 
 
 async def post_ingest_events(events: list[dict[str, Any]]) -> tuple[int, Any]:
@@ -324,11 +456,12 @@ async def emit_llm_response(
     claims: CredClaims,
     *,
     model: Any,
-    usage: dict[str, int],
+    usage: dict[str, int | None],
     latency_ms: int,
     http_status: int,
     provider: str | None = None,
     cached: bool = False,
+    usage_estimated: bool = False,
 ) -> None:
     payload: dict[str, Any] = {
         "model": model,
@@ -341,6 +474,10 @@ async def emit_llm_response(
     }
     if cached:
         payload["cached"] = True
+    if usage_estimated:
+        # No provider usage was reported — completion_tokens is the len/4
+        # output-text estimate (see metering.metered_stream_usage).
+        payload["usage_estimated"] = True
     await emit_event(
         claims,
         source="gateway",

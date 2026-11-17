@@ -148,8 +148,48 @@ def test_parse_duplicate_dimension_last_wins() -> None:
 def test_parse_overall_non_numeric_ignored() -> None:
     payload = {"scores": [{"dimension": "d", "score": 5}], "overall": "great"}
     parsed = parse_scores_json(json.dumps(payload))
-    assert parsed.overall is None
-    assert any("overall" in w for w in parsed.warnings)
+    # non-numeric overall is ignored, then synthesized from the entries
+    assert parsed.overall == 5.0
+    assert any("not numeric" in w for w in parsed.warnings)
+    assert any("computed as mean" in w for w in parsed.warnings)
+
+
+def test_parse_overall_synthesized_when_missing() -> None:
+    """Dimension scores without an `overall` must not leave the field null —
+    the results matrix treats it as the headline score."""
+    payload = {
+        "scores": [
+            {"dimension": "functional_requirements", "score": 8},
+            {"dimension": "code_quality", "score": 4},
+        ]
+    }
+    parsed = parse_scores_json(json.dumps(payload))
+    assert parsed.overall == 6.0
+    assert parsed.warnings == [
+        "overall missing — computed as mean of dimension scores"
+    ]
+
+
+def test_parse_genuine_overall_not_flagged() -> None:
+    """A real `overall` is used verbatim — no synthesis warning."""
+    parsed = parse_scores_json(json.dumps(GOOD))
+    assert parsed.overall == 7.2
+    assert not any("computed as mean" in w for w in parsed.warnings)
+
+
+def test_parse_overall_synthesis_rounds_to_one_decimal() -> None:
+    payload = {
+        "scores": [
+            {"dimension": "a", "score": 8},
+            {"dimension": "b", "score": 7},
+            {"dimension": "c", "score": 9},
+        ]
+    }
+    parsed = parse_scores_json(json.dumps(payload))
+    assert parsed.overall == 8.0  # 24/3 — mean rounded to 1 decimal
+    payload["scores"].append({"dimension": "d", "score": 7})
+    parsed = parse_scores_json(json.dumps(payload))
+    assert parsed.overall == 7.8  # 31/4 = 7.75 -> 7.8
 
 
 def test_parse_bool_score_rejected() -> None:
@@ -216,8 +256,10 @@ def test_parse_salvages_bare_array_plus_truncated_object() -> None:
         "functional_requirements",
         "code_quality",
     ]
-    # trailing object was truncated -> overall lost, entries salvaged
-    assert parsed.overall is None
+    # trailing object was truncated -> genuine overall lost; the mean of
+    # the salvaged entries is synthesized instead (flagged in warnings)
+    assert parsed.overall == 10.0
+    assert any("computed as mean" in w for w in parsed.warnings)
 
 
 def test_parse_salvages_bare_array_plus_complete_object() -> None:

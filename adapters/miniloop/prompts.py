@@ -54,6 +54,14 @@ You act ONLY through tool calls. Available tools:
 """
 
 
+# Corrective nudge injected on EVERY tool-less assistant reply before the
+# reply counts toward the text-only stuck streak — many small models answer
+# in plain prose unless explicitly told prose is invalid here.
+AGENT_NUDGE = (
+    "You must respond with a tool call. Available tools: shell, read_file, "
+    "write_file, done. Do not reply in plain text."
+)
+
 NUDGE_TEXT_STREAK_2 = (
     "Reminder: you must take action through tool calls — plain-text replies "
     "do not change the workspace. If the task is already complete, call the "

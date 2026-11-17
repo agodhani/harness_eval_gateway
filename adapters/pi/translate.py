@@ -46,6 +46,31 @@ def _checkpoint(stage: str, **fields: Any) -> dict[str, Any]:
     return {"type": "checkpoint", "payload": {"stage": stage, **fields}}
 
 
+def _tool_error_detail(obj: dict[str, Any]) -> str | None:
+    """Best-effort failure detail out of a ``tool_execution_end``-shaped
+    record (stream record or extension-forwarded ``event``).
+
+    Pi reports tool errors under varying keys — probe the message-ish
+    fields first, then the result payload (``{content|text|stderr|message}``
+    dict or a bare string). Returns None when the record truly carries no
+    detail — callers fall back to a named-tool fallback so the event is
+    never an opaque ``{"tool": "bash"}`` with no hint what went wrong.
+    """
+    for key in ("error", "message", "stderr"):
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            return _truncate(value, 2000)
+    result = obj.get("result")
+    if isinstance(result, str) and result.strip():
+        return _truncate(result, 2000)
+    if isinstance(result, dict):
+        for key in ("content", "text", "stderr", "message", "error"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return _truncate(value, 2000)
+    return None
+
+
 def _assistant_text(message: dict[str, Any]) -> str | None:
     content = message.get("content")
     if isinstance(content, str):
@@ -127,16 +152,27 @@ def translate_obj(obj: dict[str, Any]) -> list[dict[str, Any]]:
         if obj.get("isError"):
             # Thin signal only — the extension hook's tool_result carries the
             # result payload, same as the success path's thin checkpoint.
-            return [
-                {
-                    "type": "error",
-                    "payload": {
-                        "stage": "tool_execution",
-                        "tool": obj.get("toolName"),
-                        "tool_call_id": obj.get("toolCallId"),
-                    },
-                }
-            ]
+            # Still surface whatever detail the record holds: stderr/message/
+            # result text when present, else a named-tool fallback naming the
+            # call — a bare {"tool": "bash"} error is impossible to diagnose.
+            tool = obj.get("toolName")
+            exit_code = obj.get("exitCode", obj.get("exit_code"))
+            payload: dict[str, Any] = {
+                "stage": "tool_execution",
+                "tool": tool,
+                "tool_call_id": obj.get("toolCallId"),
+            }
+            detail = _tool_error_detail(obj)
+            if detail is not None:
+                payload["message"] = detail
+            else:
+                payload["detail"] = (
+                    f"{tool or 'tool'} execution failed"
+                    + (f" (exit code {exit_code})" if exit_code is not None else "")
+                )
+            if exit_code is not None:
+                payload["exit_code"] = exit_code
+            return [{"type": "error", "payload": payload}]
         return [
             _checkpoint(
                 "tool_execution_end",
@@ -244,6 +280,20 @@ def translate_hook(obj: dict[str, Any]) -> list[dict[str, Any]]:
     }
     if event.get("result") is not None:
         payload["output"] = _truncate(event.get("result"))
+    if payload["is_error"]:
+        # Same anti-opacity rule as the stream path: stderr/message when pi
+        # sends one, else a fallback naming the tool (and its exit code).
+        detail = _tool_error_detail(event)
+        exit_code = event.get("exitCode", event.get("exit_code"))
+        if detail is not None:
+            payload["message"] = detail
+        else:
+            payload["message"] = (
+                f"{payload.get('name') or 'tool'} failed"
+                + (f" (exit code {exit_code})" if exit_code is not None else "")
+            )
+        if exit_code is not None:
+            payload["exit_code"] = exit_code
     return [
         {
             "type": "tool_result",

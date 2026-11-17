@@ -195,6 +195,7 @@ export function EventRow({
   onToggle,
   showSandbox = true,
   sandboxName,
+  displaySource,
 }: {
   ev: EventOut;
   expanded: boolean;
@@ -203,8 +204,17 @@ export function EventRow({
   showSandbox?: boolean;
   /** PR1 named harness config — chip shows the name instead of the short id. */
   sandboxName?: string;
+  /** Effective source label when it differs from the raw `source` column —
+   * judge-phase rows display "evaluator" even though the eval sandbox's
+   * miniloop emitted them as "harness" (lib/evalPhase.ts boundary rule). */
+  displaySource?: string;
 }) {
   const isErr = ev.type === "error";
+  const source = displaySource ?? ev.source;
+  const sourceNote =
+    displaySource && displaySource !== ev.source
+      ? `emitted as ${ev.source} — judge-phase activity (eval creds share this sandbox's timeline)`
+      : undefined;
   return (
     <>
       <div
@@ -222,8 +232,8 @@ export function EventRow({
       >
         <span className="tl-id">#{ev.id}</span>
         <span className="tl-time">{formatTimeMs(ev.ts)}</span>
-        <span className="tl-src">
-          <Badge tone={sourceTone(ev.source)}>{ev.source}</Badge>
+        <span className="tl-src" title={sourceNote}>
+          <Badge tone={sourceTone(source)}>{source}</Badge>
         </span>
         <span className="tl-type" data-type={ev.type}>{ev.type}</span>
         {showSandbox ? (

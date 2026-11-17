@@ -39,7 +39,7 @@ from gateway.creds import mint_cred
 from gateway.metering import tokens_used
 from sandbox.runtime import SandboxRuntime
 
-from . import monitor, provision, state_machine
+from . import monitor, pacing, provision, state_machine
 from .events import emit
 from .matrix import expanded_configs
 
@@ -52,6 +52,10 @@ EvaluatorFn = Callable[..., Awaitable[Any]]
 #: equal timeouts would let cancellation preempt evaluate_sandbox's
 #: soft-stop + scores.json salvage path.
 _EVAL_TIMEOUT_MARGIN_SECONDS = 60.0
+
+#: Poll cadence while a rescore waits for the execution slot — the same
+#: lane the PR15 submission queue serializes (pacing.ACTIVE_RUN_STATES).
+_RESCORE_SLOT_POLL_SECONDS = 5.0
 
 
 def _now() -> datetime:
@@ -516,6 +520,17 @@ async def _run_lifecycle(
     if run is None:
         log.warning("run_lifecycle: run %s not found", run_id)
         return
+    if run.status != "provisioning":
+        # Bail rather than spawn: a run only reaches this task via
+        # place_run/claim_next_queued (both leave it 'provisioning'), so any
+        # other status means the run was cancelled or swept between the
+        # claim and task start — spawning sandboxes now would defy that.
+        log.warning(
+            "run_lifecycle: run %s is %r, expected 'provisioning' — aborting",
+            run_id,
+            run.status,
+        )
+        return
 
     # 1) Provision one sandbox per expanded matrix cell (sequential awaits).
     configs = _sandbox_configs(run)
@@ -608,6 +623,54 @@ async def _run_lifecycle(
 # ---------------------------------------------------------------------------
 # re-score (PR5)
 # ---------------------------------------------------------------------------
+
+
+async def _await_rescore_slot(
+    session_factory: sessionmaker[Session], run_id: uuid.UUID
+) -> None:
+    """Park until no OTHER run holds the execution slot.
+
+    The API's ``_prepare_rescore`` moves the run to ``evaluating`` at request
+    time, so the rescore already owns a queue position — only OTHER runs in
+    ``pacing.ACTIVE_RUN_STATES`` can be ahead of us. ``queued`` runs never
+    overtake (our ``evaluating`` status blocks ``claim_next_queued``) and
+    promote when this pass finishes — the runner's ``finally`` calls
+    ``promote_next_queued`` just like ``_lifecycle_then_promote`` does.
+
+    Emits one ``rescore_queued`` checkpoint when the wait actually parks —
+    the timeline-visible counterpart to pacing's ``run_queued``. A vanished
+    run (hard delete racing a direct, non-API call) exits the wait quietly.
+    """
+    parked = False
+    while True:
+        with session_factory() as session:
+            if session.get(Run, run_id) is None:
+                log.warning("rescore_run: run %s vanished mid-wait", run_id)
+                return
+            active = int(
+                session.scalar(
+                    select(func.count(Run.id)).where(
+                        Run.id != run_id,
+                        Run.status.in_(pacing.ACTIVE_RUN_STATES),
+                    )
+                )
+                or 0
+            )
+        if active == 0:
+            return
+        if not parked:
+            parked = True
+            _emit_run_event(
+                session_factory,
+                run_id,
+                event_type="checkpoint",
+                payload={
+                    "stage": "rescore_queued",
+                    "ahead": active,
+                    "reason": "another run holds the execution slot",
+                },
+            )
+        await asyncio.sleep(_RESCORE_SLOT_POLL_SECONDS)
 
 
 def _enter_evaluating(
@@ -729,6 +792,22 @@ async def _rescore_run(
         log.warning("rescore_run: run %s not found", run_id)
         return
 
+    # Cancelled runs never spawned — there is nothing to re-score. They are
+    # in RUN_TERMINAL for sweep/delete semantics, but a rescore pass here
+    # would force cancelled→evaluating then land the run on "failed".
+    if run.status == "cancelled":
+        log.warning("rescore_run: run %s is cancelled — nothing to re-score", run_id)
+        _emit_run_event(
+            session_factory,
+            run_id,
+            event_type="error",
+            payload={
+                "stage": "rescore",
+                "message": "run is cancelled — nothing to re-score",
+            },
+        )
+        return
+
     # Re-score only applies to terminal runs (the API 409s earlier; this is
     # defense-in-depth for non-API callers). The one legitimate non-terminal
     # state is ``evaluating`` WITH a rescore marker — _prepare_rescore moves
@@ -785,6 +864,19 @@ async def _rescore_run(
             )
             _finalize_rescore(session_factory, run_id, rubric=None)
             return
+
+    # Slot discipline (same lane as the PR15 submission queue): a rescore
+    # triggered while another run executes must NOT run its evaluator
+    # concurrently — park until the slot frees. The rescore's own run is
+    # already `evaluating` (API path), so it can't be overtaken by queued
+    # runs; they promote from this pass's finally instead.
+    await _await_rescore_slot(session_factory, run_id)
+
+    # The wait may have raced a delete/cancel of this run — re-check before
+    # spending judge calls on a gone/dead run.
+    run = _load_run(session_factory, run_id)
+    if run is None:
+        return
 
     evaluator_model = model or (run.config or {}).get("evaluator_model") or run.model_name
     _enter_evaluating(
