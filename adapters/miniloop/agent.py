@@ -12,6 +12,14 @@ text-only replies), ``error`` (unhandled exception / bad config).
 Text-only replies first get ``MINILOOP_NUDGE_RETRIES`` corrective nudges
 (default 2, ``stage="agent_nudge"`` checkpoints) that demand a tool call —
 only replies after the nudge budget is spent count toward the streak.
+
+The model-call HTTP timeout is ``MINILOOP_LLM_TIMEOUT_SECONDS`` (default
+960) — it must EXCEED the gateway's worst-case silent hold on one call,
+(1 + UPSTREAM_RETRY_ATTEMPTS) x UPSTREAM_TIMEOUT_SECONDS + total retry
+backoff (~915s under the shipped defaults): an agent that gives up first
+abandons a call the gateway is still paying for upstream. Deployments
+that raise the gateway's timeout/retry knobs must raise this one
+proportionally.
 """
 
 from __future__ import annotations
@@ -74,7 +82,11 @@ class AgentConfig:
     num_ctx: int = 32768
     keep_alive: str = "30m"
     compact_ratio: float = 0.7
-    request_timeout: float = 600.0
+    # Per model-call timeout (MINILOOP_LLM_TIMEOUT_SECONDS). Must exceed
+    # the gateway's worst-case hold on a call — (1 + UPSTREAM_RETRY_ATTEMPTS)
+    # x UPSTREAM_TIMEOUT_SECONDS + total retry backoff (~915s by default) —
+    # or the agent abandons a call the gateway is still paying for upstream.
+    request_timeout: float = 960.0
     # Optional harness-config axis (F2): extra instructions appended to the
     # system prompt verbatim — e.g. comparing skill packs vs. prompt tweaks.
     system_prompt_extra: str = ""
@@ -112,6 +124,12 @@ class AgentConfig:
             nudge_retries = max(0, int(env.get("MINILOOP_NUDGE_RETRIES", "2")))
         except ValueError:
             nudge_retries = 2
+        try:
+            request_timeout = max(
+                1.0, float(env.get("MINILOOP_LLM_TIMEOUT_SECONDS", "960"))
+            )
+        except ValueError:
+            request_timeout = 960.0
 
         return cls(
             gateway_base_url=base,
@@ -125,6 +143,7 @@ class AgentConfig:
             max_tokens=max_tokens,
             system_prompt_extra=(env.get("SYSTEM_PROMPT_EXTRA") or "").strip(),
             nudge_retries=nudge_retries,
+            request_timeout=request_timeout,
         )
 
 
@@ -150,7 +169,7 @@ class HttpChatClient:
         cred: str,
         model: str,
         *,
-        timeout: float = 600.0,
+        timeout: float = 960.0,
         transport: httpx.BaseTransport | None = None,
         extra_body: dict[str, Any] | None = None,
         temperature: float = 0.2,

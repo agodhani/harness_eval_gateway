@@ -108,21 +108,26 @@ time.
 ## 2. Rubric generation — `orchestrator/rubric.py`
 
 Triggered by the background task started in `POST /api/runs` (not in-request —
-LLM call can take minutes on a 3B model).
+LLM call can take minutes on a 3B model). Draft calls serialize process-wide
+under `RUBRIC_GEN_CONCURRENCY` (default 1) — a run parked on the gate stays
+`submitted` and emits a `rubric_queued` checkpoint (pre-queue; no execution
+slot consumed).
 
 - `async def draft_rubric(run_id) -> None`: load run → mint run cred
   (`sandbox_id=None`, `ttl=3600`, `max_tokens = tokens_used + EVAL_TOKEN_BUDGET`)
   → POST
-  `{settings.GATEWAY_URL}/v1/chat/completions` (httpx, `timeout=180`,
-  `temperature=0.2`, `max_tokens=2048`, `stream=False`) with
+  `{settings.GATEWAY_URL}/v1/chat/completions` (httpx,
+  `timeout=RUBRIC_GEN_TIMEOUT_SECONDS` (default 960), `temperature=0.2`,
+  `max_tokens=RUBRIC_MAX_TOKENS`, `stream=False`) with
   `model = settings.RUBRIC_MODEL or run.model_name` → parse → validate →
   **single transaction**: insert `Rubric(version=1, status="draft")` +
   `run.status="rubric_review"` + orchestrator `checkpoint` event. Any failure →
   `run.status="failed"` + `error` event (resubmit is the recovery; no retry
   endpoint in MVP).
 - `parse_rubric_json(text) -> RubricContent`: strip ```` ``` ```` fences /
-  leading prose, `json.loads`, validate. On failure, **one** retry with a
-  "respond with ONLY the JSON object" nudge appended.
+  leading prose, `json.loads`, validate. On failure → bounded
+  `RUBRIC_GEN_RETRIES` retries (default 2) with the error fed back into
+  the retry prompt.
 - `RubricContent` (pydantic, `extra="allow"`):
   `summary: str`, `dimensions: list[{name, title, description, weight=1.0,
   min_score=0.0, max_score=10.0}]`, `criteria: list[{id, text, dimension,
@@ -301,7 +306,8 @@ total `Score` rows for the run == 0 → `run.status="failed"` + error event
 - **`token_budget` is per-run**, not per-sandbox (gateway semantics). If
   per-sandbox budgets are wanted later, monitor sums per-sandbox
   `llm_response` tokens — flagged in open questions.
-- **LLM timeouts:** rubric call 180 s + 1 retry; evaluator `wait_for` 1800 s.
+- **LLM timeouts:** rubric call `RUBRIC_GEN_TIMEOUT_SECONDS` (default 960) +
+  `RUBRIC_GEN_RETRIES` (default 2); evaluator `wait_for` 1800 s.
 
 ## 7. File/module layout + wiring
 

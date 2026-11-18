@@ -70,15 +70,17 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from typing import Annotated, Any
 
+import anyio
 import httpx
 from fastapi import APIRouter, Body, Depends, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.types import Send
 
 from api.schemas import EventSource, EventType
 from gateway import metering
@@ -234,6 +236,34 @@ async def _emit_upstream_retry(
         retry_delay_seconds=delay,
         provider=provider,
     )
+
+
+async def _emit_client_disconnected(
+    claims: CredClaims,
+    *,
+    meter: bool,
+    provider: ProviderName,
+    latency_ms: int,
+    message: str,
+) -> None:
+    """Best-effort terminal event for a call the client abandoned.
+
+    Raised from inside the cancelled request task, so this runs under a
+    SHIELDED cancel scope — every checkpoint would otherwise re-raise
+    ``Cancelled`` and the event would be dropped, leaving the streamed
+    call unaccounted (live-observed: deepseek giving up mid-request left
+    zero ``llm_response`` events).
+    """
+    if not meter:
+        return
+    with anyio.CancelScope(shield=True):
+        await metering.emit_error(
+            claims,
+            stage="client_disconnected",
+            message=message,
+            latency_ms=latency_ms,
+            provider=provider,
+        )
 
 
 async def _upstream_post(
@@ -466,16 +496,26 @@ async def chat_completions(
         )
 
     started = time.monotonic()
-    result = await _upstream_post(
-        upstream=upstream,
-        path="/v1/chat/completions",
-        body=out,
-        claims=claims,
-        provider=provider,
-        request_headers=request.headers,
-        stream=False,
-        started=started,
-    )
+    try:
+        result = await _upstream_post(
+            upstream=upstream,
+            path="/v1/chat/completions",
+            body=out,
+            claims=claims,
+            provider=provider,
+            request_headers=request.headers,
+            stream=False,
+            started=started,
+        )
+    except asyncio.CancelledError:
+        await _emit_client_disconnected(
+            claims,
+            meter=True,
+            provider=provider,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            message="client disconnected while awaiting upstream response",
+        )
+        raise
     if isinstance(result, JSONResponse):
         return result
     upstream_resp = result
@@ -487,33 +527,57 @@ async def chat_completions(
     except Exception:  # noqa: BLE001 - non-JSON upstream body
         response_json = None
     usage = metering.usage_from_response(response_json)
-    await metering.emit_llm_response(
-        claims,
-        model=out.get("model"),
-        usage=usage,
-        latency_ms=latency_ms,
-        http_status=upstream_resp.status_code,
-        provider=provider,
-    )
-    if not 200 <= upstream_resp.status_code < 300:
-        await metering.emit_error(
+    response_emitted = False
+    try:
+        await metering.emit_llm_response(
             claims,
-            stage="upstream",
-            message=upstream_resp.text[:500],
-            http_status=upstream_resp.status_code,
+            model=out.get("model"),
+            usage=usage,
             latency_ms=latency_ms,
+            http_status=upstream_resp.status_code,
             provider=provider,
         )
-    else:
-        await _cache_store(
-            cache,
-            cache_key,
-            status=upstream_resp.status_code,
-            content_type=upstream_resp.headers.get(
-                "content-type", "application/json"
-            ),
-            body=upstream_resp.content,
-        )
+        response_emitted = True
+        if not 200 <= upstream_resp.status_code < 300:
+            await metering.emit_error(
+                claims,
+                stage="upstream",
+                message=upstream_resp.text[:500],
+                http_status=upstream_resp.status_code,
+                latency_ms=latency_ms,
+                provider=provider,
+            )
+        else:
+            await _cache_store(
+                cache,
+                cache_key,
+                status=upstream_resp.status_code,
+                content_type=upstream_resp.headers.get(
+                    "content-type", "application/json"
+                ),
+                body=upstream_resp.content,
+            )
+    except asyncio.CancelledError:
+        with anyio.CancelScope(shield=True):
+            if not response_emitted:
+                await metering.emit_llm_response(
+                    claims,
+                    model=out.get("model"),
+                    usage=usage,
+                    latency_ms=latency_ms,
+                    http_status=upstream_resp.status_code,
+                    provider=provider,
+                )
+            await metering.emit_error(
+                claims,
+                stage="client_disconnected",
+                message="client disconnected while metering upstream response",
+                http_status=upstream_resp.status_code,
+                latency_ms=latency_ms,
+                provider=provider,
+                usage=usage,
+            )
+        raise
 
     return Response(
         content=upstream_resp.content,
@@ -573,6 +637,35 @@ async def _budget_gate(
     )
 
 
+class _GuardedStreamingResponse(StreamingResponse):
+    """StreamingResponse that always runs ``on_finalize`` when the send
+    loop exits — normal completion, send failure, or task cancellation.
+
+    The metering generator's own ``finally`` covers every exit AFTER its
+    first iteration, but a client already gone when ``http.response.start``
+    is sent (OSError under ASGI spec>=2.4, stream-task cancellation under
+    <2.4) prevents the generator from ever starting — and an unstarted
+    async generator's ``finally`` does not run, so terminal metering and
+    the upstream close would silently never happen.
+    """
+
+    def __init__(
+        self,
+        content: Any,
+        *,
+        on_finalize: Callable[[], Awaitable[None]],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(content, **kwargs)
+        self._on_finalize = on_finalize
+
+    async def stream_response(self, send: Send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            await self._on_finalize()
+
+
 async def _passthrough(
     *,
     path: str,
@@ -611,6 +704,16 @@ async def _passthrough(
     emitted events are identical to a live call (payload ``cached: true``).
     Only fully-captured 2xx responses are stored; ``meter=False`` callers
     (e.g. count_tokens preflight) bypass the cache entirely.
+
+    Client abandonment never leaves the call unaccounted: a disconnect
+    while the upstream request is in flight emits a ``client_disconnected``
+    -staged ``error`` event, and a disconnect mid-stream emits the partial
+    ``llm_response`` (usage captured so far or ``usage_estimated``) plus
+    the same error — all under a shielded cancel scope, since Starlette
+    delivers the disconnect by cancelling this generator. A disconnect
+    before the stream's first byte never even starts the generator, so
+    ``_GuardedStreamingResponse`` guarantees that same teardown from the
+    send loop's own ``finally``.
     """
     body = _strip_ollama_only(body, provider)
     if meter:
@@ -655,28 +758,45 @@ async def _passthrough(
         cache_key = None
 
     started = time.monotonic()
-    result = await _upstream_post(
-        upstream=upstream,
-        path=path,
-        body=body,
-        claims=claims,
-        provider=provider,
-        request_headers=request_headers,
-        stream=True,
-        started=started,
-        meter=meter,
-    )
+    try:
+        result = await _upstream_post(
+            upstream=upstream,
+            path=path,
+            body=body,
+            claims=claims,
+            provider=provider,
+            request_headers=request_headers,
+            stream=True,
+            started=started,
+            meter=meter,
+        )
+    except asyncio.CancelledError:
+        await _emit_client_disconnected(
+            claims,
+            meter=meter,
+            provider=provider,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            message="client disconnected while awaiting upstream response",
+        )
+        raise
     if isinstance(result, JSONResponse):
         return result
     upstream_resp = result
 
+    # Generator-lifecycle state shared with the response-level teardown:
+    # the send loop can die before the generator's first __anext__ (client
+    # already gone at http.response.start), which skips its finally.
+    stream_state = {"started": False, "emitted": False}
+
     async def _aiter():
+        stream_state["started"] = True
         # Bounded capture for metering: the client stream is unbounded, but
         # usage/output text only needs the head — past the cap the emitted
         # usage simply degrades to the estimate path.
         captured = bytearray()
         truncated = False
         complete = False
+        abandoned = False
         stream_error: Exception | None = None
         try:
             async for chunk in upstream_resp.aiter_bytes():
@@ -687,21 +807,154 @@ async def _passthrough(
                         ]
                     else:
                         truncated = True
-                yield chunk
+                try:
+                    yield chunk
+                except (GeneratorExit, asyncio.CancelledError, OSError):
+                    # An exception at the yield means the DOWNSTREAM side
+                    # is dead — send failed or the task was cancelled on
+                    # disconnect (Starlette cancels the stream task).
+                    # Upstream-read failures raise from the async-for.
+                    abandoned = True
+                    raise
             complete = True
         except Exception as exc:
             # Mid-stream transport failure: the body already reached the
             # client so retrying is impossible — terminal by definition.
             stream_error = exc
             raise
+        except BaseException:
+            # GeneratorExit/CancelledError raised on the upstream-read
+            # await — the generator was closed or the task cancelled
+            # mid-stream; the client is gone either way.
+            abandoned = True
+            raise
         finally:
+            stream_state["emitted"] = True
             latency_ms = int((time.monotonic() - started) * 1000)
+            # Shield the terminal events: after a client disconnect every
+            # checkpoint re-raises Cancelled, which would silently drop
+            # llm_response AND the error event — an unaccounted streamed
+            # call whose upstream tokens were still spent.
+            with anyio.CancelScope(shield=True):
+                try:
+                    if meter:
+                        captured_b = bytes(captured)
+                        parsed = metering.metered_stream_usage(
+                            captured_b, api=api
+                        )
+                        await metering.emit_llm_response(
+                            claims,
+                            model=body.get("model"),
+                            usage=parsed["usage"],
+                            latency_ms=latency_ms,
+                            http_status=upstream_resp.status_code,
+                            provider=provider,
+                            usage_estimated=parsed["estimated"],
+                        )
+                        if abandoned:
+                            # Mid-stream disconnect: the llm_response
+                            # above accounts the partial stream (real
+                            # usage if a usage frame arrived, else the
+                            # len/4 estimate); this marks the lane dead.
+                            await metering.emit_error(
+                                claims,
+                                stage="client_disconnected",
+                                message=(
+                                    "client disconnected mid-stream "
+                                    f"({len(captured_b)} bytes streamed)"
+                                ),
+                                http_status=upstream_resp.status_code,
+                                latency_ms=latency_ms,
+                                provider=provider,
+                                usage=parsed["usage"],
+                                usage_estimated=parsed["estimated"],
+                            )
+                        elif stream_error is not None:
+                            await metering.emit_error(
+                                claims,
+                                stage="upstream",
+                                message=(
+                                    f"{type(stream_error).__name__}: "
+                                    f"{stream_error}"
+                                ),
+                                http_status=upstream_resp.status_code,
+                                latency_ms=latency_ms,
+                                provider=provider,
+                            )
+                        elif not 200 <= upstream_resp.status_code < 300:
+                            await metering.emit_error(
+                                claims,
+                                stage="upstream",
+                                message=captured_b.decode(
+                                    "utf-8", errors="replace"
+                                )[:500],
+                                http_status=upstream_resp.status_code,
+                                latency_ms=latency_ms,
+                                provider=provider,
+                            )
+                        else:
+                            # Provider-reported mid-stream failures
+                            # (OpenRouter et al. stream {"error": ...}
+                            # frames under a 200).
+                            for err in parsed["errors"]:
+                                await metering.emit_error(
+                                    claims,
+                                    stage="upstream",
+                                    message=err,
+                                    http_status=upstream_resp.status_code,
+                                    latency_ms=latency_ms,
+                                    provider=provider,
+                                )
+                            if complete and not truncated:
+                                # Cache only fully-captured 2xx bodies —
+                                # partial streams (client abort, transport
+                                # error, capture cap) would replay
+                                # truncated output.
+                                await _cache_store(
+                                    cache,
+                                    cache_key,
+                                    status=upstream_resp.status_code,
+                                    content_type=upstream_resp.headers.get(
+                                        "content-type", "application/json"
+                                    ),
+                                    body=captured_b,
+                                )
+                except Exception:
+                    # Metering must never break the proxy — and a raise
+                    # here would reproduce the silent-terminal-event gap
+                    # this whole block exists to prevent.
+                    log.warning(
+                        "terminal stream metering failed", exc_info=True
+                    )
+                finally:
+                    try:
+                        await upstream_resp.aclose()
+                    except Exception:
+                        log.warning(
+                            "upstream response close failed", exc_info=True
+                        )
+
+    agen = _aiter()
+
+    async def _stream_finalized() -> None:
+        # The send loop is done — deterministically close the generator so
+        # a mid-stream send failure (generator left suspended at a yield)
+        # still runs its own terminal-emission finally.
+        if stream_state["emitted"]:
+            return
+        with anyio.CancelScope(shield=True):
+            try:
+                await agen.aclose()
+            except Exception:
+                log.warning("metered stream aclose failed", exc_info=True)
+            if stream_state["emitted"]:
+                return
+            # The generator never ran: emit the terminal pair and release
+            # the upstream connection from here or the call meters nothing.
             try:
                 if meter:
-                    captured_b = bytes(captured)
-                    parsed = metering.metered_stream_usage(
-                        captured_b, api=api
-                    )
+                    latency_ms = int((time.monotonic() - started) * 1000)
+                    parsed = metering.metered_stream_usage(b"", api=api)
                     await metering.emit_llm_response(
                         claims,
                         model=body.get("model"),
@@ -711,66 +964,37 @@ async def _passthrough(
                         provider=provider,
                         usage_estimated=parsed["estimated"],
                     )
-                    if stream_error is not None:
-                        await metering.emit_error(
-                            claims,
-                            stage="upstream",
-                            message=(
-                                f"{type(stream_error).__name__}: "
-                                f"{stream_error}"
-                            ),
-                            http_status=upstream_resp.status_code,
-                            latency_ms=latency_ms,
-                            provider=provider,
-                        )
-                    elif not 200 <= upstream_resp.status_code < 300:
-                        await metering.emit_error(
-                            claims,
-                            stage="upstream",
-                            message=captured_b.decode(
-                                "utf-8", errors="replace"
-                            )[:500],
-                            http_status=upstream_resp.status_code,
-                            latency_ms=latency_ms,
-                            provider=provider,
-                        )
-                    else:
-                        # Provider-reported mid-stream failures (OpenRouter
-                        # et al. stream {"error": ...} frames under a 200).
-                        for err in parsed["errors"]:
-                            await metering.emit_error(
-                                claims,
-                                stage="upstream",
-                                message=err,
-                                http_status=upstream_resp.status_code,
-                                latency_ms=latency_ms,
-                                provider=provider,
-                            )
-                        if complete and not truncated:
-                            # Cache only fully-captured 2xx bodies —
-                            # partial streams (client abort, transport
-                            # error, capture cap) would replay truncated
-                            # output.
-                            await _cache_store(
-                                cache,
-                                cache_key,
-                                status=upstream_resp.status_code,
-                                content_type=upstream_resp.headers.get(
-                                    "content-type", "application/json"
-                                ),
-                                body=captured_b,
-                            )
+                    await metering.emit_error(
+                        claims,
+                        stage="client_disconnected",
+                        message=(
+                            "client disconnected before response start"
+                            if not stream_state["started"]
+                            else "client disconnected mid-stream"
+                        ),
+                        http_status=upstream_resp.status_code,
+                        latency_ms=latency_ms,
+                        provider=provider,
+                        usage=parsed["usage"],
+                        usage_estimated=parsed["estimated"],
+                    )
+            except Exception:
+                log.warning("terminal stream metering failed", exc_info=True)
             finally:
-                await upstream_resp.aclose()
+                try:
+                    await upstream_resp.aclose()
+                except Exception:
+                    log.warning("upstream response close failed", exc_info=True)
 
-    return StreamingResponse(
-        _aiter(),
+    return _GuardedStreamingResponse(
+        agen,
         status_code=upstream_resp.status_code,
         headers={
             "content-type": upstream_resp.headers.get(
                 "content-type", "application/json"
             )
         },
+        on_finalize=_stream_finalized,
     )
 
 

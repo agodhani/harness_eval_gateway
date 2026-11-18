@@ -494,6 +494,50 @@ def test_config_nudge_retries_env(
     assert AgentConfig.from_env().nudge_retries == 2
 
 
+def test_config_llm_timeout_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """MINILOOP_LLM_TIMEOUT_SECONDS bounds each model call — it must
+    out-wait the gateway's worst-case call hold so the agent never
+    abandons a call the gateway is still paying for upstream."""
+    monkeypatch.setenv("GATEWAY_BASE_URL", "http://gw")
+    monkeypatch.setenv("MODEL_NAME", "m")
+    monkeypatch.setenv("TASK_PROMPT", "t")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    monkeypatch.delenv("MINILOOP_LLM_TIMEOUT_SECONDS", raising=False)
+    assert AgentConfig.from_env().request_timeout == 960.0
+    monkeypatch.setenv("MINILOOP_LLM_TIMEOUT_SECONDS", "900")
+    assert AgentConfig.from_env().request_timeout == 900.0
+    monkeypatch.setenv("MINILOOP_LLM_TIMEOUT_SECONDS", "banana")
+    assert AgentConfig.from_env().request_timeout == 960.0
+
+
+def test_config_llm_timeout_outwaits_gateway_worst_case(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The default must exceed the gateway's worst-case silent hold on one
+    call: (1 + UPSTREAM_RETRY_ATTEMPTS) attempts each burning the whole
+    UPSTREAM_TIMEOUT_SECONDS, plus the summed exponential retry backoff —
+    derived from GatewaySettings' declared defaults so a gateway-side bump
+    that breaks the guarantee fails this test."""
+    from gateway.config import GatewaySettings
+
+    monkeypatch.setenv("GATEWAY_BASE_URL", "http://gw")
+    monkeypatch.setenv("MODEL_NAME", "m")
+    monkeypatch.setenv("TASK_PROMPT", "t")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    monkeypatch.delenv("MINILOOP_LLM_TIMEOUT_SECONDS", raising=False)
+
+    fields = GatewaySettings.model_fields
+    attempts = 1 + int(fields["UPSTREAM_RETRY_ATTEMPTS"].default)
+    upstream_timeout = float(fields["UPSTREAM_TIMEOUT_SECONDS"].default)
+    backoff_base = float(fields["UPSTREAM_RETRY_BACKOFF_SECONDS"].default)
+    worst_case = attempts * upstream_timeout + sum(
+        backoff_base * (2**i) for i in range(attempts - 1)
+    )
+    assert AgentConfig.from_env().request_timeout > worst_case
+
+
 # ---------------------------------------------------------------------------
 # HttpChatClient request formation (MockTransport — still hermetic)
 # ---------------------------------------------------------------------------

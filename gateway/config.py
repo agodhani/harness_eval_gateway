@@ -125,7 +125,12 @@ class GatewaySettings(BaseSettings):
     # claim. A cred's own max_tokens overrides this.
     DEFAULT_RUN_TOKEN_BUDGET: int = 200_000
 
-    UPSTREAM_TIMEOUT: float = 300.0
+    # Whole-request timeout for the upstream httpx clients (connect+read
+    # bound per attempt). Congested local providers queue calls
+    # server-side, so this must exceed the slowest expected generation —
+    # a firing read timeout abandons upstream work the client still
+    # waits on (the retry then re-queues it). Raise it for big models.
+    UPSTREAM_TIMEOUT_SECONDS: float = 300.0
     INGEST_TIMEOUT: float = 10.0
 
     # --- Transient upstream retry (bughunt) ---

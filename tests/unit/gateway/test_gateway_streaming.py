@@ -10,15 +10,19 @@ override; ingest emission is monkeypatched — no live Ollama/Postgres/api.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from typing import Any
 
 import httpx
 import pytest
+from anyio.lowlevel import checkpoint
 from fastapi.testclient import TestClient
+from starlette.responses import ClientDisconnect
 
 from gateway import metering
+from gateway.config import get_settings
 from gateway.creds import mint_cred
 from gateway.deps import get_ollama_client, get_upstream_client
 from gateway.main import app
@@ -400,3 +404,335 @@ def test_stream_estimated_usage_on_empty_stream(
         "total_tokens": 0,
     }
     assert payload["usage_estimated"] is True
+
+
+# ---------------------------------------------------------------------------
+# retried streams — exactly one llm_response (bughunt follow-up)
+# ---------------------------------------------------------------------------
+
+_ANTHROPIC_SSE_USAGE = (
+    'event: message_start\ndata: {"type":"message_start","message":'
+    '{"usage":{"input_tokens":9,"output_tokens":1}}}\n\n'
+    'event: content_block_delta\ndata: {"type":"content_block_delta",'
+    '"delta":{"type":"text_delta","text":"hi"}}\n\n'
+    'event: message_delta\ndata: {"type":"message_delta",'
+    '"usage":{"output_tokens":7}}\n\n'
+)
+
+
+def _next_step(steps: Any) -> httpx.Response:
+    step = next(steps)
+    if isinstance(step, Exception):
+        raise step
+    return step
+
+
+def test_messages_stream_retried_emits_one_llm_response(
+    gw_client: TestClient,
+    upstream: Any,
+    emitted: list,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A /v1/messages stream that ReadTimeouts once then succeeds emits
+    exactly ONE llm_response — the post-retry stream goes through the same
+    metering tee as a first-attempt stream."""
+    monkeypatch.setattr(get_settings(), "UPSTREAM_RETRY_BACKOFF_SECONDS", 0)
+    steps = iter(
+        [
+            httpx.ReadTimeout("read timed out"),
+            httpx.Response(
+                200,
+                text=_ANTHROPIC_SSE_USAGE,
+                headers={"content-type": "text/event-stream"},
+            ),
+        ]
+    )
+    upstream["handler"] = lambda _req: _next_step(steps)
+
+    resp = gw_client.post(
+        "/v1/messages",
+        json={**_MESSAGES_BODY, "stream": True},
+        headers=_auth(_cred()),
+    )
+    assert resp.status_code == 200
+    assert resp.text == _ANTHROPIC_SSE_USAGE
+    assert len(upstream["seen"]) == 2
+
+    assert [c["type"] for c in emitted] == [
+        "llm_request",
+        "error",
+        "llm_response",
+    ]
+    retry = emitted[1]["payload"]
+    assert retry["stage"] == "upstream_retry"
+    assert "ReadTimeout" in retry["message"]
+    usage = emitted[2]["payload"]["usage"]
+    assert usage == {"prompt_tokens": 9, "completion_tokens": 7, "total_tokens": 16}
+
+
+# ---------------------------------------------------------------------------
+# client abandonment (bughunt — live-observed metering gap): a client that
+# disconnects mid-stream must still leave llm_response (partial usage, or
+# usage_estimated) + a client_disconnected error event. Emission runs under
+# a shielded cancel scope — Starlette delivers disconnects by cancelling
+# the stream task, so unshielded emit awaits re-raise Cancelled and the
+# call leaves NOTHING.
+# ---------------------------------------------------------------------------
+
+
+def _messages_scope(cred: str) -> dict[str, Any]:
+    """Minimal POST /v1/messages ASGI scope at spec 2.3 (uvicorn's level —
+    Starlette then disconnects via a collapsing task group)."""
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"authorization", f"Bearer {cred}".encode()),
+            (b"content-type", b"application/json"),
+        ],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+
+
+def _checkpointing_emit(
+    monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, Any]]
+) -> None:
+    """Emit-capture that HITS an anyio checkpoint per call — reproduces the
+    production emit path (httpx ingest POST) where the first await inside
+    a cancelled scope re-raises Cancelled. A checkpoint-free fake would
+    'emit' fine under cancellation and mask the bug."""
+
+    async def fake_emit_event(
+        claims, *, source: str, event_type: str, payload: dict[str, Any]
+    ) -> None:
+        await checkpoint()  # anyio checkpoint — dies in a cancelled scope
+        calls.append(
+            {
+                "run_id": claims.run_id,
+                "sandbox_id": claims.sandbox_id,
+                "source": source,
+                "type": event_type,
+                "payload": payload,
+            }
+        )
+
+    monkeypatch.setattr(metering, "emit_event", fake_emit_event)
+
+
+def test_abandoned_stream_emits_terminal_events(
+    upstream: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Client disconnects mid-stream: llm_response still lands (partial
+    capture → usage_estimated) + error stage=client_disconnected."""
+    calls: list[dict[str, Any]] = []
+    _checkpointing_emit(monkeypatch, calls)
+
+    chunk = (
+        b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+        b'"delta":{"type":"text_delta","text":"hello"}}\n\n'
+    )
+
+    class _NeverEnding(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self._sent = False
+
+        async def __aiter__(self):
+            if not self._sent:
+                self._sent = True
+                yield chunk
+            await asyncio.Event().wait()  # streams forever until cancelled
+
+        async def aclose(self) -> None:
+            return None
+
+    upstream["handler"] = lambda _req: httpx.Response(
+        200,
+        stream=_NeverEnding(),
+        headers={"content-type": "text/event-stream"},
+    )
+
+    first_body = asyncio.Event()
+    sent: list[dict[str, Any]] = []
+    request_sent = False
+
+    async def receive() -> dict[str, Any]:
+        # First call feeds the request body; the next — which only happens
+        # once StreamingResponse starts listening for disconnects — waits
+        # for the first streamed chunk, then reports the disconnect.
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {
+                "type": "http.request",
+                "body": json.dumps({**_MESSAGES_BODY, "stream": True}).encode(),
+                "more_body": False,
+            }
+        await first_body.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+        if message["type"] == "http.response.body" and message.get("body"):
+            first_body.set()
+
+    async def _drive() -> None:
+        scope = _messages_scope(_cred())
+        await app(scope, receive, send)
+
+    asyncio.run(_drive())
+
+    # The first chunk reached the (then-gone) client, then the lane died.
+    body_msgs = [m for m in sent if m["type"] == "http.response.body"]
+    assert body_msgs and body_msgs[0]["body"] == chunk
+
+    types = [c["type"] for c in calls]
+    assert types == ["llm_request", "llm_response", "error"]
+    resp_payload = calls[1]["payload"]
+    assert resp_payload["usage_estimated"] is True
+    assert resp_payload["http_status"] == 200
+    err = calls[2]["payload"]
+    assert err["stage"] == "client_disconnected"
+    assert err["usage_estimated"] is True
+    assert err["usage"] == resp_payload["usage"]
+
+
+def test_disconnect_during_upstream_wait_emits_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Client gives up while the gateway is still awaiting the upstream
+    (headers / retry backoff): llm_request + a client_disconnected error —
+    upstream may still be burning tokens, so the call can't end silent."""
+    calls: list[dict[str, Any]] = []
+    _checkpointing_emit(monkeypatch, calls)
+
+    send_started = asyncio.Event()
+
+    class _HangingClient:
+        """Upstream client whose send() never returns headers."""
+
+        def build_request(
+            self, method: str, path: str, json: Any = None, headers: Any = None
+        ) -> httpx.Request:
+            return httpx.Request(
+                method, f"http://upstream.test{path}", json=json, headers=headers
+            )
+
+        async def send(self, request: httpx.Request, stream: bool = False) -> httpx.Response:
+            send_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable — cancelled while waiting")
+
+    async def _dep():
+        yield _HangingClient()
+
+    app.dependency_overrides[get_upstream_client] = _dep
+    try:
+        scope = _messages_scope(_cred())
+
+        async def receive() -> dict[str, Any]:
+            return {
+                "type": "http.request",
+                "body": json.dumps({**_MESSAGES_BODY, "stream": True}).encode(),
+                "more_body": False,
+            }
+
+        sent: list[dict[str, Any]] = []
+
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        async def _drive() -> None:
+            task = asyncio.create_task(app(scope, receive, send))
+            await send_started.wait()
+            # The client's HTTP layer is gone — uvicorn cancels the request
+            # task mid-flight.
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_drive())
+    finally:
+        app.dependency_overrides.pop(get_upstream_client, None)
+
+    types = [c["type"] for c in calls]
+    # No response ever reached the client — llm_request + the terminal
+    # disconnect error; llm_response stays reserved for real responses.
+    assert types == ["llm_request", "error"]
+    assert calls[1]["payload"]["stage"] == "client_disconnected"
+
+
+def test_disconnect_at_response_start_emits_terminal_events(
+    upstream: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """spec>=2.4: the client is already gone when http.response.start is
+    sent, so send() raises OSError before the metering generator's first
+    iteration — an unstarted async generator's finally NEVER runs. The
+    response-level teardown must still land llm_response + a
+    client_disconnected error and close the upstream connection."""
+    calls: list[dict[str, Any]] = []
+    _checkpointing_emit(monkeypatch, calls)
+
+    class _TrackedStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def __aiter__(self):
+            yield b'data: {"type":"message_stop"}\n\n'
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = _TrackedStream()
+    upstream["handler"] = lambda _req: httpx.Response(
+        200,
+        stream=stream,
+        headers={"content-type": "text/event-stream"},
+    )
+
+    scope = _messages_scope(_cred())
+    scope["asgi"]["spec_version"] = "2.4"  # send-failure disconnect path
+
+    async def receive() -> dict[str, Any]:
+        return {
+            "type": "http.request",
+            "body": json.dumps({**_MESSAGES_BODY, "stream": True}).encode(),
+            "more_body": False,
+        }
+
+    sent: list[dict[str, Any]] = []
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+        if message["type"] == "http.response.start":
+            raise OSError("write to a closed socket")
+
+    async def _drive() -> None:
+        # spec>=2.4: send failure → ClientDisconnect (possibly re-wrapped as
+        # OSError when a middleware's error response hits the dead socket).
+        with pytest.raises((ClientDisconnect, OSError)):
+            await app(scope, receive, send)
+
+    asyncio.run(_drive())
+
+    # The stream generator was never iterated — the upstream connection
+    # still had to be released by the response-level teardown.
+    assert stream.closed
+
+    types = [c["type"] for c in calls]
+    assert types == ["llm_request", "llm_response", "error"]
+    resp_payload = calls[1]["payload"]
+    assert resp_payload["usage_estimated"] is True
+    assert resp_payload["http_status"] == 200
+    err = calls[2]["payload"]
+    assert err["stage"] == "client_disconnected"
+    assert err["usage"] == resp_payload["usage"]

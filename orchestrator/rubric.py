@@ -9,6 +9,13 @@ in ONE transaction inserts a ``draft`` Rubric row, moves the run to
 ``rubric_review``, and emits orchestrator checkpoint events. Failure marks the
 run ``failed`` — resubmit is the recovery (no retry endpoint in MVP).
 
+Generation is paced process-wide: ``_rubric_gen_semaphore``
+(``RUBRIC_GEN_CONCURRENCY``, default 1) serializes the provider call across
+concurrent submits — the PR15 run queue paces EXECUTION, but drafting fires
+at submit time ahead of it. A run that finds the gate taken emits a
+``stage="rubric_queued"`` checkpoint and stays ``submitted`` until its turn
+(pre-queue: it never consumes an execution slot).
+
 The generation call is fault-tolerant at two levels (live-observed flake
 modes: a 429/5xx upstream, thinking-model output truncation, ``generated_by``
 emitted as a bare string): a bounded retry loop (``RUBRIC_GEN_RETRIES``
@@ -160,6 +167,21 @@ class RubricParseError(ValueError):
 #: env override) — covers transient upstream failures (429/5xx, timeouts)
 #: and parse/validation failures alike. Total attempts = 1 + retries.
 DEFAULT_GEN_RETRIES = 2
+#: Concurrent rubric generations allowed process-wide
+#: (``RUBRIC_GEN_CONCURRENCY`` env override) — 1 = serialized. Drafting is
+#: the pipeline's one pre-queue provider call: parallel submits used to
+#: thrash a single-model upstream (live-observed model-swap + ~2h read
+#: timeouts, every run failed), so the generation phase paces itself
+#: instead of relying on the PR15 execution queue it precedes.
+DEFAULT_GEN_CONCURRENCY = 1
+#: Per-call HTTP timeout for the draft generation request
+#: (``RUBRIC_GEN_TIMEOUT_SECONDS`` env override). Must EXCEED the gateway's
+#: worst-case silent hold on one call — (1 + UPSTREAM_RETRY_ATTEMPTS) x
+#: UPSTREAM_TIMEOUT_SECONDS + total retry backoff (~915s under the shipped
+#: defaults) — or a congested draft abandons the call while the gateway is
+#: still paying for it upstream, and the retry then overlaps the orphaned
+#: job (the bounded version of the pileup the semaphore exists to prevent).
+DEFAULT_GEN_TIMEOUT_SECONDS = 960.0
 #: Base seconds of the linear backoff between transient-failure retries.
 _RETRY_BACKOFF_SECONDS = 1.0
 #: Cap on the validation-error detail echoed back into the retry prompt —
@@ -170,6 +192,13 @@ _RETRY_ERROR_CAP = 300
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
     except ValueError:
         return default
 
@@ -559,6 +588,65 @@ def _mark_failed(
         session.commit()
 
 
+# ---------------------------------------------------------------------------
+# generation pacing — one provider call at a time, process-wide
+# ---------------------------------------------------------------------------
+
+_gen_sem: asyncio.Semaphore | None = None
+_gen_sem_permits: int | None = None
+
+
+def _rubric_gen_semaphore() -> asyncio.Semaphore:
+    """Process-wide cap on concurrent rubric generations.
+
+    Sized ``RUBRIC_GEN_CONCURRENCY`` (default :data:`DEFAULT_GEN_CONCURRENCY`
+    = 1 → serialized). Module-level: one api process owns every
+    ``draft_rubric`` task (submit path AND the startup-sweep respawn), so a
+    plain ``asyncio.Semaphore`` paces them all. Built lazily — the env is
+    read at first use, not import — and rebuilt when the env value changes
+    so tests/late overrides get a correctly-sized gate (asyncio semaphores
+    can't be resized in place; parked waiters stay on the old object).
+    """
+    global _gen_sem, _gen_sem_permits
+    permits = max(1, _env_int("RUBRIC_GEN_CONCURRENCY", DEFAULT_GEN_CONCURRENCY))
+    if _gen_sem is None or permits != _gen_sem_permits:
+        _gen_sem = asyncio.Semaphore(permits)
+        _gen_sem_permits = permits
+    return _gen_sem
+
+
+def _emit_queued(
+    session_factory: sessionmaker[Session], run_id: uuid.UUID
+) -> None:
+    """``rubric_queued`` checkpoint — the run is parked on the generation
+    semaphore, still ``submitted`` (pre-queue; no execution slot taken).
+
+    Purely explanatory (the timeline shows WHY the run is waiting): a
+    failure here — e.g. the run was deleted mid-queue — mustn't abort the
+    draft, which still proceeds to wait on the semaphore.
+    """
+    try:
+        with session_factory() as session:
+            emit(
+                session,
+                run_id=run_id,
+                event_type="checkpoint",
+                payload={
+                    "stage": "rubric_queued",
+                    "detail": (
+                        "rubric generation is serialized "
+                        "(RUBRIC_GEN_CONCURRENCY) — waiting behind an "
+                        "in-flight draft"
+                    ),
+                },
+            )
+            session.commit()
+    except Exception:  # noqa: BLE001 — observability only, never fatal
+        log.warning(
+            "draft_rubric: could not emit rubric_queued for run %s", run_id
+        )
+
+
 async def draft_rubric(
     run_id: uuid.UUID,
     *,
@@ -568,39 +656,57 @@ async def draft_rubric(
 ) -> None:
     """Generate + persist a draft rubric for ``run_id`` (background task).
 
+    The generation phase (cred mint → gateway call → retries) is serialized
+    process-wide by :func:`_rubric_gen_semaphore` — submits arrive together
+    but a single-model provider can only serve one draft at a time. A run
+    that finds the semaphore taken emits a ``rubric_queued`` checkpoint and
+    stays ``submitted`` while it waits; the run-queue slot is untouched
+    (this precedes it).
+
     Never raises — failures mark the run ``failed`` with an orchestrator
     ``error`` event so the API surface stays consistent.
     """
     own_client = client is None
     if client is None:
-        client = httpx.AsyncClient(timeout=180.0)
+        client = httpx.AsyncClient(
+            timeout=_env_float(
+                "RUBRIC_GEN_TIMEOUT_SECONDS", DEFAULT_GEN_TIMEOUT_SECONDS
+            )
+        )
     try:
         run = _load_run(session_factory, run_id)
         if run is None:
             log.warning("draft_rubric: run %s not found", run_id)
             return
 
-        # Run-level cred: no sandbox_id; max_tokens = tokens already spent
-        # (~0 at draft time) + EVAL_TOKEN_BUDGET — an explicit allowance so
-        # drafting can't 429 on the shared default budget. TTL covers the call.
-        with session_factory() as session:
-            used = tokens_used(session, run.id)
-        cred = mint_cred(
-            run_id=run.id,
-            sandbox_id=None,
-            secret=settings.GATEWAY_CRED_SECRET,
-            ttl_seconds=3600,
-            max_tokens=used + int(settings.EVAL_TOKEN_BUDGET),
-        )
-        model = settings.RUBRIC_MODEL or run.model_name
-        content = await _request_rubric(
-            client,
-            gateway_url=settings.GATEWAY_URL,
-            cred=cred,
-            model=model,
-            task_prompt=run.task_prompt,
-            max_tokens=int(settings.RUBRIC_MAX_TOKENS),
-        )
+        sem = _rubric_gen_semaphore()
+        if sem.locked():
+            # Would block → say so before parking. A free semaphore skips
+            # the event entirely; retries INSIDE the gate don't re-emit.
+            _emit_queued(session_factory, run_id)
+        async with sem:
+            # Run-level cred: no sandbox_id; max_tokens = tokens already
+            # spent (~0 at draft time) + EVAL_TOKEN_BUDGET — an explicit
+            # allowance so drafting can't 429 on the shared default budget.
+            # TTL covers the call.
+            with session_factory() as session:
+                used = tokens_used(session, run.id)
+            cred = mint_cred(
+                run_id=run.id,
+                sandbox_id=None,
+                secret=settings.GATEWAY_CRED_SECRET,
+                ttl_seconds=3600,
+                max_tokens=used + int(settings.EVAL_TOKEN_BUDGET),
+            )
+            model = settings.RUBRIC_MODEL or run.model_name
+            content = await _request_rubric(
+                client,
+                gateway_url=settings.GATEWAY_URL,
+                cred=cred,
+                model=model,
+                task_prompt=run.task_prompt,
+                max_tokens=int(settings.RUBRIC_MAX_TOKENS),
+            )
         _persist_draft(session_factory, run_id, content, model=model)
         log.info("draft_rubric: run %s -> rubric_review", run_id)
     except Exception as exc:

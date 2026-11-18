@@ -105,6 +105,13 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (`RUBRIC_GEN_RETRIES`, default 2) cover transient upstream errors +
   validation failures (error fed back into the prompt), and lenient
   normalization coerces scalar `generated_by` + numeric-string fields.
+  Drafting is serialized process-wide (`RUBRIC_GEN_CONCURRENCY`, default
+  1) so parallel submits can't thrash a single-model provider; a run
+  parked on the semaphore stays `submitted` (pre-queue) and emits a
+  `rubric_queued` checkpoint. The draft call's per-attempt HTTP timeout
+  (`RUBRIC_GEN_TIMEOUT_SECONDS`, default 960) out-waits the gateway's
+  worst-case upstream hold (~915s) so a congested draft can't abandon a
+  call its retry would then overlap.
 - **Pacing (PR15):** one active run at a time — approvals while a run
   executes (or is queued) park in `queued` and promote FIFO by approval
   (`pacing.place_run` / `claim_next_queued`; promotion is wired into
@@ -143,7 +150,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   tee; `GET /v1/models` for CLI probes; per-run/sandbox HMAC credentials
   (`heg.<b64>.<sig>`); records tokens in/out, latency, failures; token
   budgets (429 + `error` event); emits `llm_request`/`llm_response`/`error`
-  events carrying the resolved upstream provider. `/internal/events`
+  events carrying the resolved upstream provider — every metered call is
+  terminally accounted, so a client disconnect mid-stream or while the
+  upstream request is in flight still lands `llm_response` (partial /
+  `usage_estimated`) plus `error` `stage="client_disconnected"` under a
+  shielded cancel scope; upstream calls bound by
+  `UPSTREAM_TIMEOUT_SECONDS` (default 300). `/internal/events`
   (harness-event proxy, cred or ingest-token auth) + `/internal/done`
   (done_signal) for sandbox egress.
 - **Upstreams:** `UPSTREAM_PROVIDER` picks the default provider —
@@ -178,7 +190,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (:8081→8080)
 - **Verify:**
   - Unit: `tests/unit/gateway/` (creds, metering, proxy — hermetic; protocol
-    pass-throughs + SSE usage normalization covered),
+    pass-throughs + SSE usage normalization covered; stream retry + client-
+    abandonment terminal events + upstream timeout wiring covered),
     `test_upstream_provider.py` (provider selection, key validation,
     PROVIDER_ROUTES resolution, `x-heg-provider` override, per-provider
     client base/headers, ollama-param stripping, anthropic protocol-header
@@ -222,7 +235,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   progressive-disclosure catalog in system prompt. Tool-less assistant
   replies get `MINILOOP_NUDGE_RETRIES` corrective nudges (default 2,
   `stage="agent_nudge"` checkpoints) before counting toward the text-only
-  `stuck_loop` streak.
+  `stuck_loop` streak. Per model-call timeout
+  `MINILOOP_LLM_TIMEOUT_SECONDS` (default 960 — must exceed the gateway's
+  worst-case call hold, (1 + `UPSTREAM_RETRY_ATTEMPTS`) ×
+  `UPSTREAM_TIMEOUT_SECONDS` + retry backoff, so calls aren't abandoned
+  mid-spend).
 - **Where:** `adapters/miniloop/` (`agent.py`, `tools.py`, `events.py`,
   `skills.py`, `prompts.py`, `adapter.py`, `__main__.py`), `skillpacks/`
 - **Verify:**
@@ -354,7 +371,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `SCORING_TESTGEN=0` disables (conftest pins it); knobs:
   `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
   `TESTGEN_MAX_FILES` (8), `TESTGEN_MAX_TOKENS` (4096),
-  `TESTGEN_TIMEOUT_SECONDS` (240, the one raised-cap retry gets 2×),
+  `TESTGEN_TIMEOUT_SECONDS` (960, the one raised-cap retry gets up to 2×,
+  clamped to the eval-attempt deadline),
   `TESTGEN_MAX_TOKENS_RETRY` (8192) — retries cover empty content,
   zero-runnable-file output, and timeouts. A scores doc missing
   `overall` gets it synthesized as the mean of dimension scores +
@@ -409,7 +427,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   renders per-sandbox score columns + an `overall` row once results exist
   (`RunDetailClient.tsx` `RubricView` + `getRunResults` poll while
   `evaluating`). Sandboxes whose eval failed surface an `eval failed` badge
-  (from `SandboxResult.eval_error`) instead of blank score cells. Directory
+  (from `SandboxResult.eval_error`) instead of blank score cells, and a
+  file-less workspace lights an `empty workspace` badge
+  (`SandboxResult.empty_workspace`, sourced from the stored
+  `sandbox_finalized`/`empty_workspace` checkpoint payloads — no FS
+  re-probe). Directory
   artifact downloads ship as ZIPs that filter `.git`, `__pycache__`,
   `*.pyc`, `node_modules`, `.venv` at any depth (download-side only — the
   raw workspace on disk is untouched).

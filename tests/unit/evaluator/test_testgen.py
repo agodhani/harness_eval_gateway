@@ -10,6 +10,7 @@ judge brief + results API read.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -330,12 +331,14 @@ async def test_empty_content_retries_with_raised_caps(
     """Live-observed qwen3:8b failure: reasoning burned the output budget
     → empty content. ONE retry at TESTGEN_MAX_TOKENS_RETRY + 2x timeout."""
     client = _FakeClient(texts=["", GOOD_OUTPUT])
-    report = await _gen(python_ws, gen_dir, client=client)
+    report = await _gen(
+        python_ws, gen_dir, client=client, timeout_seconds=240.0
+    )
     assert report.status == "ok"
     assert len(client.calls) == 2
     assert client.calls[0]["json"]["max_tokens"] == 4096
     assert client.calls[1]["json"]["max_tokens"] == 8192  # raised cap
-    assert client.calls[1]["timeout"] == 480.0  # 2x TESTGEN_TIMEOUT_SECONDS
+    assert client.calls[1]["timeout"] == 480.0  # 2x the per-attempt timeout
     assert report.metrics["retried"] is True
     assert any("retrying" in w for w in report.warnings)
 
@@ -407,6 +410,42 @@ async def test_no_retry_on_first_success(python_ws: Path, gen_dir: Path) -> None
     client = _FakeClient()
     report = await _gen(python_ws, gen_dir, client=client)
     assert report.status == "ok"
+    assert len(client.calls) == 1
+    assert report.metrics["retried"] is False
+
+
+async def test_retry_timeout_clamped_to_attempt_deadline(
+    python_ws: Path, gen_dir: Path
+) -> None:
+    """The raised-cap retry must fit inside the caller's attempt deadline —
+    a retry that outlives the eval envelope gets hard-cancelled by the
+    orchestrator's wait_for instead of degrading to a report."""
+    client = _FakeClient(texts=[httpx.ReadTimeout("t1"), GOOD_OUTPUT])
+    report = await _gen(
+        python_ws,
+        gen_dir,
+        client=client,
+        timeout_seconds=960.0,
+        attempt_deadline=time.monotonic() + 300.0,
+    )
+    assert report.status == "ok"
+    assert len(client.calls) == 2
+    assert 0 < client.calls[1]["timeout"] <= 300.0
+
+
+async def test_retry_skipped_when_attempt_budget_exhausted(
+    python_ws: Path, gen_dir: Path
+) -> None:
+    """Below the retry-budget floor the retry never fires — degrade to
+    skipped so the judge keeps the rest of the eval envelope."""
+    client = _FakeClient(texts=[httpx.ReadTimeout("t1"), GOOD_OUTPUT])
+    report = await _gen(
+        python_ws,
+        gen_dir,
+        client=client,
+        attempt_deadline=time.monotonic() + 10.0,
+    )
+    assert report.status == "skipped"
     assert len(client.calls) == 1
     assert report.metrics["retried"] is False
 
@@ -582,3 +621,27 @@ def test_parse_sanitizes_names_and_dedupes() -> None:
         "test_generated_3.py",
     ]
     assert all("/" not in n for n in names)
+
+
+# ----------------------------------------------------------------------
+# generation call timeout bound
+# ----------------------------------------------------------------------
+
+
+def test_default_timeout_outwaits_gateway_worst_case() -> None:
+    """TESTGEN_TIMEOUT_SECONDS' default must exceed the gateway's worst-case
+    silent hold on one call: (1 + UPSTREAM_RETRY_ATTEMPTS) attempts each
+    burning the whole UPSTREAM_TIMEOUT_SECONDS, plus the summed exponential
+    retry backoff — derived from GatewaySettings' declared defaults so a
+    gateway-side bump that breaks the guarantee fails this test."""
+    from evaluator.testgen import DEFAULT_TIMEOUT_SECONDS
+    from gateway.config import GatewaySettings
+
+    fields = GatewaySettings.model_fields
+    attempts = 1 + int(fields["UPSTREAM_RETRY_ATTEMPTS"].default)
+    upstream_timeout = float(fields["UPSTREAM_TIMEOUT_SECONDS"].default)
+    backoff_base = float(fields["UPSTREAM_RETRY_BACKOFF_SECONDS"].default)
+    worst_case = attempts * upstream_timeout + sum(
+        backoff_base * (2**i) for i in range(attempts - 1)
+    )
+    assert DEFAULT_TIMEOUT_SECONDS > worst_case

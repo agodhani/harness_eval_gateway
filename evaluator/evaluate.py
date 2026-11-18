@@ -232,6 +232,7 @@ async def _collect_generated_tests(
     model: str,
     gateway_base_url: str,
     cred: str,
+    attempt_deadline: float | None = None,
 ) -> SignalReport | None:
     """PR8: generate + execute an LLM-written pytest suite; never raises.
 
@@ -248,6 +249,7 @@ async def _collect_generated_tests(
             cred=cred,
             model=model,
             rubric=rubric,
+            attempt_deadline=attempt_deadline,
         )
     except Exception:
         logger.warning(
@@ -677,6 +679,14 @@ async def evaluate_sandbox(
         model=model_name,
         gateway_base_url=gateway_base_url,
         cred=cred_token,
+        # Same bound the orchestrator's outer wait_for enforces on the whole
+        # attempt — keeps the raised-cap retry inside the envelope so a slow
+        # retry degrades to skipped instead of a hard cancel.
+        attempt_deadline=(
+            attempt_started
+            + float(timeout_seconds)
+            + float(deadline_margin_seconds)
+        ),
     )
     if gen_sig is not None:
         # A declined (``skipped``) signal rides along inside an existing

@@ -117,7 +117,8 @@ adapters are added.
    `response_format=json_object`; `EVAL_DIRECT_FALLBACK=0` disables) lands
    scores when the agentic judge's output is unusable. Testgen retries the
    generation call once at raised caps on empty/timed-out/zero-file output
-   (`TESTGEN_MAX_TOKENS_RETRY`, 2× `TESTGEN_TIMEOUT_SECONDS`); a scores doc
+   (`TESTGEN_MAX_TOKENS_RETRY`, up to 2× `TESTGEN_TIMEOUT_SECONDS` clamped
+   to the eval-attempt deadline); a scores doc
    missing `overall` gets it synthesized as the dimension mean + a warning.
 7. **Artifact store** — `./data/artifacts/<run_id>/<sandbox_id>/` — repo
    tarballs, transcripts, event exports.
@@ -131,6 +132,10 @@ adapters are added.
    landing while a run executes (or is already queued) parks in `queued`
    and promotes FIFO by approval when the slot frees (lifecycle end or the
    next startup sweep). `started_at` = approval/queue-entry time.
+   Drafting itself is pre-queue: a process-wide semaphore
+   (`RUBRIC_GEN_CONCURRENCY`, default 1) serializes the gateway call across
+   parallel submits — a run parked on it stays `submitted` and emits a
+   `rubric_queued` checkpoint while it waits.
 3. **Provision** — prepare identical initial repo; build/launch N sandboxes.
    `spawn_one` additionally gates each `docker run` on host memory headroom
    (`SPAWN_MIN_FREE_MEM_MB`, probed via `/proc/meminfo` → `sysconf` →
@@ -224,7 +229,12 @@ hosted providers; Ollama keeps everything free). Miniloop retries a
 tool-less reply with a corrective `agent_nudge` message
 (`MINILOOP_NUDGE_RETRIES`, default 2) before it counts toward the
 text-only `stuck_loop` streak — small models answer in prose unless told
-prose is invalid.
+prose is invalid. Its per model-call timeout is
+`MINILOOP_LLM_TIMEOUT_SECONDS` (default 960) and must exceed the
+gateway's worst-case silent hold on one call — (1 +
+`UPSTREAM_RETRY_ATTEMPTS`) × `UPSTREAM_TIMEOUT_SECONDS` + total retry
+backoff (~915s under the shipped defaults) — an agent that gives up
+first abandons a call the gateway is still paying for upstream.
 
 **Default skill packs** (named presets, vendored under `skillpacks/`):
 `superpowers`, `mattpocock-skills`, `spec-kit`.
@@ -267,7 +277,7 @@ counts, failing names, and coverage land in the `generated_tests`
 copy staged for the judge. Flags: `SCORING_TESTGEN=0` disables (conftest
 pins it); `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
 `TESTGEN_MAX_FILES` (8), `TESTGEN_MAX_TOKENS` (4096),
-`TESTGEN_TIMEOUT_SECONDS` (240). `EXEC_TEST_TARGET` is the
+`TESTGEN_TIMEOUT_SECONDS` (960). `EXEC_TEST_TARGET` is the
 ExecRunner→runner env contract for the suite mount.
 
 Flow: auto-generated from task spec → HITL review/edit in UI → frozen →
@@ -430,6 +440,16 @@ or tests change.
   (`usage_from_sse`). `/v1/chat/completions` now honors `stream: true` the
   same way (pi streams unconditionally; the old force-`stream:false`
   returned a bare JSON body its SSE reader dropped as an empty response).
+  Every metered call leaves a terminal event: a client that disconnects
+  mid-stream still gets `llm_response` (partial capture or
+  `usage_estimated`) plus an `error` `stage="client_disconnected"`, and
+  one that disconnects while the gateway awaits upstream headers/retries
+  gets the same `client_disconnected` error — all emitted under a
+  shielded anyio cancel scope, since Starlette delivers the disconnect by
+  cancelling the stream task and unshielded emit awaits would re-raise
+  `Cancelled` (live-observed: a dsh lane left `llm_request` + zero
+  `llm_response`). Upstream timeouts are `UPSTREAM_TIMEOUT_SECONDS`
+  (default 300) on the gateway side.
 - **CLI image pattern**: node:slim base + `python3` for the shim + pinned
   npm CLI + `adapters/` under `/opt/harness` + `done` at `/usr/local/bin`.
   npm install happens before COPY so dependency layers cache. DeepSeek's

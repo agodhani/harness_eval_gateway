@@ -28,7 +28,11 @@ Env knobs (all optional):
 - ``EVAL_DIRECT_FALLBACK`` — ``0``/``false``/``off`` disables the fallback
   entirely (default ON).
 - ``EVAL_DIRECT_MAX_TOKENS`` — request ``max_tokens`` (default 4096).
-- ``EVAL_DIRECT_TIMEOUT_SECONDS`` — HTTP timeout (default 240).
+- ``EVAL_DIRECT_TIMEOUT_SECONDS`` — HTTP timeout (default 960). Must
+  exceed the gateway's worst-case silent hold on one call —
+  (1 + UPSTREAM_RETRY_ATTEMPTS) x UPSTREAM_TIMEOUT_SECONDS + retry backoff
+  (~915s under shipped defaults) — so the fallback never abandons a call
+  the gateway is still paying for upstream.
 - ``EVAL_DIRECT_SOURCE_BUDGET_BYTES`` — candidate-source bytes fed into the
   prompt (default 24000).
 """
@@ -62,7 +66,12 @@ from scoring.static import SKIP_DIRS
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOKENS = 4096
-DEFAULT_TIMEOUT_SECONDS = 240.0
+#: Must exceed the gateway's worst-case silent hold on one call —
+#: (1 + UPSTREAM_RETRY_ATTEMPTS) x UPSTREAM_TIMEOUT_SECONDS + retry backoff
+#: (~915s under shipped defaults) — or the fallback abandons a call the
+#: gateway keeps paying for upstream. The caller's asyncio.wait_for keeps
+#: this bounded by the eval attempt envelope.
+DEFAULT_TIMEOUT_SECONDS = 960.0
 DEFAULT_SOURCE_BUDGET_BYTES = 24_000
 #: Char cap on the staged ANALYSIS.md fed into the prompt.
 ANALYSIS_BUDGET_CHARS = 16_000

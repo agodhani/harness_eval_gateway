@@ -158,6 +158,47 @@ class TestSettings:
         with pytest.raises(ValidationError, match="ANTHROPIC_API_KEY"):
             _settings(UPSTREAM_PROVIDER="anthropic")
 
+    def test_upstream_timeout_seconds_default(self) -> None:
+        assert _settings().UPSTREAM_TIMEOUT_SECONDS == 300.0
+
+    def test_upstream_timeout_seconds_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """UPSTREAM_TIMEOUT_SECONDS env overrides the upstream httpx
+        timeout — congested local providers need headroom past 300s."""
+        monkeypatch.setenv("UPSTREAM_TIMEOUT_SECONDS", "620")
+        assert _settings().UPSTREAM_TIMEOUT_SECONDS == 620.0
+
+
+class TestUpstreamClientTimeout:
+    """deps' httpx clients take the configured whole-request timeout."""
+
+    async def test_upstream_client_uses_configured_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            deps.get_settings(), "UPSTREAM_TIMEOUT_SECONDS", 123.0
+        )
+        agen = deps.get_upstream_client("ollama")
+        client = await agen.__anext__()
+        try:
+            assert client.timeout.read == 123.0
+        finally:
+            await agen.aclose()
+
+    async def test_ollama_client_uses_configured_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            deps.get_settings(), "UPSTREAM_TIMEOUT_SECONDS", 45.0
+        )
+        agen = deps.get_ollama_client()
+        client = await agen.__anext__()
+        try:
+            assert client.timeout.read == 45.0
+        finally:
+            await agen.aclose()
+
 
 class TestProviderRoutes:
     """PROVIDER_ROUTES — JSON map of model globs → provider, resolved per

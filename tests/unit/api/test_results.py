@@ -162,6 +162,26 @@ def _error_event(session_factory, run_id, sandbox_id, payload, source="evaluator
         s.close()
 
 
+def _checkpoint_event(
+    session_factory, run_id, sandbox_id, payload, source="orchestrator"
+):
+    """Monitor-style checkpoint (``sandbox_finalized`` / warning markers)."""
+    s = session_factory()
+    try:
+        s.add(
+            Event(
+                run_id=run_id,
+                sandbox_id=sandbox_id,
+                source=source,
+                type="checkpoint",
+                payload=payload,
+            )
+        )
+        s.commit()
+    finally:
+        s.close()
+
+
 def test_run_results_surfaces_eval_failure(
     client: TestClient, scored_run, session_factory
 ) -> None:
@@ -254,6 +274,74 @@ def test_run_results_non_eval_errors_ignored(
         s for s in resp.json()["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"])
     )
     assert sb2["eval_error"] is None
+
+
+def test_run_results_empty_workspace_from_finalized_payload(
+    client: TestClient, scored_run, session_factory
+) -> None:
+    """``sandbox_finalized``'s ``empty_workspace`` payload key flags the
+    results row — read from the stored event, not the artifact FS."""
+    _checkpoint_event(
+        session_factory,
+        scored_run["run_id"],
+        scored_run["sb1"],
+        {
+            "stage": "sandbox_finalized",
+            "terminal_reason": "agent_done",
+            "sandbox_status": "done",
+            "empty_workspace": True,
+        },
+    )
+    # A finalized checkpoint WITHOUT the key is a normal finalize, not a flag.
+    _checkpoint_event(
+        session_factory,
+        scored_run["run_id"],
+        scored_run["sb2"],
+        {"stage": "sandbox_finalized", "terminal_reason": "timeout"},
+    )
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    body = resp.json()
+    sb1 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"]))
+    sb2 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"]))
+    assert sb1["empty_workspace"] is True
+    assert sb2["empty_workspace"] is False
+
+
+def test_run_results_empty_workspace_from_warning_checkpoint(
+    client: TestClient, scored_run, session_factory
+) -> None:
+    """The dedicated ``stage="empty_workspace"`` warning also flags the
+    row (the monitor emits it for done-ish exits; the finalized payload
+    key may be absent on older events)."""
+    _checkpoint_event(
+        session_factory,
+        scored_run["run_id"],
+        scored_run["sb2"],
+        {
+            "stage": "empty_workspace",
+            "severity": "warning",
+            "terminal_reason": "harness_complete",
+        },
+    )
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    body = resp.json()
+    sb1 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb1"]))
+    sb2 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"]))
+    assert sb2["empty_workspace"] is True
+    assert sb1["empty_workspace"] is False
+
+
+def test_run_results_empty_workspace_defaults_false(
+    client: TestClient, scored_run
+) -> None:
+    """No markers → every row reports false (the field is always present)."""
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/results")
+    assert resp.status_code == 200
+    assert all(
+        sb["empty_workspace"] is False for sb in resp.json()["sandboxes"]
+    )
 
 
 def test_run_results_includes_artifacts(
