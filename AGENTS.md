@@ -229,9 +229,11 @@ tool-less reply with a corrective `agent_nudge` message
 (`MINILOOP_NUDGE_RETRIES`, default 2) before it counts toward the
 text-only `stuck_loop` streak — small models answer in prose unless told
 prose is invalid. Its per model-call timeout is
-`MINILOOP_LLM_TIMEOUT_SECONDS` (default 600) and must exceed the
-gateway's `UPSTREAM_TIMEOUT_SECONDS` — an agent that gives up first
-abandons a call the gateway is still paying for upstream.
+`MINILOOP_LLM_TIMEOUT_SECONDS` (default 960) and must exceed the
+gateway's worst-case silent hold on one call — (1 +
+`UPSTREAM_RETRY_ATTEMPTS`) × `UPSTREAM_TIMEOUT_SECONDS` + total retry
+backoff (~915s under the shipped defaults) — an agent that gives up
+first abandons a call the gateway is still paying for upstream.
 
 **Default skill packs** (named presets, vendored under `skillpacks/`):
 `superpowers`, `mattpocock-skills`, `spec-kit`.

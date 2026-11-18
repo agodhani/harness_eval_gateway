@@ -233,8 +233,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   replies get `MINILOOP_NUDGE_RETRIES` corrective nudges (default 2,
   `stage="agent_nudge"` checkpoints) before counting toward the text-only
   `stuck_loop` streak. Per model-call timeout
-  `MINILOOP_LLM_TIMEOUT_SECONDS` (default 600 — must exceed the gateway's
-  `UPSTREAM_TIMEOUT_SECONDS` so calls aren't abandoned mid-spend).
+  `MINILOOP_LLM_TIMEOUT_SECONDS` (default 960 — must exceed the gateway's
+  worst-case call hold, (1 + `UPSTREAM_RETRY_ATTEMPTS`) ×
+  `UPSTREAM_TIMEOUT_SECONDS` + retry backoff, so calls aren't abandoned
+  mid-spend).
 - **Where:** `adapters/miniloop/` (`agent.py`, `tools.py`, `events.py`,
   `skills.py`, `prompts.py`, `adapter.py`, `__main__.py`), `skillpacks/`
 - **Verify:**

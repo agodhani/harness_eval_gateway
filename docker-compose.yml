@@ -75,8 +75,9 @@ services:
       PROVIDER_ROUTES: ${PROVIDER_ROUTES:-}
       # Miniloop agent's per model-call timeout (seconds) — the control plane
       # injects this into each miniloop sandbox's agent env; it must exceed
-      # the gateway's UPSTREAM_TIMEOUT_SECONDS so agents never abandon calls
-      # the gateway is still paying for upstream.
+      # the gateway's worst-case call hold ((1 + UPSTREAM_RETRY_ATTEMPTS) x
+      # UPSTREAM_TIMEOUT_SECONDS + retry backoff, ~915s by default) so agents
+      # never abandon calls the gateway is still paying for upstream.
       MINILOOP_LLM_TIMEOUT_SECONDS: ${MINILOOP_LLM_TIMEOUT_SECONDS:-}
       # --- Objective scoring (PR7) ---
       # Exec signal: candidate build/tests/coverage inside the locked
@@ -147,6 +148,10 @@ services:
       INGEST_TOKEN: dev-ingest-token
       GATEWAY_CRED_SECRET: dev-secret-change-me
       DEFAULT_RUN_TOKEN_BUDGET: "200000"
+      # Whole-request timeout per upstream attempt (seconds) — congested
+      # local providers queue calls server-side, so keep it comfortably
+      # above the slowest expected generation; raise for big/slow models.
+      UPSTREAM_TIMEOUT_SECONDS: ${UPSTREAM_TIMEOUT_SECONDS:-300}
       # PR18 — opt-in response cache for deterministic replay (dev/CI aid;
       # keep off for real runs). Path lives under the ./data mount below so
       # the store survives container rebuilds.
