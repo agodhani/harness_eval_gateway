@@ -63,6 +63,9 @@ services:
       # rubric JSON / scores.json into unparseable output.
       RUBRIC_MAX_TOKENS: ${RUBRIC_MAX_TOKENS:-8192}
       EVAL_JUDGE_MAX_TOKENS: ${EVAL_JUDGE_MAX_TOKENS:-8192}
+      # Bound on concurrent rubric-draft calls through the gateway (1 =
+      # serialized — the documented default; unset keeps it).
+      RUBRIC_GEN_CONCURRENCY: ${RUBRIC_GEN_CONCURRENCY:-}
       # Optional GitHub PAT for skillpack import (F11) — private repos +
       # higher rate limits; public repos work without it.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}

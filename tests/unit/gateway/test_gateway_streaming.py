@@ -19,6 +19,7 @@ import httpx
 import pytest
 from anyio.lowlevel import checkpoint
 from fastapi.testclient import TestClient
+from starlette.responses import ClientDisconnect
 
 from gateway import metering
 from gateway.config import get_settings
@@ -667,3 +668,71 @@ def test_disconnect_during_upstream_wait_emits_error(
     # disconnect error; llm_response stays reserved for real responses.
     assert types == ["llm_request", "error"]
     assert calls[1]["payload"]["stage"] == "client_disconnected"
+
+
+def test_disconnect_at_response_start_emits_terminal_events(
+    upstream: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """spec>=2.4: the client is already gone when http.response.start is
+    sent, so send() raises OSError before the metering generator's first
+    iteration — an unstarted async generator's finally NEVER runs. The
+    response-level teardown must still land llm_response + a
+    client_disconnected error and close the upstream connection."""
+    calls: list[dict[str, Any]] = []
+    _checkpointing_emit(monkeypatch, calls)
+
+    class _TrackedStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def __aiter__(self):
+            yield b'data: {"type":"message_stop"}\n\n'
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = _TrackedStream()
+    upstream["handler"] = lambda _req: httpx.Response(
+        200,
+        stream=stream,
+        headers={"content-type": "text/event-stream"},
+    )
+
+    scope = _messages_scope(_cred())
+    scope["asgi"]["spec_version"] = "2.4"  # send-failure disconnect path
+
+    async def receive() -> dict[str, Any]:
+        return {
+            "type": "http.request",
+            "body": json.dumps({**_MESSAGES_BODY, "stream": True}).encode(),
+            "more_body": False,
+        }
+
+    sent: list[dict[str, Any]] = []
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+        if message["type"] == "http.response.start":
+            raise OSError("write to a closed socket")
+
+    async def _drive() -> None:
+        # spec>=2.4: send failure → ClientDisconnect (possibly re-wrapped as
+        # OSError when a middleware's error response hits the dead socket).
+        with pytest.raises((ClientDisconnect, OSError)):
+            await app(scope, receive, send)
+
+    asyncio.run(_drive())
+
+    # The stream generator was never iterated — the upstream connection
+    # still had to be released by the response-level teardown.
+    assert stream.closed
+
+    types = [c["type"] for c in calls]
+    assert types == ["llm_request", "llm_response", "error"]
+    resp_payload = calls[1]["payload"]
+    assert resp_payload["usage_estimated"] is True
+    assert resp_payload["http_status"] == 200
+    err = calls[2]["payload"]
+    assert err["stage"] == "client_disconnected"
+    assert err["usage"] == resp_payload["usage"]

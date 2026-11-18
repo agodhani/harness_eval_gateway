@@ -70,7 +70,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -80,6 +80,7 @@ from fastapi import APIRouter, Body, Depends, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.types import Send
 
 from api.schemas import EventSource, EventType
 from gateway import metering
@@ -636,6 +637,35 @@ async def _budget_gate(
     )
 
 
+class _GuardedStreamingResponse(StreamingResponse):
+    """StreamingResponse that always runs ``on_finalize`` when the send
+    loop exits — normal completion, send failure, or task cancellation.
+
+    The metering generator's own ``finally`` covers every exit AFTER its
+    first iteration, but a client already gone when ``http.response.start``
+    is sent (OSError under ASGI spec>=2.4, stream-task cancellation under
+    <2.4) prevents the generator from ever starting — and an unstarted
+    async generator's ``finally`` does not run, so terminal metering and
+    the upstream close would silently never happen.
+    """
+
+    def __init__(
+        self,
+        content: Any,
+        *,
+        on_finalize: Callable[[], Awaitable[None]],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(content, **kwargs)
+        self._on_finalize = on_finalize
+
+    async def stream_response(self, send: Send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            await self._on_finalize()
+
+
 async def _passthrough(
     *,
     path: str,
@@ -680,7 +710,10 @@ async def _passthrough(
     -staged ``error`` event, and a disconnect mid-stream emits the partial
     ``llm_response`` (usage captured so far or ``usage_estimated``) plus
     the same error — all under a shielded cancel scope, since Starlette
-    delivers the disconnect by cancelling this generator.
+    delivers the disconnect by cancelling this generator. A disconnect
+    before the stream's first byte never even starts the generator, so
+    ``_GuardedStreamingResponse`` guarantees that same teardown from the
+    send loop's own ``finally``.
     """
     body = _strip_ollama_only(body, provider)
     if meter:
@@ -750,7 +783,13 @@ async def _passthrough(
         return result
     upstream_resp = result
 
+    # Generator-lifecycle state shared with the response-level teardown:
+    # the send loop can die before the generator's first __anext__ (client
+    # already gone at http.response.start), which skips its finally.
+    stream_state = {"started": False, "emitted": False}
+
     async def _aiter():
+        stream_state["started"] = True
         # Bounded capture for metering: the client stream is unbounded, but
         # usage/output text only needs the head — past the cap the emitted
         # usage simply degrades to the estimate path.
@@ -790,6 +829,7 @@ async def _passthrough(
             abandoned = True
             raise
         finally:
+            stream_state["emitted"] = True
             latency_ms = int((time.monotonic() - started) * 1000)
             # Shield the terminal events: after a client disconnect every
             # checkpoint re-raises Cancelled, which would silently drop
@@ -889,14 +929,67 @@ async def _passthrough(
                 finally:
                     await upstream_resp.aclose()
 
-    return StreamingResponse(
-        _aiter(),
+    agen = _aiter()
+
+    async def _stream_finalized() -> None:
+        # The send loop is done — deterministically close the generator so
+        # a mid-stream send failure (generator left suspended at a yield)
+        # still runs its own terminal-emission finally.
+        if stream_state["emitted"]:
+            return
+        with anyio.CancelScope(shield=True):
+            try:
+                await agen.aclose()
+            except Exception:
+                log.warning("metered stream aclose failed", exc_info=True)
+            if stream_state["emitted"]:
+                return
+            # The generator never ran: emit the terminal pair and release
+            # the upstream connection from here or the call meters nothing.
+            try:
+                if meter:
+                    latency_ms = int((time.monotonic() - started) * 1000)
+                    parsed = metering.metered_stream_usage(b"", api=api)
+                    await metering.emit_llm_response(
+                        claims,
+                        model=body.get("model"),
+                        usage=parsed["usage"],
+                        latency_ms=latency_ms,
+                        http_status=upstream_resp.status_code,
+                        provider=provider,
+                        usage_estimated=parsed["estimated"],
+                    )
+                    await metering.emit_error(
+                        claims,
+                        stage="client_disconnected",
+                        message=(
+                            "client disconnected before response start"
+                            if not stream_state["started"]
+                            else "client disconnected mid-stream"
+                        ),
+                        http_status=upstream_resp.status_code,
+                        latency_ms=latency_ms,
+                        provider=provider,
+                        usage=parsed["usage"],
+                        usage_estimated=parsed["estimated"],
+                    )
+            except Exception:
+                log.warning("terminal stream metering failed", exc_info=True)
+            finally:
+                try:
+                    await upstream_resp.aclose()
+                except Exception:
+                    log.warning("upstream response close failed", exc_info=True)
+
+    return _GuardedStreamingResponse(
+        agen,
         status_code=upstream_resp.status_code,
         headers={
             "content-type": upstream_resp.headers.get(
                 "content-type", "application/json"
             )
         },
+        on_finalize=_stream_finalized,
     )
 
 
