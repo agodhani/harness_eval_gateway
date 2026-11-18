@@ -10,6 +10,7 @@ judge brief + results API read.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -409,6 +410,42 @@ async def test_no_retry_on_first_success(python_ws: Path, gen_dir: Path) -> None
     client = _FakeClient()
     report = await _gen(python_ws, gen_dir, client=client)
     assert report.status == "ok"
+    assert len(client.calls) == 1
+    assert report.metrics["retried"] is False
+
+
+async def test_retry_timeout_clamped_to_attempt_deadline(
+    python_ws: Path, gen_dir: Path
+) -> None:
+    """The raised-cap retry must fit inside the caller's attempt deadline —
+    a retry that outlives the eval envelope gets hard-cancelled by the
+    orchestrator's wait_for instead of degrading to a report."""
+    client = _FakeClient(texts=[httpx.ReadTimeout("t1"), GOOD_OUTPUT])
+    report = await _gen(
+        python_ws,
+        gen_dir,
+        client=client,
+        timeout_seconds=960.0,
+        attempt_deadline=time.monotonic() + 300.0,
+    )
+    assert report.status == "ok"
+    assert len(client.calls) == 2
+    assert 0 < client.calls[1]["timeout"] <= 300.0
+
+
+async def test_retry_skipped_when_attempt_budget_exhausted(
+    python_ws: Path, gen_dir: Path
+) -> None:
+    """Below the retry-budget floor the retry never fires — degrade to
+    skipped so the judge keeps the rest of the eval envelope."""
+    client = _FakeClient(texts=[httpx.ReadTimeout("t1"), GOOD_OUTPUT])
+    report = await _gen(
+        python_ws,
+        gen_dir,
+        client=client,
+        attempt_deadline=time.monotonic() + 10.0,
+    )
+    assert report.status == "skipped"
     assert len(client.calls) == 1
     assert report.metrics["retried"] is False
 

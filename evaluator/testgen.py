@@ -46,7 +46,9 @@ Env knobs (all optional):
 - ``TESTGEN_TIMEOUT_SECONDS`` — generation HTTP timeout PER ATTEMPT
   (default 960 — must exceed the gateway's worst-case hold on one call,
   ~915s under shipped defaults, so generation never abandons paid upstream
-  work); the raised-budget retry gets 2× this value.
+  work); the raised-budget retry gets 2× this value, clamped to what
+  remains of the caller-supplied ``attempt_deadline`` so the retry can
+  never outlive the eval-attempt envelope.
 
 Status semantics mirror ``scoring.exec``: ``skipped`` = declined (disabled,
 non-python workspace, gateway/image unavailable, model produced no runnable
@@ -63,6 +65,7 @@ import logging
 import os
 import re
 import shutil
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -101,6 +104,10 @@ DEFAULT_TIMEOUT_SECONDS = 960.0
 #: The raised-budget retry also gets a longer wall clock — slow big models
 #: (live: a 35B judge) hit ReadTimeout at the base cap.
 RETRY_TIMEOUT_MULTIPLIER = 2.0
+#: Minimum attempt-budget remainder below which the raised-cap retry is
+#: skipped outright — a call clamped to seconds can only burn the rest of
+#: the caller's eval deadline before the outer wait_for cancels it.
+MIN_RETRY_BUDGET_SECONDS = 60.0
 #: Per-file cap — one giant output chunk is almost certainly a model rant.
 MAX_FILE_BYTES = 64_000
 
@@ -374,10 +381,16 @@ async def generate_tests_signal(
     max_files: int | None = None,
     max_tokens: int | None = None,
     timeout_seconds: float | None = None,
+    attempt_deadline: float | None = None,
 ) -> SignalReport:
     """Generate + execute an LLM-written pytest suite → ``generated_tests``
     :class:`SignalReport`. Never raises for LLM/docker problems — every
     failure mode lands on the report as ``skipped``/``error``.
+
+    ``attempt_deadline`` is a ``time.monotonic()`` timestamp bounding the
+    whole eval attempt (the caller's outer ``wait_for``); the raised-cap
+    retry's timeout is clamped to what remains of it so a late retry
+    degrades to ``skipped`` instead of being hard-cancelled mid-call.
     """
     report = SignalReport(name=SIGNAL_NAME, status="ok")
     metrics: dict[str, Any] = report.metrics
@@ -416,8 +429,18 @@ async def generate_tests_signal(
         "TESTGEN_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS
     )
     # The retry's wall clock doubles the per-attempt timeout — the call it
-    # replaces timed out BECAUSE the base budget was too tight for the model.
-    retry_timeout = timeout * RETRY_TIMEOUT_MULTIPLIER
+    # replaces timed out BECAUSE the base budget was too tight for the
+    # model — but it is still bounded by the caller's attempt deadline: an
+    # overlong retry cancelled by the orchestrator's wait_for surfaces as a
+    # hard infra failure where a bounded one degrades to a report.
+    def _retry_timeout() -> float | None:
+        budget = timeout * RETRY_TIMEOUT_MULTIPLIER
+        if attempt_deadline is None:
+            return budget
+        remaining = attempt_deadline - time.monotonic()
+        if remaining < MIN_RETRY_BUDGET_SECONDS:
+            return None
+        return min(budget, remaining)
     gen_model = (os.environ.get("TESTGEN_MODEL") or "").strip() or (model or "")
 
     sources = _gather_sources(ws, budget_bytes=budget)
@@ -439,9 +462,9 @@ async def generate_tests_signal(
     # ONE retry at raised caps covers the live-observed thinking/slow-model
     # modes: empty content (reasoning burned the output budget), a response
     # that yields zero runnable test files, and httpx timeouts — the retry
-    # uses TESTGEN_MAX_TOKENS_RETRY and 2x TESTGEN_TIMEOUT_SECONDS. Every
-    # degraded outcome (``skipped``/``error``) applies unchanged when the
-    # retry also fails.
+    # uses TESTGEN_MAX_TOKENS_RETRY and up to 2x TESTGEN_TIMEOUT_SECONDS
+    # (deadline-clamped). Every degraded outcome (``skipped``/``error``)
+    # applies unchanged when the retry also fails or can't fit.
     prompt = build_testgen_prompt(rubric, sources)
     own_client = client is None
     if client is None:
@@ -452,6 +475,17 @@ async def generate_tests_signal(
     try:
         for attempt in range(2):
             retrying = attempt > 0
+            attempt_timeout = timeout
+            if retrying:
+                retry_timeout = _retry_timeout()
+                if retry_timeout is None:
+                    report.status = "skipped"
+                    report.warnings.append(
+                        "attempt deadline too close for the raised-cap "
+                        "retry — generation stays skipped"
+                    )
+                    return report
+                attempt_timeout = retry_timeout
             metrics["retried"] = retrying
             try:
                 raw = await _request_suite(
@@ -461,7 +495,7 @@ async def generate_tests_signal(
                     model=gen_model,
                     user_prompt=prompt,
                     max_tokens=retry_tok_cap if retrying else tok_cap,
-                    timeout_seconds=retry_timeout if retrying else timeout,
+                    timeout_seconds=attempt_timeout,
                 )
             except (TestgenError, httpx.TimeoutException) as exc:
                 # Empty/no-choice content and timeouts earn the one raised-

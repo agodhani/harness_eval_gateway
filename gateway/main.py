@@ -927,7 +927,12 @@ async def _passthrough(
                         "terminal stream metering failed", exc_info=True
                     )
                 finally:
-                    await upstream_resp.aclose()
+                    try:
+                        await upstream_resp.aclose()
+                    except Exception:
+                        log.warning(
+                            "upstream response close failed", exc_info=True
+                        )
 
     agen = _aiter()
 
