@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import uuid
 from datetime import UTC, datetime
@@ -122,7 +123,7 @@ def build_env(
     system_prompt_extra: str | None = None,
 ) -> dict[str, str]:
     """Sandbox env for one harness config via the adapter contract."""
-    return adapter.env(
+    env = adapter.env(
         gateway_url=GATEWAY_INTERNAL_URL,
         cred=cred,
         task_prompt=task_prompt,
@@ -131,6 +132,9 @@ def build_env(
         max_iters=max_iters,
         system_prompt_extra=system_prompt_extra,
     )
+    if timeout := os.environ.get("MINILOOP_LLM_TIMEOUT_SECONDS"):
+        env["MINILOOP_LLM_TIMEOUT_SECONDS"] = timeout
+    return env
 
 
 def budgets_for(run: Run) -> dict[str, Any]:

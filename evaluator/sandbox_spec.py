@@ -9,6 +9,7 @@ ANALYSIS.md/analysis.json when collected) and the task prompt.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -84,7 +85,7 @@ def build_eval_env(
     the 4096 miniloop default can truncate scores.json into invalid JSON.
     """
     gw = sandbox_gateway_url(gateway_base_url)
-    return miniloop_adapter.env(
+    env = miniloop_adapter.env(
         gateway_url=gw,
         cred=cred,
         task_prompt=EVAL_TASK_PROMPT,
@@ -93,6 +94,9 @@ def build_eval_env(
         max_iters=max_iters,
         max_tokens=max_tokens,
     )
+    if timeout := os.environ.get("MINILOOP_LLM_TIMEOUT_SECONDS"):
+        env["MINILOOP_LLM_TIMEOUT_SECONDS"] = timeout
+    return env
 
 
 def build_eval_spec(

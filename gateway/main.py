@@ -526,33 +526,57 @@ async def chat_completions(
     except Exception:  # noqa: BLE001 - non-JSON upstream body
         response_json = None
     usage = metering.usage_from_response(response_json)
-    await metering.emit_llm_response(
-        claims,
-        model=out.get("model"),
-        usage=usage,
-        latency_ms=latency_ms,
-        http_status=upstream_resp.status_code,
-        provider=provider,
-    )
-    if not 200 <= upstream_resp.status_code < 300:
-        await metering.emit_error(
+    response_emitted = False
+    try:
+        await metering.emit_llm_response(
             claims,
-            stage="upstream",
-            message=upstream_resp.text[:500],
-            http_status=upstream_resp.status_code,
+            model=out.get("model"),
+            usage=usage,
             latency_ms=latency_ms,
+            http_status=upstream_resp.status_code,
             provider=provider,
         )
-    else:
-        await _cache_store(
-            cache,
-            cache_key,
-            status=upstream_resp.status_code,
-            content_type=upstream_resp.headers.get(
-                "content-type", "application/json"
-            ),
-            body=upstream_resp.content,
-        )
+        response_emitted = True
+        if not 200 <= upstream_resp.status_code < 300:
+            await metering.emit_error(
+                claims,
+                stage="upstream",
+                message=upstream_resp.text[:500],
+                http_status=upstream_resp.status_code,
+                latency_ms=latency_ms,
+                provider=provider,
+            )
+        else:
+            await _cache_store(
+                cache,
+                cache_key,
+                status=upstream_resp.status_code,
+                content_type=upstream_resp.headers.get(
+                    "content-type", "application/json"
+                ),
+                body=upstream_resp.content,
+            )
+    except asyncio.CancelledError:
+        with anyio.CancelScope(shield=True):
+            if not response_emitted:
+                await metering.emit_llm_response(
+                    claims,
+                    model=out.get("model"),
+                    usage=usage,
+                    latency_ms=latency_ms,
+                    http_status=upstream_resp.status_code,
+                    provider=provider,
+                )
+            await metering.emit_error(
+                claims,
+                stage="client_disconnected",
+                message="client disconnected while metering upstream response",
+                http_status=upstream_resp.status_code,
+                latency_ms=latency_ms,
+                provider=provider,
+                usage=usage,
+            )
+        raise
 
     return Response(
         content=upstream_resp.content,

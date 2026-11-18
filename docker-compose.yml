@@ -70,6 +70,11 @@ services:
       # (non-secret only — upstream keys stay inside the gateway service).
       UPSTREAM_PROVIDER: ${UPSTREAM_PROVIDER:-ollama}
       PROVIDER_ROUTES: ${PROVIDER_ROUTES:-}
+      # Miniloop agent's per model-call timeout (seconds) — the control plane
+      # injects this into each miniloop sandbox's agent env; it must exceed
+      # the gateway's UPSTREAM_TIMEOUT_SECONDS so agents never abandon calls
+      # the gateway is still paying for upstream.
+      MINILOOP_LLM_TIMEOUT_SECONDS: ${MINILOOP_LLM_TIMEOUT_SECONDS:-}
       # --- Objective scoring (PR7) ---
       # Exec signal: candidate build/tests/coverage inside the locked
       # heg-exec container. 0 disables; the image is repo-built, never pulled.
