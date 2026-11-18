@@ -105,6 +105,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (`RUBRIC_GEN_RETRIES`, default 2) cover transient upstream errors +
   validation failures (error fed back into the prompt), and lenient
   normalization coerces scalar `generated_by` + numeric-string fields.
+  Drafting is serialized process-wide (`RUBRIC_GEN_CONCURRENCY`, default
+  1) so parallel submits can't thrash a single-model provider; a run
+  parked on the semaphore stays `submitted` (pre-queue) and emits a
+  `rubric_queued` checkpoint.
 - **Pacing (PR15):** one active run at a time — approvals while a run
   executes (or is queued) park in `queued` and promote FIFO by approval
   (`pacing.place_run` / `claim_next_queued`; promotion is wired into
@@ -409,7 +413,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   renders per-sandbox score columns + an `overall` row once results exist
   (`RunDetailClient.tsx` `RubricView` + `getRunResults` poll while
   `evaluating`). Sandboxes whose eval failed surface an `eval failed` badge
-  (from `SandboxResult.eval_error`) instead of blank score cells. Directory
+  (from `SandboxResult.eval_error`) instead of blank score cells, and a
+  file-less workspace lights an `empty workspace` badge
+  (`SandboxResult.empty_workspace`, sourced from the stored
+  `sandbox_finalized`/`empty_workspace` checkpoint payloads — no FS
+  re-probe). Directory
   artifact downloads ship as ZIPs that filter `.git`, `__pycache__`,
   `*.pyc`, `node_modules`, `.venv` at any depth (download-side only — the
   raw workspace on disk is untouched).

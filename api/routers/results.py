@@ -161,6 +161,12 @@ class SandboxResult(BaseModel):
     model: str = ""
     status: str
     terminal_reason: str | None = None
+    # Monitor flagged a done-ish exit whose snapshot workspace had no real
+    # files — the ``empty_workspace`` badge on the results row. Sourced from
+    # the stored checkpoint payloads (``sandbox_finalized`` key /
+    # ``stage="empty_workspace"`` warning — same markers analytics keys
+    # on), never an FS probe.
+    empty_workspace: bool = False
     artifact_path: str | None = None
     rubric_id: UUID | None = None
     # PR5: version of the rubric the displayed scores were judged against
@@ -443,6 +449,18 @@ def _eval_error_label(payload: dict[str, Any]) -> str | None:
     return str(code)
 
 
+def _empty_workspace_marker(event_type: str, payload: dict[str, Any]) -> bool:
+    """Monitor's file-less-workspace markers (orchestrator/monitor.py) —
+    ``empty_workspace`` on the ``sandbox_finalized`` checkpoint payload, or
+    the dedicated ``stage="empty_workspace"`` warning checkpoint. Same
+    detection the analytics row uses; the results flag reads the stored
+    events, never the artifact FS."""
+    return bool(payload.get("empty_workspace")) or (
+        event_type == "checkpoint"
+        and payload.get("stage") == "empty_workspace"
+    )
+
+
 # ---------------------------------------------------------------------------
 # rubric versions + results
 # ---------------------------------------------------------------------------
@@ -593,22 +611,29 @@ def get_run_results(
     # sandboxes with NO Score rows: a retry that eventually produced scores
     # supersedes its earlier failed attempts.
     eval_failures: dict[UUID, str] = {}
+    # Sandboxes the monitor finalized on a file-less workspace — feeds the
+    # ``empty_workspace`` row flag. Same stored-event markers the analytics
+    # row keys on (finalized payload + warning checkpoint); no FS re-probe.
+    empty_ws: set[UUID] = set()
     if sandbox_ids:
-        err_rows = session.execute(
-            select(Event.sandbox_id, Event.payload)
+        ev_rows = session.execute(
+            select(Event.sandbox_id, Event.type, Event.payload)
             .where(
                 Event.run_id == run_id,
                 Event.sandbox_id.in_(sandbox_ids),
-                Event.type == "error",
+                Event.type.in_(("error", "checkpoint")),
             )
             .order_by(Event.id)
         ).all()
-        for sid, payload in err_rows:
+        for sid, ev_type, payload in ev_rows:
             if sid is None or not isinstance(payload, dict):
                 continue
-            label = _eval_error_label(payload)
-            if label is not None:
-                eval_failures[sid] = label
+            if ev_type == "error":
+                label = _eval_error_label(payload)
+                if label is not None:
+                    eval_failures[sid] = label
+            if _empty_workspace_marker(ev_type, payload):
+                empty_ws.add(sid)
 
     jail = _artifact_jail()
     scan_ttl = get_settings().PREVIEW_SCAN_TTL_SECONDS
@@ -651,6 +676,7 @@ def get_run_results(
                 model=sandbox_model(sb.harness_config or {}, run.model_name),
                 status=sb.status,
                 terminal_reason=sb.terminal_reason,
+                empty_workspace=sb.id in empty_ws,
                 artifact_path=sb.artifact_path,
                 rubric_id=rubric_id,
                 rubric_version=sb_rubric_version,

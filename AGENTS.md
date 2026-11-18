@@ -131,6 +131,10 @@ adapters are added.
    landing while a run executes (or is already queued) parks in `queued`
    and promotes FIFO by approval when the slot frees (lifecycle end or the
    next startup sweep). `started_at` = approval/queue-entry time.
+   Drafting itself is pre-queue: a process-wide semaphore
+   (`RUBRIC_GEN_CONCURRENCY`, default 1) serializes the gateway call across
+   parallel submits — a run parked on it stays `submitted` and emits a
+   `rubric_queued` checkpoint while it waits.
 3. **Provision** — prepare identical initial repo; build/launch N sandboxes.
    `spawn_one` additionally gates each `docker run` on host memory headroom
    (`SPAWN_MIN_FREE_MEM_MB`, probed via `/proc/meminfo` → `sysconf` →

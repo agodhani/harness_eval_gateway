@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from gateway.creds import verify_cred
 from orchestrator import rubric as rubric_mod
 from orchestrator.rubric import (
     CANONICAL_DIMENSIONS,
+    RubricContent,
     RubricParseError,
     parse_rubric_json,
 )
@@ -443,3 +445,176 @@ async def test_draft_rubric_double_failure_marks_failed(session_factory) -> None
 async def test_draft_rubric_missing_run_is_noop(session_factory) -> None:
     client = _mock_client(lambda r: _chat_response("{}"))
     await rubric_mod.draft_rubric(uuid.uuid4(), session_factory=session_factory, settings=SETTINGS, client=client)
+
+
+# ---------------------------------------------------------------------------
+# draft_rubric — generation pacing (RUBRIC_GEN_CONCURRENCY semaphore)
+# ---------------------------------------------------------------------------
+
+
+def _content() -> RubricContent:
+    """A valid parsed rubric — the mocked ``_request_rubric`` return."""
+    return parse_rubric_json(json.dumps(_valid_rubric_payload()))
+
+
+def _stages(session_factory, run_id) -> list[str | None]:
+    with session_factory() as s:
+        return [
+            e.payload.get("stage")
+            for e in s.execute(
+                select(Event).where(Event.run_id == run_id)
+            ).scalars()
+        ]
+
+
+async def test_draft_rubric_generations_serialize(session_factory, monkeypatch) -> None:
+    """Two concurrent drafts never overlap at the provider: with the default
+    concurrency (1) the second waits on the semaphore, emits
+    ``rubric_queued``, and stays ``submitted`` — pre-queue, no slot taken.
+    FIFO wake order makes the sequence deterministic."""
+    run_a = make_run(session_factory, status="submitted", task_prompt="task-a")
+    run_b = make_run(session_factory, status="submitted", task_prompt="task-b")
+    calls: list[tuple[str, str]] = []
+    a_inside = asyncio.Event()
+    release_a = asyncio.Event()
+
+    async def fake_request(client, *, task_prompt, **_kw):
+        calls.append(("enter", task_prompt))
+        if task_prompt == "task-a":
+            a_inside.set()
+            await release_a.wait()
+        calls.append(("exit", task_prompt))
+        return _content()
+
+    monkeypatch.setattr(rubric_mod, "_request_rubric", fake_request)
+
+    t_a = asyncio.create_task(
+        rubric_mod.draft_rubric(
+            run_a.id, session_factory=session_factory, settings=SETTINGS
+        )
+    )
+    await asyncio.wait_for(a_inside.wait(), 5)
+
+    t_b = asyncio.create_task(
+        rubric_mod.draft_rubric(
+            run_b.id, session_factory=session_factory, settings=SETTINGS
+        )
+    )
+    # B's path to the wait is synchronous (load → locked-check → emit →
+    # acquire) — two yields put it parked behind A's permit.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert calls == [("enter", "task-a")]  # B queued, not inside
+    assert "rubric_queued" in _stages(session_factory, run_b.id)
+    assert "rubric_queued" not in _stages(session_factory, run_a.id)
+    with session_factory() as s:
+        assert s.get(Run, run_b.id).status == "submitted"
+
+    release_a.set()
+    await asyncio.wait_for(asyncio.gather(t_a, t_b), 5)
+
+    assert calls == [
+        ("enter", "task-a"),
+        ("exit", "task-a"),
+        ("enter", "task-b"),
+        ("exit", "task-b"),
+    ]
+    with session_factory() as s:
+        assert s.get(Run, run_a.id).status == "rubric_review"
+        assert s.get(Run, run_b.id).status == "rubric_review"
+    assert not rubric_mod._rubric_gen_semaphore().locked()
+
+
+async def test_draft_rubric_semaphore_released_on_success(
+    session_factory, monkeypatch
+) -> None:
+    """A completed draft frees the gate — back-to-back drafts never queue."""
+    run_a = make_run(session_factory, status="submitted", task_prompt="task-a")
+    run_b = make_run(session_factory, status="submitted", task_prompt="task-b")
+
+    async def fake_request(client, **_kw):
+        return _content()
+
+    monkeypatch.setattr(rubric_mod, "_request_rubric", fake_request)
+    await rubric_mod.draft_rubric(
+        run_a.id, session_factory=session_factory, settings=SETTINGS
+    )
+    assert not rubric_mod._rubric_gen_semaphore().locked()
+    # Would hang forever if the permit leaked.
+    await asyncio.wait_for(
+        rubric_mod.draft_rubric(
+            run_b.id, session_factory=session_factory, settings=SETTINGS
+        ),
+        timeout=5,
+    )
+    with session_factory() as s:
+        assert s.get(Run, run_a.id).status == "rubric_review"
+        assert s.get(Run, run_b.id).status == "rubric_review"
+    assert "rubric_queued" not in _stages(session_factory, run_b.id)
+
+
+async def test_draft_rubric_semaphore_released_on_failure(
+    session_factory, monkeypatch
+) -> None:
+    """A failed draft frees the gate too — the next run isn't stranded
+    behind a crashed generation."""
+    run_a = make_run(session_factory, status="submitted", task_prompt="task-a")
+    run_b = make_run(session_factory, status="submitted", task_prompt="task-b")
+
+    async def fake_request(client, *, task_prompt, **_kw):
+        if task_prompt == "task-a":
+            raise RuntimeError("provider exploded")
+        return _content()
+
+    monkeypatch.setattr(rubric_mod, "_request_rubric", fake_request)
+    await rubric_mod.draft_rubric(
+        run_a.id, session_factory=session_factory, settings=SETTINGS
+    )
+    with session_factory() as s:
+        assert s.get(Run, run_a.id).status == "failed"
+    assert not rubric_mod._rubric_gen_semaphore().locked()
+    await asyncio.wait_for(
+        rubric_mod.draft_rubric(
+            run_b.id, session_factory=session_factory, settings=SETTINGS
+        ),
+        timeout=5,
+    )
+    with session_factory() as s:
+        assert s.get(Run, run_b.id).status == "rubric_review"
+
+
+async def test_draft_rubric_concurrency_env_override(
+    session_factory, monkeypatch
+) -> None:
+    """``RUBRIC_GEN_CONCURRENCY=2`` widens the gate: two drafts overlap at
+    the provider instead of serializing (env read at use, not import)."""
+    monkeypatch.setenv("RUBRIC_GEN_CONCURRENCY", "2")
+    run_a = make_run(session_factory, status="submitted", task_prompt="task-a")
+    run_b = make_run(session_factory, status="submitted", task_prompt="task-b")
+    inside: list[str] = []
+    both_inside = asyncio.Event()
+
+    async def fake_request(client, *, task_prompt, **_kw):
+        inside.append(task_prompt)
+        if len(inside) == 2:
+            both_inside.set()
+        await both_inside.wait()  # deadlocks here if still serialized
+        return _content()
+
+    monkeypatch.setattr(rubric_mod, "_request_rubric", fake_request)
+    await asyncio.wait_for(
+        asyncio.gather(
+            rubric_mod.draft_rubric(
+                run_a.id, session_factory=session_factory, settings=SETTINGS
+            ),
+            rubric_mod.draft_rubric(
+                run_b.id, session_factory=session_factory, settings=SETTINGS
+            ),
+        ),
+        timeout=10,
+    )
+    assert sorted(inside) == ["task-a", "task-b"]
+    with session_factory() as s:
+        assert s.get(Run, run_a.id).status == "rubric_review"
+        assert s.get(Run, run_b.id).status == "rubric_review"
