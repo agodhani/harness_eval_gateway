@@ -618,3 +618,59 @@ async def test_draft_rubric_concurrency_env_override(
     with session_factory() as s:
         assert s.get(Run, run_a.id).status == "rubric_review"
         assert s.get(Run, run_b.id).status == "rubric_review"
+
+
+# ---------------------------------------------------------------------------
+# draft_rubric — generation call timeout (RUBRIC_GEN_TIMEOUT_SECONDS)
+# ---------------------------------------------------------------------------
+
+
+async def test_draft_rubric_client_timeout_env(session_factory, monkeypatch) -> None:
+    """The internally-built draft client takes its per-call timeout from
+    ``RUBRIC_GEN_TIMEOUT_SECONDS`` — it must out-wait the gateway's
+    worst-case call hold so a congested draft never abandons upstream work
+    its retry would then overlap."""
+    real_cls = httpx.AsyncClient
+    seen: list[dict] = []
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs)
+        return real_cls(
+            transport=httpx.MockTransport(
+                lambda r: _chat_response(json.dumps(_valid_rubric_payload()))
+            )
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", spy)
+
+    monkeypatch.delenv("RUBRIC_GEN_TIMEOUT_SECONDS", raising=False)
+    run = make_run(session_factory, status="submitted")
+    await rubric_mod.draft_rubric(
+        run.id, session_factory=session_factory, settings=SETTINGS
+    )
+    assert seen[-1]["timeout"] == 960.0
+
+    monkeypatch.setenv("RUBRIC_GEN_TIMEOUT_SECONDS", "1200")
+    run2 = make_run(session_factory, status="submitted")
+    await rubric_mod.draft_rubric(
+        run2.id, session_factory=session_factory, settings=SETTINGS
+    )
+    assert seen[-1]["timeout"] == 1200.0
+
+
+def test_draft_rubric_timeout_outwaits_gateway_worst_case() -> None:
+    """The default must exceed the gateway's worst-case silent hold on one
+    call: (1 + UPSTREAM_RETRY_ATTEMPTS) attempts each burning the whole
+    UPSTREAM_TIMEOUT_SECONDS, plus the summed exponential retry backoff —
+    derived from GatewaySettings' declared defaults so a gateway-side bump
+    that breaks the guarantee fails this test."""
+    from gateway.config import GatewaySettings
+
+    fields = GatewaySettings.model_fields
+    attempts = 1 + int(fields["UPSTREAM_RETRY_ATTEMPTS"].default)
+    upstream_timeout = float(fields["UPSTREAM_TIMEOUT_SECONDS"].default)
+    backoff_base = float(fields["UPSTREAM_RETRY_BACKOFF_SECONDS"].default)
+    worst_case = attempts * upstream_timeout + sum(
+        backoff_base * (2**i) for i in range(attempts - 1)
+    )
+    assert rubric_mod.DEFAULT_GEN_TIMEOUT_SECONDS > worst_case

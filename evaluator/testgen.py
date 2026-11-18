@@ -40,11 +40,13 @@ Env knobs (all optional):
   (default 8192). Thinking models (live: qwen3:8b) burn the whole output
   budget on reasoning and return EMPTY content; output that parses to zero
   usable test files and httpx timeouts (slow big models, live: a 35B judge
-  hitting ReadTimeout at the 240s cap) also earn ONE retry with the raised
-  cap and a doubled timeout — the degraded ``skipped``/``error`` outcomes
-  apply unchanged when the retry fails too.
+  hitting ReadTimeout at the per-attempt cap) also earn ONE retry with the
+  raised cap and a doubled timeout — the degraded ``skipped``/``error``
+  outcomes apply unchanged when the retry fails too.
 - ``TESTGEN_TIMEOUT_SECONDS`` — generation HTTP timeout PER ATTEMPT
-  (default 240); the raised-budget retry gets 2× this value.
+  (default 960 — must exceed the gateway's worst-case hold on one call,
+  ~915s under shipped defaults, so generation never abandons paid upstream
+  work); the raised-budget retry gets 2× this value.
 
 Status semantics mirror ``scoring.exec``: ``skipped`` = declined (disabled,
 non-python workspace, gateway/image unavailable, model produced no runnable
@@ -91,7 +93,11 @@ DEFAULT_MAX_TOKENS = 4096
 #: — thinking models burn the base cap on reasoning and return empty
 #: content; 8192 leaves headroom for <think> + the suite.
 DEFAULT_MAX_TOKENS_RETRY = 8192
-DEFAULT_TIMEOUT_SECONDS = 240.0
+#: Per-attempt HTTP timeout — must exceed the gateway's worst-case silent
+#: hold on one call ((1 + UPSTREAM_RETRY_ATTEMPTS) x UPSTREAM_TIMEOUT_SECONDS
+#: + retry backoff, ~915s under shipped defaults) so generation never
+#: abandons a call the gateway is still paying for upstream.
+DEFAULT_TIMEOUT_SECONDS = 960.0
 #: The raised-budget retry also gets a longer wall clock — slow big models
 #: (live: a 35B judge) hit ReadTimeout at the base cap.
 RETRY_TIMEOUT_MULTIPLIER = 2.0

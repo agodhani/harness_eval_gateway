@@ -174,6 +174,14 @@ DEFAULT_GEN_RETRIES = 2
 #: timeouts, every run failed), so the generation phase paces itself
 #: instead of relying on the PR15 execution queue it precedes.
 DEFAULT_GEN_CONCURRENCY = 1
+#: Per-call HTTP timeout for the draft generation request
+#: (``RUBRIC_GEN_TIMEOUT_SECONDS`` env override). Must EXCEED the gateway's
+#: worst-case silent hold on one call — (1 + UPSTREAM_RETRY_ATTEMPTS) x
+#: UPSTREAM_TIMEOUT_SECONDS + total retry backoff (~915s under the shipped
+#: defaults) — or a congested draft abandons the call while the gateway is
+#: still paying for it upstream, and the retry then overlaps the orphaned
+#: job (the bounded version of the pileup the semaphore exists to prevent).
+DEFAULT_GEN_TIMEOUT_SECONDS = 960.0
 #: Base seconds of the linear backoff between transient-failure retries.
 _RETRY_BACKOFF_SECONDS = 1.0
 #: Cap on the validation-error detail echoed back into the retry prompt —
@@ -184,6 +192,13 @@ _RETRY_ERROR_CAP = 300
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
     except ValueError:
         return default
 
@@ -653,7 +668,11 @@ async def draft_rubric(
     """
     own_client = client is None
     if client is None:
-        client = httpx.AsyncClient(timeout=180.0)
+        client = httpx.AsyncClient(
+            timeout=_env_float(
+                "RUBRIC_GEN_TIMEOUT_SECONDS", DEFAULT_GEN_TIMEOUT_SECONDS
+            )
+        )
     try:
         run = _load_run(session_factory, run_id)
         if run is None:

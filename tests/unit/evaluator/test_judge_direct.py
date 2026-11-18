@@ -354,3 +354,29 @@ def test_build_direct_prompt_minimal() -> None:
     prompt = build_direct_prompt({"dimensions": []})
     assert "Rubric dimensions" in prompt
     assert "JSON" in prompt
+
+
+# ----------------------------------------------------------------------
+# call timeout bound
+# ----------------------------------------------------------------------
+
+
+def test_default_timeout_outwaits_gateway_worst_case() -> None:
+    """EVAL_DIRECT_TIMEOUT_SECONDS' default must exceed the gateway's
+    worst-case silent hold on one call: (1 + UPSTREAM_RETRY_ATTEMPTS)
+    attempts each burning the whole UPSTREAM_TIMEOUT_SECONDS, plus the
+    summed exponential retry backoff — derived from GatewaySettings'
+    declared defaults so a gateway-side bump that breaks the guarantee
+    fails this test."""
+    from gateway.config import GatewaySettings
+
+    from evaluator.judge_direct import DEFAULT_TIMEOUT_SECONDS
+
+    fields = GatewaySettings.model_fields
+    attempts = 1 + int(fields["UPSTREAM_RETRY_ATTEMPTS"].default)
+    upstream_timeout = float(fields["UPSTREAM_TIMEOUT_SECONDS"].default)
+    backoff_base = float(fields["UPSTREAM_RETRY_BACKOFF_SECONDS"].default)
+    worst_case = attempts * upstream_timeout + sum(
+        backoff_base * (2**i) for i in range(attempts - 1)
+    )
+    assert DEFAULT_TIMEOUT_SECONDS > worst_case

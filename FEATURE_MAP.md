@@ -108,7 +108,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   Drafting is serialized process-wide (`RUBRIC_GEN_CONCURRENCY`, default
   1) so parallel submits can't thrash a single-model provider; a run
   parked on the semaphore stays `submitted` (pre-queue) and emits a
-  `rubric_queued` checkpoint.
+  `rubric_queued` checkpoint. The draft call's per-attempt HTTP timeout
+  (`RUBRIC_GEN_TIMEOUT_SECONDS`, default 960) out-waits the gateway's
+  worst-case upstream hold (~915s) so a congested draft can't abandon a
+  call its retry would then overlap.
 - **Pacing (PR15):** one active run at a time — approvals while a run
   executes (or is queued) park in `queued` and promote FIFO by approval
   (`pacing.place_run` / `claim_next_queued`; promotion is wired into
@@ -368,7 +371,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `SCORING_TESTGEN=0` disables (conftest pins it); knobs:
   `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
   `TESTGEN_MAX_FILES` (8), `TESTGEN_MAX_TOKENS` (4096),
-  `TESTGEN_TIMEOUT_SECONDS` (240, the one raised-cap retry gets 2×),
+  `TESTGEN_TIMEOUT_SECONDS` (960, the one raised-cap retry gets 2×),
   `TESTGEN_MAX_TOKENS_RETRY` (8192) — retries cover empty content,
   zero-runnable-file output, and timeouts. A scores doc missing
   `overall` gets it synthesized as the mean of dimension scores +

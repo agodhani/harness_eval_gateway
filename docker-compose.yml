@@ -66,6 +66,10 @@ services:
       # Bound on concurrent rubric-draft calls through the gateway (1 =
       # serialized — the documented default; unset keeps it).
       RUBRIC_GEN_CONCURRENCY: ${RUBRIC_GEN_CONCURRENCY:-}
+      # Per-call HTTP timeout for the draft — must out-wait the gateway's
+      # worst-case call hold (same bound as MINILOOP_LLM_TIMEOUT_SECONDS
+      # below); unset keeps the orchestrator default.
+      RUBRIC_GEN_TIMEOUT_SECONDS: ${RUBRIC_GEN_TIMEOUT_SECONDS:-}
       # Optional GitHub PAT for skillpack import (F11) — private repos +
       # higher rate limits; public repos work without it.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
