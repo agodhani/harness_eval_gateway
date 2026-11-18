@@ -1,5 +1,10 @@
 # Post-MVP roadmap — PR plan
 
+> **Continued:** the phase-3 business-eval program (preset task library +
+> tiers 1–3 of the 2026-11-17 audit) lives in
+> **[roadmap-business.md](./roadmap-business.md)** — PR21+. Open items
+> below: PR16, PR19, PR20.
+
 Handoff doc for implementation agents. Read `AGENTS.md` (architecture,
 conventions, decisions log) and `FEATURE_MAP.md` (per-feature code paths +
 verify steps) first. Repo conventions: Python 3.12 type hints, pydantic at
