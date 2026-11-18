@@ -147,7 +147,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   tee; `GET /v1/models` for CLI probes; per-run/sandbox HMAC credentials
   (`heg.<b64>.<sig>`); records tokens in/out, latency, failures; token
   budgets (429 + `error` event); emits `llm_request`/`llm_response`/`error`
-  events carrying the resolved upstream provider. `/internal/events`
+  events carrying the resolved upstream provider — every metered call is
+  terminally accounted, so a client disconnect mid-stream or while the
+  upstream request is in flight still lands `llm_response` (partial /
+  `usage_estimated`) plus `error` `stage="client_disconnected"` under a
+  shielded cancel scope; upstream calls bound by
+  `UPSTREAM_TIMEOUT_SECONDS` (default 300). `/internal/events`
   (harness-event proxy, cred or ingest-token auth) + `/internal/done`
   (done_signal) for sandbox egress.
 - **Upstreams:** `UPSTREAM_PROVIDER` picks the default provider —
@@ -182,7 +187,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (:8081→8080)
 - **Verify:**
   - Unit: `tests/unit/gateway/` (creds, metering, proxy — hermetic; protocol
-    pass-throughs + SSE usage normalization covered),
+    pass-throughs + SSE usage normalization covered; stream retry + client-
+    abandonment terminal events + upstream timeout wiring covered),
     `test_upstream_provider.py` (provider selection, key validation,
     PROVIDER_ROUTES resolution, `x-heg-provider` override, per-provider
     client base/headers, ollama-param stripping, anthropic protocol-header
@@ -226,7 +232,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   progressive-disclosure catalog in system prompt. Tool-less assistant
   replies get `MINILOOP_NUDGE_RETRIES` corrective nudges (default 2,
   `stage="agent_nudge"` checkpoints) before counting toward the text-only
-  `stuck_loop` streak.
+  `stuck_loop` streak. Per model-call timeout
+  `MINILOOP_LLM_TIMEOUT_SECONDS` (default 600 — must exceed the gateway's
+  `UPSTREAM_TIMEOUT_SECONDS` so calls aren't abandoned mid-spend).
 - **Where:** `adapters/miniloop/` (`agent.py`, `tools.py`, `events.py`,
   `skills.py`, `prompts.py`, `adapter.py`, `__main__.py`), `skillpacks/`
 - **Verify:**

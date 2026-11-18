@@ -242,7 +242,7 @@ async def get_upstream_client(
     async with httpx.AsyncClient(
         base_url=settings.upstream_base_url_for(provider),
         headers=settings.upstream_headers_for(provider),
-        timeout=settings.UPSTREAM_TIMEOUT,
+        timeout=settings.UPSTREAM_TIMEOUT_SECONDS,
     ) as client:
         yield client
 
@@ -258,6 +258,6 @@ async def get_ollama_client() -> AsyncIterator[httpx.AsyncClient]:
     settings = get_settings()
     async with httpx.AsyncClient(
         base_url=settings.OLLAMA_UPSTREAM_URL.rstrip("/"),
-        timeout=settings.UPSTREAM_TIMEOUT,
+        timeout=settings.UPSTREAM_TIMEOUT_SECONDS,
     ) as client:
         yield client

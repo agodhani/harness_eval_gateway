@@ -228,7 +228,10 @@ hosted providers; Ollama keeps everything free). Miniloop retries a
 tool-less reply with a corrective `agent_nudge` message
 (`MINILOOP_NUDGE_RETRIES`, default 2) before it counts toward the
 text-only `stuck_loop` streak — small models answer in prose unless told
-prose is invalid.
+prose is invalid. Its per model-call timeout is
+`MINILOOP_LLM_TIMEOUT_SECONDS` (default 600) and must exceed the
+gateway's `UPSTREAM_TIMEOUT_SECONDS` — an agent that gives up first
+abandons a call the gateway is still paying for upstream.
 
 **Default skill packs** (named presets, vendored under `skillpacks/`):
 `superpowers`, `mattpocock-skills`, `spec-kit`.
@@ -434,6 +437,16 @@ or tests change.
   (`usage_from_sse`). `/v1/chat/completions` now honors `stream: true` the
   same way (pi streams unconditionally; the old force-`stream:false`
   returned a bare JSON body its SSE reader dropped as an empty response).
+  Every metered call leaves a terminal event: a client that disconnects
+  mid-stream still gets `llm_response` (partial capture or
+  `usage_estimated`) plus an `error` `stage="client_disconnected"`, and
+  one that disconnects while the gateway awaits upstream headers/retries
+  gets the same `client_disconnected` error — all emitted under a
+  shielded anyio cancel scope, since Starlette delivers the disconnect by
+  cancelling the stream task and unshielded emit awaits would re-raise
+  `Cancelled` (live-observed: a dsh lane left `llm_request` + zero
+  `llm_response`). Upstream timeouts are `UPSTREAM_TIMEOUT_SECONDS`
+  (default 300) on the gateway side.
 - **CLI image pattern**: node:slim base + `python3` for the shim + pinned
   npm CLI + `adapters/` under `/opt/harness` + `done` at `/usr/local/bin`.
   npm install happens before COPY so dependency layers cache. DeepSeek's

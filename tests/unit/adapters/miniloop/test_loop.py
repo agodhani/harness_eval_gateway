@@ -494,6 +494,24 @@ def test_config_nudge_retries_env(
     assert AgentConfig.from_env().nudge_retries == 2
 
 
+def test_config_llm_timeout_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """MINILOOP_LLM_TIMEOUT_SECONDS bounds each model call — it must
+    exceed the gateway upstream timeout so the agent never abandons a
+    call the gateway is still paying for upstream."""
+    monkeypatch.setenv("GATEWAY_BASE_URL", "http://gw")
+    monkeypatch.setenv("MODEL_NAME", "m")
+    monkeypatch.setenv("TASK_PROMPT", "t")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    monkeypatch.delenv("MINILOOP_LLM_TIMEOUT_SECONDS", raising=False)
+    assert AgentConfig.from_env().request_timeout == 600.0
+    monkeypatch.setenv("MINILOOP_LLM_TIMEOUT_SECONDS", "900")
+    assert AgentConfig.from_env().request_timeout == 900.0
+    monkeypatch.setenv("MINILOOP_LLM_TIMEOUT_SECONDS", "banana")
+    assert AgentConfig.from_env().request_timeout == 600.0
+
+
 # ---------------------------------------------------------------------------
 # HttpChatClient request formation (MockTransport — still hermetic)
 # ---------------------------------------------------------------------------
