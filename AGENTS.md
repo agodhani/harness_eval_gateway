@@ -117,7 +117,8 @@ adapters are added.
    `response_format=json_object`; `EVAL_DIRECT_FALLBACK=0` disables) lands
    scores when the agentic judge's output is unusable. Testgen retries the
    generation call once at raised caps on empty/timed-out/zero-file output
-   (`TESTGEN_MAX_TOKENS_RETRY`, 2× `TESTGEN_TIMEOUT_SECONDS`); a scores doc
+   (`TESTGEN_MAX_TOKENS_RETRY`, up to 2× `TESTGEN_TIMEOUT_SECONDS` clamped
+   to the eval-attempt deadline); a scores doc
    missing `overall` gets it synthesized as the dimension mean + a warning.
 7. **Artifact store** — `./data/artifacts/<run_id>/<sandbox_id>/` — repo
    tarballs, transcripts, event exports.
@@ -276,7 +277,7 @@ counts, failing names, and coverage land in the `generated_tests`
 copy staged for the judge. Flags: `SCORING_TESTGEN=0` disables (conftest
 pins it); `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
 `TESTGEN_MAX_FILES` (8), `TESTGEN_MAX_TOKENS` (4096),
-`TESTGEN_TIMEOUT_SECONDS` (240). `EXEC_TEST_TARGET` is the
+`TESTGEN_TIMEOUT_SECONDS` (960). `EXEC_TEST_TARGET` is the
 ExecRunner→runner env contract for the suite mount.
 
 Flow: auto-generated from task spec → HITL review/edit in UI → frozen →

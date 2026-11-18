@@ -371,7 +371,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `SCORING_TESTGEN=0` disables (conftest pins it); knobs:
   `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
   `TESTGEN_MAX_FILES` (8), `TESTGEN_MAX_TOKENS` (4096),
-  `TESTGEN_TIMEOUT_SECONDS` (960, the one raised-cap retry gets 2×),
+  `TESTGEN_TIMEOUT_SECONDS` (960, the one raised-cap retry gets up to 2×,
+  clamped to the eval-attempt deadline),
   `TESTGEN_MAX_TOKENS_RETRY` (8192) — retries cover empty content,
   zero-runnable-file output, and timeouts. A scores doc missing
   `overall` gets it synthesized as the mean of dimension scores +

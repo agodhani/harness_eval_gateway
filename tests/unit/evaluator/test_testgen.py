@@ -634,9 +634,8 @@ def test_default_timeout_outwaits_gateway_worst_case() -> None:
     burning the whole UPSTREAM_TIMEOUT_SECONDS, plus the summed exponential
     retry backoff — derived from GatewaySettings' declared defaults so a
     gateway-side bump that breaks the guarantee fails this test."""
-    from gateway.config import GatewaySettings
-
     from evaluator.testgen import DEFAULT_TIMEOUT_SECONDS
+    from gateway.config import GatewaySettings
 
     fields = GatewaySettings.model_fields
     attempts = 1 + int(fields["UPSTREAM_RETRY_ATTEMPTS"].default)
