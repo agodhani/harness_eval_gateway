@@ -324,7 +324,7 @@ function TrendMeta({ meta }: { meta: Row }) {
     llm_turns?: number;
     errors?: number;
     evaluator_errors?: number;
-    estimated_cost_usd?: number;
+    estimated_cost_usd?: number | null;
     price_model?: string | null;
     task_prompt?: string;
   };
@@ -337,8 +337,9 @@ function TrendMeta({ meta }: { meta: Row }) {
         {m.evaluator_errors ? ` · ${m.evaluator_errors} judge err` : ""}
       </div>
       <div>
-        est. ${(m.estimated_cost_usd ?? 0).toFixed(4)} at{" "}
-        {m.price_model ?? "per-model rates"}
+        {m.estimated_cost_usd == null
+          ? "cost unpriced — model not in the price table"
+          : `est. $${m.estimated_cost_usd.toFixed(4)} at ${m.price_model ?? "per-model rates"}`}
       </div>
     </>
   );

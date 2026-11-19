@@ -3,10 +3,21 @@ import Section from "./Section";
 
 const CONSTANTS = [
   ["task_prompt", "one prompt, verbatim, to every sandbox"],
-  ["model", "same checkpoint — harness capability is what's measured"],
   ["workspace", "identical clean repo staged per sandbox"],
   ["rubric", "drafted by LLM, edited by you, frozen pre-launch"],
   ["egress", "one route out — the gateway. No telemetry holes"],
+] as const;
+
+// The measured axes — each matrix cell fixes one combination of these.
+const AXES = [
+  [
+    "harness config",
+    "adapter + skill packs + system prompt — the scaffolding under test",
+  ],
+  [
+    "model",
+    "the participant model set — each config runs on every selected model",
+  ],
 ] as const;
 
 export default function Method() {
@@ -23,9 +34,9 @@ export default function Method() {
         </>
       }
       lede="Agent CLIs ship different scaffolding — tool loops, system prompts, skill
-      injection, compaction strategy. Comparing them on different models or
-      different tasks tells you nothing. This platform holds every variable
-      constant except the one you're measuring."
+      injection, compaction strategy — and models differ in capability. A run
+      is a config × model matrix over one task: every other variable is held
+      constant, so the deltas split cleanly between the two axes."
     >
       <div className="lp-cells lp-split-7-5">
         {/* variables table */}
@@ -36,7 +47,7 @@ export default function Method() {
               className="kicker"
               style={{ letterSpacing: "0.06em", textTransform: "none" }}
             >
-              n = 2 sandboxes
+              n = configs × models
             </span>
           </div>
           <ul className="lp-varlist">
@@ -50,14 +61,16 @@ export default function Method() {
                 <span className="lp-var__tag">held constant</span>
               </li>
             ))}
-            <li className="lp-var lp-var--measured">
-              <span className="lp-var__n">06</span>
-              <span className="lp-var__k">harness</span>
-              <span className="lp-var__v">
-                adapter + skill packs + system prompt — the independent variable
-              </span>
-              <span className="lp-var__tag">measured</span>
-            </li>
+            {AXES.map(([k, v], i) => (
+              <li key={k} className="lp-var lp-var--measured">
+                <span className="lp-var__n">
+                  {String(CONSTANTS.length + i + 1).padStart(2, "0")}
+                </span>
+                <span className="lp-var__k">{k}</span>
+                <span className="lp-var__v">{v}</span>
+                <span className="lp-var__tag">measured</span>
+              </li>
+            ))}
           </ul>
         </Reveal>
 
@@ -66,10 +79,11 @@ export default function Method() {
           <Reveal delay={90} className="lp-side-note">
             <span className="kicker">what a run proves</span>
             <p>
-              When sandbox <span className="mono-inline">a</span> scores 8.4 and
-              sandbox <span className="mono-inline">b</span> scores 5.9 on the
-              same rubric, the model didn’t change — the harness did. The delta
-              is attributable.
+              When cell <span className="mono-inline">a</span> scores 8.4 and
+              cell <span className="mono-inline">b</span> scores 5.9 on the
+              same rubric, the matrix isolates the difference — one axis
+              changed, the rest held. The delta is attributable to the config
+              or the model.
             </p>
           </Reveal>
           <Reveal delay={160} className="lp-side-note">

@@ -174,13 +174,26 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
     },
     {
       label: "estimated cost",
-      hint: priceModel ? `at ${priceModel}` : "auto — per-model rates",
+      hint: priceModel
+        ? `at ${priceModel}`
+        : "auto — per-model rates · unlisted = unpriced",
       cell: (col) => {
         // Explicit pick reprices every column uniformly (what-if); auto
         // uses each column's own resolved rate (PR14 per-model pricing).
+        // A null key is an unlisted model (PR21) — unpriced, never billed
+        // at a guessed rate.
         const rateKey = priceModel ?? col.price_model;
-        const p = current.price_table[rateKey];
-        if (!p) return <span className="score-na">—</span>;
+        const p = rateKey ? current.price_table[rateKey] : undefined;
+        if (!p) {
+          return (
+            <span
+              className="faint"
+              title={`${col.model} isn't in the price table — no honest rate`}
+            >
+              unpriced
+            </span>
+          );
+        }
         if (p.local) return <span className="mono">local — $0</span>;
         return (
           <span className="mono">{formatUsd(estimateCostUsd(p, col.tokens))}</span>
@@ -339,8 +352,10 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
                       <span className="faint" style={{ fontSize: "0.8rem" }}>
                         {formatNum(col.evaluator.llm_turns)} ·{" "}
                         {formatNum(col.evaluator.tokens.total)} ·{" "}
-                        {formatUsd(col.evaluator.estimated_cost_usd)} ·{" "}
-                        {formatNum(col.evaluator.errors)} err
+                        {col.evaluator.estimated_cost_usd == null
+                          ? "unpriced"
+                          : formatUsd(col.evaluator.estimated_cost_usd)}{" "}
+                        · {formatNum(col.evaluator.errors)} err
                       </span>
                     ) : (
                       <span className="score-na">—</span>

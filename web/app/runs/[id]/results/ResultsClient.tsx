@@ -21,6 +21,7 @@ import {
   dimensionOrder,
   getRun,
   getRunResults,
+  getRubricVersion,
   getSandboxScores,
   harnessConfigLabel,
   listEvents,
@@ -28,11 +29,13 @@ import {
   TERMINAL_RUN_STATUSES,
   type DimensionScore,
   type EventOut,
+  type RubricDimension,
   type RunOut,
   type RunResults,
   type SandboxResult,
 } from "@/lib/api";
 import { formatTs, shortId } from "@/lib/format";
+import { dimensionSpecMap, weightedDimTotal } from "@/lib/scoreMath";
 import { specFromRun, stageResubmit } from "@/lib/resubmit";
 import {
   Badge,
@@ -169,6 +172,14 @@ export default function ResultsClient({ runId }: { runId: string }) {
   // `eval_scored` checkpoint events — source of the per-sandbox judge-mode
   // badge when the results payload doesn't carry `eval_mode` yet.
   const [scoredEvents, setScoredEvents] = useState<EventOut[]>([]);
+  // PR21 — rubric dims (weight + score scale) for the pinned version when it
+  // isn't the latest rubric on the run record; keyed to runId+version like
+  // `versionSel` so cross-run navigation can't reuse stale dims.
+  const [pinnedDims, setPinnedDims] = useState<{
+    run: string;
+    v: number;
+    dims: RubricDimension[];
+  } | null>(null);
 
   // Scope loaded data to the current runId — survives client-side navigation
   // between /runs/A/results and /runs/B/results without a remount.
@@ -297,6 +308,61 @@ export default function ResultsClient({ runId }: { runId: string }) {
     return m;
   }, [scoredEvents, selectedVersion]);
 
+  // Weighted totals need the rubric dims the displayed scores were judged
+  // under: the latest rubric (run.rubric) normally; a pinned older version
+  // fetches its immutable content once (results.rubric_versions gives the id).
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      // Deferred setState — react-hooks/set-state-in-effect lint.
+      await Promise.resolve();
+      if (cancelled) return;
+      const latest = run?.rubric ?? null;
+      if (
+        selectedVersion == null ||
+        latest?.version === selectedVersion ||
+        (pinnedDims?.run === runId && pinnedDims.v === selectedVersion)
+      ) {
+        return;
+      }
+      const ver = currentResults?.rubric_versions?.find(
+        (x) => x.version === selectedVersion,
+      );
+      const apply = (dims: RubricDimension[]) => {
+        if (!cancelled) setPinnedDims({ run: runId, v: selectedVersion, dims });
+      };
+      if (!ver) {
+        apply([]);
+        return;
+      }
+      try {
+        const r = await getRubricVersion(ver.id);
+        apply(r.content?.dimensions ?? []);
+      } catch {
+        apply([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [run, currentResults, selectedVersion, pinnedDims, runId]);
+
+  /** Rubric dims for weighting — pinned version's own content when it
+   * applies (falls back to the latest rubric while that fetch is in
+   * flight); empty → every dim defaults to weight 1 on 0–10. */
+  const specDims = useMemo(() => {
+    const latest = run?.rubric;
+    if (selectedVersion == null || latest?.version === selectedVersion) {
+      return latest?.content?.dimensions ?? [];
+    }
+    if (pinnedDims?.run === runId && pinnedDims.v === selectedVersion) {
+      return pinnedDims.dims;
+    }
+    return latest?.content?.dimensions ?? [];
+  }, [run, pinnedDims, selectedVersion, runId]);
+
+  const specMap = useMemo(() => dimensionSpecMap(specDims), [specDims]);
+
   /** Resubmit — stage this run's spec and open /submit prefilled. */
   function resubmit() {
     if (!run) return;
@@ -320,36 +386,35 @@ export default function ResultsClient({ runId }: { runId: string }) {
     return dimensionOrder([...set]);
   }, [sandboxes]);
 
-  /** F13 — per-sandbox Σ of dimension scores for the matrix totals row.
+  /** PR21 — per-sandbox weighted, scale-normalised dimension total for the
+   * matrix totals row: Σ ((score − min)/(max − min)) × weight over Σ weight,
+   * rescaled to 0–10 ({@link weightedDimTotal}). Honors the rubric's `weight`
+   * + `min_score`/`max_score` instead of the old raw Σ that ignored both.
    * Distinct from `overall` (judge-reported aggregate); the max gets the
    * "leader" highlight so the winner is visible at a glance. */
   const dimTotals = useMemo(() => {
-    const m = new Map<string, { sum: number; count: number }>();
+    const m = new Map<string, { total: number; scored: number }>();
     for (const sb of sandboxes) {
-      let sum = 0;
-      let count = 0;
-      for (const d of dimensionKeys) {
-        const e = sb.dimensions?.[d];
-        if (e) {
-          sum += e.score;
-          count++;
-        }
-      }
-      m.set(sb.sandbox_id, { sum, count });
+      m.set(
+        sb.sandbox_id,
+        weightedDimTotal(sb.dimensions, dimensionKeys, specMap),
+      );
     }
     return m;
-  }, [sandboxes, dimensionKeys]);
+  }, [sandboxes, dimensionKeys, specMap]);
   const maxTotal = useMemo(
     () =>
       Math.max(
         0,
-        ...[...dimTotals.values()].filter((t) => t.count > 0).map((t) => t.sum),
+        ...[...dimTotals.values()]
+          .filter((t) => t.scored > 0)
+          .map((t) => t.total),
       ),
     [dimTotals],
   );
 
   /** PR14 — group sandboxes by participant model for the compare-by-model
-   * card: sandbox count, mean judge `overall`, mean Σ-dimensions total. */
+   * card: sandbox count, mean judge `overall`, mean weighted total. */
   const modelGroups = useMemo(() => {
     const map = new Map<string, SandboxResult[]>();
     for (const sb of sandboxes) {
@@ -364,7 +429,9 @@ export default function ResultsClient({ runId }: { runId: string }) {
         .filter((v): v is number => typeof v === "number");
       const totals = sbs
         .map((s) => dimTotals.get(s.sandbox_id))
-        .filter((t): t is { sum: number; count: number } => !!t && t.count > 0);
+        .filter(
+          (t): t is { total: number; scored: number } => !!t && t.scored > 0,
+        );
       return {
         model,
         count: sbs.length,
@@ -374,7 +441,7 @@ export default function ResultsClient({ runId }: { runId: string }) {
             : null,
         meanTotal:
           totals.length > 0
-            ? totals.reduce((a, t) => a + t.sum, 0) / totals.length
+            ? totals.reduce((a, t) => a + t.total, 0) / totals.length
             : null,
       };
     });
@@ -627,25 +694,28 @@ export default function ResultsClient({ runId }: { runId: string }) {
                       <tr className="row-total">
                         <td>
                           <div className="dim-name">total</div>
-                          <div className="dim-desc">Σ dimension scores · computed</div>
+                          <div className="dim-desc">
+                            weighted · score/max × weight · 0–10
+                          </div>
                         </td>
                         {sandboxes.map((sb) => {
                           const t = dimTotals.get(sb.sandbox_id);
-                          const isLeader = !!t && t.count > 0 && t.sum === maxTotal;
+                          const isLeader =
+                            !!t && t.scored > 0 && t.total === maxTotal;
                           return (
                             <td
                               key={sb.sandbox_id}
                               className={`score-cell${isLeader ? " score-cell--leader" : ""}`}
                             >
-                              {t && t.count > 0 ? (
+                              {t && t.scored > 0 ? (
                                 <>
                                   <span className="score-value">
-                                    {Math.round(t.sum * 10) / 10}
+                                    {Math.round(t.total * 10) / 10}
                                   </span>
                                   <div
                                     className={`dim-desc${isLeader ? " dim-desc--leader" : ""}`}
                                   >
-                                    {t.count} dim{t.count === 1 ? "" : "s"}
+                                    {t.scored}/{dimensionKeys.length} dims
                                     {isLeader ? " · leader" : ""}
                                   </div>
                                 </>
@@ -671,7 +741,7 @@ export default function ResultsClient({ runId }: { runId: string }) {
                         <th>Model</th>
                         <th>Sandboxes</th>
                         <th>Mean overall</th>
-                        <th>Mean total (Σ dims)</th>
+                        <th>Mean total (weighted)</th>
                       </tr>
                     </thead>
                     <tbody>
