@@ -21,7 +21,9 @@ lifecycle routes to):
    system message when set. One caller-level retry on upstream 5xx or a
    timeout/transport failure (the gateway's own upstream retries already
    ran inside the first call); 429 ``budget_exceeded`` and other 4xx are
-   terminal immediately.
+   terminal immediately. The run's ``wall_clock_seconds`` bounds the whole
+   cell like a container's cap: the deadline aborts an in-flight call and
+   skips any remaining retry (terminal ``timeout``).
 4. Write the artifact: ``output.txt`` (the reply text), ``transcript.log``
    (readable request/response), ``meta.json`` (provenance + error detail)
    under ``<artifact_root>/<run>/<sandbox>/`` and index them as Artifact
@@ -131,6 +133,7 @@ class _CallResult:
     duration_ms: int = 0
     terminal_reason: str = "harness_complete"
     error: str | None = None
+    deadline_hit: bool = False
 
     @property
     def ok(self) -> bool:
@@ -192,6 +195,7 @@ async def _call_gateway(
     model: str,
     messages: list[dict[str, str]],
     max_tokens: int,
+    deadline: float,
 ) -> _CallResult:
     """One chat-completions call + ONE retry on upstream 5xx/timeout.
 
@@ -199,6 +203,13 @@ async def _call_gateway(
     502/503/504 upstream retries already ran inside the call) and
     ``httpx.TransportError`` subclasses (timeouts + connect/read errors).
     429s and other 4xx are deterministic — no retry.
+
+    ``deadline`` (monotonic) is the cell's wall-clock cap, the same
+    ``started_at + wall_clock_seconds`` bound the monitor applies to
+    containers: an attempt still in flight at the deadline is cancelled —
+    the orphaned upstream call mirrors a container being killed — and an
+    already-elapsed deadline skips any remaining retry; either way the
+    cell ends ``timeout`` rather than the httpx timeout's own verdicts.
     """
     url = f"{gateway_url.rstrip('/')}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {cred}"}
@@ -211,10 +222,23 @@ async def _call_gateway(
     result = _CallResult()
     started = time.monotonic()
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        if time.monotonic() >= deadline:
+            result.terminal_reason = "timeout"
+            result.error = "wall_clock_seconds deadline exceeded"
+            result.deadline_hit = True
+            break
         result.attempts = attempt
         try:
-            resp = await client.post(url, json=body, headers=headers)
-        except httpx.TimeoutException as exc:
+            resp = await asyncio.wait_for(
+                client.post(url, json=body, headers=headers),
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            if time.monotonic() >= deadline:
+                result.terminal_reason = "timeout"
+                result.error = "wall_clock_seconds deadline exceeded"
+                result.deadline_hit = True
+                break
             if attempt < MAX_ATTEMPTS:
                 _emit_retry(
                     session_factory,
@@ -474,6 +498,8 @@ def _finalize(
             "attempts": call.attempts,
             "usage": call.usage,
         }
+        if call.deadline_hit:
+            ts_payload["reason"] = "wall_clock"
         if call.error:
             ts_payload["error"] = call.error
         emit(
@@ -575,6 +601,7 @@ async def run_prompt_cell(
             harness_config.get("system_prompt_extra") or ""
         ).strip()
         max_tokens = _env_int("PROMPT_CELL_MAX_TOKENS", DEFAULT_MAX_TOKENS)
+        deadline = time.monotonic() + float(budgets["wall_clock_seconds"])
         _mark_running(
             session_factory,
             run_id=run_id,
@@ -606,6 +633,7 @@ async def run_prompt_cell(
                 model=model,
                 messages=messages,
                 max_tokens=max_tokens,
+                deadline=deadline,
             )
         finally:
             if own_client:

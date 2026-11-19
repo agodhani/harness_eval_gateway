@@ -249,7 +249,10 @@ which runs the ordinary sandbox row through a single
 retry on upstream 5xx/timeout; 4xx fails immediately), writes
 `output.txt` + `meta.json` + `transcript.log` into the standard
 artifact dir, emits `run_started` + `terminal_state` +
-`sandbox_finalized`, and finishes `done`/`harness_complete`. Prompt and
+`sandbox_finalized`, and finishes `done`/`harness_complete`. The run's
+`wall_clock_seconds` bounds the cell like a container cap — a monotonic
+deadline cancels an in-flight call and skips the remaining retry
+(terminal `timeout`, reason `wall_clock`). Prompt and
 container cells interleave in one run; evaluation receives
 `prompt_output_path` so `output.txt` stages as the submission.
 `system_prompt_extra` becomes a `system` message. Preview/thumbnail

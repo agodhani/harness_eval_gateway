@@ -189,6 +189,27 @@ async def test_tool_optional_adapter_pin_allows_no_tools(monkeypatch) -> None:
     assert await modelcheck.validate_run_models(body, settings=_settings()) == []
 
 
+async def test_prompt_adapter_is_tool_optional(monkeypatch) -> None:
+    """The prompt pseudo-adapter sends a bare chat-completions body — no
+    ``tools`` field ever — so a no-tools model must not 422 a prompt-only
+    run, whether it comes through ``model_name`` or a per-config pin."""
+    _patch_fetch(
+        monkeypatch,
+        {
+            "v-only": frozenset({"completion", "vision"}),
+            "eval-model": frozenset({"tools"}),
+        },
+    )
+    body = _body(
+        model_name="v-only",
+        harness_configs=[
+            {"adapter": "prompt"},
+            {"adapter": "prompt", "model": "v-only"},
+        ],
+    )
+    assert await modelcheck.validate_run_models(body, settings=_settings()) == []
+
+
 async def test_no_capability_metadata_skips_tool_check(monkeypatch) -> None:
     """Provider reports ids only (caps=None) → absent-tool check can't
     fire; presence still counts (no warning for catalogued models)."""

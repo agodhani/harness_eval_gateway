@@ -7,6 +7,7 @@ the single retry). No real gateway, no containers.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -644,6 +645,132 @@ async def test_prompt_cell_connect_error_is_error_not_timeout(
         e for e in _events(session_factory, sid) if e.type == "terminal_state"
     ]
     assert term[0].payload["terminal_state"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# wall_clock_seconds — cell-level deadline (monitor parity)
+# ---------------------------------------------------------------------------
+
+
+async def test_prompt_cell_wall_clock_deadline_aborts_call(
+    session_factory, settings, artifact_root
+) -> None:
+    """``wall_clock_seconds`` bounds a prompt cell like a container's
+    monitor cap: an in-flight call past the deadline is aborted — the
+    orphaned upstream call mirrors a container being killed — and the
+    sandbox lands ``timeout``/``failed`` with its artifact set."""
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(5)  # outlives the 1s deadline; gets cancelled
+        return _chat_response()
+
+    run = make_run(
+        session_factory,
+        config=run_config(
+            budgets={
+                "max_iters": 10,
+                "token_budget": 100_000,
+                "wall_clock_seconds": 1,
+            }
+        ),
+    )
+    sid = await run_prompt_cell(
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        run_id=run.id,
+        harness_config=_prompt_config(),
+        settings=settings,
+        client=_client(handler),
+    )
+
+    assert calls == 1  # aborted mid-flight — no second attempt
+    sb = _sandbox(session_factory, sid)
+    assert sb.status == "failed"
+    assert sb.terminal_reason == "timeout"
+    meta = json.loads((Path(sb.artifact_path) / "meta.json").read_text())
+    assert meta["terminal_reason"] == "timeout"
+    assert "wall_clock" in meta["error"]
+    term = [e for e in _events(session_factory, sid) if e.type == "terminal_state"]
+    assert term[0].payload["terminal_state"] == "timeout"
+    assert term[0].payload["reason"] == "wall_clock"
+
+
+async def test_prompt_cell_wall_clock_expired_between_retries(
+    session_factory, settings, artifact_root
+) -> None:
+    """A deadline that lands after a retryable failure suppresses the
+    remaining retry — the 5xx is superseded by ``timeout``, not ``error``."""
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.9)  # burns most of the 1s deadline
+        return httpx.Response(503, json={"error": {"message": "upstream down"}})
+
+    run = make_run(
+        session_factory,
+        config=run_config(
+            budgets={
+                "max_iters": 10,
+                "token_budget": 100_000,
+                "wall_clock_seconds": 1,
+            }
+        ),
+    )
+    sid = await run_prompt_cell(
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        run_id=run.id,
+        harness_config=_prompt_config(),
+        settings=settings,
+        client=_client(handler),
+    )
+
+    assert calls == 1  # the retry the 5xx would normally earn never ran
+    sb = _sandbox(session_factory, sid)
+    assert sb.status == "failed"
+    assert sb.terminal_reason == "timeout"
+
+
+async def test_prompt_cell_wall_clock_already_elapsed_makes_no_call(
+    session_factory, settings, artifact_root
+) -> None:
+    """A deadline already past at cell start issues zero requests — same
+    as a container the monitor kills before its first poll."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _chat_response()
+
+    run = make_run(
+        session_factory,
+        config=run_config(
+            budgets={
+                "max_iters": 10,
+                "token_budget": 100_000,
+                "wall_clock_seconds": 0,
+            }
+        ),
+    )
+    sid = await run_prompt_cell(
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        run_id=run.id,
+        harness_config=_prompt_config(),
+        settings=settings,
+        client=_client(handler),
+    )
+
+    assert calls == 0
+    sb = _sandbox(session_factory, sid)
+    assert sb.status == "failed"
+    assert sb.terminal_reason == "timeout"
 
 
 def test_prompt_cell_timeout_outwaits_gateway_worst_case() -> None:
