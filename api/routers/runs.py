@@ -23,6 +23,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from api import modelcheck
+from api import presets as preset_store
 from api.config import get_settings
 from api.deps import get_db
 from api.schemas import (
@@ -119,6 +120,8 @@ def _run_out(
             _queue_positions(session).get(run.id) if run.status == "queued" else None
         ),
         warnings=list(warnings or []),
+        preset_ref=run.preset_ref,
+        preset_revision=run.preset_revision,
         sandboxes=[SandboxOut.model_validate(s) for s in _run_sandboxes(session, run.id)],
         rubric=RubricOut.model_validate(rubric) if rubric else None,
     )
@@ -203,11 +206,37 @@ async def create_run(body: RunCreate, session: DbSession) -> RunOut:
     config["same_model_eval"] = evaluator_model in set(
         run_models(config, body.model_name)
     )
+
+    # PR22 preset resolution — a preset_ref asserts the task came from the
+    # preset: the preset's body REPLACES the submitted task_prompt (stored
+    # verbatim, same comparison contract) and the resolved slug+revision are
+    # snapshotted as provenance. Unknown refs 422 like unknown adapters.
+    task_prompt = body.task_prompt
+    preset_ref: str | None = None
+    preset_revision: int | None = None
+    if body.preset_ref:
+        preset = preset_store.resolve(
+            session, get_settings().TASK_PRESETS_DIR, body.preset_ref
+        )
+        if preset is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"unknown preset {body.preset_ref!r} — "
+                    "GET /api/presets lists valid slugs"
+                ),
+            )
+        task_prompt = preset.task_prompt
+        preset_ref = preset.slug
+        preset_revision = preset.revision
+
     run = Run(
         status="submitted",
-        task_prompt=body.task_prompt,
+        task_prompt=task_prompt,
         model_name=body.model_name,
         config=config,
+        preset_ref=preset_ref,
+        preset_revision=preset_revision,
     )
     session.add(run)
     session.commit()
@@ -220,13 +249,16 @@ async def create_run(body: RunCreate, session: DbSession) -> RunOut:
 async def list_runs(
     session: DbSession,
     run_status: Annotated[str | None, Query(alias="status")] = None,
+    preset: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[RunSummary]:
-    """Runs newest-first; ``?status=`` filters, ``limit``/``offset`` paginate."""
+    """Runs newest-first; ``?status=``/``?preset=`` filter, paginated."""
     stmt = select(Run).order_by(Run.created_at.desc()).limit(limit).offset(offset)
     if run_status:
         stmt = stmt.where(Run.status == run_status)
+    if preset:
+        stmt = stmt.where(Run.preset_ref == preset.strip())
     runs = session.execute(stmt).scalars().all()
 
     run_ids = [r.id for r in runs]
@@ -256,6 +288,7 @@ async def list_runs(
             created_at=r.created_at,
             finished_at=r.finished_at,
             sandbox_count=counts.get(r.id, 0),
+            preset_ref=r.preset_ref,
             queue_position=positions.get(r.id),
         )
         for r in runs

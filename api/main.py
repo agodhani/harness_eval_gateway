@@ -22,6 +22,7 @@ from api.routers import (
     harnesses,
     health,
     models,
+    presets,
     preview,
     results,
     runs,
@@ -61,6 +62,7 @@ def create_app() -> FastAPI:
     app.include_router(analytics.router)
     app.include_router(preview.router)
     app.include_router(skillpacks.router)
+    app.include_router(presets.router)
     return app
 
 

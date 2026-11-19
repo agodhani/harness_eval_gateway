@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     # Anchored to the repo root so it resolves inside the api image (/app)
     # and in host-run dev alike.
     SKILLPACKS_DIR: Path = Path(__file__).resolve().parents[1] / "skillpacks"
+    # PR22 vendored task presets (<root>/<slug>.md — frontmatter + prompt
+    # body). Same repo-root anchoring: the api image bakes the repo, so
+    # adding a committed preset needs no extra config.
+    TASK_PRESETS_DIR: Path = Path(__file__).resolve().parents[1] / "task_presets"
     # Root for USER-IMPORTED skill packs (F11). None => derived from
     # ARTIFACT_ROOT as <data>/skillpacks (sibling of artifacts/ + sandboxes/,
     # so compose's ./data:/data mount + SandboxRuntime.to_host_path cover it).

@@ -58,6 +58,11 @@ class Run(Base):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # PR22 preset provenance — the preset slug the task_prompt was taken from
+    # (vendored file or user row) and the revision it had at submit time.
+    # task_prompt stays the verbatim contract; these are grouping/provenance.
+    preset_ref: Mapped[str | None] = mapped_column(String(64), index=True)
+    preset_revision: Mapped[int | None] = mapped_column(Integer)
 
     sandboxes: Mapped[list[Sandbox]] = relationship(back_populates="run")
     rubrics: Mapped[list[Rubric]] = relationship(back_populates="run")
@@ -183,6 +188,44 @@ class Score(Base):
 
     sandbox: Mapped[Sandbox] = relationship(back_populates="scores")
     rubric: Mapped[Rubric | None] = relationship(back_populates="scores")
+
+
+class TaskPreset(Base):
+    """PR22 — user-saved task preset (the "user" side of the preset library).
+
+    Vendored presets are files under ``task_presets/`` and never appear here;
+    rows in this table are always ``source="user"`` and share the vendored
+    slug namespace (creation rejects vendored-name collisions). ``revision``
+    bumps on every PATCH and is what ``runs.preset_revision`` snapshots.
+    ``suggested_rubric`` (PR23) and ``suite`` (PR26) land as populated columns
+    later — they exist now so later PRs don't re-migrate the table.
+    """
+
+    __tablename__ = "task_presets"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    # One slug namespace with the vendored files — URL token for
+    # /api/presets/{slug} and runs.preset_ref.
+    slug: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str] = mapped_column(Text, default="")
+    task_prompt: Mapped[str] = mapped_column(Text)
+    category: Mapped[str] = mapped_column(String(64), default="")
+    tags: Mapped[list[Any]] = mapped_column(JSONType, default=list)
+    # "user" for every row — "vendored" is reserved for file presets and
+    # never written here (kept in the column doc for the shared namespace).
+    source: Mapped[str] = mapped_column(String(16), default="user")
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    # Optional submit-form hints — same names as the vendored frontmatter
+    # keys so vendored and user presets read uniformly in PresetOut.
+    suggested_adapter: Mapped[str | None] = mapped_column(String(64))
+    suggested_models: Mapped[list[Any] | None] = mapped_column(JSONType)
+    suggested_rubric: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    suite: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class Artifact(Base):

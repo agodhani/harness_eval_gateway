@@ -181,6 +181,15 @@ class RunCreate(BaseModel):
     task_prompt: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
         min_length=1, max_length=100_000
     )
+    # PR22: optional task-preset reference (a slug from GET /api/presets).
+    # When set, the submit resolves the preset and REPLACES task_prompt with
+    # the preset's body verbatim — preset_ref asserts the task came from the
+    # preset, so a divergent prompt must be submitted without the ref (the
+    # "edit as custom copy" path drops the ref rather than lying about
+    # provenance). runs.preset_revision snapshots the resolved revision.
+    preset_ref: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, max_length=64
+    )
     model_name: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
         min_length=1, max_length=255
     )
@@ -204,6 +213,8 @@ class RunCreate(BaseModel):
         """Dedupe/blank-drop ``models`` (model_name always wins), then cap
         the expanded matrix — 8 configs × 8 models would spawn 64 sandboxes.
         A config pinned via ``model`` expands to one cell, not len(models)."""
+        if self.preset_ref is not None and not self.preset_ref:
+            self.preset_ref = None
         if self.models is not None:
             seen = {self.model_name}
             cleaned: list[str] = []
@@ -272,6 +283,10 @@ class RunOut(BaseModel):
     updated_at: datetime | None
     started_at: datetime | None
     finished_at: datetime | None
+    # PR22 preset provenance — the preset slug the task_prompt was resolved
+    # from (null for freeform prompts) + the revision snapshot at submit.
+    preset_ref: str | None = None
+    preset_revision: int | None = None
     # 1-based position among ``queued`` runs (approval/queue-entry order) —
     # set only while the run is parked; null in every other status.
     queue_position: int | None = None
@@ -297,6 +312,9 @@ class RunSummary(BaseModel):
     created_at: datetime
     finished_at: datetime | None
     sandbox_count: int
+    # PR22: preset slug the task came from (null for freeform prompts) —
+    # drives the list view's preset column/filter.
+    preset_ref: str | None = None
     # Same contract as RunOut.queue_position — null unless status=queued.
     queue_position: int | None = None
 
@@ -608,3 +626,160 @@ class RunTrends(BaseModel):
     price_model: str | None = None
     price_table: dict[str, ModelPrice] = Field(default_factory=dict)
     points: list[RunTrendPoint] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# PR22 — task preset library (api/routers/presets.py)
+# ---------------------------------------------------------------------------
+
+
+class PresetOut(BaseModel):
+    """One task preset — a vendored ``task_presets/<slug>.md`` file or a
+    user-saved ``task_presets`` row. Both sources read identically; ``source``
+    distinguishes them and decides PATCH/DELETE-ability (user only)."""
+
+    slug: str
+    title: str
+    description: str = ""
+    # The verbatim task text a preset submit runs — same contract as
+    # RunCreate.task_prompt.
+    task_prompt: str
+    category: str = ""
+    tags: list[str] = Field(default_factory=list)
+    source: str = "user"  # "vendored" | "user"
+    # Bumps on every user-preset PATCH (vendored presets are immutable →
+    # always 1). runs.preset_revision snapshots this at submit so the run
+    # records which preset version its prompt came from.
+    revision: int = 1
+    suggested_adapter: str | None = None
+    suggested_models: list[str] = Field(default_factory=list)
+    # Forward-declared for PR23 (rubric library) / PR26 (suites) — the
+    # columns exist; null until those features populate them.
+    suggested_rubric: dict[str, Any] | None = None
+    suite: dict[str, Any] | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    # Library-browse aggregates — every run whose preset_ref matches the
+    # slug (any preset_revision — a run keeps pointing at the preset it was
+    # submitted from), plus the most recent run's mean ``overall`` score
+    # (null when the newest run is unscored).
+    runs_count: int = 0
+    last_run_mean: float | None = None
+
+
+class PresetCreate(BaseModel):
+    """POST /api/presets/{slug} body — save a task prompt as a user preset.
+
+    The slug comes from the path (one namespace shared with vendored
+    presets — a collision 409s with a ``suggested_name`` for the rename
+    flow). ``revision`` starts at 1.
+    """
+
+    title: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
+        min_length=1, max_length=255
+    )
+    task_prompt: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
+        min_length=1, max_length=100_000
+    )
+    description: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
+        default="", max_length=2000
+    )
+    category: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
+        default="", max_length=64
+    )
+    tags: list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=64)]] = Field(
+        default_factory=list, max_length=16
+    )
+    suggested_adapter: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, max_length=64
+    )
+    suggested_models: list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]] | None = Field(
+        default=None, max_length=8
+    )
+
+
+class PresetUpdate(BaseModel):
+    """PATCH /api/presets/{slug} body — partial edit of a USER preset.
+
+    Every applied field replaces the stored value; omitted fields keep
+    theirs. Any successful PATCH bumps ``revision`` — runs snapshot it, so
+    pre-edit runs keep pointing at the revision they ran on.
+    """
+
+    title: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, min_length=1, max_length=255
+    )
+    task_prompt: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, min_length=1, max_length=100_000
+    )
+    description: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, max_length=2000
+    )
+    category: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, max_length=64
+    )
+    tags: list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=64)]] | None = Field(
+        default=None, max_length=16
+    )
+    suggested_adapter: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, max_length=64
+    )
+    suggested_models: list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]] | None = Field(
+        default=None, max_length=8
+    )
+
+
+class PresetRunPoint(BaseModel):
+    """One run's row inside a preset's analytics — the preset detail page's
+    "every run on this preset" table row."""
+
+    run_id: uuid.UUID
+    status: str
+    created_at: datetime | None = None
+    finished_at: datetime | None = None
+    sandbox_count: int = 0
+    # Mean of the run's sandbox-level ``overall`` scores (null unscored)
+    # + how many cells the mean covers.
+    mean_overall_score: float | None = None
+    scored_sandboxes: int = 0
+
+
+class PresetLeaderboardEntry(BaseModel):
+    """One row of a preset leaderboard — mean ``overall`` score pooled over
+    every scored sandbox cell in the bucket across all runs on the preset."""
+
+    key: str  # group key — model name, or the config label
+    label: str  # display label (same as key today; kept for richer labels)
+    adapter: str | None = None  # config board only: the grouped adapter
+    name: str | None = None  # config board only: PR1 config name when set
+    mean_overall_score: float
+    n: int  # scored sandbox cells in the bucket
+    runs: int  # distinct runs contributing a scored cell
+
+
+class PresetTrendPoint(BaseModel):
+    """Score-over-time point for the preset detail chart — one per run that
+    has at least one scored cell, oldest first."""
+
+    run_id: uuid.UUID
+    created_at: datetime | None = None
+    finished_at: datetime | None = None
+    mean_overall_score: float
+    scored_sandboxes: int = 0
+
+
+class PresetAnalytics(BaseModel):
+    """GET /api/presets/{slug}/analytics — everything the preset detail page
+    needs in one shot: the preset itself, every run on it, per-model and
+    per-config leaderboards, the pooled mean, and the score-over-time trend.
+    """
+
+    preset: PresetOut
+    runs: list[PresetRunPoint] = Field(default_factory=list)  # newest first
+    by_model: list[PresetLeaderboardEntry] = Field(default_factory=list)
+    by_config: list[PresetLeaderboardEntry] = Field(default_factory=list)
+    # Pooled mean ``overall`` over every scored cell on the preset + that
+    # count; null when nothing on the preset has been scored yet.
+    mean_overall_score: float | None = None
+    n_scored: int = 0
+    trend: list[PresetTrendPoint] = Field(default_factory=list)  # oldest first
