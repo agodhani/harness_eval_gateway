@@ -142,6 +142,12 @@ async def test_prompt_cell_happy_path(
     assert claims.run_id == str(run.id)
     assert claims.sandbox_id == str(sid)
     assert claims.max_tokens == 100_000  # run token_budget
+    # provider override is a SERVICE-cred privilege — a sandbox cell sends
+    # only its bearer token; the provider is baked into the cred
+    assert "x-heg-provider" not in req.headers
+    assert set(req.headers).isdisjoint(
+        h for h in req.headers if h.startswith("x-heg-")
+    )
 
     # artifacts on disk
     art_dir = Path(sb.artifact_path)
@@ -564,3 +570,96 @@ def test_is_prompt_config() -> None:
     assert not prompt_cell.is_prompt_config({"adapter": "miniloop"})
     assert not prompt_cell.is_prompt_config(None)
     assert not prompt_cell.is_prompt_config({})
+
+
+# ---------------------------------------------------------------------------
+# config-shape edge cases + constants contract
+# ---------------------------------------------------------------------------
+
+
+async def test_prompt_cell_ignores_skill_packs(
+    session_factory, settings, artifact_root
+) -> None:
+    """A stale skill_packs selection on a prompt config is inert: the cell
+    stages nothing, sends the bare task prompt, and still lands a normal
+    artifact (submit strips these client-side; this proves the backend
+    ignores whatever survives)."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _chat_response("pack-free reply")
+
+    run = make_run(session_factory, config=run_config())
+    sid = await run_prompt_cell(
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        run_id=run.id,
+        harness_config=_prompt_config(skill_packs=["superpowers", "spec-kit"]),
+        settings=settings,
+        client=_client(handler),
+    )
+
+    sb = _sandbox(session_factory, sid)
+    assert sb.status == "done"
+    assert len(requests) == 1
+    body = json.loads(requests[0].content)
+    # no pack names/content ever reach the model call
+    assert body["messages"] == [{"role": "user", "content": run.task_prompt}]
+    assert "superpowers" not in requests[0].content.decode()
+    assert "spec-kit" not in requests[0].content.decode()
+    assert (Path(sb.artifact_path) / "output.txt").read_text() == "pack-free reply"
+
+
+async def test_prompt_cell_connect_error_is_error_not_timeout(
+    session_factory, settings, artifact_root
+) -> None:
+    """Non-timeout transport failures (connection refused/reset) are
+    retried once, then land as `error` — NOT `timeout` (which is reserved
+    for the cell's wall-clock cap, matching monitor semantics)."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("gateway refused", request=request)
+
+    run = make_run(session_factory, config=run_config())
+    sid = await run_prompt_cell(
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        run_id=run.id,
+        harness_config=_prompt_config(),
+        settings=settings,
+        client=_client(handler),
+    )
+
+    assert calls == 2  # one retry, then terminal
+    sb = _sandbox(session_factory, sid)
+    assert sb.status == "failed"
+    assert sb.terminal_reason == "error"
+    meta = json.loads((Path(sb.artifact_path) / "meta.json").read_text())
+    assert "ConnectError" in meta["error"]
+    term = [
+        e for e in _events(session_factory, sid) if e.type == "terminal_state"
+    ]
+    assert term[0].payload["terminal_state"] == "error"
+
+
+def test_prompt_cell_timeout_outwaits_gateway_worst_case() -> None:
+    """PROMPT_CELL_TIMEOUT_SECONDS must exceed the gateway's worst-case
+    silent hold on one call — (1 + UPSTREAM_RETRY_ATTEMPTS) attempts each
+    burning the whole UPSTREAM_TIMEOUT_SECONDS plus summed exponential
+    backoff — same contract as rubric/miniloop/testgen callers. Derived
+    from GatewaySettings defaults so a gateway-side bump that breaks the
+    guarantee fails this test."""
+    from gateway.config import GatewaySettings
+
+    fields = GatewaySettings.model_fields
+    attempts = 1 + int(fields["UPSTREAM_RETRY_ATTEMPTS"].default)
+    upstream_timeout = float(fields["UPSTREAM_TIMEOUT_SECONDS"].default)
+    backoff_base = float(fields["UPSTREAM_RETRY_BACKOFF_SECONDS"].default)
+    worst_case = attempts * upstream_timeout + sum(
+        backoff_base * (2**i) for i in range(attempts - 1)
+    )
+    assert prompt_cell.DEFAULT_TIMEOUT_SECONDS > worst_case

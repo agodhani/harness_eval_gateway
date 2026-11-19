@@ -28,6 +28,7 @@ import {
   NO_SANDBOX_ADAPTERS,
   PROVIDERS,
   pullModel,
+  sanitizeHarnessConfigs,
   SKILL_PACKS,
   type Budgets,
   type HarnessConfig,
@@ -503,17 +504,18 @@ export default function SubmitPage() {
     setFieldErrors(validation);
     if (!isValid || submitting) return;
 
-    const harness_configs: HarnessConfig[] = configs.map((c) => ({
-      adapter: c.adapter,
-      // Prompt cells stage nothing — a stale selection from a previous
-      // adapter pick must not ship packs the cell can't use.
-      skill_packs: isNoSandboxAdapter(c.adapter) ? [] : c.skill_packs,
-      system_prompt_extra: c.system_prompt_extra.trim() || null,
-      name: c.name.trim() || null,
-      // Per-config model pin (PR14) — only ever set by a resubmit restore;
-      // the form itself has no pin UI.
-      model: c.model ?? null,
-    }));
+    const harness_configs: HarnessConfig[] = sanitizeHarnessConfigs(
+      configs.map((c) => ({
+        adapter: c.adapter,
+        skill_packs: c.skill_packs,
+        system_prompt_extra: c.system_prompt_extra.trim() || null,
+        name: c.name.trim() || null,
+        // Per-config model pin (PR14) — only ever set by a resubmit
+        // restore; the form itself has no pin UI.
+        model: c.model ?? null,
+      })),
+      isNoSandboxAdapter,
+    );
     // Row 1 → model_name; remaining deduped rows → models (null when
     // single-model). Providers stay client-side — RunCreate has no
     // per-model provider field; routing resolves gateway-side.

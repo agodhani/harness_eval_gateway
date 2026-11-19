@@ -225,6 +225,19 @@ export interface HarnessConfig {
   model?: string | null;
 }
 
+/** PR25: no-sandbox pseudo-adapters run a single model call and stage
+ * nothing — a skill_packs selection left over from a previous adapter
+ * pick must not ship on a prompt cell (the backend ignores it, but the
+ * payload shouldn't claim packs it never used). */
+export function sanitizeHarnessConfigs(
+  configs: HarnessConfig[],
+  isNoSandbox: (adapter: string) => boolean,
+): HarnessConfig[] {
+  return configs.map((c) =>
+    isNoSandbox(c.adapter) ? { ...c, skill_packs: [] } : c,
+  );
+}
+
 export interface Budgets {
   max_iters: number;
   token_budget: number;
