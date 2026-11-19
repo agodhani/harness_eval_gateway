@@ -30,6 +30,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F15 | Submit UX: live model picker + install, named harness configs | ✅ | `api/routers/models.py`, `gateway/main.py` (`/v1/models/pull`), `web/app/submit/page.tsx`, `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`, `orchestrator/provision.py` | `tests/unit/api/test_models.py`, `tests/unit/gateway/test_proxy.py` (pull), `tests/unit/db/test_migrations.py`, `tests/unit/orchestrator/test_provision.py` (name) |
 | F16 | Model-vs-model matrix (config × model) + per-model analytics | ✅ | `orchestrator/matrix.py`, `orchestrator/lifecycle.py`, `orchestrator/provision.py`, `api/schemas.py`, `api/routers/runs.py`, `results.py`, `analytics.py`, `web/app/submit/page.tsx`, `web/lib/api.ts`, `web/app/runs/[id]/` (detail, results, analysis) | `tests/unit/orchestrator/test_matrix.py`, `test_lifecycle.py`, `test_provision.py`, `tests/unit/api/test_runs.py`, `test_results.py`, `test_analytics.py` |
 | F17 | Artifact thumbnails (headless screenshots via the preview stack; desktop captures wait on real VNC framebuffer content, dead-app fast-fail with exit reason) | ✅ | `sandbox/thumbnails.py`, `sandbox/images/thumbnail-capture.{Dockerfile,sh}`, `sandbox/images/thumbnail-vnc.py`, `api/routers/preview.py` (`.../thumbnail`), `api/routers/results.py` (`SandboxResult.thumbnail`), `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_thumbnails.py`, `tests/unit/api/test_thumbnails.py`, `tests/integration/test_thumbnail.py` |
+| F18 | Task preset library (vendored md + user presets, preset_ref on runs, /presets browse + detail) | ✅ | `task_presets/`, `api/presets.py`, `api/routers/presets.py`, `api/routers/runs.py` (preset_ref), `db/models.py` (`TaskPreset`, `Run.preset_*`), `web/app/presets/`, `web/components/SavePresetDialog.tsx`, `web/app/submit/page.tsx` | `tests/unit/api/test_presets.py`, `tests/unit/db/test_migrations.py`, `web/lib/resubmit.test.ts` |
 
 ## Feature details
 
@@ -1113,6 +1114,92 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     appears → click → live preview opens.
 - **Depends on:** F12 (preview stack, purpose label plumbing, jailed
   workspace resolution), F8 (results page)
+
+### F18 — Task preset library ✅
+
+- **What:** a shared library of reusable evaluation tasks. Submit can pick
+  a preset instead of writing a freeform prompt — the preset's markdown
+  body runs verbatim as `task_prompt`, and the run records `preset_ref` +
+  `preset_revision` provenance so presets become a durable grouping axis
+  (run history, leaderboards, trends) for suites and comparison pages.
+  Two source kinds share one slug namespace — the skillpack model, applied
+  to tasks:
+  - **vendored** — Markdown files under `task_presets/<slug>.md` (commit-
+    ted, read-only at runtime, `TASK_PRESETS_DIR` configurable). YAML-
+    frontmatter-ish metadata (slug/title/description/category/tags/
+    suggested_adapter/suggested_models/suggested_rubric/suite) parsed by
+    the same stdlib frontmatter parser as skillpacks
+    (`adapters/miniloop/skills.py` — flow-style values like
+    `tags: [a, b]`, no YAML block lists); the body below `---` is the
+    task prompt. Ships ten starters incl. live-validation `wordle-html`
+    + `snake-pygame`, game-2048, bugfix/refactor/docs, csv analysis,
+    extraction/classification, sql report, support reply.
+  - **user** — `task_presets` table rows (`source="user"`), created via
+    the UI's "save as preset" or POST; `revision` starts at 1 and bumps
+    on every PATCH; deletable.
+- **API** (`api/routers/presets.py`, store `api/presets.py`):
+  - `GET /api/presets` → merged list (vendored + user), each row carries
+    browse aggregates `runs_count` + `last_run_mean` (newest scored run).
+  - `GET /api/presets/{slug}` → one preset; `.../analytics` → preset +
+    every run on it + per-model/per-config leaderboards (pooled mean
+    `overall`) + pooled mean/n + score-over-time trend.
+  - `POST /api/presets/{slug}` → create a user preset; `409` on slug
+    collision returns structured `{kind: name_conflict, name, source,
+    suggested_name}` (same contract as skillpack import).
+  - `PATCH`/`DELETE` → user presets only; vendored 403s ("filesystem
+    resource"); PATCH bumps `revision`.
+  - Slug validation (`^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$`) applies
+    before any filesystem touch — vendored resolution is traversal-safe.
+- **Runs integration:** `RunCreate.preset_ref` — when set, the submit
+  resolves the preset (merged namespace; unknown → 422) and REPLACES the
+  submitted `task_prompt` with the preset body verbatim, then snapshots
+  `runs.preset_ref` + `runs.preset_revision`. `task_prompt` remains the
+  authoritative run text (a preset edit never rewrites history).
+  `GET /api/runs?preset=<slug>` filters; `RunOut`/`RunSummary` carry
+  `preset_ref`/`preset_revision`.
+- **Web:** `/presets` index (search + category chips, runs count +
+  last-run mean columns, "run →" submit link); `/presets/[slug]` detail
+  (prompt, KPI strip, trend chart via the analysis recharts theme,
+  per-model + per-config leaderboards, run history, edit/delete for user
+  presets); submit page custom|preset toggle + scrollable picker
+  (`.preset-pick`), `?preset=` prefill, "edit as custom copy" detach,
+  suggested adapter/model "apply to empty fields", "save as preset"
+  dialog (`SavePresetDialog` — shared, also edit mode); run detail shows
+  preset provenance + "save prompt as preset" on freeform runs; `/runs`
+  gains a preset column + select filter; resubmit carries `preset_ref`
+  (re-resolves the CURRENT revision); nav gains "Presets".
+- **Where:** `task_presets/*.md`, `api/presets.py` (vendored discovery,
+  frontmatter parse, merged `resolve`/`list`, slug helpers, error types),
+  `api/routers/presets.py`, `api/routers/runs.py` (resolve + `?preset=`
+  filter), `api/schemas.py` (`PresetOut`/`PresetCreate`/`PresetUpdate`/
+  `PresetAnalytics`/`PresetLeaderboardEntry`/`PresetRunPoint`/
+  `PresetTrendPoint`, `RunCreate.preset_ref`, Run* preset fields),
+  `api/config.py` (`TASK_PRESETS_DIR`), `db/models.py` (`TaskPreset`,
+  `Run.preset_ref`/`preset_revision`), migration
+  `d1e2f3a4b5c6_task_presets.py`, `web/lib/api.ts` (preset types +
+  client fns), `web/lib/resubmit.ts`, `web/components/
+  SavePresetDialog.tsx`, `web/app/presets/{page,[slug]/}`,
+  `web/app/submit/page.tsx`, `web/app/runs/page.tsx`,
+  `web/app/runs/[id]/RunDetailClient.tsx`, `.preset-*`/`.kpi*` styles in
+  `globals.css`.
+- **Verify:**
+  - Unit: `tests/unit/api/test_presets.py` — vendored discovery/parse,
+    merged list/detail, shared-namespace collision guard (a vendored or
+    existing user slug → structured 409), CRUD + revision bumps,
+    vendored PATCH/DELETE 403s, traversal slugs 422, analytics shapes,
+    run-submit preset_ref resolution (verbatim prompt + revision
+    snapshot) + unknown ref 422 + `?preset=` list filter +
+    starter-file contract (all ten presets parse, required fields,
+    nonempty body).
+  - `tests/unit/db/test_migrations.py` — `task_presets` table + runs
+    preset columns land; single alembic head.
+  - Web: `web/lib/resubmit.test.ts` (preset_ref carry), `next build` +
+    `eslint` clean.
+  - Manual: `/presets` → pick `wordle-html` → "run →" → submit → run
+    detail shows `wordle-html · rev 1` → `/runs?preset=` filter → preset
+    detail shows the run + leaderboards once scored.
+- **Depends on:** F1 (submit form + RunCreate), F8/F13 (runs list +
+  analytics patterns), F11 (vendored-vs-db merge + name_conflict model)
 
 ## Implementation sequence
 

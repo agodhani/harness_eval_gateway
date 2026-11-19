@@ -16,6 +16,12 @@ import type { Budgets, HarnessConfig, RunOut } from "./api.ts";
 /** Everything the submit form needs to re-create a run's spec. */
 export interface ResubmitSpec {
   task_prompt: string;
+  /** PR22: preset slug the task_prompt resolved from (null for freeform
+   * prompts). Carried so resubmit re-attaches to the preset — the new run
+   * resolves the preset's CURRENT revision verbatim (an updated preset
+   * submits its updated body; the staged task_prompt is the "edit as
+   * custom copy" fallback if the user detaches it). */
+  preset_ref?: string | null;
   /** Participant models, primary first (row 1 → model_name). */
   models: string[];
   evaluator_model: string | null;
@@ -37,6 +43,7 @@ export function specFromRun(run: RunOut): ResubmitSpec {
   }
   return {
     task_prompt: run.task_prompt ?? "",
+    preset_ref: run.preset_ref ?? null,
     models: models.length ? models : [run.model_name].filter(Boolean),
     evaluator_model:
       (cfg.evaluator_model as string | null | undefined) ?? null,

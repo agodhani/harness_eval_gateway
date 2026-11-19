@@ -83,9 +83,7 @@ def _preset_err(exc: preset_store.PresetError) -> HTTPException:
             "suggested_name": exc.suggested_name,
         }
     return HTTPException(
-        status_code=_STORE_STATUS.get(
-            exc.kind, status.HTTP_500_INTERNAL_SERVER_ERROR
-        ),
+        status_code=_STORE_STATUS.get(exc.kind, status.HTTP_500_INTERNAL_SERVER_ERROR),
         detail=detail,
     )
 
@@ -129,11 +127,7 @@ def _latest_overalls(
     endpoints (rubric versions + rescore insert newer rows).
     """
     sandboxes = (
-        session.execute(
-            select(Sandbox).where(Sandbox.run_id.in_(run_ids))
-        )
-        .scalars()
-        .all()
+        session.execute(select(Sandbox).where(Sandbox.run_id.in_(run_ids))).scalars().all()
         if run_ids
         else []
     )
@@ -170,18 +164,14 @@ def _run_means(
     return out
 
 
-def _list_stats(
-    session: Session, slugs: set[str]
-) -> dict[str, tuple[int, float | None]]:
+def _list_stats(session: Session, slugs: set[str]) -> dict[str, tuple[int, float | None]]:
     """slug -> (runs_count, last scored run's mean overall) for the browse
     list — one pass over every preset-tagged run."""
     if not slugs:
         return {}
     runs = (
         session.execute(
-            select(Run)
-            .where(Run.preset_ref.in_(slugs))
-            .order_by(Run.created_at.desc())
+            select(Run).where(Run.preset_ref.in_(slugs)).order_by(Run.created_at.desc())
         )
         .scalars()
         .all()
@@ -264,11 +254,7 @@ async def preset_analytics(slug: str, session: DbSession) -> PresetAnalytics:
     stats = _list_stats(session, {slug})
 
     runs = (
-        session.execute(
-            select(Run)
-            .where(Run.preset_ref == slug)
-            .order_by(Run.created_at.desc())
-        )
+        session.execute(select(Run).where(Run.preset_ref == slug).order_by(Run.created_at.desc()))
         .scalars()
         .all()
     )
@@ -289,9 +275,7 @@ async def preset_analytics(slug: str, session: DbSession) -> PresetAnalytics:
                 created_at=run.created_at,
                 finished_at=run.finished_at,
                 sandbox_count=sb_count.get(run.id, 0),
-                mean_overall_score=(
-                    round(sum(overalls) / len(overalls), 2) if overalls else None
-                ),
+                mean_overall_score=(round(sum(overalls) / len(overalls), 2) if overalls else None),
                 scored_sandboxes=len(overalls),
             )
         )
@@ -323,8 +307,7 @@ async def preset_analytics(slug: str, session: DbSession) -> PresetAnalytics:
                     or (sb.harness_config or {}).get("harness")
                     or "?"
                 ),
-                "name": str((sb.harness_config or {}).get("name") or "").strip()
-                or None,
+                "name": str((sb.harness_config or {}).get("name") or "").strip() or None,
             },
         )
         cb["scores"].append(score)
@@ -337,9 +320,7 @@ async def preset_analytics(slug: str, session: DbSession) -> PresetAnalytics:
                 label=bucket.get("label") or key,
                 adapter=bucket.get("adapter") if config else None,
                 name=bucket.get("name") if config else None,
-                mean_overall_score=round(
-                    sum(bucket["scores"]) / len(bucket["scores"]), 2
-                ),
+                mean_overall_score=round(sum(bucket["scores"]) / len(bucket["scores"]), 2),
                 n=len(bucket["scores"]),
                 runs=len(bucket["runs"]),
             )
@@ -359,9 +340,7 @@ async def preset_analytics(slug: str, session: DbSession) -> PresetAnalytics:
             run_id=r.id,
             created_at=r.created_at,
             finished_at=r.finished_at,
-            mean_overall_score=round(
-                sum(means[r.id]) / len(means[r.id]), 2
-            ),
+            mean_overall_score=round(sum(means[r.id]) / len(means[r.id]), 2),
             scored_sandboxes=len(means[r.id]),
         )
         for r in trend_runs
@@ -372,27 +351,21 @@ async def preset_analytics(slug: str, session: DbSession) -> PresetAnalytics:
         runs=run_points,
         by_model=_board(by_model, config=False),
         by_config=_board(by_config, config=True),
-        mean_overall_score=(
-            round(sum(all_scores) / len(all_scores), 2) if all_scores else None
-        ),
+        mean_overall_score=(round(sum(all_scores) / len(all_scores), 2) if all_scores else None),
         n_scored=len(all_scores),
         trend=trend,
     )
 
 
 @router.post("/{slug}", status_code=status.HTTP_201_CREATED)
-async def create_preset(
-    slug: str, body: PresetCreate, session: DbSession
-) -> PresetOut:
+async def create_preset(slug: str, body: PresetCreate, session: DbSession) -> PresetOut:
     """Save a task prompt as a user preset at the path's slug."""
     settings = get_settings()
     try:
         slug = preset_store.validate_slug(slug)
         taken = preset_store.taken_slugs(session, settings.TASK_PRESETS_DIR)
         if slug in taken:
-            vendored = preset_store.get_vendored(
-                settings.TASK_PRESETS_DIR, slug
-            )
+            vendored = preset_store.get_vendored(settings.TASK_PRESETS_DIR, slug)
             raise preset_store.PresetError(
                 "name_conflict",
                 f"preset slug {slug!r} is already taken",
@@ -418,9 +391,7 @@ async def create_preset(
         except IntegrityError:
             # Concurrent create lost the slug race — same rename flow.
             session.rollback()
-            taken = preset_store.taken_slugs(
-                session, settings.TASK_PRESETS_DIR
-            )
+            taken = preset_store.taken_slugs(session, settings.TASK_PRESETS_DIR)
             raise preset_store.PresetError(
                 "name_conflict",
                 f"preset slug {slug!r} is already taken",
@@ -437,9 +408,7 @@ async def create_preset(
 
 
 @router.patch("/{slug}")
-async def update_preset(
-    slug: str, body: PresetUpdate, session: DbSession
-) -> PresetOut:
+async def update_preset(slug: str, body: PresetUpdate, session: DbSession) -> PresetOut:
     """Partial-edit a USER preset; bumps ``revision`` on every change."""
     settings = get_settings()
     try:
@@ -452,9 +421,7 @@ async def update_preset(
             )
         row = preset_store.get_user(session, slug)
         if row is None:
-            raise preset_store.PresetError(
-                "not_found", f"preset {slug!r} not found"
-            )
+            raise preset_store.PresetError("not_found", f"preset {slug!r} not found")
         changed = False
         for field_name in (
             "title",
@@ -497,9 +464,7 @@ async def delete_preset(slug: str, session: DbSession) -> None:
             )
         row = preset_store.get_user(session, slug)
         if row is None:
-            raise preset_store.PresetError(
-                "not_found", f"preset {slug!r} not found"
-            )
+            raise preset_store.PresetError("not_found", f"preset {slug!r} not found")
         session.delete(row)
         session.commit()
     except preset_store.PresetError as exc:

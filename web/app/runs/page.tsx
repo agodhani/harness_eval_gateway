@@ -13,10 +13,12 @@ import { useEffect, useMemo, useState } from "react";
 import {
   ApiError,
   getRunTrends,
+  listPresets,
   listRuns,
   RUN_STATUSES,
   TERMINAL_RUN_STATUSES,
   type RunSummary,
+  type TaskPreset,
 } from "@/lib/api";
 import { formatTs, shortId, truncate } from "@/lib/format";
 import { Badge, Card, EmptyState, ErrorNote, Loading, statusTone } from "@/components/ui";
@@ -42,6 +44,8 @@ function matchesQuery(r: RunSummary, q: string): boolean {
     // `adapters` isn't on RunSummary yet — optional field that lights up
     // when the backend exposes it.
     ...(r.adapters ?? []),
+    // PR22 — preset provenance on the row.
+    ...(r.preset_ref ? [r.preset_ref] : []),
   ];
   return hay.some((h) => h.toLowerCase().includes(q));
 }
@@ -50,7 +54,10 @@ export default function RunsPage() {
   const [runs, setRuns] = useState<RunSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string>("");
+  const [presetFilter, setPresetFilter] = useState<string>("");
   const [query, setQuery] = useState("");
+  // Preset library for the filter dropdown labels — silent on failure.
+  const [presets, setPresets] = useState<TaskPreset[]>([]);
   // run_id → mean overall score (one trends call, not N results fetches);
   // null until the analytics endpoint responds / stays empty when it 404s.
   const [scores, setScores] = useState<Map<string, number | null>>(new Map());
@@ -65,6 +72,7 @@ export default function RunsPage() {
       try {
         const data = await listRuns({
           status: statusFilter || undefined,
+          preset: presetFilter || undefined,
           limit: 100,
         });
         if (cancelled) return;
@@ -84,7 +92,24 @@ export default function RunsPage() {
     return () => {
       cancelled = true;
     };
-  }, [statusFilter]);
+  }, [statusFilter, presetFilter]);
+
+  // Preset dropdown — one list fetch; failure just means a slimmer select.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      await Promise.resolve();
+      try {
+        const data = await listPresets();
+        if (!cancelled) setPresets(data);
+      } catch {
+        /* preset lane unavailable — the select falls back to run refs */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Mean overall scores — a single trends call keyed by run_id. Failure is
   // silent: the column just shows "—" for every row.
@@ -112,14 +137,30 @@ export default function RunsPage() {
     const anyActive = (runs ?? []).some((r) => !TERMINAL_RUN_STATUSES.includes(r.status));
     if (!anyActive) return;
     const t = setInterval(() => {
-      listRuns({ status: statusFilter || undefined, limit: 100 })
+      listRuns({
+        status: statusFilter || undefined,
+        preset: presetFilter || undefined,
+        limit: 100,
+      })
         .then((data) => setRuns(data))
         .catch(() => {
           /* transient — next tick retries */
         });
     }, POLL_MS);
     return () => clearInterval(t);
-  }, [runs, statusFilter]);
+  }, [runs, statusFilter, presetFilter]);
+
+  // Filter dropdown: library slugs first, then any preset_ref seen on runs
+  // that the library doesn't know (deleted presets keep their provenance).
+  const presetOptions = useMemo(() => {
+    const slugs = new Set(presets.map((p) => p.slug));
+    for (const r of runs ?? []) {
+      if (r.preset_ref) slugs.add(r.preset_ref);
+    }
+    return [...slugs].sort();
+  }, [presets, runs]);
+  const presetTitle = (slug: string) =>
+    presets.find((p) => p.slug === slug)?.title;
 
   const q = query.trim().toLowerCase();
   const filtered = useMemo(
@@ -159,6 +200,23 @@ export default function RunsPage() {
               </option>
             ))}
           </select>
+          {presetOptions.length > 0 ? (
+            <select
+              className="select"
+              style={{ width: "auto" }}
+              value={presetFilter}
+              onChange={(e) => setPresetFilter(e.target.value)}
+              aria-label="Filter by preset"
+              title="Filter runs by task preset"
+            >
+              <option value="">All presets</option>
+              {presetOptions.map((slug) => (
+                <option key={slug} value={slug}>
+                  {presetTitle(slug) ?? slug}
+                </option>
+              ))}
+            </select>
+          ) : null}
           <Link href="/submit" className="btn btn--primary btn--sm">
             + New run
           </Link>
@@ -184,6 +242,11 @@ export default function RunsPage() {
                     {" "}with status <code>{statusFilter}</code>
                   </>
                 ) : null}
+                {presetFilter ? (
+                  <>
+                    {" "}on preset <code>{presetFilter}</code>
+                  </>
+                ) : null}
                 .{" "}
                 <button
                   type="button"
@@ -191,20 +254,35 @@ export default function RunsPage() {
                   onClick={() => {
                     setQuery("");
                     setStatusFilter("");
+                    setPresetFilter("");
                   }}
                 >
                   clear filters
                 </button>
               </>
-            ) : statusFilter ? (
+            ) : statusFilter || presetFilter ? (
               <>
-                No runs with status <code>{statusFilter}</code>.{" "}
+                No runs
+                {statusFilter ? (
+                  <>
+                    {" "}with status <code>{statusFilter}</code>
+                  </>
+                ) : null}
+                {presetFilter ? (
+                  <>
+                    {" "}on preset <code>{presetFilter}</code>
+                  </>
+                ) : null}
+                .{" "}
                 <button
                   type="button"
                   className="btn btn--sm btn--ghost"
-                  onClick={() => setStatusFilter("")}
+                  onClick={() => {
+                    setStatusFilter("");
+                    setPresetFilter("");
+                  }}
                 >
-                  clear filter
+                  clear filters
                 </button>
               </>
             ) : (
@@ -226,6 +304,7 @@ export default function RunsPage() {
                 <tr>
                   <th>Run</th>
                   <th>Task</th>
+                  <th>Preset</th>
                   <th>Model</th>
                   <th>Status</th>
                   <th>Sandboxes</th>
@@ -245,6 +324,19 @@ export default function RunsPage() {
                         </Link>
                       </td>
                       <td style={{ maxWidth: "340px" }}>{truncate(r.task_prompt, 90)}</td>
+                      <td className="num">
+                        {r.preset_ref ? (
+                          <Link
+                            href={`/presets/${r.preset_ref}`}
+                            className="mono"
+                            title={presetTitle(r.preset_ref) ?? r.preset_ref}
+                          >
+                            {r.preset_ref}
+                          </Link>
+                        ) : (
+                          <span className="faint">—</span>
+                        )}
+                      </td>
                       <td className="num">
                         {r.model_name}
                         {(r.models?.length ?? 0) > 1 ? (

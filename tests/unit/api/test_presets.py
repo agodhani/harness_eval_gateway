@@ -97,9 +97,7 @@ def api(session_factory, presets_dir: Path, tmp_path: Path, monkeypatch):
     async def _no_catalog(body, settings=None):
         return []
 
-    monkeypatch.setattr(
-        runs_router.modelcheck, "validate_run_models", _no_catalog
-    )
+    monkeypatch.setattr(runs_router.modelcheck, "validate_run_models", _no_catalog)
     monkeypatch.setattr(runner, "start_rubric_task", lambda *a, **k: None)
 
     def override_get_db():
@@ -222,9 +220,7 @@ def test_parse_preset_md_rejects_bad_files(tmp_path: Path) -> None:
         )
     # empty prompt body
     with pytest.raises(preset_store.PresetError):
-        preset_store.parse_preset_md(
-            "---\nslug: x\ntitle: t\ncategory: c\n---\n", filename="x.md"
-        )
+        preset_store.parse_preset_md("---\nslug: x\ntitle: t\ncategory: c\n---\n", filename="x.md")
 
 
 def test_list_vendored_sorted_and_skips_bad_file(tmp_path: Path) -> None:
@@ -256,9 +252,7 @@ def test_resolve_rejects_weird_slugs(tmp_path: Path, session_factory) -> None:
     looking values must resolve to nothing, never read outside the root."""
     root = tmp_path / "task_presets"
     root.mkdir()
-    (root / "ok.md").write_text(
-        "---\nslug: ok\ntitle: t\ncategory: c\n---\nbody\n"
-    )
+    (root / "ok.md").write_text("---\nslug: ok\ntitle: t\ncategory: c\n---\nbody\n")
     for bad in ("../escape", "..", "a/b", "x.md", "ok/../ok"):
         assert preset_store.get_vendored(root, bad) is None
         with session_factory() as s:
@@ -279,9 +273,7 @@ def test_merged_list_vendored_wins_on_clash(session_factory, tmp_path) -> None:
                 task_prompt="fake",
             )
         )
-        s.add(
-            TaskPreset(slug="user-only", title="mine", task_prompt="real")
-        )
+        s.add(TaskPreset(slug="user-only", title="mine", task_prompt="real"))
         s.commit()
         merged = preset_store.list_all(s, root)
     by_slug = {p.slug: p for p in merged}
@@ -398,15 +390,11 @@ def test_create_user_preset(api) -> None:
 
 def test_create_preset_slug_validation_and_conflicts(api) -> None:
     # bad path slug → 422
-    resp = api.client.post(
-        "/api/presets/Bad%20Slug", json={"title": "t", "task_prompt": "p"}
-    )
+    resp = api.client.post("/api/presets/Bad%20Slug", json={"title": "t", "task_prompt": "p"})
     assert resp.status_code == 422
 
     # vendored slug → 409 with the rename-flow payload
-    resp = api.client.post(
-        "/api/presets/alpha-preset", json={"title": "t", "task_prompt": "p"}
-    )
+    resp = api.client.post("/api/presets/alpha-preset", json={"title": "t", "task_prompt": "p"})
     assert resp.status_code == 409, resp.text
     detail = resp.json()["detail"]
     assert detail["kind"] == "name_conflict"
@@ -415,9 +403,7 @@ def test_create_preset_slug_validation_and_conflicts(api) -> None:
 
     # user slug → same rename flow, source "user"
     api.client.post("/api/presets/mine", json={"title": "t", "task_prompt": "p"})
-    resp = api.client.post(
-        "/api/presets/mine", json={"title": "t2", "task_prompt": "p2"}
-    )
+    resp = api.client.post("/api/presets/mine", json={"title": "t2", "task_prompt": "p2"})
     assert resp.status_code == 409
     assert resp.json()["detail"]["source"] == "user"
     assert resp.json()["detail"]["suggested_name"] == "mine-2"
@@ -429,9 +415,7 @@ def test_create_preset_slug_validation_and_conflicts(api) -> None:
 
 def test_patch_preset_bumps_revision(api) -> None:
     api.client.post("/api/presets/editable", json={"title": "v1", "task_prompt": "p1"})
-    resp = api.client.patch(
-        "/api/presets/editable", json={"title": "v2", "category": "docs"}
-    )
+    resp = api.client.patch("/api/presets/editable", json={"title": "v2", "category": "docs"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["title"] == "v2"
@@ -473,9 +457,7 @@ def test_delete_user_preset(api) -> None:
 def test_submit_run_with_preset_ref_snapshots_prompt(api) -> None:
     """preset_ref resolves → the preset body becomes the stored task_prompt
     (verbatim), with slug + revision provenance columns."""
-    resp = api.client.post(
-        "/api/runs", json=_run_body(preset_ref="alpha-preset")
-    )
+    resp = api.client.post("/api/runs", json=_run_body(preset_ref="alpha-preset"))
     assert resp.status_code == 201, resp.text
     data = resp.json()
     assert data["preset_ref"] == "alpha-preset"
@@ -500,16 +482,12 @@ def test_submit_run_no_preset_stays_freeform(api) -> None:
 
 def test_user_preset_revision_snapshot_on_submit(api) -> None:
     api.client.post("/api/presets/evolving", json={"title": "t", "task_prompt": "v1 prompt"})
-    first = api.client.post(
-        "/api/runs", json=_run_body(preset_ref="evolving")
-    ).json()
+    first = api.client.post("/api/runs", json=_run_body(preset_ref="evolving")).json()
     assert first["preset_revision"] == 1
     assert first["task_prompt"] == "v1 prompt"
 
     api.client.patch("/api/presets/evolving", json={"task_prompt": "v2 prompt"})
-    second = api.client.post(
-        "/api/runs", json=_run_body(preset_ref="evolving")
-    ).json()
+    second = api.client.post("/api/runs", json=_run_body(preset_ref="evolving")).json()
     assert second["preset_revision"] == 2
     assert second["task_prompt"] == "v2 prompt"
 

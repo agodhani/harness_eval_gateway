@@ -208,9 +208,7 @@ def parse_preset_md(text: str, *, filename: str) -> Preset:
     slug = _scalar(meta["slug"])
     stem = filename.removesuffix(".md")
     if not SLUG_RE.match(slug):
-        raise PresetError(
-            "invalid_body", f"{filename}: slug {slug!r} fails the slug pattern"
-        )
+        raise PresetError("invalid_body", f"{filename}: slug {slug!r} fails the slug pattern")
     if stem != slug:
         raise PresetError(
             "invalid_body",
@@ -312,9 +310,7 @@ def get_user(session: Session, slug: str) -> TaskPreset | None:
 
 
 def list_user(session: Session) -> list[Preset]:
-    rows = session.execute(
-        select(TaskPreset).order_by(TaskPreset.slug)
-    ).scalars().all()
+    rows = session.execute(select(TaskPreset).order_by(TaskPreset.slug)).scalars().all()
     return [user_to_preset(r) for r in rows]
 
 

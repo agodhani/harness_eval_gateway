@@ -33,6 +33,13 @@ adapters are added.
   harnesses + skill packs + evaluator model. `model_name` is the default
   participant model; `models` (normalized into `config.models`) selects the
   full participant set.
+- **Task preset (PR22)** — a reusable evaluation task. Vendored presets are
+  committed Markdown under `task_presets/<slug>.md` (frontmatter metadata +
+  body = the prompt); user presets are `task_presets` table rows. One shared
+  slug namespace; submitting `preset_ref` resolves the preset, replaces the
+  task prompt with the preset body verbatim, and snapshots
+  `runs.preset_ref` + `preset_revision`. Freeform prompts stay supported —
+  `task_prompt` is always the authoritative run text.
 - **Sandbox** — a Docker container running one harness instance on the task,
   with an identical clean initial repo/workspace as its siblings.
 - **Harness adapter** — per-harness plugin: knows how to install, configure,
@@ -311,6 +318,8 @@ evaluator/     # rubric scoring agent
 scoring/       # objective signal collectors (static analysis + exec/coverage)
 skillpacks/    # vendored default packs: superpowers, mattpocock-skills, spec-kit
 skillpack_import/  # F11 GitHub import: codeload fetch, SKILL.md scan, pack store
+task_presets/  # vendored task presets (<slug>.md — frontmatter + prompt body)
+api/presets.py # preset store: vendored discovery + merged vendored/user resolve
 web/           # Next.js app
 db/            # schema + Alembic migrations
 tests/         # unit / integration / e2e
@@ -665,6 +674,22 @@ or tests change.
   (≤64, whitespace-normalized) lands on `sandboxes.name`; `spawn_one` fills
   blanks with `<adapter>-<shortid>` once the UUID exists. All UI surfaces
   read the column — no per-component re-derivation to drift.
+- **Task presets (PR22) mirror the skillpack resource model** — vendored
+  presets are committed `task_presets/<slug>.md` files (same stdlib
+  frontmatter parser as skillpacks — flow-style values like
+  `tags: [a, b]`, no YAML block lists), user presets are Postgres rows;
+  both share ONE slug namespace and create-collisions return the same
+  structured 409 `name_conflict` + `suggested_name`. Submit sends
+  `preset_ref` — the API resolves it, REPLACES `task_prompt` with the
+  preset body verbatim, and snapshots `runs.preset_ref` +
+  `preset_revision` (provenance + grouping axis; `task_prompt` stays the
+  authoritative run text — a preset edit never rewrites history; resubmit
+  re-resolves the CURRENT revision). Vendored presets are read-only at
+  runtime (PATCH/DELETE 403); user PATCH bumps `revision`. Slugs validate
+  before any filesystem touch — traversal (`../x`) is a 422, never a
+  path. `/presets` + `/presets/[slug]` expose browse/detail with run
+  history, per-model/per-config leaderboards, and a score trend — the
+  grouping axis later suites/leaderboard pages hang off.
 
 ## Working conventions
 
@@ -724,6 +749,18 @@ or tests change.
   skills), `POST /api/skillpacks/import` (selection → `data/skillpacks/`;
   `mode` = `pack`|`merge`|`split`, collision → 409 `detail.suggested_name`),
   `DELETE /api/skillpacks/{name}` (imported only).
+- `GET /api/presets` (PR22) lists the merged task-preset library (vendored
+  `task_presets/` + user rows) with browse aggregates (`runs_count`,
+  `last_run_mean`); `GET /api/presets/{slug}` (+`/analytics` → runs,
+  per-model/per-config leaderboards, trend), `POST /api/presets/{slug}`
+  (create user preset — slug collision → 409 `name_conflict` +
+  `suggested_name`, same contract as skillpack import), `PATCH`/`DELETE`
+  (user presets only — vendored are filesystem resources; PATCH bumps
+  `revision`). `RunCreate.preset_ref` resolves the preset and REPLACES
+  `task_prompt` with its body verbatim; `runs.preset_ref` +
+  `preset_revision` snapshot the provenance, and `GET /api/runs?preset=`
+  filters. Slugs validate `^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$` BEFORE
+  any filesystem touch — vendored resolution is traversal-safe.
 - **Known issues (Phase 3 candidates):** event ingest has no retry/buffering —
   a sandbox emitting during an api restart loses early events; gateway emits
   best-effort. `heg-dev` static cred exists for dev only. Unauthenticated

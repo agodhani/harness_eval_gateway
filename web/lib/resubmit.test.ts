@@ -86,4 +86,11 @@ describe("specFromRun", () => {
     assert.equal(spec.harness_configs[0].model, "gpt-4o");
     assert.equal(spec.harness_configs[1].model, null);
   });
+
+  test("preset_ref rides along (PR22); freeform runs carry none", () => {
+    const spec = specFromRun(run({ preset_ref: "wordle-html" }));
+    assert.equal(spec.preset_ref, "wordle-html");
+    const freeform = specFromRun(run({ preset_ref: null }));
+    assert.equal(freeform.preset_ref, null);
+  });
 });
