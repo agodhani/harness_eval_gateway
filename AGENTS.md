@@ -631,7 +631,7 @@ or tests change.
   grouped/stacked bars + a composed bar-line trend under React 19 / Next 16;
   themed via hexes mirroring globals.css tokens (no CSS-var reads). The
   cross-run trends endpoint (`GET /api/analytics/runs`) prices each point's
-  cells at their own model's rate (unlisted → the run's resolved rate)
+  cells at their own model's rate (unlisted → unpriced, null cost)
   unless `?price_model=` forces uniform
   repricing — same "estimate, not billing" framing as F9.
 - **Rubric versions are immutable** (F14): post-run edits INSERT a new

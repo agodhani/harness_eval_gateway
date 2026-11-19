@@ -791,8 +791,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   + F8 scores, using **recharts** (v3.10.x — React-19-compatible, lightweight
   enough for the plain-CSS theme; palette hexes mirror the globals.css
   tokens in `analysis/charts.tsx`). Cards: score-by-rubric-dimension
-  (grouped horizontal bars + "Σ leader" line), tool-call mix (stacked,
-  top-7 tools + `other`), tokens in/out (stacked), LLM latency
+  (grouped horizontal bars + "weighted total leader" line), tool-call mix
+  (stacked, top-7 tools + `other`), tokens in/out (stacked), LLM latency
   (avg/p95/max), estimated cost per sandbox (price-model dropdown →
   client-side recompute, same trick as AnalyticsSection — local models show
   a note instead of empty bars), participant-vs-evaluator spend split
@@ -838,7 +838,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     (120 chars), `limit` bounds (1/0/101), 422 unknown price_model, null
     mean for unscored runs.
   - API: `curl localhost:8001/api/analytics/runs?limit=20`
-  - UI: results page → matrix `total` row sums match the dimension columns
+  - UI: results page → matrix `total` row shows the weighted 0–10 aggregate
     and flags the leader; run detail → "Analysis →" → all cards render on a
     scored run; cost dropdown reprices the cost + split charts client-side.
 - **Depends on:** F6 (events), F7 (scores), F8 (results page), F9
