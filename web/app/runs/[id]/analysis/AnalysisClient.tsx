@@ -245,7 +245,11 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     [data.analytics, priceModel],
   );
   const evaluatorModel =
-    data.results?.evaluator_model ?? data.run?.config?.evaluator_model ?? null;
+    data.results?.evaluator_model ??
+    data.run?.config?.evaluator_model ??
+    data.run?.model_name ??
+    data.analytics?.model_name ??
+    null;
   // Judge price mirrors the server: the evaluator model's own rate when
   // listed, else the explicit pick (what-if) — unlisted and unpicked means
   // unpriced, never another model's rate (PR21).

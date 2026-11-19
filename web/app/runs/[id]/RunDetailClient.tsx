@@ -514,7 +514,7 @@ export default function RunDetailClient({ runId }: { runId: string }) {
 
   const configs: HarnessConfig[] = run.config?.harness_configs ?? [];
   const budgets = run.config?.budgets;
-  const evaluatorModel = run.config?.evaluator_model ?? null;
+  const evaluatorModel = run.config?.evaluator_model ?? run.model_name;
   // PR14: effective participant-model set ([model_name] + config extras).
   const participantModels = runModels(
     run.model_name,

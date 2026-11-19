@@ -514,7 +514,12 @@ export default function ResultsClient({ runId }: { runId: string }) {
   }
 
   const modelName = currentResults?.model_name ?? run?.model_name ?? "?";
-  const evaluatorModel = currentResults?.evaluator_model ?? run?.config?.evaluator_model ?? null;
+  const evaluatorModel =
+    currentResults?.evaluator_model ??
+    run?.config?.evaluator_model ??
+    run?.model_name ??
+    currentResults?.model_name ??
+    null;
   const sameModel = currentResults?.same_model_eval ?? run?.same_model_eval ?? null;
   // PR14: full participant-model set for the header note.
   const participantModels =
