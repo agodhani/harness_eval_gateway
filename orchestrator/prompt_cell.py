@@ -234,12 +234,8 @@ async def _call_gateway(
                 timeout=max(0.0, deadline - time.monotonic()),
             )
         except (TimeoutError, httpx.TimeoutException) as exc:
-            if time.monotonic() >= deadline:
-                result.terminal_reason = "timeout"
-                result.error = "wall_clock_seconds deadline exceeded"
-                result.deadline_hit = True
-                break
-            if attempt < MAX_ATTEMPTS:
+            expired = time.monotonic() >= deadline
+            if attempt < MAX_ATTEMPTS and not expired:
                 _emit_retry(
                     session_factory,
                     run_id=run_id,
@@ -247,16 +243,23 @@ async def _call_gateway(
                     attempt=attempt + 1,
                     reason=f"timeout: {type(exc).__name__}",
                 )
-                await asyncio.sleep(RETRY_BACKOFF_SECONDS)
+                await asyncio.sleep(
+                    min(RETRY_BACKOFF_SECONDS, deadline - time.monotonic())
+                )
                 continue
             result.terminal_reason = "timeout"
-            result.error = (
-                f"gateway call timed out ({type(exc).__name__}) "
-                f"after {attempt} attempt(s)"
-            )
+            if expired:
+                result.error = "wall_clock_seconds deadline exceeded"
+                result.deadline_hit = True
+            else:
+                result.error = (
+                    f"gateway call timed out ({type(exc).__name__}) "
+                    f"after {attempt} attempt(s)"
+                )
             break
         except httpx.TransportError as exc:
-            if attempt < MAX_ATTEMPTS:
+            expired = time.monotonic() >= deadline
+            if attempt < MAX_ATTEMPTS and not expired:
                 _emit_retry(
                     session_factory,
                     run_id=run_id,
@@ -264,18 +267,26 @@ async def _call_gateway(
                     attempt=attempt + 1,
                     reason=f"transport: {type(exc).__name__}",
                 )
-                await asyncio.sleep(RETRY_BACKOFF_SECONDS)
+                await asyncio.sleep(
+                    min(RETRY_BACKOFF_SECONDS, deadline - time.monotonic())
+                )
                 continue
-            result.terminal_reason = "error"
-            result.error = (
-                f"gateway unreachable ({type(exc).__name__}: {exc}) "
-                f"after {attempt} attempt(s)"
-            )
+            if expired:
+                result.terminal_reason = "timeout"
+                result.error = "wall_clock_seconds deadline exceeded"
+                result.deadline_hit = True
+            else:
+                result.terminal_reason = "error"
+                result.error = (
+                    f"gateway unreachable ({type(exc).__name__}: {exc}) "
+                    f"after {attempt} attempt(s)"
+                )
             break
 
         result.http_status = resp.status_code
         if resp.status_code >= 500:
-            if attempt < MAX_ATTEMPTS:
+            expired = time.monotonic() >= deadline
+            if attempt < MAX_ATTEMPTS and not expired:
                 _emit_retry(
                     session_factory,
                     run_id=run_id,
@@ -283,13 +294,20 @@ async def _call_gateway(
                     attempt=attempt + 1,
                     reason=f"upstream HTTP {resp.status_code}",
                 )
-                await asyncio.sleep(RETRY_BACKOFF_SECONDS)
+                await asyncio.sleep(
+                    min(RETRY_BACKOFF_SECONDS, deadline - time.monotonic())
+                )
                 continue
-            result.terminal_reason = "error"
-            result.error = (
-                f"upstream HTTP {resp.status_code} after {attempt} attempt(s): "
-                f"{_body_excerpt(resp)}"
-            )
+            if expired:
+                result.terminal_reason = "timeout"
+                result.error = "wall_clock_seconds deadline exceeded"
+                result.deadline_hit = True
+            else:
+                result.terminal_reason = "error"
+                result.error = (
+                    f"upstream HTTP {resp.status_code} after {attempt} attempt(s): "
+                    f"{_body_excerpt(resp)}"
+                )
             break
         if resp.status_code == 429:
             etype = _response_error_type(resp)
