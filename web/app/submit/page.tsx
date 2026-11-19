@@ -59,6 +59,7 @@ import { ImportSkillPackDialog } from "./ImportSkillPackDialog";
 // Offline fallback for the model pickers — the live list comes from
 // GET /api/models (gateway → upstream) when the backend is reachable.
 const MODEL_SUGGESTIONS = ["qwen3:8b", "qwen2.5-coder:3b", "qwen2.5-coder:7b"];
+const DEFAULT_ADAPTER = "miniloop";
 const MAX_CONFIGS = 8;
 // Mirrors api/schemas.py MAX_MATRIX_CELLS — configs × models sandbox cap.
 const MAX_MATRIX_CELLS = 32;
@@ -97,7 +98,7 @@ function blankConfig(): ConfigRow {
   return {
     key: nextKey++,
     name: "",
-    adapter: "miniloop",
+    adapter: DEFAULT_ADAPTER,
     skill_packs: [],
     system_prompt_extra: "",
   };
@@ -410,14 +411,19 @@ export default function SubmitPage() {
   );
 
   /** One-click preset suggestions — fills EMPTY participant-model fields
-   * with suggested_models and sets every config's adapter to
-   * suggested_adapter (only when it's a known adapter). Never overwrites a
+   * with suggested_models and applies suggested_adapter (when it's a known
+   * adapter) to configs still at the form default. Never overwrites a
    * field the user already filled. */
   function applyPresetSuggestions() {
     const p = selectedPreset;
     if (!p) return;
     if (p.suggested_adapter && adapterNames.includes(p.suggested_adapter)) {
-      setConfigs((cs) => cs.map((c) => ({ ...c, adapter: p.suggested_adapter! })));
+      const a = p.suggested_adapter;
+      setConfigs((cs) =>
+        cs.map((c) =>
+          !c.adapter || c.adapter === DEFAULT_ADAPTER ? { ...c, adapter: a } : c,
+        ),
+      );
     }
     const sugg = p.suggested_models ?? [];
     if (sugg.length > 0) {
