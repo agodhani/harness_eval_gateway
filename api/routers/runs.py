@@ -138,7 +138,9 @@ def _get_run_or_404(session: Session, run_id: uuid.UUID) -> Run:
 
 def _validate_harness_configs(body: RunCreate) -> None:
     settings = get_settings()
-    known_adapters = set(orch_adapters.adapter_names())
+    # PR25: selectable includes no-sandbox pseudo-adapters (``prompt``) —
+    # they're valid matrix cells, just never spawned.
+    known_adapters = set(orch_adapters.selectable_adapter_names())
     # Pack names merge the vendored + imported roots into one namespace
     # (imported packs under data/skillpacks — F11).
     known_packs = set(

@@ -1114,6 +1114,78 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Depends on:** F12 (preview stack, purpose label plumbing, jailed
   workspace resolution), F8 (results page)
 
+### F18 — Prompt-only matrix cells (no-sandbox adapter) ✅
+
+**What:** a pseudo-adapter `prompt` that makes a single LLM call per
+matrix cell with zero Docker containers — widening the matrix beyond
+coding agents to business-task evals (extraction, summarisation, Q&A,
+classification) while reusing the same creds, metering, artifacts,
+timeline, evaluation, and results pipeline.
+
+**Why:** the matrix already expands `configs × models`; prompt cells add
+a row type that answers "what does the model itself do with this prompt"
+— baseline-vs-harness comparisons and non-coding tasks that have no
+workspace to produce.
+
+- `prompt` appears in `/api/harnesses` + the submit picker under the
+  **No sandbox** group (manifest `no_sandbox: true`, no image/cli), but
+  is NOT in `adapter_names()` — `get_adapter("prompt")` raises a
+  no-sandbox `KeyError` and spawn-side lookups can't smuggle a
+  container-less cell into `spawn_one`.
+- Cell flow (`orchestrator/prompt_cell.py::run_prompt_cell`): create the
+  ordinary `Sandbox` row → mint the normal sandbox-scoped gateway cred
+  → `emit run_started` → POST `{GATEWAY_URL}/v1/chat/completions` with
+  `Bearer <cred>` — one retry on upstream 5xx/timeout only; 4xx fails
+  immediately. Gateway emits `llm_request`/`llm_response` + metering as
+  usual. Assistant text → `output.txt` (+ `meta.json` +
+  `transcript.log`) under the standard artifact dir; `sandbox_finalized`
+  + `terminal_state` events + `done`/`harness_complete` close the cell.
+- `harness_configs[].system_prompt_extra` lands as a `system` message
+  before the task prompt.
+- Mixed runs interleave: prompt cells resolve inline, container cells
+  spawn+monitor in the same loop; evaluation runs once all cells are
+  terminal, with `prompt_output_path` pointing the evaluator at
+  `output.txt`.
+- Evaluator: `evaluate_sandbox(prompt_output_path=...)` stages
+  `output.txt` as the submission (no workspace required); EVAL_PROMPT
+  frames it as a prompt output. Missing output stages empty — judged,
+  not infra-failed. Static/exec/generated-test collectors degrade to
+  `skipped` on `.txt`-only submissions.
+- Results/preview: the `output` artifact kind downloads via the existing
+  endpoint; results rows report `previewable: false` and the preview +
+  thumbnail endpoints 404 early for prompt cells (before any workspace
+  scan). The web results page shows output text inline + download,
+  suppressing preview affordances.
+- Files: `orchestrator/prompt_cell.py`, `orchestrator/adapters.py`
+  (pseudo-manifest + `no_sandbox_adapter_names()`),
+  `orchestrator/lifecycle.py` (prompt branch + all-cells-fail early
+  exit), `evaluator/evaluate.py` + `evaluator/prompts.py`
+  (`prompt_output_path`), `api/routers/runs.py` (validation),
+  `api/routers/preview.py` (guards), `web/lib/api.ts`,
+  `web/app/submit/page.tsx` (group), `web/app/runs/[id]/results/*`
+  (output view + preview suppression).
+- Tests:
+  - `tests/unit/orchestrator/test_prompt_cell.py` — request shape, cred
+    scope, single retry on 5xx/timeout, artifact/meta/events/finalize,
+    failure paths.
+  - `tests/unit/orchestrator/test_lifecycle.py::test_lifecycle_prompt_only_run`
+    + `test_lifecycle_mixed_prompt_and_container` — zero spawns, mixed
+    routing, all-fail → run failed.
+  - `tests/unit/adapters/test_adapter_contract.py` — selectable-but-not-
+    spawnable + manifest keys.
+  - `tests/unit/api/test_harnesses.py`, `test_runs.py`, `test_results.py`,
+    `test_preview.py` — manifest surface, submit validation, output
+    artifact/download + previewable:false, preview/thumbnail 404s.
+  - `tests/unit/evaluator/test_evaluate.py` — output.txt staging,
+    missing-output empty stage, analysis persistence.
+- Verify: `uv run pytest tests/unit/orchestrator/test_prompt_cell.py
+  tests/unit/orchestrator/test_lifecycle.py -k prompt -q`; manual:
+  submit a `prompt × 3 models` run → no containers started (docker ps),
+  three `output.txt` artifacts, scores land, cost/tokens metered;
+  results page shows output inline with preview absent.
+- **Depends on:** F16 (config × model matrix expansion), F3 (gateway
+  creds/metering), F7 (evaluator staging), F8/F12 (results + preview).
+
 ## Implementation sequence
 
 **Phase 0 — foundation (sequential):** F0 scaffold + base schema.

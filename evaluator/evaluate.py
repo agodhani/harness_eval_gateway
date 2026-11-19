@@ -88,7 +88,11 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from db.models import Event, Rubric, Score
-from evaluator.judge_direct import direct_fallback_enabled, judge_direct
+from evaluator.judge_direct import (
+    _read_text_capped,
+    direct_fallback_enabled,
+    judge_direct,
+)
 from evaluator.prompts import build_eval_prompt
 from evaluator.sandbox_spec import (
     DEFAULT_EVAL_MAX_ITERS,
@@ -118,6 +122,20 @@ logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EVAL_ROOT = _REPO_ROOT / "data" / "eval"
+
+#: PR25: bound on the prompt-cell output staged as the judge's submission —
+#: far past any sane reply, still bounded (untrusted model text).
+PROMPT_OUTPUT_MAX_CHARS = 200_000
+
+#: EVAL_PROMPT.md bullet replacing the default "candidate submission" line
+#: for prompt-only cells — the judge should read output.txt as the whole
+#: submission rather than hunt for a code workspace.
+PROMPT_SUBMISSION_NOTE = (
+    "**The candidate submission** — `output.txt`, the whole reply of a "
+    "single prompt-only model call (a no-sandbox cell: no agent loop, no "
+    "tools, no code workspace). Judge its content against the rubric. "
+    "**Do NOT modify, fix, or add to it.**"
+)
 
 #: Container states worth continuing to poll for (docker .State.Status).
 _ACTIVE_STATES = {"created", "running", "restarting", "paused"}
@@ -332,6 +350,31 @@ def _staging_ignore(dirpath: str, names: list[str]) -> set[str]:
     return ignored
 
 
+def _stage_prompt_submission(
+    eval_root: Path,
+    run_uuid: uuid.UUID,
+    sandbox_uuid: uuid.UUID,
+    output_path: Path,
+) -> Path:
+    """PR25: synthesize the dir the pipeline treats as the submission.
+
+    A prompt cell has no snapshot workspace — the submission is the single
+    ``output.txt`` the cell wrote. A bounded copy lands under
+    ``<eval_root>/<run>/<sandbox>/prompt_submission/`` (daemon-visible like
+    the eval workspace itself); collectors/staging/judging then run
+    unchanged — analysis reports an empty code profile, and the judge
+    reads output.txt as the submission. A missing/unreadable output stages
+    an empty file (same judgment as an empty workspace).
+    """
+    sub_dir = eval_root / str(run_uuid) / str(sandbox_uuid) / "prompt_submission"
+    if sub_dir.exists():
+        shutil.rmtree(sub_dir)
+    sub_dir.mkdir(parents=True)
+    text = _read_text_capped(Path(output_path), PROMPT_OUTPUT_MAX_CHARS) or ""
+    (sub_dir / "output.txt").write_text(text, encoding="utf-8")
+    return sub_dir
+
+
 def _stage_eval_workspace(
     *,
     eval_root: Path,
@@ -344,6 +387,7 @@ def _stage_eval_workspace(
     prior_error: str | None = None,
     analysis: AnalysisReport | None = None,
     generated_tests_dir: Path | None = None,
+    submission_note: str | None = None,
 ) -> Path:
     """Build ``<eval_root>/<run>/<sandbox>/eval_workspace/`` and return it.
 
@@ -403,7 +447,10 @@ def _stage_eval_workspace(
     )
     (eval_ws / "EVAL_PROMPT.md").write_text(
         build_eval_prompt(
-            rubric, terminal_reason=terminal_reason, prior_error=prior_error
+            rubric,
+            terminal_reason=terminal_reason,
+            prior_error=prior_error,
+            submission_note=submission_note,
         ),
         encoding="utf-8",
     )
@@ -549,6 +596,7 @@ async def evaluate_sandbox(
     rubric: dict[str, Any] | None = None,
     artifact_dir: Path | str | None = None,
     workspace_dir: Path | str | None = None,
+    prompt_output_path: Path | str | None = None,
     transcript_path: Path | str | None = None,
     terminal_reason: str | None = None,
     prior_error: str | None = None,
@@ -595,6 +643,14 @@ async def evaluate_sandbox(
     ``wait_for`` margin); the direct fallback is bounded to what remains of
     it so a slow fallback can't outlive the attempt and forfeit the
     configured score retries.
+
+    ``prompt_output_path`` (PR25) marks an output-only submission: the
+    orchestrator passes the prompt cell's ``output.txt`` instead of a
+    snapshot workspace. A bounded copy is staged into a synthesized
+    submission dir and the usual pipeline (analysis, judge staging, direct
+    fallback) treats it as the submission — ``workspace_dir`` is ignored
+    and never required. A missing/unreadable output evaluates as an empty
+    submission.
     """
     # ---- resolve + validate ------------------------------------------------
     attempt_started = time.monotonic()
@@ -612,20 +668,31 @@ async def evaluate_sandbox(
     if not isinstance(rubric, dict) or not rubric:
         raise ValueError("evaluate_sandbox: 'rubric' must be a non-empty dict")
 
-    ws_dir = workspace_dir
+    prompt_output = (
+        Path(prompt_output_path) if prompt_output_path is not None else None
+    )
     art_dir = Path(artifact_dir) if artifact_dir is not None else None
-    if ws_dir is None and art_dir is not None:
-        ws_dir = art_dir / "workspace"
-    if ws_dir is None:
-        raise ValueError(
-            "evaluate_sandbox: 'workspace_dir' (or 'artifact_dir') is required"
-        )
-    ws_path = Path(ws_dir)
-    art_path = art_dir if art_dir is not None else ws_path.parent
-    if not ws_path.is_dir():
-        raise FileNotFoundError(
-            f"evaluate_sandbox: artifact workspace not found: {ws_path}"
-        )
+    ws_path: Path | None
+    if prompt_output is not None:
+        # Output-only submission — the synthesized dir staged below stands
+        # in for the snapshot workspace; artifact_dir still anchors outputs
+        # (analysis.json etc.), defaulting to output.txt's parent.
+        ws_path = None
+        art_path = art_dir if art_dir is not None else prompt_output.parent
+    else:
+        ws_dir = workspace_dir
+        if ws_dir is None and art_dir is not None:
+            ws_dir = art_dir / "workspace"
+        if ws_dir is None:
+            raise ValueError(
+                "evaluate_sandbox: 'workspace_dir' (or 'artifact_dir') is required"
+            )
+        ws_path = Path(ws_dir)
+        art_path = art_dir if art_dir is not None else ws_path.parent
+        if not ws_path.is_dir():
+            raise FileNotFoundError(
+                f"evaluate_sandbox: artifact workspace not found: {ws_path}"
+            )
     transcript = (
         Path(transcript_path)
         if transcript_path is not None
@@ -659,6 +726,18 @@ async def evaluate_sandbox(
             Path(art_root).parent / "eval" if art_root else DEFAULT_EVAL_ROOT
         )
     eval_sid = eval_sandbox_id(sandbox_uuid)
+
+    if prompt_output is not None:
+        # PR25: stand the staged output.txt copy in for the workspace — a
+        # real dir under eval_root so analysis/staging/judge paths are the
+        # same shape a container artifact produces.
+        ws_path = await asyncio.to_thread(
+            _stage_prompt_submission,
+            eval_root_path,
+            run_uuid,
+            sandbox_uuid,
+            prompt_output,
+        )
 
     # ---- objective signals (PR6) --------------------------------------------
     # Parse-only measurement of the candidate workspace — runs BEFORE staging
@@ -783,6 +862,9 @@ async def evaluate_sandbox(
         prior_error=prior_error,
         analysis=analysis_report,
         generated_tests_dir=gen_stage_dir,
+        submission_note=(
+            PROMPT_SUBMISSION_NOTE if prompt_output is not None else None
+        ),
     )
 
     _emit_event(

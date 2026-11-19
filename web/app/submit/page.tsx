@@ -25,6 +25,7 @@ import {
   getModels,
   listHarnesses,
   listSkillPacks,
+  NO_SANDBOX_ADAPTERS,
   PROVIDERS,
   pullModel,
   SKILL_PACKS,
@@ -280,6 +281,15 @@ export default function SubmitPage() {
   );
   const adapterLabel = (name: string) =>
     harnesses.find((h) => h.name === name)?.display_name ?? name;
+  /** PR25 no-sandbox pseudo-adapters (prompt): manifest flag wins, static
+   * list is the offline fallback. Prompt cells run one gateway call — no
+   * container, no skill packs to stage. */
+  const isNoSandboxAdapter = (name: string) =>
+    harnesses.length > 0
+      ? harnesses.find((h) => h.name === name)?.no_sandbox === true
+      : NO_SANDBOX_ADAPTERS.includes(name);
+  const sandboxedAdapters = adapterNames.filter((a) => !isNoSandboxAdapter(a));
+  const noSandboxAdapters = adapterNames.filter(isNoSandboxAdapter);
 
   // Selectable packs — vendored fallback until GET /api/skillpacks lands
   // (imported packs only exist server-side). `importFor` = config key the
@@ -386,6 +396,7 @@ export default function SubmitPage() {
       if (!adapterNames.includes(c.adapter)) {
         errs[`cfg_${i}_adapter`] = `Unknown adapter "${c.adapter}".`;
       }
+      if (isNoSandboxAdapter(c.adapter)) return; // no packs to stage
       for (const p of c.skill_packs) {
         if (!packNames.has(p)) errs[`cfg_${i}_packs`] = `Unknown skill pack "${p}".`;
       }
@@ -401,6 +412,7 @@ export default function SubmitPage() {
         `Matrix too large: ${configs.length} configs × ${modelCount} models ` +
         `= ${sandboxCount} sandboxes (max ${MAX_MATRIX_CELLS}).`;
     return errs;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskPrompt, primaryModel, configs, budgets, adapterNames, packNames, sandboxCount, modelCount]);
 
   const isValid = Object.keys(validation).length === 0;
@@ -493,7 +505,9 @@ export default function SubmitPage() {
 
     const harness_configs: HarnessConfig[] = configs.map((c) => ({
       adapter: c.adapter,
-      skill_packs: c.skill_packs,
+      // Prompt cells stage nothing — a stale selection from a previous
+      // adapter pick must not ship packs the cell can't use.
+      skill_packs: isNoSandboxAdapter(c.adapter) ? [] : c.skill_packs,
       system_prompt_extra: c.system_prompt_extra.trim() || null,
       name: c.name.trim() || null,
       // Per-config model pin (PR14) — only ever set by a resubmit restore;
@@ -811,60 +825,82 @@ export default function SubmitPage() {
                       onChange={(e) => updateConfig(cfg.key, { adapter: e.target.value })}
                       disabled={submitting}
                     >
-                      {adapterNames.map((a) => (
-                        <option key={a} value={a}>
-                          {adapterLabel(a)}
-                        </option>
-                      ))}
+                      <optgroup label="Agent harnesses">
+                        {sandboxedAdapters.map((a) => (
+                          <option key={a} value={a}>
+                            {adapterLabel(a)}
+                          </option>
+                        ))}
+                      </optgroup>
+                      {noSandboxAdapters.length > 0 ? (
+                        <optgroup label="No sandbox">
+                          {noSandboxAdapters.map((a) => (
+                            <option key={a} value={a}>
+                              {adapterLabel(a)}
+                            </option>
+                          ))}
+                        </optgroup>
+                      ) : null}
                     </select>
+                    {isNoSandboxAdapter(cfg.adapter) ? (
+                      <span className="field__hint">
+                        Prompt cell — one model call per cell, no container.
+                      </span>
+                    ) : null}
                   </div>
-                  <div className="field">
-                    <label className="field__label">
-                      Skill packs{" "}
-                      <button
-                        type="button"
-                        className="btn btn--sm btn--ghost"
-                        onClick={() => setImportFor(cfg.key)}
-                        disabled={submitting}
-                        title="Import skills from a GitHub repo link"
-                      >
-                        + import from GitHub
-                      </button>
-                    </label>
-                    <div className="check-list">
-                      {packs.map((p) => (
-                        <label key={p.name} className="check-item">
-                          <input
-                            type="checkbox"
-                            checked={cfg.skill_packs.includes(p.name)}
-                            onChange={() => togglePack(cfg, p.name)}
-                            disabled={submitting}
-                          />
-                          <code>{p.name}</code>
-                          {p.source === "imported" ? (
-                            <Badge tone="violet" title={p.origin_url ?? "user-imported"}>
-                              imported
-                            </Badge>
-                          ) : null}
-                          {p.skill_count > 0 ? (
-                            <span className="faint">({p.skill_count})</span>
-                          ) : null}
-                        </label>
-                      ))}
+                  {!isNoSandboxAdapter(cfg.adapter) ? (
+                    <div className="field">
+                      <label className="field__label">
+                        Skill packs{" "}
+                        <button
+                          type="button"
+                          className="btn btn--sm btn--ghost"
+                          onClick={() => setImportFor(cfg.key)}
+                          disabled={submitting}
+                          title="Import skills from a GitHub repo link"
+                        >
+                          + import from GitHub
+                        </button>
+                      </label>
+                      <div className="check-list">
+                        {packs.map((p) => (
+                          <label key={p.name} className="check-item">
+                            <input
+                              type="checkbox"
+                              checked={cfg.skill_packs.includes(p.name)}
+                              onChange={() => togglePack(cfg, p.name)}
+                              disabled={submitting}
+                            />
+                            <code>{p.name}</code>
+                            {p.source === "imported" ? (
+                              <Badge tone="violet" title={p.origin_url ?? "user-imported"}>
+                                imported
+                              </Badge>
+                            ) : null}
+                            {p.skill_count > 0 ? (
+                              <span className="faint">({p.skill_count})</span>
+                            ) : null}
+                          </label>
+                        ))}
+                      </div>
+                      <span className="field__hint">
+                        {cfg.skill_packs.length === 0
+                          ? "None — sandbox gets an empty packs dir."
+                          : `${cfg.skill_packs.length} pack${cfg.skill_packs.length > 1 ? "s" : ""} staged.`}
+                      </span>
                     </div>
-                    <span className="field__hint">
-                      {cfg.skill_packs.length === 0
-                        ? "None — sandbox gets an empty packs dir."
-                        : `${cfg.skill_packs.length} pack${cfg.skill_packs.length > 1 ? "s" : ""} staged.`}
-                    </span>
-                  </div>
+                  ) : null}
                 </div>
                 <div className="field">
                   <label className="field__label">System prompt extra</label>
                   <textarea
                     className="textarea"
                     rows={2}
-                    placeholder="Optional instructions appended to the harness system prompt (a comparison axis)."
+                    placeholder={
+                      isNoSandboxAdapter(cfg.adapter)
+                        ? "Sent as the system message of the cell's single model call (a comparison axis)."
+                        : "Optional instructions appended to the harness system prompt (a comparison axis)."
+                    }
                     value={cfg.system_prompt_extra}
                     onChange={(e) => updateConfig(cfg.key, { system_prompt_extra: e.target.value })}
                     disabled={submitting}

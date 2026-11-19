@@ -133,7 +133,12 @@ export const ADAPTERS: readonly string[] = [
   "codex",
   "deepseek",
   "pi",
+  "prompt",
 ];
+
+/** PR25 pseudo-adapters that never spawn a container — offline fallback
+ * for {@link HarnessManifest.no_sandbox} when the API is unreachable. */
+export const NO_SANDBOX_ADAPTERS: readonly string[] = ["prompt"];
 
 /** Adapter manifest as served by GET /api/harnesses (Phase 2.5). */
 export interface HarnessManifest {
@@ -146,6 +151,8 @@ export interface HarnessManifest {
   install?: string;
   image?: string;
   requires?: string[];
+  /** PR25: pseudo-adapter — the cell runs one gateway call, no container. */
+  no_sandbox?: boolean;
   [key: string]: unknown;
 }
 
