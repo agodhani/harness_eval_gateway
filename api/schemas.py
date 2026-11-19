@@ -661,8 +661,8 @@ class PresetOut(BaseModel):
     updated_at: datetime | None = None
     # Library-browse aggregates — every run whose preset_ref matches the
     # slug (any preset_revision — a run keeps pointing at the preset it was
-    # submitted from), plus the most recent run's mean ``overall`` score
-    # (null when the newest run is unscored).
+    # submitted from), plus the newest *scored* run's mean ``overall``
+    # score (null when nothing on the preset is scored yet).
     runs_count: int = 0
     last_run_mean: float | None = None
 

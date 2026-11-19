@@ -685,7 +685,7 @@ or tests change.
   `preset_revision` (provenance + grouping axis; `task_prompt` stays the
   authoritative run text — a preset edit never rewrites history; resubmit
   re-resolves the CURRENT revision). Vendored presets are read-only at
-  runtime (PATCH/DELETE 403); user PATCH bumps `revision`. Slugs validate
+  runtime (PATCH/DELETE 409); user PATCH bumps `revision`. Slugs validate
   before any filesystem touch — traversal (`../x`) is a 422, never a
   path. `/presets` + `/presets/[slug]` expose browse/detail with run
   history, per-model/per-config leaderboards, and a score trend — the

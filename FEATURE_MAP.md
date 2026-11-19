@@ -1146,8 +1146,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - `POST /api/presets/{slug}` → create a user preset; `409` on slug
     collision returns structured `{kind: name_conflict, name, source,
     suggested_name}` (same contract as skillpack import).
-  - `PATCH`/`DELETE` → user presets only; vendored 403s ("filesystem
-    resource"); PATCH bumps `revision`.
+  - `PATCH`/`DELETE` → user presets only; vendored 409s
+    (`vendored_protected`); PATCH bumps `revision`.
   - Slug validation (`^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$`) applies
     before any filesystem touch — vendored resolution is traversal-safe.
 - **Runs integration:** `RunCreate.preset_ref` — when set, the submit
@@ -1186,7 +1186,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - Unit: `tests/unit/api/test_presets.py` — vendored discovery/parse,
     merged list/detail, shared-namespace collision guard (a vendored or
     existing user slug → structured 409), CRUD + revision bumps,
-    vendored PATCH/DELETE 403s, traversal slugs 422, analytics shapes,
+    vendored PATCH/DELETE 409s, traversal slugs 422, analytics shapes,
     run-submit preset_ref resolution (verbatim prompt + revision
     snapshot) + unknown ref 422 + `?preset=` list filter +
     starter-file contract (all ten presets parse, required fields,

@@ -258,7 +258,7 @@ async def list_runs(
     if run_status:
         stmt = stmt.where(Run.status == run_status)
     if preset:
-        stmt = stmt.where(Run.preset_ref == preset.strip())
+        stmt = stmt.where(Run.preset_ref == preset.strip().lower())
     runs = session.execute(stmt).scalars().all()
 
     run_ids = [r.id for r in runs]

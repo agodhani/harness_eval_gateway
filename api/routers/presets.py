@@ -236,7 +236,7 @@ async def get_preset(slug: str, session: DbSession) -> PresetOut:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"preset {slug!r} not found",
         )
-    stats = _list_stats(session, {slug})
+    stats = _list_stats(session, {preset.slug})
     return _preset_out(preset, stats)
 
 
@@ -251,10 +251,14 @@ async def preset_analytics(slug: str, session: DbSession) -> PresetAnalytics:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"preset {slug!r} not found",
         )
-    stats = _list_stats(session, {slug})
+    stats = _list_stats(session, {preset.slug})
 
     runs = (
-        session.execute(select(Run).where(Run.preset_ref == slug).order_by(Run.created_at.desc()))
+        session.execute(
+            select(Run)
+            .where(Run.preset_ref == preset.slug)
+            .order_by(Run.created_at.desc())
+        )
         .scalars()
         .all()
     )

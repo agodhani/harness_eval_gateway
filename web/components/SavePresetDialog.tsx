@@ -50,6 +50,7 @@ export function SavePresetDialog({
     initialSlug ?? presetSlugify(existing?.title ?? initialTitle ?? taskPrompt ?? "").slice(0, 48),
   );
   const [title, setTitle] = useState(existing?.title ?? initialTitle ?? "");
+  const [editPrompt, setEditPrompt] = useState(existing?.task_prompt ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
   const [category, setCategory] = useState(existing?.category ?? "");
   const [tags, setTags] = useState((existing?.tags ?? []).join(", "));
@@ -61,7 +62,9 @@ export function SavePresetDialog({
   const canSave =
     !busy &&
     title.trim().length > 0 &&
-    (editing || (slugOk && (taskPrompt ?? "").trim().length > 0));
+    (editing
+      ? editPrompt.trim().length > 0
+      : slugOk && (taskPrompt ?? "").trim().length > 0);
 
   async function onSave() {
     if (!canSave) return;
@@ -76,6 +79,7 @@ export function SavePresetDialog({
       const saved = editing
         ? await updatePreset(existing.slug, {
             title: title.trim(),
+            task_prompt: editPrompt.trim(),
             description: description.trim(),
             category: category.trim(),
             tags: parsedTags,
@@ -218,6 +222,23 @@ export function SavePresetDialog({
               placeholder="One line — what this task measures."
             />
           </div>
+
+          {editing ? (
+            <div className="field">
+              <label className="field__label" htmlFor="preset-prompt">
+                Task prompt <span className="faint">(verbatim — stored as revision {(existing.revision ?? 1) + 1})</span>
+              </label>
+              <textarea
+                id="preset-prompt"
+                className="textarea"
+                rows={8}
+                value={editPrompt}
+                onChange={(e) => setEditPrompt(e.target.value)}
+                disabled={busy}
+                maxLength={100000}
+              />
+            </div>
+          ) : null}
 
           {editing ? (
             <InfoNote>
