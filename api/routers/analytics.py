@@ -6,6 +6,11 @@
 - ``llm_turns``/``tokens``/``latency_ms`` from ``llm_response`` payloads
   (``usage.{prompt,completion,total}_tokens``, ``latency_ms`` — see
   ``gateway/metering.py::emit_llm_response``).
+- ``ttft_ms`` (avg/p95/max of the payload's first-byte timing) and
+  ``avg_tokens_per_sec`` (mean per-call output throughput) — PR30 speed
+  axis; events predating the fields contribute no sample, and cache
+  replays emit a null ``tokens_per_sec`` so a replay can't masquerade as
+  measured model speed.
 - ``tool_calls.by_tool`` merges every per-tool signal without double
   counting: ``tool_call`` events (miniloop, translated streams) plus
   hook-sourced ``tool_result`` outcomes (claude_code PostToolUse, pi's
@@ -115,6 +120,11 @@ class _Agg:
         self.llm_turns = 0
         self.tokens = TokenUsage()
         self.latencies: list[int] = []
+        # PR30: per-call first-byte times + output throughput from the
+        # gateway's speed fields (older events without them contribute no
+        # sample — stats stay null rather than averaging phantom zeros).
+        self.ttfts: list[int] = []
+        self.toks_per_sec: list[float] = []
         self.tool_calls = ToolCallStats()
         # Hook-sourced tool outcomes (claude_code PostToolUse, pi extension):
         # name -> count, folded into resolved_tool_calls below.
@@ -147,6 +157,16 @@ class _Agg:
                 lat = _int(payload.get("latency_ms"))
                 if lat:
                     self.latencies.append(lat)
+                ttft = _int(payload.get("ttft_ms"))
+                if ttft:
+                    self.ttfts.append(ttft)
+                tps = payload.get("tokens_per_sec")
+                if (
+                    isinstance(tps, (int, float))
+                    and not isinstance(tps, bool)
+                    and math.isfinite(tps)
+                ):
+                    self.toks_per_sec.append(float(tps))
             case "tool_call":
                 self.tool_calls.total += 1
                 name = str(
@@ -275,10 +295,21 @@ def _agg_metrics(agg: _Agg) -> dict:
         p95=_p95(agg.latencies) if agg.latencies else None,
         max=float(max(agg.latencies)) if agg.latencies else None,
     )
+    ttft = LatencyStats(
+        avg=round(sum(agg.ttfts) / len(agg.ttfts), 1) if agg.ttfts else None,
+        p95=_p95(agg.ttfts) if agg.ttfts else None,
+        max=float(max(agg.ttfts)) if agg.ttfts else None,
+    )
     return {
         "llm_turns": agg.llm_turns,
         "tokens": agg.tokens,
         "latency_ms": lat,
+        "ttft_ms": ttft,
+        "avg_tokens_per_sec": (
+            round(sum(agg.toks_per_sec) / len(agg.toks_per_sec), 1)
+            if agg.toks_per_sec
+            else None
+        ),
         "tool_calls": agg.resolved_tool_calls(),
         "skill_calls": agg.skill_calls,
         "shell_commands": agg.shell_commands,

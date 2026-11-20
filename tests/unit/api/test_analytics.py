@@ -84,23 +84,34 @@ def analytics_run(session_factory: sessionmaker[Session]):
         s.add_all([sb1, sb2])
         s.flush()
 
-        def resp(sb, ts, prompt, completion, latency, model="qwen3:8b", source="gateway"):
+        def resp(
+            sb, ts, prompt, completion, latency, model="qwen3:8b",
+            source="gateway", ttft=None, tps=None,
+        ):
+            payload = {
+                "model": model,
+                "usage": {
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
+                    "total_tokens": prompt + completion,
+                },
+                "latency_ms": latency,
+                "total_ms": latency,
+                "http_status": 200,
+            }
+            # PR30 speed fields ride only when present — events predating
+            # them contribute no sample (sb2 stays uninstrumented on purpose).
+            if ttft is not None:
+                payload["ttft_ms"] = ttft
+            if tps is not None:
+                payload["tokens_per_sec"] = tps
             return _ev(
                 run.id,
                 sandbox_id=sb.id,
                 source=source,
                 type_="llm_response",
                 ts=ts,
-                payload={
-                    "model": model,
-                    "usage": {
-                        "prompt_tokens": prompt,
-                        "completion_tokens": completion,
-                        "total_tokens": prompt + completion,
-                    },
-                    "latency_ms": latency,
-                    "http_status": 200,
-                },
+                payload=payload,
             )
 
         s.add_all(
@@ -108,7 +119,8 @@ def analytics_run(session_factory: sessionmaker[Session]):
                 # ---- sb1 participant phase (t0 .. t0+9min) ----
                 _ev(run.id, sandbox_id=sb1.id, type_="run_started", ts=T0,
                     payload={"model": "qwen3:8b"}),
-                resp(sb1, T0 + timedelta(minutes=1), 100, 40, 500),
+                resp(sb1, T0 + timedelta(minutes=1), 100, 40, 500,
+                     ttft=100, tps=80.0),
                 _ev(run.id, sandbox_id=sb1.id, type_="tool_call",
                     ts=T0 + timedelta(minutes=2), payload={"name": "shell"}),
                 _ev(run.id, sandbox_id=sb1.id, type_="shell_command",
@@ -130,7 +142,8 @@ def analytics_run(session_factory: sessionmaker[Session]):
                 _ev(run.id, sandbox_id=sb1.id, type_="error",
                     ts=T0 + timedelta(minutes=7),
                     payload={"message": "flaky"}),
-                resp(sb1, T0 + timedelta(minutes=8), 200, 60, 1500),
+                resp(sb1, T0 + timedelta(minutes=8), 200, 60, 1500,
+                     ttft=300, tps=40.0),
                 _ev(run.id, sandbox_id=sb1.id, type_="terminal_state",
                     ts=T0 + timedelta(minutes=9),
                     payload={"terminal_state": "agent_done", "iters": 9}),
@@ -139,7 +152,7 @@ def analytics_run(session_factory: sessionmaker[Session]):
                     type_="checkpoint", ts=T0 + timedelta(minutes=20),
                     payload={"phase": "eval_started"}),
                 resp(sb1, T0 + timedelta(minutes=21), 1000, 90, 800,
-                     model="gpt-4o"),
+                     model="gpt-4o", ttft=50, tps=112.5),
                 _ev(run.id, sandbox_id=sb1.id, source="evaluator",
                     type_="error", ts=T0 + timedelta(minutes=21, seconds=30),
                     payload={"message": "judge timeout"}),
@@ -208,6 +221,35 @@ def test_per_sandbox_aggregation(client: TestClient, analytics_run) -> None:
     assert sb1["errors"] == 1
     # run_started @t0 → terminal_state @t0+9m (judge events excluded)
     assert sb1["wall_clock_seconds"] == pytest.approx(540.0)
+
+
+def test_speed_metrics_per_sandbox_and_model_rollup(
+    client: TestClient, analytics_run
+) -> None:
+    """PR30: ttft stats + avg tok/s roll up per cell and per model.
+
+    Hand-worked oracles on sb1's two participant responses (ttft 100/300,
+    tok/s 80/40): avg = mean; p95 = nearest-rank → the larger sample. The
+    judge-phase response (ttft 50, tok/s 112.5) must NOT leak into
+    participant stats — it lands on the evaluator side of the boundary.
+    """
+    body = _get(client, analytics_run["run_id"])
+    sb1 = next(x for x in body["sandboxes"] if x["sandbox_id"] == str(analytics_run["sb1"]))
+    assert sb1["ttft_ms"] == {"avg": 200.0, "p95": 300.0, "max": 300.0}
+    assert sb1["avg_tokens_per_sec"] == pytest.approx(60.0)
+
+    # sb2's response predates the speed fields → stats stay null, not a
+    # phantom-zero average.
+    sb2 = next(x for x in body["sandboxes"] if x["sandbox_id"] == str(analytics_run["sb2"]))
+    assert sb2["ttft_ms"] == {"avg": None, "p95": None, "max": None}
+    assert sb2["avg_tokens_per_sec"] is None
+
+    # Model rollup (single-model run): same samples pooled across cells —
+    # sb2 contributes no ttft sample, so the model stats equal sb1's.
+    (model_row,) = body["models"]
+    assert model_row["model"] == "qwen3:8b"
+    assert model_row["ttft_ms"] == {"avg": 200.0, "p95": 300.0, "max": 300.0}
+    assert model_row["avg_tokens_per_sec"] == pytest.approx(60.0)
 
 
 def test_terminal_reason_falls_back_to_event(

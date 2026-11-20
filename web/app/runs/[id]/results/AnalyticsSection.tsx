@@ -217,6 +217,34 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
         ),
     },
     {
+      // PR30: time to first response byte — null on pre-speed-metric
+      // backends/events.
+      label: "ttft ms",
+      hint: "avg / p95 — first response byte",
+      cell: (sb) =>
+        sb.ttft_ms?.avg == null ? (
+          <span className="score-na">—</span>
+        ) : (
+          <span className="mono" style={{ fontSize: "0.8rem" }}>
+            {Math.round(sb.ttft_ms.avg)} / {Math.round(sb.ttft_ms.p95 ?? 0)}
+          </span>
+        ),
+    },
+    {
+      // PR30: mean output throughput across the cell's llm_responses —
+      // null on cache replays (the payload rate is null by design there).
+      label: "tok/s",
+      hint: "avg output tokens per sec",
+      cell: (sb) =>
+        sb.avg_tokens_per_sec == null ? (
+          <span className="score-na">—</span>
+        ) : (
+          <span className="mono" style={{ fontSize: "0.8rem" }}>
+            {formatNum(sb.avg_tokens_per_sec)}
+          </span>
+        ),
+    },
+    {
       label: "tool calls",
       cell: (sb) => (
         <>

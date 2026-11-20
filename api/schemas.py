@@ -560,6 +560,11 @@ class SandboxAnalytics(BaseModel):
     llm_turns: int = 0
     tokens: TokenUsage = Field(default_factory=TokenUsage)
     latency_ms: LatencyStats = Field(default_factory=LatencyStats)
+    # PR30 speed metrics: time-to-first-byte stats (ms) + mean output
+    # throughput across the sandbox's llm_response events — both all-null
+    # when no event carried the new gateway timing fields.
+    ttft_ms: LatencyStats = Field(default_factory=LatencyStats)
+    avg_tokens_per_sec: float | None = None
     tool_calls: ToolCallStats = Field(default_factory=ToolCallStats)
     skill_calls: SkillCallStats = Field(default_factory=SkillCallStats)
     shell_commands: int = 0
@@ -589,6 +594,10 @@ class ModelAnalytics(BaseModel):
     llm_turns: int = 0
     tokens: TokenUsage = Field(default_factory=TokenUsage)
     latency_ms: LatencyStats = Field(default_factory=LatencyStats)
+    # PR30 speed metrics — pooled across the model's sandboxes (see
+    # SandboxAnalytics.ttft_ms / avg_tokens_per_sec).
+    ttft_ms: LatencyStats = Field(default_factory=LatencyStats)
+    avg_tokens_per_sec: float | None = None
     tool_calls: ToolCallStats = Field(default_factory=ToolCallStats)
     skill_calls: SkillCallStats = Field(default_factory=SkillCallStats)
     shell_commands: int = 0

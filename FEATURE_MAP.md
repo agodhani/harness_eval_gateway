@@ -160,6 +160,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   tee; `GET /v1/models` for CLI probes; per-run/sandbox HMAC credentials
   (`heg.<b64>.<sig>`); records tokens in/out, latency, failures; token
   budgets (429 + `error` event) — the cred's `max_tokens` run ceiling plus,
+  since PR30, every metered `llm_response` also carries per-call speed:
+  `ttft_ms` (first response byte — first content chunk for streams, first
+  body byte for buffered reads), `total_ms` (same value as `latency_ms`),
+  and derived `tokens_per_sec` (completion ÷ call wall seconds; null on
+  cache replays — a replay times the store, not the model),
   since PR28, a `sandbox_max_tokens` per-cell claim metered against only
   that sandbox's own usage; emits `llm_request`/`llm_response`/`error`
   events carrying the resolved upstream provider — every metered call is
@@ -466,7 +471,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 
 - **What:** `GET /api/runs/{id}/analytics?price_model=` — per-sandbox metrics
   aggregated from the `events` stream: llm turns, token split
-  (in/out/cache/total), latency (avg/p95/max), tool-call + skill-invocation
+  (in/out/cache/total), latency (avg/p95/max), PR30 speed — `ttft_ms`
+  (avg/p95/max first-byte stats) + `avg_tokens_per_sec` (mean per-call
+  output rate; events without the gateway's speed fields contribute no
+  sample) — tool-call + skill-invocation
   breakdowns, shell/file/test/error counts, wall clock, estimated cost at a
   selectable price model (`api/pricing.py` `PRICE_TABLE`; local models
   flagged `local` → $0). The tool-call mix merges `tool_call` events,
@@ -482,8 +490,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   price-model dropdown that recomputes cost client-side (no refetch).
   Timeline page (PR9) hosts the same numbers in-context: a per-sandbox
   metrics strip between the filter toolbar and the event stream — compact
-  chips (turns · tokens in→out · avg latency · est. cost · errors, plus a
-  judge-traffic line once the evaluator runs). Chips double as sandbox
+  chips (turns · tokens in→out · avg latency · tok/s speed · est. cost ·
+  errors, plus a judge-traffic line once the evaluator runs; the `spd`
+  chip carries ttft detail on hover — PR30). Chips double as sandbox
   selectors: merged mode toggles the sandbox filter (same state as the
   toolbar dropdown, whose options gain adapter labels); split mode (PR10)
   assigns the sandbox to a comparison lane instead. The strip refreshes
@@ -810,8 +819,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   enough for the plain-CSS theme; palette hexes mirror the globals.css
   tokens in `analysis/charts.tsx`). Cards: score-by-rubric-dimension
   (grouped horizontal bars + "weighted total leader" line), tool-call mix
-  (stacked, top-7 tools + `other`), tokens in/out (stacked), LLM latency
-  (avg/p95/max), estimated cost per sandbox (price-model dropdown →
+  (stacked, top-7 tools + `other`), tokens in/out (stacked), LLM latency /
+  TTFT (avg/p95/max plus ttft avg/p95 bars when the backend records them —
+  PR30), estimated cost per sandbox (price-model dropdown →
   client-side recompute, same trick as AnalyticsSection — local models show
   a note instead of empty bars), participant-vs-evaluator spend split
   (stacked; judge priced at the evaluator model's rate when listed), and a

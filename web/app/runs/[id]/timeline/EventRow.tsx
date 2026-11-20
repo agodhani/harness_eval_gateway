@@ -76,6 +76,12 @@ export function summarizeEvent(ev: EventOut): ReactNode {
             </>
           ) : null}
           {num(p.latency_ms) != null ? <> · {Math.round(num(p.latency_ms)!)}ms</> : null}
+          {num(p.ttft_ms) != null && num(p.ttft_ms)! < (num(p.latency_ms) ?? Infinity) ? (
+            <> · ttft {Math.round(num(p.ttft_ms)!)}ms</>
+          ) : null}
+          {num(p.tokens_per_sec) != null ? (
+            <> · {num(p.tokens_per_sec)} t/s</>
+          ) : null}
           {status != null ? (
             <> · <Badge tone={bad ? "red" : "green"}>HTTP {status}</Badge></>
           ) : null}

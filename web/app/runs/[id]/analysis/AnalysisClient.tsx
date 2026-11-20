@@ -243,6 +243,9 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     () =>
       sbs.map((sb) => ({
         name: shortId(sb.sandbox_id),
+        // PR30: ttft stats — absent on pre-speed-metrics backends.
+        ttft_avg: sb.ttft_ms?.avg ?? 0,
+        ttft_p95: sb.ttft_ms?.p95 ?? 0,
         avg: sb.latency_ms.avg ?? 0,
         p95: sb.latency_ms.p95 ?? 0,
         max: sb.latency_ms.max ?? 0,
@@ -398,6 +401,7 @@ export default function AnalysisClient({ runId }: { runId: string }) {
 
   const anyToolCalls = sbs.some((sb) => sb.tool_calls.total > 0);
   const anyLatency = sbs.some((sb) => sb.latency_ms.avg != null);
+  const anyTtft = sbs.some((sb) => sb.ttft_ms?.avg != null);
   const anyEval = sbs.some((sb) => sb.evaluator != null && sb.evaluator.llm_turns > 0);
 
   return (
@@ -552,7 +556,7 @@ export default function AnalysisClient({ runId }: { runId: string }) {
           )}
         </Card>
 
-        <Card title="LLM latency (ms)" className="card--flush">
+        <Card title="LLM latency / TTFT (ms)" className="card--flush">
           {notes.analytics && !data.analytics ? (
             <InfoNote>Metrics unavailable: {notes.analytics}</InfoNote>
           ) : !anyLatency ? (
@@ -562,6 +566,14 @@ export default function AnalysisClient({ runId }: { runId: string }) {
               <VBars
                 rows={latencyRows}
                 series={[
+                  // TTFT bars first — first-byte time precedes the rest of
+                  // the call; only rendered when the gateway records it.
+                  ...(anyTtft
+                    ? [
+                        { key: "ttft_avg", name: "ttft avg", color: C.blue },
+                        { key: "ttft_p95", name: "ttft p95", color: C.violet },
+                      ]
+                    : []),
                   { key: "avg", name: "avg", color: C.teal },
                   { key: "p95", name: "p95", color: C.amber },
                   { key: "max", name: "max", color: C.red },
@@ -570,6 +582,12 @@ export default function AnalysisClient({ runId }: { runId: string }) {
               />
               <SeriesChips
                 items={[
+                  ...(anyTtft
+                    ? [
+                        { color: C.blue, label: "ttft avg" },
+                        { color: C.violet, label: "ttft p95" },
+                      ]
+                    : []),
                   { color: C.teal, label: "avg" },
                   { color: C.amber, label: "p95" },
                   { color: C.red, label: "max" },
