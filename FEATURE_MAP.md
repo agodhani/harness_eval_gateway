@@ -821,7 +821,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (grouped horizontal bars + "weighted total leader" line), tool-call mix
   (stacked, top-7 tools + `other`), tokens in/out (stacked), LLM latency /
   TTFT (avg/p95/max plus ttft avg/p95 bars when the backend records them —
-  PR30), estimated cost per sandbox (price-model dropdown →
+  PR30), output speed per sandbox (mean avg tok/s — PR30), estimated cost
+  per sandbox (price-model dropdown →
   client-side recompute, same trick as AnalyticsSection — local models show
   a note instead of empty bars), participant-vs-evaluator spend split
   (stacked; judge priced at the evaluator model's rate when listed), and a

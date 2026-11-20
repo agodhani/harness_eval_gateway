@@ -790,9 +790,9 @@ or tests change.
   pooled) + `avg_tokens_per_sec` per cell and per model; events
   predating the fields contribute no sample. The analysis page's
   latency chart renders ttft avg/p95 bars next to avg/p95/max (hidden
-  when a backend emits no ttft), the timeline metrics strip gains a
-  `spd` chip, and the results Analytics table adds `ttft ms` + `tok/s`
-  rows.
+  when a backend emits no ttft) plus an output-speed card (mean avg
+  tok/s per cell), the timeline metrics strip gains a `spd` chip, and
+  the results Analytics table adds `ttft ms` + `tok/s` rows.
 
 ## Working conventions
 
