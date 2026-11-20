@@ -151,6 +151,27 @@ describe("mergeFileLists (PR10 split idiom for files)", () => {
     const rows = mergeFileLists(A_ENTRIES, []);
     assert.ok(rows.every((r) => r.side === "left" && r.right === null));
   });
+
+  test("a file-vs-dir path merges as a clickable file row", () => {
+    // 'util' is a FILE on a and a DIR on b (with a file under it) — the
+    // server diffs it (the dir side resolves as missing), so the row must
+    // stay file-kind: clickable and counted by diffSummary.
+    const rows = mergeFileLists(
+      [file("util", 10)],
+      [dir("util"), file("util/x.py", 5)],
+    );
+    const byPath = new Map(rows.map((r) => [r.path, r]));
+    const util = byPath.get("util")!;
+    assert.equal(util.kind, "file");
+    assert.equal(util.side, "both");
+    assert.equal(util.left?.kind, "file");
+    assert.equal(util.right?.kind, "dir");
+    assert.deepEqual(diffSummary(rows), {
+      onlyLeft: 0,
+      onlyRight: 1,
+      both: 1,
+    });
+  });
 });
 
 describe("diffSummary", () => {
@@ -193,6 +214,26 @@ describe("parseDiffLines", () => {
     // by ' ' in unified format → context, not add.
     const lines = parseDiffLines("@@ -1 +1 @@\n +literal\n");
     assert.equal(lines[1].kind, "context");
+  });
+
+  test("in-hunk ---/+++ prefixed lines classify del/add, not meta", () => {
+    // difflib emits the file headers only as the first two lines — a
+    // deleted '-- comment' arrives as '--- comment', an added '++x' as
+    // '+++x', and both must classify by their leading -/+.
+    const diff = [
+      "--- a/f.yaml",
+      "+++ b/f.yaml",
+      "@@ -1,3 +1,3 @@",
+      " keep",
+      "--- comment",
+      "+++x",
+      " ctx",
+    ].join("\n");
+    const lines = parseDiffLines(diff);
+    assert.deepEqual(
+      lines.map((l) => l.kind),
+      ["meta", "meta", "hunk", "context", "del", "add", "context"],
+    );
   });
 
   test("empty diff → no lines", () => {

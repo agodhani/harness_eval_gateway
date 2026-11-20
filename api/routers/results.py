@@ -1181,16 +1181,32 @@ def _resolve_in_root(root: Path, rel: str) -> tuple[Path, str] | None:
         return None
     try:
         resolved = (root / rel).resolve()
-    except OSError:
+    except (OSError, ValueError):
         return None
     if resolved != root and root not in resolved.parents:
         return None
     try:
         if not resolved.is_file():
             return None
-    except OSError:
+    except (OSError, ValueError):
         return None
     return resolved, resolved.relative_to(root).as_posix()
+
+
+def _browsable_file(dirpath: str, name: str) -> int | None:
+    """Size of a listable artifact file — ``None`` when the listing
+    predicate rejects it (noise name, symlink, non-regular file, or a
+    stat that fails). Shared by the emit loop and the depth cutoff so
+    ``truncated`` flags only when a browsable entry is actually cut."""
+    if name in _ZIP_EXCLUDED_DIRS or name.endswith(".pyc"):
+        return None
+    p = Path(dirpath) / name
+    if p.is_symlink() or not p.is_file():
+        return None
+    try:
+        return p.stat().st_size
+    except OSError:
+        return None
 
 
 def _list_root_entries(root: Path) -> tuple[list[FileEntry], bool]:
@@ -1222,19 +1238,16 @@ def _list_root_entries(root: Path) -> tuple[list[FileEntry], bool]:
             and not (Path(dirpath) / d).is_symlink()
         )
         if depth >= _BROWSE_MAX_DEPTH:
-            if dirnames or filenames:
+            if dirnames or any(
+                _browsable_file(dirpath, name) is not None
+                for name in filenames
+            ):
                 truncated = True
             dirnames[:] = []
             continue
         for name in sorted(filenames):
-            if name in _ZIP_EXCLUDED_DIRS or name.endswith(".pyc"):
-                continue
-            p = Path(dirpath) / name
-            if p.is_symlink() or not p.is_file():
-                continue
-            try:
-                size = p.stat().st_size
-            except OSError:
+            size = _browsable_file(dirpath, name)
+            if size is None:
                 continue
             rel = name if depth == 0 else (rel_dir / name).as_posix()
             entries.append(FileEntry(path=rel, kind="file", size=size))
@@ -1251,10 +1264,17 @@ def _read_text_capped(path: Path) -> tuple[str | None, bool, int]:
     """``(text, truncated, size)`` — ``text`` is None when the read head
     carries NUL bytes (binary). Reads at most ``_FILE_TEXT_CAP_BYTES + 1``;
     a mid-codepoint cut decodes with ``errors="replace"`` so a large text
-    file is never mislabeled binary."""
-    size = path.stat().st_size
-    with path.open("rb") as fh:
-        data = fh.read(_FILE_TEXT_CAP_BYTES + 1)
+    file is never mislabeled binary. A file that can't be statted/read
+    404s like a missing one — a chmod-0 candidate file must not escape as
+    a 500."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            data = fh.read(_FILE_TEXT_CAP_BYTES + 1)
+    except OSError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+        )
     truncated = len(data) > _FILE_TEXT_CAP_BYTES
     body = data[:_FILE_TEXT_CAP_BYTES]
     if b"\x00" in body:
@@ -1262,25 +1282,28 @@ def _read_text_capped(path: Path) -> tuple[str | None, bool, int]:
     return body.decode("utf-8", errors="replace"), truncated, size
 
 
-def _diff_side(file_path: Path | None) -> tuple[list[str] | None, bool, bool]:
-    """One side of a file diff → ``(lines, binary, truncated_input)``.
+def _diff_side(
+    file_path: Path | None,
+) -> tuple[list[str] | None, bool, bool, bytes | None]:
+    """One side of a file diff → ``(lines, binary, truncated_input, body)``.
 
     ``file_path`` None (absent on that side) → empty side — the diff
     renders the other side as all +/-. A NUL-carrying side flips
     ``binary`` so the caller returns no diff at all instead of garbage.
+    An unreadable side propagates OSError — the caller 404s rather than
+    diffing a present file as absent. ``body`` is the raw capped bytes so
+    ``identical`` can require true byte equality, not just equal decoded
+    heads.
     """
     if file_path is None:
-        return None, False, False
-    try:
-        with file_path.open("rb") as fh:
-            data = fh.read(_DIFF_SIDE_CAP_BYTES + 1)
-    except OSError:
-        return None, False, False
+        return None, False, False, None
+    with file_path.open("rb") as fh:
+        data = fh.read(_DIFF_SIDE_CAP_BYTES + 1)
     truncated = len(data) > _DIFF_SIDE_CAP_BYTES
     body = data[:_DIFF_SIDE_CAP_BYTES]
     if b"\x00" in body:
-        return None, True, truncated
-    return body.decode("utf-8", errors="replace").splitlines(), False, truncated
+        return None, True, truncated, body
+    return body.decode("utf-8", errors="replace").splitlines(), False, truncated, body
 
 
 def _file_diff(
@@ -1311,8 +1334,18 @@ def _file_diff(
     assert resolved is not None  # the 404 above guarantees one side
     rel_posix = resolved[1]
 
-    a_lines, a_binary, a_trunc = _diff_side(a_found[0] if a_found else None)
-    b_lines, b_binary, b_trunc = _diff_side(b_found[0] if b_found else None)
+    try:
+        a_lines, a_binary, a_trunc, a_body = _diff_side(
+            a_found[0] if a_found else None
+        )
+        b_lines, b_binary, b_trunc, b_body = _diff_side(
+            b_found[0] if b_found else None
+        )
+    except OSError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="file unreadable on one side",
+        )
 
     common = {
         "sandbox_id": sandbox.id,
@@ -1326,7 +1359,13 @@ def _file_diff(
             **common, binary=True, truncated=a_trunc or b_trunc
         )
 
-    identical = a_lines is not None and b_lines is not None and a_lines == b_lines
+    identical = (
+        a_body is not None
+        and b_body is not None
+        and not a_trunc
+        and not b_trunc
+        and a_body == b_body
+    )
     diff_text = ""
     out_truncated = a_trunc or b_trunc
     if not identical:
@@ -1417,6 +1456,15 @@ def get_sandbox_file(
     file_path, rel_posix = found
 
     if download:
+        # FileResponse stats/opens at send time — probe readability now so
+        # an unreadable file 404s instead of erroring mid-response.
+        try:
+            with file_path.open("rb"):
+                pass
+        except OSError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
         return FileResponse(file_path, filename=file_path.name)
 
     text, truncated, size = _read_text_capped(file_path)

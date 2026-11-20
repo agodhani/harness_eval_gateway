@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import time
 import uuid
 import zipfile
@@ -1691,3 +1692,85 @@ def test_files_diff_unknown_and_binary(client: TestClient, browsed_run) -> None:
     ).json()
     assert body["binary"] is True
     assert body["diff"] == ""
+
+
+def test_files_nul_path_404(client: TestClient, browsed_run) -> None:
+    """A percent-encoded NUL in the browsed path makes resolve() raise
+    ValueError — it must 404 like traversal, on the read AND diff paths,
+    never escape as a 500."""
+    sb1, sb2 = browsed_run["sb1"], browsed_run["sb2"]
+    assert (
+        client.get(f"/api/sandboxes/{sb1}/files/%00x").status_code == 404
+    )
+    assert (
+        client.get(
+            f"/api/sandboxes/{sb1}/files/%00x",
+            params={"diff": str(sb2)},
+        ).status_code
+        == 404
+    )
+
+
+def test_files_unreadable_404(client: TestClient, browsed_run) -> None:
+    """A candidate file with chmod-0 permissions resolves fine (stat works)
+    but can't be opened — read, download, and diff all 404 rather than
+    500ing or diffing the present file as absent."""
+    sb1, sb2 = browsed_run["sb1"], browsed_run["sb2"]
+    locked = browsed_run["ws1"] / "locked.txt"
+    locked.write_text("secret\n")
+    locked.chmod(0)
+    try:
+        if os.access(locked, os.R_OK):
+            pytest.skip("privileged run — chmod 0 file still readable")
+        assert (
+            client.get(f"/api/sandboxes/{sb1}/files/locked.txt").status_code
+            == 404
+        )
+        assert (
+            client.get(
+                f"/api/sandboxes/{sb1}/files/locked.txt",
+                params={"download": "1"},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.get(
+                f"/api/sandboxes/{sb1}/files/locked.txt",
+                params={"diff": str(sb2)},
+            ).status_code
+            == 404
+        )
+    finally:
+        locked.chmod(0o644)
+
+
+def test_files_list_depth_cutoff_counts_only_browsable(
+    client: TestClient, browsed_run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The depth cutoff flags ``truncated`` only when a BROWSABLE entry is
+    actually cut — a capped dir holding only pruned names isn't a cut."""
+    deep = browsed_run["ws1"] / "src" / "deep"
+    deep.mkdir()
+    (deep / "noise.pyc").write_text("x")
+    monkeypatch.setattr(results_router, "_BROWSE_MAX_DEPTH", 2)
+    body = client.get(f"/api/sandboxes/{browsed_run['sb1']}/files").json()
+    assert body["truncated"] is False
+    (deep / "real.txt").write_text("x")
+    body = client.get(f"/api/sandboxes/{browsed_run['sb1']}/files").json()
+    assert body["truncated"] is True
+
+
+def test_files_diff_identical_requires_full_equality(
+    client: TestClient, browsed_run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two files sharing the capped head but differing afterwards are NOT
+    identical — the flag requires whole-file byte equality."""
+    monkeypatch.setattr(results_router, "_DIFF_SIDE_CAP_BYTES", 8)
+    (browsed_run["ws1"] / "big.txt").write_text("AAAAAAAAtail-a\n")
+    (browsed_run["ws2"] / "big.txt").write_text("AAAAAAAAtail-b\n")
+    body = client.get(
+        f"/api/sandboxes/{browsed_run['sb1']}/files/big.txt",
+        params={"diff": str(browsed_run["sb2"])},
+    ).json()
+    assert body["identical"] is False
+    assert body["truncated"] is True

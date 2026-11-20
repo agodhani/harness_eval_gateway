@@ -93,7 +93,10 @@ export function buildFileTree(entries: FileEntry[]): FileNode[] {
 }
 
 /** One row of the merged two-lane listing — a path present on left (a),
- *  right (b), or both. `side` drives the +/- presence badge. */
+ *  right (b), or both. `side` drives the +/- presence badge. `kind` is
+ *  "file" when EITHER side holds a file there — a file-vs-dir path is
+ *  still diffable (the server resolves the dir side as missing), so the
+ *  row stays clickable and counts in `diffSummary`. */
 export interface MergedFileRow {
   key: string;
   path: string;
@@ -140,8 +143,7 @@ export function mergeFileLists(
   return paths.map((path) => {
     const l = left.get(path) ?? null;
     const r = right.get(path) ?? null;
-    const kind =
-      (l ?? r)?.kind === "dir" || (r ?? l)?.kind === "dir" ? "dir" : "file";
+    const kind = l?.kind === "file" || r?.kind === "file" ? "file" : "dir";
     return {
       key: path,
       path,
@@ -181,15 +183,23 @@ export interface DiffLine {
 
 /**
  * Classify server-side unified-diff text for colored `<pre>` rendering:
- * `---`/`+++`/`\` → meta, `@@` → hunk, `+` → add, `-` → del, else context
- * (context lines carry a leading space; a trailing bare line is still
- * context). No diff parsing beyond line prefix — the format is stable.
+ * `---`/`+++` → meta ONLY as the first two lines (the file headers
+ * difflib always emits first) — later `---`/`+++`-prefixed lines are
+ * in-hunk content (a deleted `-- comment`, an added `++x`) and classify
+ * del/add. `\` → meta anywhere, `@@` → hunk, `+` → add, `-` → del, else
+ * context (context lines carry a leading space; a trailing bare line is
+ * still context). No diff parsing beyond line prefix — the format is
+ * stable.
  */
 export function parseDiffLines(diff: string): DiffLine[] {
   if (!diff) return [];
-  return diff.split("\n").map((text) => {
+  return diff.split("\n").map((text, i) => {
     let kind: DiffLine["kind"];
-    if (text.startsWith("---") || text.startsWith("+++") || text.startsWith("\\")) {
+    if (
+      text.startsWith("\\") ||
+      (i === 0 && text.startsWith("---")) ||
+      (i === 1 && text.startsWith("+++"))
+    ) {
       kind = "meta";
     } else if (text.startsWith("@@")) {
       kind = "hunk";
