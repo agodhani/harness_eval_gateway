@@ -195,7 +195,8 @@ def _config_key(harness_config: dict) -> tuple[str, str]:
     axis across runs. Unnamed configs group by adapter + pack set +
     prompt-extra (``model`` deliberately excluded — the model board owns
     that axis), displayed ``adapter · packs`` like the results matrix,
-    with a ``+prompt`` marker when a prompt-extra distinguishes the group.
+    with the (truncated) prompt-extra quoted when it distinguishes the
+    group.
     """
     hc = harness_config or {}
     adapter = str(hc.get("adapter") or hc.get("harness") or "?")
@@ -207,7 +208,8 @@ def _config_key(harness_config: dict) -> tuple[str, str]:
     key = f"cfg:{adapter}|{','.join(sorted(packs))}|{extra}"
     label = " · ".join([adapter, *packs]) if packs else adapter
     if extra:
-        label += " · +prompt"
+        shown = extra if len(extra) <= 24 else extra[:24] + "…"
+        label += f" · {shown!r}"
     return key, label
 
 
@@ -249,8 +251,6 @@ async def preset_analytics(slug: str, session: DbSession) -> PresetAnalytics:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"preset {slug!r} not found",
         )
-    stats = _list_stats(session, {preset.slug})
-
     runs = (
         session.execute(
             select(Run)
@@ -281,6 +281,15 @@ async def preset_analytics(slug: str, session: DbSession) -> PresetAnalytics:
                 scored_sandboxes=len(overalls),
             )
         )
+    stats = {
+        preset.slug: (
+            len(run_points),
+            next(
+                (p.mean_overall_score for p in run_points if p.mean_overall_score is not None),
+                None,
+            ),
+        )
+    }
 
     # Leaderboards — scored cells bucketed by participant model / by harness
     # config; each cell contributes its latest overall to its bucket's mean.
@@ -304,13 +313,16 @@ async def preset_analytics(slug: str, session: DbSession) -> PresetAnalytics:
                 "scores": [],
                 "runs": set(),
                 "label": clabel,
-                "adapter": str(
-                    (sb.harness_config or {}).get("adapter")
-                    or (sb.harness_config or {}).get("harness")
-                    or "?"
-                ),
+                "adapters": set(),
                 "name": str((sb.harness_config or {}).get("name") or "").strip() or None,
             },
+        )
+        cb["adapters"].add(
+            str(
+                (sb.harness_config or {}).get("adapter")
+                or (sb.harness_config or {}).get("harness")
+                or "?"
+            )
         )
         cb["scores"].append(score)
         cb["runs"].add(sb.run_id)
@@ -320,7 +332,7 @@ async def preset_analytics(slug: str, session: DbSession) -> PresetAnalytics:
             PresetLeaderboardEntry(
                 key=key,
                 label=bucket.get("label") or key,
-                adapter=bucket.get("adapter") if config else None,
+                adapter=", ".join(sorted(bucket["adapters"])) if config else None,
                 name=bucket.get("name") if config else None,
                 mean_overall_score=round(sum(bucket["scores"]) / len(bucket["scores"]), 2),
                 n=len(bucket["scores"]),

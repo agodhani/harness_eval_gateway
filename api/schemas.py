@@ -745,7 +745,7 @@ class PresetLeaderboardEntry(BaseModel):
     every scored sandbox cell in the bucket across all runs on the preset."""
 
     key: str  # group key — model name, or ``name:<name>`` / ``cfg:<adapter>|<packs>|<extra>``
-    label: str  # display label — model name, or ``adapter · packs [· +prompt]`` / config name
+    label: str  # display label — model name, or ``adapter · packs [· 'extra']`` / config name
     adapter: str | None = None  # config board only: the grouped adapter
     name: str | None = None  # config board only: PR1 config name when set
     mean_overall_score: float
