@@ -169,7 +169,12 @@ Terminal states per sandbox:
 `budget_exceeded` keys on the gateway's own budget-gate event
 (`stage="budget"` + `reason="budget_exceeded"`) — a bare 429 from the
 *upstream provider* is NOT budget exhaustion: ≥3 `stage="upstream"` error
-events terminate the sandbox `error` instead.
+events terminate the sandbox `error` instead. Three limits share the
+verdict (PR28) — the terminate checkpoint's `payload.limit` says which:
+`run_tokens` (shared ceiling, cred `max_tokens`), `sandbox_tokens`
+(per-cell ceiling, cred `sandbox_max_tokens` metered against the cell's
+own usage + monitor backstop), `cost` (`max_cost_usd` vs the cell's
+estimated spend at the layered price table — priced models only).
 
 Provisional defaults (confirm with user): 60 min wall clock, $2 spend cap,
 stuck-loop = 3 consecutive identical tool calls.
@@ -698,6 +703,22 @@ or tests change.
   ("Load more"), landing copy describes the config × model matrix, and the
   results `total` row is the weighted scale-normalised aggregate
   (`web/lib/scoreMath.ts`), not a raw Σ.
+- **Price truth lives in the DB, static table is the fallback (PR28)** —
+  `model_prices` rows keyed by case-insensitive fnmatch `model_glob`
+  (`created_at, id` declaration order, first match wins) layer OVER
+  `api.pricing.PRICE_TABLE` via `PriceBook`; a bare (no `/`) glob never
+  matches `vendor/model` ids. `PUT /api/prices` upserts user rows
+  (never clobbered by sync); `POST /api/prices/sync` maps OpenRouter
+  `/models` `pricing.*` USD-per-token strings to per-Mtok rates through
+  the gateway's `x-heg-provider` override — entries with no parseable
+  rate are skipped rather than priced-free. Per-cell budgets:
+  `sandbox_token_budget` mints a `sandbox_max_tokens` cred claim
+  (gateway gate + monitor backstop → `limit="sandbox_tokens"`);
+  `max_cost_usd` is monitor-polled against the cell's layered-price
+  estimate → `limit="cost"`, and it can't trip an unpriced model
+  (no honest rate to bill against). Cache-read tokens bill at
+  `cache_read_per_mtok_usd` when declared, else the input rate.
+  Price pickers (results + analysis) grow rates inline via "+ add rate".
 
 ## Working conventions
 
@@ -712,7 +733,10 @@ or tests change.
   `cd web && npm run dev` (use `-p 3002` if :3000 is taken);
   e2e `cd web && E2E_PORT=3100 npm run test:e2e`.
 - `GET /api/runs/{id}/analytics?price_model=` (F9) serves per-sandbox metrics
-  + estimated cost; price table lives in `api/pricing.py` (`PRICE_TABLE`).
+  + estimated cost; price resolution runs through the layered
+  `api/pricing.py::PriceBook` (`model_prices` glob rows over the static
+  `PRICE_TABLE`, F19 — managed via `GET/PUT/DELETE /api/prices`,
+  `POST /api/prices/sync` for OpenRouter).
   `tool_calls` merges every agent-activity signal without double counting —
   `tool_call` events, hook-sourced `tool_result` outcomes (per-name max),
   and `shell_command`/`file_op`/`test_execution` as proxies when a lane has
