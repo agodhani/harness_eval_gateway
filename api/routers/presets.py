@@ -427,14 +427,14 @@ async def update_preset(slug: str, body: PresetUpdate, session: DbSession) -> Pr
     settings = get_settings()
     try:
         slug = preset_store.validate_slug(slug)
-        if preset_store.get_vendored(settings.TASK_PRESETS_DIR, slug) is not None:
-            raise preset_store.PresetError(
-                "vendored_protected",
-                f"{slug!r} is a vendored preset — it can't be edited "
-                "(copy it via POST /api/presets/{new-slug} instead)",
-            )
         row = preset_store.get_user(session, slug)
         if row is None:
+            if preset_store.get_vendored(settings.TASK_PRESETS_DIR, slug) is not None:
+                raise preset_store.PresetError(
+                    "vendored_protected",
+                    f"{slug!r} is a vendored preset — it can't be edited "
+                    "(copy it via POST /api/presets/{new-slug} instead)",
+                )
             raise preset_store.PresetError("not_found", f"preset {slug!r} not found")
         changed = False
         for field_name in (
@@ -473,13 +473,13 @@ async def delete_preset(slug: str, session: DbSession) -> None:
     settings = get_settings()
     try:
         slug = preset_store.validate_slug(slug)
-        if preset_store.get_vendored(settings.TASK_PRESETS_DIR, slug) is not None:
-            raise preset_store.PresetError(
-                "vendored_protected",
-                f"{slug!r} is a vendored preset and cannot be deleted",
-            )
         row = preset_store.get_user(session, slug)
         if row is None:
+            if preset_store.get_vendored(settings.TASK_PRESETS_DIR, slug) is not None:
+                raise preset_store.PresetError(
+                    "vendored_protected",
+                    f"{slug!r} is a vendored preset and cannot be deleted",
+                )
             raise preset_store.PresetError("not_found", f"preset {slug!r} not found")
         session.delete(row)
         session.commit()

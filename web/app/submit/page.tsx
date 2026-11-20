@@ -343,28 +343,27 @@ export default function SubmitPage() {
       });
   }, []);
 
-  // PR22 preset library — merged vendored + user presets. On success, the
-  // ?preset=<slug> param prefills preset mode (detail-page "run this preset"
-  // links); a staged resubmit ref may already have set one — the URL param
-  // is an explicit user intent so it wins. A slug absent from the loaded
-  // library isn't detached here — the picker surfaces the mismatch and
-  // validation makes the user re-pick or switch to custom (a missing slug
-  // would 422 server-side anyway).
+  // PR22 preset library — merged vendored + user presets. The
+  // ?preset=<slug> param (detail-page "run this preset" links) is explicit
+  // user intent applied on mount regardless of the fetch outcome — a staged
+  // resubmit ref may already have set one and the URL param wins. A slug
+  // absent from the loaded library isn't detached — the picker surfaces the
+  // mismatch and validation makes the user re-pick or switch to custom (a
+  // missing slug would 422 server-side anyway).
   useEffect(() => {
     let cancelled = false;
+    const qp = new URLSearchParams(window.location.search).get("preset");
+    if (qp) {
+      selectPreset(qp);
+      setTaskMode("preset");
+    }
     listPresets()
       .then((list) => {
-        if (cancelled) return;
-        setPresets(list);
-        const qp = new URLSearchParams(window.location.search).get("preset");
-        if (qp) {
-          selectPreset(qp);
-          setTaskMode("preset");
-        }
+        if (!cancelled) setPresets(list);
       })
       .catch(() => {
         /* API down — preset mode stays selectable but unverifiable;
-           a staged preset_ref still submits (server resolves it). */
+           a preset_ref slug still submits (server resolves it). */
         if (!cancelled) setPresetsFailed(true);
       });
     return () => {

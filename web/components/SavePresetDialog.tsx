@@ -54,6 +54,10 @@ export function SavePresetDialog({
   const [description, setDescription] = useState(existing?.description ?? "");
   const [category, setCategory] = useState(existing?.category ?? "");
   const [tags, setTags] = useState((existing?.tags ?? []).join(", "));
+  const [suggAdapter, setSuggAdapter] = useState(existing?.suggested_adapter ?? "");
+  const [suggModels, setSuggModels] = useState(
+    (existing?.suggested_models ?? []).join(", "),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [collision, setCollision] = useState<{ attempted: string; suggested: string; source: string | null } | null>(null);
@@ -75,6 +79,11 @@ export function SavePresetDialog({
       .map((t) => t.trim())
       .filter(Boolean)
       .slice(0, 16);
+    const parsedSuggModels = suggModels
+      .split(",")
+      .map((m) => m.trim())
+      .filter(Boolean)
+      .slice(0, 8);
     try {
       const saved = editing
         ? await updatePreset(existing.slug, {
@@ -83,6 +92,8 @@ export function SavePresetDialog({
             description: description.trim(),
             category: category.trim(),
             tags: parsedTags,
+            suggested_adapter: suggAdapter.trim() || null,
+            suggested_models: parsedSuggModels.length ? parsedSuggModels : null,
           })
         : await createPreset(slug.trim().toLowerCase(), {
             title: title.trim(),
@@ -237,6 +248,39 @@ export function SavePresetDialog({
                 disabled={busy}
                 maxLength={100000}
               />
+            </div>
+          ) : null}
+
+          {editing ? (
+            <div className="input-row">
+              <div className="field" style={{ flex: 1 }}>
+                <label className="field__label" htmlFor="preset-sugg-adapter">
+                  Suggested adapter <span className="faint">(empty clears)</span>
+                </label>
+                <input
+                  id="preset-sugg-adapter"
+                  className="input input--mono"
+                  value={suggAdapter}
+                  onChange={(e) => setSuggAdapter(e.target.value)}
+                  disabled={busy}
+                  maxLength={64}
+                  placeholder="e.g. miniloop"
+                />
+              </div>
+              <div className="field" style={{ flex: 1 }}>
+                <label className="field__label" htmlFor="preset-sugg-models">
+                  Suggested models{" "}
+                  <span className="faint">(comma-separated — empty clears)</span>
+                </label>
+                <input
+                  id="preset-sugg-models"
+                  className="input input--mono"
+                  value={suggModels}
+                  onChange={(e) => setSuggModels(e.target.value)}
+                  disabled={busy}
+                  placeholder="qwen3:8b, qwen2.5-coder:7b"
+                />
+              </div>
             </div>
           ) : null}
 

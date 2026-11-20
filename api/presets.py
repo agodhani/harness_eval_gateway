@@ -292,7 +292,9 @@ def list_all(session: Session, vendored_root: str | Path) -> list[Preset]:
 
     One slug namespace: POST rejects user slugs that collide with either
     source, so a vendored/user slug clash should never occur — if it does
-    (hand-edited DB), the vendored entry wins the listing.
+    (a vendored file added over an existing user slug, or a hand-edited
+    DB), the vendored entry wins the listing. The user row stays
+    manageable: PATCH/DELETE address it directly.
     """
     out = list_vendored(vendored_root)
     seen = {p.slug for p in out}
