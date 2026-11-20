@@ -630,17 +630,18 @@ async def run_prompt_cell(
         system_extra = str(
             harness_config.get("system_prompt_extra") or ""
         ).strip()
-        # PR27: model_options.max_tokens overrides the env knob's default —
-        # env still wins when the config didn't set the key.
+        # PR27: a configured model_options.max_tokens wins; the env knob
+        # fills in when the config didn't set the key.
         model_options = harness_config.get("model_options")
         opt_max_tokens = (
             model_options.get("max_tokens")
             if isinstance(model_options, dict)
             else None
         )
-        max_tokens = _env_int(
-            "PROMPT_CELL_MAX_TOKENS",
-            int(opt_max_tokens) if opt_max_tokens else DEFAULT_MAX_TOKENS,
+        max_tokens = (
+            int(opt_max_tokens)
+            if opt_max_tokens
+            else _env_int("PROMPT_CELL_MAX_TOKENS", DEFAULT_MAX_TOKENS)
         )
         deadline = time.monotonic() + float(budgets["wall_clock_seconds"])
         _mark_running(

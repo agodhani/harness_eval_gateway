@@ -145,6 +145,7 @@ def launch(task: dict[str, Any]) -> dict[str, Any]:
       - ``events_ingest_url``, ``ingest_token``, ``max_iters``, ``max_tokens``,
         ``skillpacks_root``
       - ``system_prompt_extra``: appended to the agent's system prompt
+      - ``model_options``: PR27 per-config knobs mapped to env (see ``env``)
 
     Returns::
 

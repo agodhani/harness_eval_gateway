@@ -71,6 +71,22 @@ const BLANK_OPTS: ModelOptsRow = {
   reasoning: "",
 };
 
+// Reasoning-effort vocabularies are adapter-scoped: codex writes the value
+// verbatim into model_reasoning_effort (minimal|low|medium|high|xhigh —
+// max/none fail config parse); pass-through adapters (miniloop, prompt)
+// forward it to the provider, which accepts the broader set.
+const DEFAULT_REASONING_EFFORTS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "max",
+];
+const REASONING_EFFORTS: Record<string, string[]> = {
+  codex: ["minimal", "low", "medium", "high", "xhigh"],
+};
+
 interface ConfigRow {
   key: number;
   name: string;
@@ -1103,6 +1119,14 @@ export default function SubmitPage() {
                         const sup = supportedOpts(cfg.adapter);
                         const unsupported =
                           sup !== null && !sup.includes("reasoning");
+                        const efforts =
+                          REASONING_EFFORTS[cfg.adapter] ??
+                          DEFAULT_REASONING_EFFORTS;
+                        const options =
+                          cfg.opts.reasoning &&
+                          !efforts.includes(cfg.opts.reasoning)
+                            ? [...efforts, cfg.opts.reasoning]
+                            : efforts;
                         return (
                           <div className="field">
                             <label className="field__label">Reasoning</label>
@@ -1122,13 +1146,11 @@ export default function SubmitPage() {
                               }
                             >
                               <option value="">adapter default</option>
-                              {["none", "minimal", "low", "medium", "high", "max"].map(
-                                (r) => (
-                                  <option key={r} value={r}>
-                                    {r}
-                                  </option>
-                                ),
-                              )}
+                              {options.map((r) => (
+                                <option key={r} value={r}>
+                                  {r}
+                                </option>
+                              ))}
                             </select>
                             {unsupported ? (
                               <span className="field__hint">

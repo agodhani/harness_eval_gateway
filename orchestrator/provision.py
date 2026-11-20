@@ -189,6 +189,7 @@ def build_spec(
         "events_ingest_url": GATEWAY_INGEST_URL,
         "max_iters": env.get("MAX_ITERS"),
         "system_prompt_extra": harness_config.get("system_prompt_extra"),
+        "model_options": harness_config.get("model_options"),
     }
     launch = adapter.launch(task)
     return SandboxSpec(
@@ -220,7 +221,9 @@ def _sandbox_name(hc: dict[str, Any], sid: uuid.UUID) -> str:
     distinguishable in the timeline filter, results matrix, and analytics.
     PR14: on multi-model runs the cell's ``model`` is appended
     (``<label> · <model>``) so same-config siblings on different models stay
-    distinguishable everywhere the name is shown.
+    distinguishable everywhere the name is shown. PR27: trialed cells also
+    get a `` · tN`` suffix so the N replicas of one cell stay
+    distinguishable.
     """
     label = str(hc.get("name") or "").strip()
     if not label:
