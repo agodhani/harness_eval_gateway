@@ -352,14 +352,21 @@ export default function SubmitPage() {
   // missing slug would 422 server-side anyway).
   useEffect(() => {
     let cancelled = false;
-    const qp = new URLSearchParams(window.location.search).get("preset");
+    const qp = new URLSearchParams(window.location.search)
+      .get("preset")
+      ?.trim()
+      .toLowerCase();
     if (qp) {
       selectPreset(qp);
       setTaskMode("preset");
     }
     listPresets()
       .then((list) => {
-        if (!cancelled) setPresets(list);
+        if (cancelled) return;
+        setPresets((prev) => {
+          const fetched = new Set(list.map((p) => p.slug));
+          return [...list, ...(prev ?? []).filter((p) => !fetched.has(p.slug))];
+        });
       })
       .catch(() => {
         /* API down — preset mode stays selectable but unverifiable;

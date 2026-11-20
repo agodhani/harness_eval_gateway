@@ -47,7 +47,7 @@ export function SavePresetDialog({
 }: Props) {
   const editing = existing !== undefined;
   const [slug, setSlug] = useState(
-    initialSlug ?? presetSlugify(existing?.title ?? initialTitle ?? taskPrompt ?? "").slice(0, 48),
+    initialSlug ?? presetSlugify(existing?.title ?? initialTitle ?? taskPrompt ?? "").slice(0, 48).replace(/-+$/, ""),
   );
   const [title, setTitle] = useState(existing?.title ?? initialTitle ?? "");
   const [editPrompt, setEditPrompt] = useState(existing?.task_prompt ?? "");

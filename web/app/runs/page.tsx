@@ -157,8 +157,9 @@ export default function RunsPage() {
     for (const r of runs ?? []) {
       if (r.preset_ref) slugs.add(r.preset_ref);
     }
+    if (presetFilter) slugs.add(presetFilter);
     return [...slugs].sort();
-  }, [presets, runs]);
+  }, [presets, runs, presetFilter]);
   const presetTitle = (slug: string) =>
     presets.find((p) => p.slug === slug)?.title;
 
