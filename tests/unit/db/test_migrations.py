@@ -20,6 +20,8 @@ import api.config
 REPO_ROOT = Path(__file__).resolve().parents[3]
 INITIAL_REV = "f0a1b2c3d4e5"
 SANDBOX_NAME_REV = "a2b3c4d5e6f7"
+# PR27: new single head — adds ``runs.trials`` (int, default 1).
+RUNS_TRIALS_REV = "d7e9f1a3b5c7"
 
 
 @pytest.fixture()
@@ -51,7 +53,7 @@ def _columns(url: str, table: str) -> set[str]:
 
 def test_migration_chain_single_headed() -> None:
     heads = ScriptDirectory.from_config(_cfg()).get_heads()
-    assert list(heads) == [SANDBOX_NAME_REV]
+    assert list(heads) == [RUNS_TRIALS_REV]
 
 
 def test_sandbox_name_upgrade_downgrade(sqlite_url: str) -> None:
@@ -78,5 +80,31 @@ def test_sandbox_name_matches_model(sqlite_url: str) -> None:
         )
         assert col["nullable"] is True
         assert str(col["type"]) == "VARCHAR(255)"
+    finally:
+        engine.dispose()
+
+
+def test_runs_trials_upgrade_downgrade(sqlite_url: str) -> None:
+    """PR27: ``runs.trials`` lands at head and drops below ``d7e9f1a3b5c7``."""
+    command.upgrade(_cfg(), "head")
+    assert "trials" in _columns(sqlite_url, "runs")
+
+    command.downgrade(_cfg(), SANDBOX_NAME_REV)
+    assert "trials" not in _columns(sqlite_url, "runs")
+
+    command.upgrade(_cfg(), "head")
+    assert "trials" in _columns(sqlite_url, "runs")
+
+
+def test_runs_trials_matches_model(sqlite_url: str) -> None:
+    """PR27: migrated column agrees with db.models — int, non-null, default 1."""
+    command.upgrade(_cfg(), "head")
+    engine = create_engine(sqlite_url)
+    try:
+        col = next(
+            c for c in inspect(engine).get_columns("runs") if c["name"] == "trials"
+        )
+        assert col["nullable"] is False
+        assert "INT" in str(col["type"]).upper()
     finally:
         engine.dispose()

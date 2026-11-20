@@ -1031,3 +1031,108 @@ def test_empty_workspace_surfaced_on_row(
     assert _row(body, mixed_signal_run["sbs"]["empty"])["empty_workspace"] is True
     for key in ("hook", "mixed", "coarse"):
         assert _row(body, mixed_signal_run["sbs"][key])["empty_workspace"] is False
+
+
+# ---------------------------------------------------------------------------
+# PR27 — trials: per-cell rollups with mean ± sd variance
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def trialed_run(session_factory: sessionmaker[Session]):
+    """One config × model cell × 3 trials, hand-worked overall scores.
+
+    Scores 6, 8, 9 → mean 23/3 ≈ 7.667; sample sd (n−1) =
+    sqrt(14/3 / 2) = sqrt(7/3) ≈ 1.528; n = 3.
+    A second cell × 2 trials with one unscored trial exercises the
+    missing-score path: n counts only scored trials.
+    """
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="repeat me",
+            model_name="qwen3:8b",
+            trials=3,
+            config={
+                "evaluator_model": "qwen3:8b",
+                "trials": 3,
+            },
+            status="done",
+        )
+        s.add(run)
+        s.flush()
+        cell_a = {"adapter": "miniloop", "name": "cfg-a"}
+        cell_b = {"adapter": "codex", "name": "cfg-b"}
+        sbs: dict[str, list[Sandbox]] = {"a": [], "b": []}
+        for i in (1, 2, 3):
+            sbs["a"].append(
+                Sandbox(
+                    run_id=run.id,
+                    name=f"cfg-a · t{i}",
+                    harness_config={**cell_a, "trial_index": i},
+                    status="done",
+                    terminal_reason="agent_done",
+                )
+            )
+        for i in (1, 2):
+            sbs["b"].append(
+                Sandbox(
+                    run_id=run.id,
+                    name=f"cfg-b · t{i}",
+                    harness_config={**cell_b, "trial_index": i},
+                    status="done",
+                    terminal_reason="agent_done",
+                )
+            )
+        s.add_all([sb for group in sbs.values() for sb in group])
+        s.flush()
+        # cell A: all three scored — 6, 8, 9 (in insertion order)
+        for sb, sc in zip(sbs["a"], (6.0, 8.0, 9.0), strict=True):
+            s.add(Score(sandbox_id=sb.id, dimension="overall", score=sc))
+        # cell B: only trial 1 scored (trial 2 failed unscored)
+        s.add(Score(sandbox_id=sbs["b"][0].id, dimension="overall", score=5.0))
+        s.commit()
+        return {"run_id": run.id, "a": [sb.id for sb in sbs["a"]],
+                "b": [sb.id for sb in sbs["b"]]}
+    finally:
+        s.close()
+
+
+def _cell(body: dict, label: str) -> dict:
+    return next(c for c in body["cells"] if c["label"] == label)
+
+
+def test_trial_cell_rollup_hand_worked(client: TestClient, trialed_run) -> None:
+    """Hand-worked mean ± sd: scores 6/8/9 → mean 7.667, sample sd 1.528, n=3."""
+    body = _get(client, trialed_run["run_id"])
+    cell = _cell(body, "miniloop")  # label = adapter · packs shape
+    assert cell["sandbox_count"] == 3
+    assert cell["overall_mean"] == 7.667
+    assert cell["overall_sd"] == 1.528
+    assert cell["overall_n"] == 3
+
+
+def test_trial_cell_rollup_counts_scored_trials_only(
+    client: TestClient, trialed_run
+) -> None:
+    """A trial with no overall score is excluded from n — sd needs ≥2."""
+    body = _get(client, trialed_run["run_id"])
+    cell = _cell(body, "codex")
+    assert cell["sandbox_count"] == 2
+    assert cell["overall_mean"] == 5.0
+    assert cell["overall_sd"] is None  # <2 scored trials
+    assert cell["overall_n"] == 1
+
+
+def test_trial_sandbox_rows_carry_cell_and_index(
+    client: TestClient, trialed_run
+) -> None:
+    """Per-sandbox analytics rows self-describe their cell + trial_index so
+    the UI can group trials under one header."""
+    body = _get(client, trialed_run["run_id"])
+    rows = {str(r["sandbox_id"]): r for r in body["sandboxes"]}
+    a_rows = [rows[str(sid)] for sid in trialed_run["a"]]
+    assert sorted(r["trial_index"] for r in a_rows) == [1, 2, 3]
+    assert len({r["cell"] for r in a_rows}) == 1  # one shared cell key
+    b_rows = [rows[str(sid)] for sid in trialed_run["b"]]
+    assert a_rows[0]["cell"] != b_rows[0]["cell"]

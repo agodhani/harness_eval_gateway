@@ -102,3 +102,38 @@ def test_completion_signal() -> None:
     assert "agent_done" in sig["terminal_states"]
     assert sig["exit_codes"]["agent_done"] == 0
     assert sig["exit_codes"]["error"] == 2
+
+
+def test_env_model_options_map_to_knobs() -> None:
+    """PR27: model_options land on the env knobs AgentConfig.from_env reads."""
+    env = adapter.env(
+        "http://g", "c", "t", "m",
+        model_options={
+            "temperature": 0.9,
+            "seed": 123,
+            "max_tokens": 4096,
+            "reasoning": "low",
+        },
+    )
+    assert env["MINILOOP_TEMPERATURE"] == "0.9"
+    assert env["MINILOOP_SEED"] == "123"
+    assert env["MAX_TOKENS"] == "4096"
+    assert env["MINILOOP_REASONING_EFFORT"] == "low"
+
+
+def test_env_explicit_max_tokens_kwarg_wins() -> None:
+    """The explicit ``max_tokens`` kwarg (judge/rubric calls) outranks
+    model_options.max_tokens — evaluator callers keep their raised cap."""
+    env = adapter.env(
+        "http://g", "c", "t", "m",
+        max_tokens=8192,
+        model_options={"max_tokens": 1024},
+    )
+    assert env["MAX_TOKENS"] == "8192"
+
+
+def test_env_no_model_options_omits_knobs() -> None:
+    env = adapter.env("http://g", "c", "t", "m")
+    for key in ("MINILOOP_TEMPERATURE", "MINILOOP_SEED",
+                "MINILOOP_REASONING_EFFORT"):
+        assert key not in env
