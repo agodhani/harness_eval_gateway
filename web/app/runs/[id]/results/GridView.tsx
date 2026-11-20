@@ -112,8 +112,12 @@ function WinnerCard({
             {r1(cell.meanWeighted!)}
           </span>
           <span className="winner__label">
-            weighted total{cell.n > 1 ? ` · mean of ${cell.n}` : ""}
-            {cell.sdWeighted ? ` ±${r2(cell.sdWeighted)}` : ""}
+            weighted total
+            {cell.nWeighted > 1 ? ` · mean of ${cell.nWeighted}` : ""}
+            {cell.nWeighted < cell.n
+              ? ` (${cell.nWeighted}/${cell.n} scored)`
+              : ""}
+            {cell.sdWeighted != null ? ` ±${r2(cell.sdWeighted)}` : ""}
           </span>
         </div>
         {cell.meanOverall != null ? (
