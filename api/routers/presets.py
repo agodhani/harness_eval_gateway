@@ -396,7 +396,7 @@ async def create_preset(slug: str, body: PresetCreate, session: DbSession) -> Pr
             tags=body.tags,
             source="user",
             revision=1,
-            suggested_adapter=body.suggested_adapter,
+            suggested_adapter=body.suggested_adapter or None,
             suggested_models=body.suggested_models,
         )
         session.add(row)
@@ -450,7 +450,7 @@ async def update_preset(slug: str, body: PresetUpdate, session: DbSession) -> Pr
                 changed = True
         for field_name in ("suggested_adapter", "suggested_models"):
             if field_name in body.model_fields_set:
-                setattr(row, field_name, getattr(body, field_name))
+                setattr(row, field_name, getattr(body, field_name) or None)
                 changed = True
         if changed:
             row.revision = (row.revision or 1) + 1

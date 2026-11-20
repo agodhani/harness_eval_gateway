@@ -1376,7 +1376,6 @@ export default function SubmitPage() {
         <SavePresetDialog
           taskPrompt={taskPrompt}
           initialTitle={taskPrompt.trim().split("\n")[0]?.slice(0, 80) ?? ""}
-          suggestedAdapter={configs[0]?.adapter ?? null}
           onClose={() => setSavePresetOpen(false)}
           onSaved={(p) => {
             setSavePresetOpen(false);

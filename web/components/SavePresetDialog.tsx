@@ -28,10 +28,7 @@ interface Props {
   taskPrompt?: string;
   /** Edit mode — the existing USER preset being patched. */
   existing?: TaskPreset;
-  /** Prefill for the slug field (e.g. slugified run-prompt first line). */
-  initialSlug?: string;
   initialTitle?: string;
-  suggestedAdapter?: string | null;
   onClose: () => void;
   onSaved: (preset: TaskPreset) => void;
 }
@@ -39,15 +36,13 @@ interface Props {
 export function SavePresetDialog({
   taskPrompt,
   existing,
-  initialSlug,
   initialTitle,
-  suggestedAdapter,
   onClose,
   onSaved,
 }: Props) {
   const editing = existing !== undefined;
   const [slug, setSlug] = useState(
-    initialSlug ?? presetSlugify(existing?.title ?? initialTitle ?? taskPrompt ?? "").slice(0, 48).replace(/-+$/, ""),
+    presetSlugify(existing?.title ?? initialTitle ?? taskPrompt ?? "").slice(0, 48).replace(/-+$/, ""),
   );
   const [title, setTitle] = useState(existing?.title ?? initialTitle ?? "");
   const [editPrompt, setEditPrompt] = useState(existing?.task_prompt ?? "");
@@ -101,7 +96,6 @@ export function SavePresetDialog({
             description: description.trim(),
             category: category.trim(),
             tags: parsedTags,
-            suggested_adapter: suggestedAdapter ?? null,
           });
       onSaved(saved);
     } catch (err) {
