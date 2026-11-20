@@ -1468,10 +1468,6 @@ export function listPresets(): Promise<TaskPreset[]> {
   return request<TaskPreset[]>("/api/presets");
 }
 
-export function getPreset(slug: string): Promise<TaskPreset> {
-  return request<TaskPreset>(`/api/presets/${encodeURIComponent(slug)}`);
-}
-
 export function getPresetAnalytics(slug: string): Promise<PresetAnalytics> {
   return request<PresetAnalytics>(
     `/api/presets/${encodeURIComponent(slug)}/analytics`,

@@ -380,6 +380,7 @@ export default function SubmitPage() {
 
   function selectPreset(slug: string | null) {
     setPresetSlug(slug);
+    setPresetNotice(null);
   }
 
   const selectedPreset = useMemo(
@@ -708,7 +709,10 @@ export default function SubmitPage() {
               <button
                 type="button"
                 className={`filter-chip${taskMode === "custom" ? " is-active" : ""}`}
-                onClick={() => setTaskMode("custom")}
+                onClick={() => {
+                  setTaskMode("custom");
+                  setPresetNotice(null);
+                }}
                 disabled={submitting}
               >
                 custom prompt
@@ -716,7 +720,10 @@ export default function SubmitPage() {
               <button
                 type="button"
                 className={`filter-chip${taskMode === "preset" ? " is-active" : ""}`}
-                onClick={() => setTaskMode("preset")}
+                onClick={() => {
+                  setTaskMode("preset");
+                  setPresetNotice(null);
+                }}
                 disabled={submitting}
               >
                 task preset

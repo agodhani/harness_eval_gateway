@@ -3,14 +3,14 @@
 /**
  * PR22 — "save as preset" / "edit preset" dialog.
  *
- * Create mode (`mode="create"`): saves a task prompt as a user preset via
+ * Create mode (no `existing`): saves a task prompt as a user preset via
  * `POST /api/presets/{slug}` — the slug lives in the path. A taken slug
  * 409s with a structured name_conflict; the suggested_name prefills a
  * rename retry (same confirm-and-rename flow as skillpack import).
  *
- * Edit mode (`mode="edit"`, `existing` preset): PATCHes a user preset —
- * the slug is immutable (the ref runs point at), every successful save
- * bumps revision server-side.
+ * Edit mode (`existing` preset): PATCHes a user preset — the slug is
+ * immutable (the ref runs point at), every successful save bumps
+ * revision server-side.
  */
 import { useState } from "react";
 import {
