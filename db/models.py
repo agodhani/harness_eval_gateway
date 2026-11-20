@@ -204,7 +204,7 @@ class TaskPreset(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     # One slug namespace with the vendored files — URL token for
     # /api/presets/{slug} and runs.preset_ref.
-    slug: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    slug: Mapped[str] = mapped_column(String(64), unique=True)
     title: Mapped[str] = mapped_column(String(255))
     description: Mapped[str] = mapped_column(Text, default="")
     task_prompt: Mapped[str] = mapped_column(Text)

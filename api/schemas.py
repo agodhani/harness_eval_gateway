@@ -693,6 +693,13 @@ class PresetCreate(BaseModel):
         default=None, max_length=8
     )
 
+    @field_validator("tags", "suggested_models", mode="after")
+    @classmethod
+    def _drop_blank_items(cls, v: list[str] | None) -> list[str] | None:
+        if isinstance(v, list):
+            return [t for t in v if t]
+        return v
+
 
 class PresetUpdate(BaseModel):
     """PATCH /api/presets/{slug} body — partial edit of a USER preset.
@@ -723,6 +730,13 @@ class PresetUpdate(BaseModel):
     suggested_models: list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]] | None = Field(
         default=None, max_length=8
     )
+
+    @field_validator("tags", "suggested_models", mode="after")
+    @classmethod
+    def _drop_blank_items(cls, v: list[str] | None) -> list[str] | None:
+        if isinstance(v, list):
+            return [t for t in v if t]
+        return v
 
 
 class PresetRunPoint(BaseModel):

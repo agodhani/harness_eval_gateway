@@ -49,7 +49,6 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.UniqueConstraint("slug", name="uq_task_presets_slug"),
     )
-    op.create_index("ix_task_presets_slug", "task_presets", ["slug"])
 
     with op.batch_alter_table("runs") as batch:
         batch.add_column(sa.Column("preset_ref", sa.String(length=64), nullable=True))
@@ -62,5 +61,4 @@ def downgrade() -> None:
         batch.drop_index("ix_runs_preset_ref")
         batch.drop_column("preset_revision")
         batch.drop_column("preset_ref")
-    op.drop_index("ix_task_presets_slug", table_name="task_presets")
     op.drop_table("task_presets")

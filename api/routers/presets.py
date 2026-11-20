@@ -397,7 +397,7 @@ async def create_preset(slug: str, body: PresetCreate, session: DbSession) -> Pr
             source="user",
             revision=1,
             suggested_adapter=body.suggested_adapter or None,
-            suggested_models=body.suggested_models,
+            suggested_models=body.suggested_models or None,
         )
         session.add(row)
         try:
