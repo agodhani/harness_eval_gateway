@@ -34,26 +34,19 @@ def session_factory() -> sessionmaker[Session]:
 
 @pytest.fixture()
 def cleanup_globs(session_factory: sessionmaker[Session]):
-    """Track created globs and delete their rows afterwards — the shared
-    :memory: DB outlives one test and a stray ``*`` row would reprice
-    everything downstream."""
-    from db.models import ModelPriceRow
-
-    seen: list[str] = []
-    yield seen
+    """Track created globs and purge the file's ``pr28-*`` namespace
+    afterwards — the shared :memory: DB outlives one test and a stray row
+    (sync creates catalog ids a test may not have tracked) would reprice
+    or pollute assertions downstream."""
+    yield []
     with session_factory() as s:
-        for glob in seen:
-            row = s.execute(
-                ModelPriceRow.__table__.select().where(
-                    ModelPriceRow.model_glob == glob
-                )
-            ).first()
-            if row is not None:
-                s.execute(
-                    ModelPriceRow.__table__.delete().where(
-                        ModelPriceRow.model_glob == glob
-                    )
-                )
+        from db.models import ModelPriceRow
+
+        s.execute(
+            ModelPriceRow.__table__.delete().where(
+                ModelPriceRow.model_glob.like("pr28-%")
+            )
+        )
         s.commit()
 
 
@@ -217,6 +210,59 @@ def test_put_row_reprices_analytics(
     assert body["price_table"][glob]["input_per_mtok_usd"] == 10.0
     # …and in price_globs (declaration order) for client-side key_for replay
     assert body["price_globs"][-1] == glob
+
+
+def test_explicit_glob_pick_selects_its_row(
+    client: TestClient, session_factory: sessionmaker[Session], cleanup_globs
+) -> None:
+    """?price_model=<glob> resolves to the picked row, not an earlier
+    broader glob — the pick names the row itself on both analytics
+    endpoints."""
+    from db.models import Event, Run, Sandbox
+
+    glob = "pr28-pick-*"
+    _put(client, model_glob="pr28-*", input_per_mtok_usd=1.0, output_per_mtok_usd=1.0)
+    _put(client, model_glob=glob, input_per_mtok_usd=10.0, output_per_mtok_usd=30.0)
+
+    with session_factory() as s:
+        run = Run(task_prompt="t", model_name="pr28-pick-model", status="done")
+        s.add(run)
+        s.flush()
+        sb = Sandbox(run_id=run.id, harness_config={"adapter": "miniloop"}, status="done")
+        s.add(sb)
+        s.flush()
+        s.add(
+            Event(
+                run_id=run.id,
+                sandbox_id=sb.id,
+                source="gateway",
+                type="llm_response",
+                payload={
+                    "model": "pr28-pick-model",
+                    "usage": {
+                        "prompt_tokens": 1_000_000,
+                        "completion_tokens": 100_000,
+                        "total_tokens": 1_100_000,
+                    },
+                    "latency_ms": 100,
+                },
+            )
+        )
+        s.commit()
+        run_id = run.id
+
+    body = client.get(
+        f"/api/runs/{run_id}/analytics", params={"price_model": glob}
+    ).json()
+    assert body["price_model"] == glob
+    cell = body["sandboxes"][0]
+    assert cell["price_model"] == glob
+    # 1M in @ $10 + 100k out @ $30 → $10 + $3 = $13 at the PICKED row's
+    # rate — the earlier "pr28-*" row ($1/$1) must not shadow it
+    assert cell["estimated_cost_usd"] == pytest.approx(13.0)
+
+    body = client.get("/api/analytics/runs", params={"price_model": glob}).json()
+    assert body["price_model"] == glob
 
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,12 @@
  */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { globMatch, matchPriceKey, type ModelPrice } from "./api.ts";
+import {
+  estimateCostUsd,
+  globMatch,
+  matchPriceKey,
+  type ModelPrice,
+} from "./api.ts";
 
 const rate = (n: number): ModelPrice => ({
   input_per_mtok_usd: n,
@@ -153,5 +158,32 @@ describe("globMatch", () => {
       "acme-[v2]*",
     );
     assert.equal(matchPriceKey("acme-x3-7b", table, ["acme-[v2]*"]), undefined);
+  });
+});
+
+// estimateCostUsd mirrors api/pricing.py::estimate_cost_usd — oracles from
+// the Python contract: a non-positive cache_read counts zero cached
+// tokens, and cache_read is clamped to the input total.
+describe("estimateCostUsd", () => {
+  const price: ModelPrice = {
+    input_per_mtok_usd: 10,
+    output_per_mtok_usd: 20,
+    cache_read_per_mtok_usd: 1,
+  };
+
+  test("a negative cache_read bills nothing at the cache rate", () => {
+    // cached=0 → 10 in @ $10 + 20 out @ $20 = $500 worth /1e6
+    assert.equal(
+      estimateCostUsd(price, { input: 10, output: 20, cache_read: -5 }),
+      (10 * 10 + 20 * 20) / 1_000_000,
+    );
+  });
+
+  test("cache_read over the input total clamps to it", () => {
+    // all 10 input cached @ $1 + 20 out @ $20 = $210 worth /1e6
+    assert.equal(
+      estimateCostUsd(price, { input: 10, output: 20, cache_read: 50 }),
+      (10 * 1 + 20 * 20) / 1_000_000,
+    );
   });
 });

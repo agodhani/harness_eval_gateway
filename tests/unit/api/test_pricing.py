@@ -141,6 +141,16 @@ def test_resolve_explicit_glob_pick() -> None:
     assert resolve_price_model("gpt-4o", "qwen3:8b", book) == "gpt-*"
 
 
+def test_resolve_explicit_pick_names_its_own_row() -> None:
+    """A pick naming a row glob verbatim selects THAT row's rate — the
+    pick names the row itself, so an earlier broader glob can't shadow
+    it. Model-like picks keep codified first-match scanning."""
+    book = PriceBook([_row("*", inp=1.0), _row("acme-*", inp=9.0)])
+    assert resolve_price_model("acme-*", "whatever", book) == "acme-*"
+    assert resolve_price_model("acme-7b", "whatever", book) == "*"
+    assert book.key_for("acme-7b") == "*"
+
+
 def test_resolve_run_model_via_book() -> None:
     book = PriceBook([_row("qwen*")])
     assert resolve_price_model(None, "qwen3:8b", book) == "qwen*"

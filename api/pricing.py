@@ -178,22 +178,26 @@ def load_book(session: Session) -> PriceBook:
 
 def resolve_price_model(
     price_model: str | None,
-    run_model: str,
+    run_model: str | None = None,
     book: PriceBook | None = None,
 ) -> str | None:
     """Pick the price-table key to cost a run at.
 
-    ``price_model`` (the query param) wins when supplied and known —
-    resolved through the layered book, so a ``model_prices`` glob is a valid
-    explicit pick and can reprice a whole run at its row's rate. Otherwise
-    the run's own model resolves the same way (glob hit → the glob, static
-    key → itself). Returns None when the resolved model isn't listed —
-    an unknown explicit ``price_model`` becomes a 422, while an unlisted
-    run model means *unpriced*: no cost estimate is produced rather than
-    billing the traffic at another model's rate.
+    ``price_model`` (the query param) wins when supplied and known. A pick
+    naming a ``model_prices`` row glob verbatim selects that row's rate —
+    the pick names the row itself, so an earlier broader glob must not
+    shadow it. Any other pick resolves like a model through the layered
+    book (glob hit → the glob, static key → itself); the run's own model
+    resolves the same way when no pick is supplied. Returns None when the
+    resolved model isn't listed — an unknown explicit ``price_model``
+    becomes a 422, while an unlisted run model means *unpriced*: no cost
+    estimate is produced rather than billing the traffic at another
+    model's rate.
     """
     if book is None:
         book = PriceBook(())
     if price_model is not None:
+        if price_model in book._by_glob:
+            return price_model
         return book.key_for(price_model)
     return book.key_for(run_model)

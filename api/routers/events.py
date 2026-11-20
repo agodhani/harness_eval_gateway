@@ -108,18 +108,32 @@ _USAGE_INT_FIELDS = (
     "total_tokens",
 )
 
+_USAGE_INT_MAX = 2**63 - 1
+
 
 def _usage_int(value: Any) -> int | None:
-    """Coerce a usage token count to int; None when it isn't numeric."""
+    """Coerce a usage token count to int; None when it isn't a sane count.
+
+    Counts are non-negative and must fit the BIGINT the metering sums
+    CAST to — a negative would deflate metered totals (a silent budget
+    bypass) and an oversized one still raises inside the Postgres CAST,
+    so out-of-range values read as absent like non-numeric ones.
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
+        number = value
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number):
+            return None
+        number = int(number)
+    if not 0 <= number <= _USAGE_INT_MAX:
         return None
-    return int(number) if math.isfinite(number) else None
+    return number
 
 
 def _normalize_llm_usage(payload: dict[str, Any]) -> None:

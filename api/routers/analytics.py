@@ -546,7 +546,7 @@ def get_run_trends(
     book = load_book(session)
     explicit_key: str | None = None
     if price_model is not None:
-        explicit_key = book.key_for(price_model)
+        explicit_key = resolve_price_model(price_model, book=book)
         if explicit_key is None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

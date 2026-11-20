@@ -935,14 +935,16 @@ export function matchPriceKey(
 
 /** Client-side cost estimate: tokens × rate. Mirrors api/pricing.py —
  * cache-read tokens (inside `input`) bill at the cache rate when one is
- * declared, else at the input rate. */
+ * declared, else at the input rate. A non-positive cache_read counts
+ * zero cached tokens, matching estimate_cost_usd's guard. */
 export function estimateCostUsd(
   price: ModelPrice,
   tokens: { input: number; output: number; cache_read?: number },
 ): number {
   const cacheRate = price.cache_read_per_mtok_usd;
+  const cacheRead = tokens.cache_read ?? 0;
   const cached =
-    cacheRate == null ? 0 : Math.min(tokens.cache_read ?? 0, tokens.input);
+    cacheRate == null || cacheRead <= 0 ? 0 : Math.min(cacheRead, tokens.input);
   return (
     ((tokens.input - cached) * price.input_per_mtok_usd +
       cached * (cacheRate ?? 0) +
