@@ -30,6 +30,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F15 | Submit UX: live model picker + install, named harness configs | ✅ | `api/routers/models.py`, `gateway/main.py` (`/v1/models/pull`), `web/app/submit/page.tsx`, `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`, `orchestrator/provision.py` | `tests/unit/api/test_models.py`, `tests/unit/gateway/test_proxy.py` (pull), `tests/unit/db/test_migrations.py`, `tests/unit/orchestrator/test_provision.py` (name) |
 | F16 | Model-vs-model matrix (config × model) + per-model analytics | ✅ | `orchestrator/matrix.py`, `orchestrator/lifecycle.py`, `orchestrator/provision.py`, `api/schemas.py`, `api/routers/runs.py`, `results.py`, `analytics.py`, `web/app/submit/page.tsx`, `web/lib/api.ts`, `web/app/runs/[id]/` (detail, results, analysis) | `tests/unit/orchestrator/test_matrix.py`, `test_lifecycle.py`, `test_provision.py`, `tests/unit/api/test_runs.py`, `test_results.py`, `test_analytics.py` |
 | F17 | Artifact thumbnails (headless screenshots via the preview stack; desktop captures wait on real VNC framebuffer content, dead-app fast-fail with exit reason) | ✅ | `sandbox/thumbnails.py`, `sandbox/images/thumbnail-capture.{Dockerfile,sh}`, `sandbox/images/thumbnail-vnc.py`, `api/routers/preview.py` (`.../thumbnail`), `api/routers/results.py` (`SandboxResult.thumbnail`), `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_thumbnails.py`, `tests/unit/api/test_thumbnails.py`, `tests/integration/test_thumbnail.py` |
+| F18 | Prompt-only matrix cells (no-sandbox `prompt` adapter) | ✅ | `orchestrator/prompt_cell.py`, `orchestrator/adapters.py`, `web/app/runs/[id]/results/` (output view) | `tests/unit/orchestrator/test_prompt_cell.py`, `test_lifecycle.py` (prompt/mixed) |
+| F19 | Task inputs — seeded workspace (repo_url or uploaded archive, identical bytes per cell proven by `harness_config.seed_sha`) | ✅ | `sandbox/seeds.py`, `api/routers/uploads.py`, `api/schemas.py` (`TaskInputsIn`), `orchestrator/provision.py`, `sandbox/runtime.py`, `web/app/submit/page.tsx` (Inputs section) | `tests/unit/sandbox/test_seeds.py`, `tests/unit/api/test_uploads.py`, `tests/unit/orchestrator/test_provision_seed.py` |
 
 ## Feature details
 
@@ -1203,6 +1205,107 @@ workspace to produce.
   results page shows output inline with preview absent.
 - **Depends on:** F16 (config × model matrix expansion), F3 (gateway
   creds/metering), F7 (evaluator staging), F8/F12 (results + preview).
+
+### F19 — Task inputs: seeded workspace ✅
+
+**What:** `RunCreate.task_inputs` lets a task carry input files — the
+thing bugfix / refactor / analysis evals need. Exactly one source:
+
+- `repo_url` + optional `ref` — a PUBLIC git repo (`https://` only —
+  ssh/git/file schemes rejected at the schema), materialized by
+  `git init` + `fetch --depth 1 origin <ref|HEAD>` + `checkout FETCH_HEAD`
+  under a wall-clock cap (`SEED_GIT_TIMEOUT_SECONDS`, default 300s; one
+  code path covers branches, tags, and raw shas). The resolved sha is
+  recorded (`harness_config.seed.resolved_sha`) so the pin is auditable.
+- `archive_id` — an upload id from `POST /api/uploads` → staged at
+  `<data>/uploads/<uuid>/archive<suffix>` + `meta.json` under a raw-byte
+  cap (`UPLOAD_MAX_BYTES`, 256 MiB). The client filename is display-only
+  (never a path part); `GET /api/uploads/{id}` reads the meta back.
+
+**Why:** eval tasks like "fix the bug in this repo" need real starting
+bytes — and *identical* bytes across the matrix, or the comparison is
+rigged before it starts.
+
+- Flow: `POST /api/runs` validates the shape (`TaskInputsIn` —
+  exactly-one-source, https-only, uuid archive id) AND that an
+  `archive_id` resolves to a staged upload (422 on a dangling id), then
+  persists `task_inputs` verbatim into `run.config`. Provisioning
+  (`spawn_one`) calls `seeds.prepare_run_seed` once per run — the
+  materialized tree lands at `<data>/seeds/<run_id>/content/` (+ meta,
+  via tmp-dir + atomic rename so concurrent cells never see a partial
+  tree; second call per run reuses it) — sets `spec.seed_host_path`, and
+  `runtime.spawn` `copy_seed`s it into THAT cell's `workspace_host_path`
+  before `docker run`. The copy's `hash_tree` content hash returns on
+  `SpawnResult.seed_sha` → stamped on the sandbox row as
+  `harness_config.seed_sha` (+ `seed` provenance + a `stage:"seed"`
+  checkpoint event). Same `seed_sha` on every cell = the
+  identical-starting-bytes proof; run detail shows a Seed row + per-
+  sandbox `seed <sha8>` badges, and results echoes
+  `RunResults.task_inputs`.
+- Safety (the "seeds can't escape `data/`" jail — artifact-jail pattern):
+  upload ids are uuids resolved jailed under `uploads_root`; archive
+  members must be regular files/dirs with clean relative POSIX names —
+  absolute paths, `..` segments, drive roots, backslash separators, NULs,
+  symlinks/hardlinks/devices/fifos all rejected at BOTH upload time
+  (`check_archive`, no extraction) and extraction (`extract_archive`
+  writes bytes manually, never `extractall`, under `SEED_MAX_BYTES` /
+  `SEED_MAX_FILES` decompression caps). A single common top-level dir is
+  flattened (`proj/x` → `x`) so the workspace mirrors the repo root like
+  a clone does. Post-materialization, `_drop_escapee_links` unlinks any
+  symlink resolving outside the seed root (a warning lands on the seed
+  checkpoint) — in-tree links stay. Uploads/seeds/sandboxes all live
+  under the compose `./data` mount; run deletion removes the
+  `<data>/seeds/<run_id>/` materialization too.
+- Submit UI: an **Inputs** select on the Task card — `none` (legacy
+  empty workspace) | `git repo` (https URL + optional ref, client-
+  validated like the schema) | `archive` (file picker stages via
+  `POST /api/uploads` on select — unsafe archives surface the server's
+  422 detail; staged file shows as a removable chip). Resubmit restores
+  repo inputs fully and archive inputs as an already-staged id (staged
+  bytes persist server-side).
+- Prompt cells (F18) are workspace-less — `task_inputs` doesn't apply to
+  them (they bypass `spawn_one` entirely).
+- Preset contract (PR22 `task_presets/*.md` — parallel branch): preset
+  frontmatter may carry a `seed` hint —
+  `seed: {repo_url: <url>, ref: <sha>} | {upload: <upload_id>}` —
+  which maps onto `task_inputs` when `preset_ref` resolves. The runs
+  schema already accepts `archive_id` for the `upload` form; the preset
+  parser should translate `upload` → `archive_id`.
+- Files: `sandbox/seeds.py` (new), `api/routers/uploads.py` (new),
+  `api/schemas.py` (`TaskInputsIn`, `UploadOut`),
+  `api/routers/runs.py` (`_validate_task_inputs`, config persist, seed
+  dir cleanup), `api/routers/results.py` (`task_inputs` echo),
+  `api/main.py` (router), `api/config.py` (UPLOADS_DIR/UPLOAD_MAX_BYTES/
+  SEED_*) , `orchestrator/provision.py` (`seed` plumbing +
+  `_mark_spawned` seed keys + checkpoint), `sandbox/spec.py`
+  (`seed_host_path`), `sandbox/runtime.py` (copy + `seed_sha`),
+  `web/lib/api.ts`, `web/lib/resubmit.ts`, `web/app/submit/page.tsx`,
+  `web/app/runs/[id]/RunDetailClient.tsx`.
+- Tests:
+  - `tests/unit/sandbox/test_seeds.py` — member-name jail
+    (traversal/absolute/drive/backslash/NUL), zip+tar special-member
+    rejection, common-root flatten, size/file caps, `hash_tree`
+    determinism, `copy_seed` identity + independence, `prepare_run_seed`
+    archive/git (faked runner: fetch argv asserts the pinned ref),
+    escapee-symlink sweep, and real `SandboxRuntime.spawn` with stubbed
+    docker (seed copy lands + `SpawnResult.seed_sha` == `hash_tree(ws)`).
+  - `tests/unit/api/test_uploads.py` — stage/GET meta, zip/tar kind
+    detection, suffix gate, unsafe-member 422 with zero residue, 413
+    raw-byte cap, run-create archive/repo echo + all shape 422s,
+    dangling archive 422, run-detail + results echo.
+  - `tests/unit/orchestrator/test_provision_seed.py` — two cells share
+    one `seed_sha` (the card's verify), per-sandbox `seed` provenance +
+    checkpoint events, unseeded runs carry no seed keys, dangling
+    archive fails the cell not the run, git seed records `resolved_sha`.
+- Verify: `uv run pytest tests/unit/sandbox/test_seeds.py
+  tests/unit/api/test_uploads.py tests/unit/orchestrator/test_provision_seed.py -q`;
+  manual: submit a 2-config run with `repo_url` → both sandboxes show
+  the same `seed <sha8>` badge; artifact workspace contains the seed
+  files + agent changes.
+- **Depends on:** F1 (run spec), F2 (provisioning), F4 (workspace
+  lifecycle + artifact jail precedent); pairs with F18 (prompt cells —
+  no workspace, seeds don't apply) and PR22 task presets (`seed`
+  frontmatter contract above).
 
 ## Implementation sequence
 

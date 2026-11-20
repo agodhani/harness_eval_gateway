@@ -11,6 +11,9 @@ data/artifacts/*
 data/sandboxes/
 data/skillpacks/
 data/eval/
+# PR24 task inputs — staged upload archives + materialized seed trees
+data/uploads/
+data/seeds/
 
 # Node / Next.js
 node_modules

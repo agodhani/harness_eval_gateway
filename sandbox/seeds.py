@@ -89,9 +89,10 @@ class SeedError(RuntimeError):
 
 def uploads_root(settings: Any) -> Path:
     """Root of the upload store: ``<data>/uploads`` (ARTIFACT_ROOT's sibling),
-    or ``settings.UPLOADS_DIR`` when explicitly set."""
+    or ``settings.UPLOADS_DIR`` when explicitly set. An empty/whitespace
+    override counts as unset (env-string foot-gun → never the cwd)."""
     override = getattr(settings, "UPLOADS_DIR", None)
-    if override:
+    if override is not None and str(override).strip() not in ("", "."):
         return Path(override).resolve()
     return (Path(settings.ARTIFACT_ROOT).resolve().parent / "uploads").resolve()
 
