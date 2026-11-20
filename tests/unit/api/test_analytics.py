@@ -259,9 +259,11 @@ def test_default_cost_is_zero_for_local_model(
         assert sb["estimated_cost_usd"] == 0.0
 
 
-def test_default_price_model_falls_back_to_first_entry(
+def test_unlisted_model_is_unpriced_not_fallback_priced(
     client: TestClient, session_factory: sessionmaker[Session]
 ) -> None:
+    """PR21: a model absent from PRICE_TABLE must not be billed at another
+    model's rate — price_model/estimated_cost_usd come back null."""
     s = session_factory()
     try:
         run = Run(task_prompt="x", model_name="mystery-model", config={}, status="running")
@@ -271,17 +273,42 @@ def test_default_price_model_falls_back_to_first_entry(
             run_id=run.id, harness_config={"adapter": "miniloop"}, status="running"
         )
         s.add(sb)
+        s.flush()
+        s.add(
+            _ev(
+                run.id,
+                sandbox_id=sb.id,
+                type_="llm_response",
+                ts=T0,
+                payload={
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50,
+                              "total_tokens": 150},
+                    "latency_ms": 10,
+                },
+            )
+        )
         s.commit()
         run_id = run.id
     finally:
         s.close()
     body = _get(client, run_id)
-    # PR14 auto mode: response price_model is None; the per-sandbox rate
-    # falls back to the first table entry for unlisted models.
+    # PR14 auto mode: response price_model is None; the sandbox reports
+    # unpriced rather than the first table entry's rate.
     assert body["price_model"] is None
     (row,) = body["sandboxes"]
-    assert row["price_model"] == next(iter(PRICE_TABLE))
     assert row["model"] == "mystery-model"
+    assert row["price_model"] is None
+    assert row["estimated_cost_usd"] is None
+    (model_row,) = body["models"]
+    assert model_row["price_model"] is None
+    assert model_row["estimated_cost_usd"] is None
+    # an explicit ?price_model= still reprices the unlisted model uniformly
+    body = _get(client, run_id, price_model="gpt-4o")
+    (row,) = body["sandboxes"]
+    assert row["price_model"] == "gpt-4o"
+    assert row["estimated_cost_usd"] == pytest.approx(
+        estimate_cost_usd(PRICE_TABLE["gpt-4o"], input_tokens=100, output_tokens=50)
+    )
 
 
 def test_unknown_price_model_422(client: TestClient, analytics_run) -> None:
@@ -453,11 +480,12 @@ def test_multimodel_uniform_repricing(client: TestClient, multimodel_run) -> Non
     assert qwen["estimated_cost_usd"] == pytest.approx(0.0105)
 
 
-def test_multimodel_unlisted_model_falls_back(
+def test_multimodel_unlisted_model_is_unpriced(
     client: TestClient, session_factory: sessionmaker[Session]
 ) -> None:
-    """A participant model absent from PRICE_TABLE costs at the run's
-    resolved fallback rate (first entry) in auto mode."""
+    """PR21: a participant model absent from PRICE_TABLE reports
+    price_model/estimated_cost_usd null in auto mode — the run's resolved
+    rate is NOT used as a stand-in."""
     s = session_factory()
     try:
         run = Run(
@@ -493,11 +521,12 @@ def test_multimodel_unlisted_model_falls_back(
     finally:
         s.close()
     body = _get(client, run_id)
-    fallback = next(iter(PRICE_TABLE))
     (row,) = [x for x in body["sandboxes"] if x["model"] == "mystery-b"]
-    assert row["price_model"] == fallback
+    assert row["price_model"] is None
+    assert row["estimated_cost_usd"] is None
     # rollup only contains models that have sandboxes
     assert [m["model"] for m in body["models"]] == ["mystery-b"]
+    assert body["models"][0]["estimated_cost_usd"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +792,92 @@ def test_trends_multimodel_prices_each_cell_at_its_own_rate(
     assert pt["price_model"] == "gpt-4o-mini"
     # 2 cells × (100*0.15 + 50*0.6)/1e6 = 0.00009
     assert pt["estimated_cost_usd"] == pytest.approx(0.00009)
+
+
+def test_trends_unlisted_model_point_is_unpriced(
+    client: TestClient, session_factory: sessionmaker[Session]
+) -> None:
+    """PR21: a run whose cells ran unlisted models reports a null cost —
+    the unknown share can't be totalled at a guessed rate. Judge traffic on
+    an unlisted evaluator model is likewise null."""
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="unpriced",
+            model_name="mystery-model",
+            config={"evaluator_model": "mystery-judge"},
+            status="done",
+        )
+        s.add(run)
+        s.flush()
+        sb = Sandbox(
+            run_id=run.id,
+            harness_config={"adapter": "miniloop"},
+            status="done",
+        )
+        s.add(sb)
+        s.flush()
+        s.add(
+            _ev(
+                run.id,
+                sandbox_id=sb.id,
+                type_="llm_response",
+                ts=T0,
+                payload={
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50,
+                              "total_tokens": 150},
+                    "latency_ms": 10,
+                },
+            )
+        )
+        # judge-phase traffic (post eval_started) on the same sandbox
+        s.add(
+            _ev(
+                run.id,
+                sandbox_id=sb.id,
+                source="evaluator",
+                type_="checkpoint",
+                ts=T0 + timedelta(minutes=5),
+                payload={"phase": "eval_started"},
+            )
+        )
+        s.add(
+            _ev(
+                run.id,
+                sandbox_id=sb.id,
+                type_="llm_response",
+                ts=T0 + timedelta(minutes=6),
+                payload={
+                    "usage": {"prompt_tokens": 200, "completion_tokens": 20,
+                              "total_tokens": 220},
+                    "latency_ms": 10,
+                },
+            )
+        )
+        s.commit()
+        run_id = run.id
+    finally:
+        s.close()
+
+    body = client.get("/api/analytics/runs", params={"limit": 100}).json()
+    pt = _trend_point(body, run_id)
+    assert pt["price_model"] is None
+    assert pt["estimated_cost_usd"] is None
+    assert pt["evaluator_cost_usd"] is None
+
+    # explicit ?price_model= reprices participant AND judge traffic uniformly
+    body = client.get(
+        "/api/analytics/runs",
+        params={"limit": 100, "price_model": "gpt-4o"},
+    ).json()
+    pt = _trend_point(body, run_id)
+    assert pt["price_model"] == "gpt-4o"
+    assert pt["estimated_cost_usd"] == pytest.approx(
+        estimate_cost_usd(PRICE_TABLE["gpt-4o"], input_tokens=100, output_tokens=50)
+    )
+    assert pt["evaluator_cost_usd"] == pytest.approx(
+        estimate_cost_usd(PRICE_TABLE["gpt-4o"], input_tokens=200, output_tokens=20)
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -32,6 +32,7 @@ import {
   type RunTrends,
 } from "@/lib/api";
 import { formatNum, formatUsd, shortId } from "@/lib/format";
+import { dimensionSpecMap, weightedDimTotal } from "@/lib/scoreMath";
 import {
   Badge,
   Card,
@@ -196,25 +197,20 @@ export default function AnalysisClient({ runId }: { runId: string }) {
   }, [resSandboxes]);
 
   /** Computed dimension totals → the at-a-glance leader(s) (matches the
-   * results-matrix totals row: every sandbox tied at the max leads). */
+   * results-matrix totals row: weighted score/max × weight on 0–10, same
+   * rubric-dimension spec — every sandbox tied at the max leads). */
   const leaders = useMemo(() => {
-    const sums: { id: string; sum: number }[] = [];
+    const specMap = dimensionSpecMap(data.run?.rubric?.content?.dimensions);
+    const keys = scoreRows.map((r) => String(r.dim));
+    const totals: { id: string; total: number }[] = [];
     for (const sb of resSandboxes) {
-      let sum = 0;
-      let count = 0;
-      for (const row of scoreRows) {
-        const e = sb.dimensions?.[String(row.dim)];
-        if (e) {
-          sum += e.score;
-          count++;
-        }
-      }
-      if (count > 0) sums.push({ id: sb.sandbox_id, sum });
+      const t = weightedDimTotal(sb.dimensions, keys, specMap);
+      if (t.scored > 0) totals.push({ id: sb.sandbox_id, total: t.total });
     }
-    const max = Math.max(0, ...sums.map((s) => s.sum));
-    const ids = sums.filter((s) => s.sum === max).map((s) => s.id);
-    return ids.length ? { ids, sum: max } : null;
-  }, [resSandboxes, scoreRows]);
+    const max = Math.max(0, ...totals.map((s) => s.total));
+    const ids = totals.filter((s) => s.total === max).map((s) => s.id);
+    return ids.length ? { ids, total: max } : null;
+  }, [resSandboxes, scoreRows, data.run]);
 
   const tokenRows: Row[] = useMemo(
     () =>
@@ -239,24 +235,30 @@ export default function AnalysisClient({ runId }: { runId: string }) {
 
   // Cost recompute — mirrors the server: an explicit pick reprices every
   // sandbox uniformly; auto ("") costs each sandbox at its OWN model's
-  // rate (PR14 — SandboxAnalytics.price_model is the server-resolved key).
+  // rate (PR14 — SandboxAnalytics.price_model is the server-resolved key,
+  // null when the model is unlisted → unpriced, PR21).
   const priceFor = useCallback(
-    (sb: { price_model?: string }) =>
-      data.analytics?.price_table?.[priceModel ?? sb.price_model ?? ""],
+    (sb: { price_model?: string | null }) => {
+      const key = priceModel ?? sb.price_model;
+      return key ? data.analytics?.price_table?.[key] : undefined;
+    },
     [data.analytics, priceModel],
   );
   const evaluatorModel =
-    data.results?.evaluator_model ?? data.run?.config?.evaluator_model ?? null;
+    data.results?.evaluator_model ??
+    data.run?.config?.evaluator_model ??
+    data.run?.model_name ??
+    data.analytics?.model_name ??
+    null;
   // Judge price mirrors the server: the evaluator model's own rate when
-  // listed, else the explicit pick, else the RUN's resolved rate (its
-  // model when listed, else the first table entry) — NOT each sandbox's.
+  // listed, else the explicit pick (what-if) — unlisted and unpicked means
+  // unpriced, never another model's rate (PR21).
   const evalPrice = useMemo(() => {
     const table = data.analytics?.price_table;
     if (!table) return undefined;
     if (evaluatorModel && table[evaluatorModel]) return table[evaluatorModel];
-    const runModel = data.analytics?.model_name ?? "";
-    const key = priceModel ?? (table[runModel] ? runModel : Object.keys(table)[0]);
-    return key ? table[key] : undefined;
+    if (priceModel && table[priceModel]) return table[priceModel];
+    return undefined;
   }, [data.analytics, evaluatorModel, priceModel]);
 
   const costRows: Row[] = useMemo(
@@ -269,6 +271,13 @@ export default function AnalysisClient({ runId }: { runId: string }) {
           value: p ? estimateCostUsd(p, sb.tokens) : 0,
         };
       }),
+    [sbs, priceFor],
+  );
+
+  /** PR21: sandboxes whose model isn't in the price table — their cost
+   * renders as 0, so the card says "unpriced" rather than implying $0. */
+  const unpricedCount = useMemo(
+    () => sbs.filter((sb) => !priceFor(sb)).length,
     [sbs, priceFor],
   );
 
@@ -401,10 +410,10 @@ export default function AnalysisClient({ runId }: { runId: string }) {
               <SeriesChips items={sbChips} />
               {leaders ? (
                 <p className="chart-legend">
-                  Σ dimensions leader{leaders.ids.length > 1 ? "s (tie)" : ""}:{" "}
+                  weighted total leader{leaders.ids.length > 1 ? "s (tie)" : ""}:{" "}
                   <strong style={{ color: "var(--accent)" }}>
                     {leaders.ids.map((id) => shortId(id)).join(", ")} (
-                    {Math.round(leaders.sum * 10) / 10})
+                    {Math.round(leaders.total * 10) / 10})
                   </strong>
                 </p>
               ) : null}
@@ -513,11 +522,26 @@ export default function AnalysisClient({ runId }: { runId: string }) {
               priced model above for an API-equivalent estimate.
             </InfoNote>
           ) : !costRows.some((r) => Number(r.value) > 0) ? (
-            <EmptyState>No billable token usage recorded.</EmptyState>
+            unpricedCount > 0 ? (
+              <InfoNote>
+                {unpricedCount} of {sbs.length} sandbox
+                {unpricedCount === 1 ? "" : "es"} ran a model that isn&apos;t in the
+                price table — cost is unpriced. Pick a priced model above for a
+                what-if estimate.
+              </InfoNote>
+            ) : (
+              <EmptyState>No billable token usage recorded.</EmptyState>
+            )
           ) : (
             <>
               <ColoredBars rows={costRows} dataKey="value" name="est. cost" fmt={formatUsd} />
               <SeriesChips items={sbChips} />
+              {unpricedCount > 0 ? (
+                <p className="chart-legend">
+                  {unpricedCount} sandbox{unpricedCount === 1 ? "" : "es"} unpriced —
+                  model not in the price table
+                </p>
+              ) : null}
             </>
           )}
         </Card>
@@ -548,8 +572,16 @@ export default function AnalysisClient({ runId }: { runId: string }) {
                 fmt={formatUsd}
               />
               <p className="chart-legend">
-                judge priced at {evaluatorModel ?? "the run's rate"} when listed ·
-                participant at {priceModel ?? "each model's own rate"}
+                judge{" "}
+                {evalPrice
+                  ? `priced at ${
+                      evaluatorModel &&
+                      (data.analytics?.price_table ?? {})[evaluatorModel]
+                        ? evaluatorModel
+                        : (priceModel ?? "the picked rate")
+                    }`
+                  : "unpriced (evaluator model not in the price table)"}{" "}
+                · participant at {priceModel ?? "each model's own rate"}
               </p>
             </>
           )}

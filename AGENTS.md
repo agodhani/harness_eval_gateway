@@ -653,7 +653,7 @@ or tests change.
   grouped/stacked bars + a composed bar-line trend under React 19 / Next 16;
   themed via hexes mirroring globals.css tokens (no CSS-var reads). The
   cross-run trends endpoint (`GET /api/analytics/runs`) prices each point's
-  cells at their own model's rate (unlisted → the run's resolved rate)
+  cells at their own model's rate (unlisted → unpriced, null cost)
   unless `?price_model=` forces uniform
   repricing — same "estimate, not billing" framing as F9.
 - **Rubric versions are immutable** (F14): post-run edits INSERT a new
@@ -687,6 +687,17 @@ or tests change.
   (≤64, whitespace-normalized) lands on `sandboxes.name`; `spawn_one` fills
   blanks with `<adapter>-<shortid>` once the UUID exists. All UI surfaces
   read the column — no per-component re-derivation to drift.
+- **Unlisted models are unpriced, not fallback-priced (PR21)** —
+  `resolve_price_model` returns `None` for models absent from
+  `PRICE_TABLE`; analytics emit `price_model`/`estimated_cost_usd`/
+  `evaluator_cost_usd` = null (never the first table entry's rate) and the
+  UI renders "unpriced". Explicit `?price_model=` still reprices uniformly;
+  unknown keys stay 422. Same audit batch: run-detail controls mirror
+  DELETE semantics (cancel only `submitted`/`rubric_review`/`queued`;
+  terminal runs hard-delete), the runs list paginates via `?offset`
+  ("Load more"), landing copy describes the config × model matrix, and the
+  results `total` row is the weighted scale-normalised aggregate
+  (`web/lib/scoreMath.ts`), not a raw Σ.
 
 ## Working conventions
 

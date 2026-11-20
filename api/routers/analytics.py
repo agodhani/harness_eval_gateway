@@ -21,8 +21,9 @@
   ``stage="empty_workspace"`` warning — see orchestrator/monitor.py).
 - ``estimated_cost_usd`` at the selected ``price_model`` (api/pricing.py
   ``PRICE_TABLE``); auto mode (no param) costs each sandbox at its own
-  participant model's listed rate, falling back to the run's resolved rate
-  for unlisted models.
+  participant model's listed rate. Unlisted models are **unpriced** (PR21):
+  ``price_model``/``estimated_cost_usd`` come back null instead of being
+  billed at another model's rate.
 
 Evaluator-phase split: eval creds carry the *participant* sandbox_id (F7 —
 judge events land on the participant timeline), so judge traffic would pollute
@@ -34,8 +35,8 @@ F13 cross-run trends: ``GET /api/analytics/runs`` rolls the same participant/
 evaluator split up to per-run points (tokens, turns, errors, mean overall
 score, cost) for the most recent runs — powers the analysis page's trend
 chart. ``?price_model=`` reprices every point uniformly; omitted, each point
-is costed at its run's per-cell model rates (a cell's own listed model,
-falling back to the run's resolved rate for unlisted models).
+is costed at its run's per-cell model rates — any unlisted cell model makes
+the point's cost unpriced (null), never a fallback rate (PR21).
 """
 
 from __future__ import annotations
@@ -50,7 +51,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.deps import get_db
-from api.pricing import PRICE_TABLE, estimate_cost_usd, resolve_price_model
+from api.pricing import (
+    PRICE_TABLE,
+    ModelPrice,
+    estimate_cost_usd,
+    resolve_price_model,
+)
 from api.schemas import (
     EvaluatorActivity,
     LatencyStats,
@@ -280,21 +286,31 @@ def _agg_metrics(agg: _Agg) -> dict:
     }
 
 
-def _eval_activity(eval_agg: _Agg | None, eval_price) -> EvaluatorActivity | None:
-    """Judge-phase rollup for one scope (sandbox or model), or None."""
+def _eval_activity(
+    eval_agg: _Agg | None, eval_price: ModelPrice | None
+) -> EvaluatorActivity | None:
+    """Judge-phase rollup for one scope (sandbox or model), or None.
+
+    ``eval_price`` is None when the evaluator model isn't in the price table
+    — the cost reports null (unpriced), never a guessed rate.
+    """
     if eval_agg is None:
         return None
     return EvaluatorActivity(
         llm_turns=eval_agg.llm_turns,
         tokens=eval_agg.tokens,
         errors=eval_agg.errors,
-        estimated_cost_usd=round(
-            estimate_cost_usd(
-                eval_price,
-                input_tokens=eval_agg.tokens.input,
-                output_tokens=eval_agg.tokens.output,
-            ),
-            6,
+        estimated_cost_usd=(
+            round(
+                estimate_cost_usd(
+                    eval_price,
+                    input_tokens=eval_agg.tokens.input,
+                    output_tokens=eval_agg.tokens.output,
+                ),
+                6,
+            )
+            if eval_price is not None
+            else None
         ),
     )
 
@@ -330,8 +346,9 @@ def get_run_analytics(
 
     # PR14 pricing: an explicit ?price_model= reprices EVERY sandbox uniformly
     # (what-if view); omitted → auto mode, each sandbox costed at its OWN
-    # participant model's listed rate (unlisted models fall back to the run's
-    # resolved rate). Response price_model is the explicit key or None —
+    # participant model's listed rate. PR21: unlisted models are unpriced —
+    # price_model/estimated_cost_usd come back null rather than billed at a
+    # fallback rate. Response price_model is the explicit key or None —
     # mirrors RunTrends.
     explicit_key: str | None = None
     if price_model is not None:
@@ -344,15 +361,11 @@ def get_run_analytics(
                     f"known: {sorted(PRICE_TABLE)}"
                 ),
             )
-    # Fallback rate for unlisted participant models — the run's own model
-    # when priced, else the first table entry (never None for a None param).
-    run_price_key = resolve_price_model(None, run.model_name)
-    assert run_price_key is not None
 
-    def _price_key(model: str) -> str:
+    def _price_key(model: str) -> str | None:
         if explicit_key is not None:
             return explicit_key
-        return model if model in PRICE_TABLE else run_price_key
+        return model if model in PRICE_TABLE else None
 
     sandboxes = (
         session.execute(
@@ -400,17 +413,20 @@ def get_run_analytics(
 
     # Judge traffic is priced at the evaluator model's rate when known —
     # judge and participant models may differ (evaluator_model is opt-in).
+    # Unlisted evaluator model → unpriced, except under an explicit
+    # ?price_model= what-if reprice which applies the picked rate.
     cfg = run.config or {}
     evaluator_model = cfg.get("evaluator_model") or run.model_name
-    eval_fallback = explicit_key or run_price_key
-    eval_price = PRICE_TABLE.get(evaluator_model, PRICE_TABLE[eval_fallback])
+    eval_price = PRICE_TABLE.get(evaluator_model) or (
+        PRICE_TABLE[explicit_key] if explicit_key else None
+    )
 
     out: list[SandboxAnalytics] = []
     for sb in sandboxes:
         agg = participant[sb.id]
         model = sb_model[sb.id]
         price_key = _price_key(model)
-        price = PRICE_TABLE[price_key]
+        price = PRICE_TABLE.get(price_key) if price_key else None
         out.append(
             SandboxAnalytics(
                 sandbox_id=sb.id,
@@ -425,13 +441,17 @@ def get_run_analytics(
                 terminal_reason=sb.terminal_reason or agg.last_terminal_state,
                 empty_workspace=sb.id in empty_ws,
                 **_agg_metrics(agg),
-                estimated_cost_usd=round(
-                    estimate_cost_usd(
-                        price,
-                        input_tokens=agg.tokens.input,
-                        output_tokens=agg.tokens.output,
-                    ),
-                    6,
+                estimated_cost_usd=(
+                    round(
+                        estimate_cost_usd(
+                            price,
+                            input_tokens=agg.tokens.input,
+                            output_tokens=agg.tokens.output,
+                        ),
+                        6,
+                    )
+                    if price is not None
+                    else None
                 ),
                 evaluator=_eval_activity(evaluator.get(sb.id), eval_price),
             )
@@ -462,7 +482,7 @@ def get_run_analytics(
     for model in ordered_models:
         agg = participant_by_model.get(model, _Agg())
         price_key = _price_key(model)
-        price = PRICE_TABLE[price_key]
+        price = PRICE_TABLE.get(price_key) if price_key else None
         metrics = _agg_metrics(agg)
         metrics["wall_clock_seconds"] = model_wall_clock.get(model, 0.0)
         models_out.append(
@@ -471,13 +491,17 @@ def get_run_analytics(
                 price_model=price_key,
                 sandbox_count=sum(1 for m in sb_model.values() if m == model),
                 **metrics,
-                estimated_cost_usd=round(
-                    estimate_cost_usd(
-                        price,
-                        input_tokens=agg.tokens.input,
-                        output_tokens=agg.tokens.output,
-                    ),
-                    6,
+                estimated_cost_usd=(
+                    round(
+                        estimate_cost_usd(
+                            price,
+                            input_tokens=agg.tokens.input,
+                            output_tokens=agg.tokens.output,
+                        ),
+                        6,
+                    )
+                    if price is not None
+                    else None
                 ),
                 evaluator=_eval_activity(evaluator_by_model.get(model), eval_price),
             )
@@ -505,9 +529,9 @@ def get_run_trends(
     participant + evaluator token/turn/error totals, the mean of its
     sandboxes' ``overall`` score rows, and cost. With ``price_model`` every
     point is repriced uniformly; without it each point's participant cells
-    are costed at their own model's listed rate (unlisted models fall back
-    to the run's resolved price — its model when listed, else the table
-    fallback).
+    are costed at their own model's listed rate — a cell on an unlisted
+    model makes the whole point unpriced (PR21: a partial total would read
+    as complete).
     """
     if price_model is not None and price_model not in PRICE_TABLE:
         raise HTTPException(
@@ -605,28 +629,35 @@ def get_run_trends(
         cfg = run.config or {}
         evaluator_model = cfg.get("evaluator_model") or run.model_name
         # Explicit param reprices every run uniformly; else the run's own
-        # resolved price (never None for a None param — falls back to the
-        # first table entry).
+        # resolved price — None when the run's model isn't listed (unpriced).
         selected = (
             price_model
             if price_model is not None
             else resolve_price_model(None, run.model_name)
         )
-        assert selected is not None  # resolve_price_model only Nones on bad param
-        eval_price = PRICE_TABLE.get(evaluator_model, PRICE_TABLE[selected])
+        # Judge traffic: the evaluator model's own rate when listed, else
+        # the explicit pick (what-if reprice) — never another model's rate.
+        eval_price = PRICE_TABLE.get(evaluator_model) or (
+            PRICE_TABLE[price_model] if price_model is not None else None
+        )
 
         agg = participant[run.id]
         eval_agg = evaluator.get(run.id)
         overalls = overall_by_run.get(run.id, [])
         # PR14 per-model pricing: auto mode costs each participant-model
-        # bucket at its own listed rate (unlisted → the run's resolved
-        # fallback); an explicit ?price_model= reprices every bucket at the
-        # one key. price_model is None when auto pricing mixed rates — no
-        # single key honestly describes the estimate.
+        # bucket at its own listed rate; an explicit ?price_model= reprices
+        # every bucket at the one key. PR21: an unlisted bucket is unpriced —
+        # its tokens get no rate and the point total reports null, since a
+        # partial sum would read as the run's full cost. price_model is None
+        # when auto pricing mixed rates — no single key honestly applies.
         cost = 0.0
+        unpriced = False
         used_keys: set[str] = set()
         for model, mb in participant_by_model.get(run.id, {}).items():
-            key = price_model or (model if model in PRICE_TABLE else selected)
+            key = price_model or (model if model in PRICE_TABLE else None)
+            if key is None:
+                unpriced = True
+                continue
             used_keys.add(key)
             cost += estimate_cost_usd(
                 PRICE_TABLE[key],
@@ -635,12 +666,12 @@ def get_run_trends(
             )
         if price_model is not None:
             point_price_model = price_model
-        elif len(used_keys) == 1:
-            point_price_model = next(iter(used_keys))
-        elif not used_keys:
-            point_price_model = selected  # no participant traffic — $0 anyway
-        else:
+        elif unpriced or len(used_keys) > 1:
             point_price_model = None
+        elif used_keys:
+            point_price_model = next(iter(used_keys))
+        else:
+            point_price_model = selected  # no participant traffic — $0 anyway
         points.append(
             RunTrendPoint(
                 run_id=run.id,
@@ -660,14 +691,18 @@ def get_run_trends(
                 ),
                 evaluator_errors=eval_agg.errors if eval_agg else 0,
                 price_model=point_price_model,
-                estimated_cost_usd=round(cost, 6),
-                evaluator_cost_usd=round(
-                    estimate_cost_usd(
-                        eval_price,
-                        input_tokens=eval_agg.tokens.input if eval_agg else 0,
-                        output_tokens=eval_agg.tokens.output if eval_agg else 0,
-                    ),
-                    6,
+                estimated_cost_usd=None if unpriced else round(cost, 6),
+                evaluator_cost_usd=(
+                    round(
+                        estimate_cost_usd(
+                            eval_price,
+                            input_tokens=eval_agg.tokens.input if eval_agg else 0,
+                            output_tokens=eval_agg.tokens.output if eval_agg else 0,
+                        ),
+                        6,
+                    )
+                    if eval_price is not None
+                    else None
                 ),
                 mean_overall_score=(
                     round(sum(overalls) / len(overalls), 2) if overalls else None
