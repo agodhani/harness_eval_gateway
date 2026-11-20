@@ -39,6 +39,7 @@ def cli_env(
     max_iters: int | None = None,
     skillpacks_root: str = "/opt/skillpacks",
     system_prompt_extra: str | None = None,
+    model_options: dict[str, Any] | None = None,
     extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Common sandbox env for CLI harnesses + per-adapter ``extra`` vars.
@@ -46,8 +47,11 @@ def cli_env(
     ``max_iters`` is accepted for contract parity but never emitted — external
     CLIs have no iteration knob; wall-clock/token budgets still cap them.
     ``ingest_token`` is likewise unused: ingest auth is the sandbox cred.
+    ``model_options`` (PR27) is also consumed by the CALLER: each adapter
+    maps the keys its harness exposes (into ``extra`` env vars) before
+    delegating here; unsupported keys are dropped at submit with a warning.
     """
-    del ingest_token, max_iters  # contract-parity params, intentionally unused
+    del ingest_token, max_iters, model_options  # contract-parity params
     out = {
         "GATEWAY_BASE_URL": gateway_url,
         "GATEWAY_CRED": cred,

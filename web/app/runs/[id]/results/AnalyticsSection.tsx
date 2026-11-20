@@ -13,11 +13,13 @@ import {
   ApiError,
   estimateCostUsd,
   getRunAnalytics,
+  type CellAnalytics,
   type ModelAnalytics,
   type RunAnalytics,
   type SandboxAnalytics,
 } from "@/lib/api";
 import { formatDuration, formatNum, formatUsd, shortId } from "@/lib/format";
+import { fmtMeanSd } from "@/lib/trialGroups";
 import { Badge, Card, InfoNote, statusTone } from "@/components/ui";
 
 function errMsg(err: unknown): string {
@@ -26,14 +28,24 @@ function errMsg(err: unknown): string {
   return "analytics endpoint unavailable";
 }
 
-/** A table column — one sandbox, or one participant-model rollup (PR14). */
-type Column = SandboxAnalytics | ModelAnalytics;
+/** A table column — one sandbox, one participant-model rollup (PR14), or
+ * one config × model trial-group rollup (PR27). */
+type Column = SandboxAnalytics | ModelAnalytics | CellAnalytics;
+
+function isCellCol(c: Column): c is CellAnalytics {
+  return "sandbox_count" in c && "cell" in c;
+}
 
 function isModelCol(c: Column): c is ModelAnalytics {
-  return "sandbox_count" in c;
+  return "sandbox_count" in c && !isCellCol(c);
+}
+
+function isSandboxCol(c: Column): c is SandboxAnalytics {
+  return "sandbox_id" in c;
 }
 
 function colKey(c: Column): string {
+  if (isCellCol(c)) return `cell:${c.cell}`;
   return isModelCol(c) ? `model:${c.model}` : c.sandbox_id;
 }
 
@@ -64,9 +76,10 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
   // null = auto: each column costed at its own model's rate (server
   // resolved); a price-table key reprices every column uniformly (what-if).
   const [priceModel, setPriceModel] = useState<string | null>(null);
-  // PR14: "sandbox" = per-cell metrics; "model" = per-model rollup. Only
-  // offered when the run actually spans >1 participant model.
-  const [view, setView] = useState<"sandbox" | "model">("sandbox");
+  // PR14: "sandbox" = per-cell metrics; "model" = per-model rollup (only
+  // offered when the run spans >1 participant model). PR27: "cell" = the
+  // trial-group rollup (only when a run repeated cells — mean ± sd (n)).
+  const [view, setView] = useState<"sandbox" | "model" | "cell">("sandbox");
 
   useEffect(() => {
     let cancelled = false;
@@ -92,10 +105,17 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
 
   const current = loadedFor === runId ? analytics : null;
   const multiModel = (current?.models?.length ?? 0) > 1;
+  const hasTrialCells = (current?.cells ?? []).some(
+    (c) => c.sandbox_count > 1,
+  );
   const byModel = view === "model" && multiModel;
+  const byCell = view === "cell" && hasTrialCells;
+  const bySandbox = !byModel && !byCell;
   const columns: Column[] = byModel
     ? (current?.models ?? [])
-    : (current?.sandboxes ?? []);
+    : byCell
+      ? (current?.cells ?? [])
+      : (current?.sandboxes ?? []);
 
   if (current === null) {
     if (loadedFor !== runId) return null; // still loading — page shows spinners
@@ -108,6 +128,26 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
   if (current.sandboxes.length === 0) return null;
 
   const rows: Row[] = [
+    ...(byCell
+      ? [
+          {
+            label: "score (overall)",
+            hint: "mean ±sd (n) across the cell's trials",
+            cell: (col: Column) =>
+              isCellCol(col) && col.overall_mean != null ? (
+                <span className="mono" style={{ fontSize: "0.8rem" }}>
+                  {fmtMeanSd({
+                    mean: col.overall_mean,
+                    sd: col.overall_sd,
+                    n: col.overall_n,
+                  })}
+                </span>
+              ) : (
+                <span className="score-na">—</span>
+              ),
+          },
+        ]
+      : []),
     {
       label: "wall clock",
       // By-model rollups sum member cells' event spans — parallel cells
@@ -181,8 +221,10 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
         // Explicit pick reprices every column uniformly (what-if); auto
         // uses each column's own resolved rate (PR14 per-model pricing).
         // A null key is an unlisted model (PR21) — unpriced, never billed
-        // at a guessed rate.
-        const rateKey = priceModel ?? col.price_model;
+        // at a guessed rate. PR27 cell columns price at their model's own
+        // table key (all trials of a cell share one model).
+        const rateKey =
+          priceModel ?? (isCellCol(col) ? col.model : col.price_model);
         const p = rateKey ? current.price_table[rateKey] : undefined;
         if (!p) {
           return (
@@ -219,8 +261,8 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
               <button
                 type="button"
                 role="tab"
-                aria-selected={!byModel}
-                className={`seg__btn${byModel ? "" : " seg__btn--active"}`}
+                aria-selected={bySandbox}
+                className={`seg__btn${bySandbox ? " seg__btn--active" : ""}`}
                 onClick={() => setView("sandbox")}
               >
                 per sandbox
@@ -233,6 +275,28 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
                 onClick={() => setView("model")}
               >
                 by model
+              </button>
+            </div>
+          ) : null}
+          {hasTrialCells ? (
+            <div className="seg" role="tablist" aria-label="Trial rollup">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={bySandbox}
+                className={`seg__btn${bySandbox ? " seg__btn--active" : ""}`}
+                onClick={() => setView("sandbox")}
+              >
+                per sandbox
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={byCell}
+                className={`seg__btn${byCell ? " seg__btn--active" : ""}`}
+                onClick={() => setView("cell")}
+              >
+                by cell
               </button>
             </div>
           ) : null}
@@ -266,7 +330,17 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
             <tr>
               <th style={{ minWidth: "150px" }}>Metric</th>
               {columns.map((col) =>
-                isModelCol(col) ? (
+                isCellCol(col) ? (
+                  <th key={colKey(col)}>
+                    <div className="row" style={{ gap: "0.4rem" }}>
+                      <span className="mono">{col.model}</span>
+                      <Badge tone="outline">
+                        {col.sandbox_count} trial{col.sandbox_count === 1 ? "" : "s"}
+                      </Badge>
+                    </div>
+                    <div className="dim-desc">{col.label}</div>
+                  </th>
+                ) : isModelCol(col) ? (
                   <th key={colKey(col)}>
                     <div className="row" style={{ gap: "0.4rem" }}>
                       <span className="mono">{col.model}</span>
@@ -281,6 +355,11 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
                       <span className="mono" title={col.sandbox_id}>
                         {shortId(col.sandbox_id)}
                       </span>
+                      {col.trial_index ? (
+                        <Badge tone="outline" title="trial index within its cell">
+                          t{col.trial_index}
+                        </Badge>
+                      ) : null}
                       <Badge tone={statusTone(col.status)}>{col.status}</Badge>
                     </div>
                     {col.name ? (
@@ -307,6 +386,18 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
                   </td>
                 ))}
               </tr>
+            ) : byCell ? (
+              <tr>
+                <td>
+                  <div className="dim-name">trials</div>
+                  <div className="dim-desc">repeats of this cell</div>
+                </td>
+                {columns.map((col) => (
+                  <td key={colKey(col)} className="num">
+                    {isCellCol(col) ? col.sandbox_count : "—"}
+                  </td>
+                ))}
+              </tr>
             ) : (
               <tr>
                 <td>
@@ -314,7 +405,7 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
                 </td>
                 {columns.map((col) => (
                   <td key={colKey(col)} className="num">
-                    {!isModelCol(col) && col.terminal_reason ? (
+                    {isSandboxCol(col) && col.terminal_reason ? (
                       <Badge tone={statusTone(col.terminal_reason)}>
                         {col.terminal_reason}
                       </Badge>

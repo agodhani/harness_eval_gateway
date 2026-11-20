@@ -49,7 +49,7 @@ from db.models import Artifact, Event, Rubric, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
 from orchestrator import events as orch_events
 from orchestrator import runner, state_machine
-from orchestrator.matrix import run_models, sandbox_model
+from orchestrator.matrix import run_models, sandbox_model, trial_index
 from orchestrator.rubric import RubricContent, create_rubric_version
 from sandbox.preview import ScanCache, resolve_artifact_dir
 from sandbox.thumbnails import THUMB_FILENAME, THUMB_META_FILENAME
@@ -159,6 +159,9 @@ class SandboxResult(BaseModel):
     # PR14: the participant model this sandbox ran — the harness_config
     # ``model`` cell on multi-model runs, else the run's ``model_name``.
     model: str = ""
+    # PR27: which repeat of its config × model cell this sandbox is
+    # (``harness_config.trial_index``; None on untrialed runs).
+    trial_index: int | None = None
     status: str
     terminal_reason: str | None = None
     # Monitor flagged a done-ish exit whose snapshot workspace had no real
@@ -268,6 +271,9 @@ class RunResults(BaseModel):
     models: list[str] = Field(default_factory=list)
     evaluator_model: str | None = None
     same_model_eval: bool | None = None
+    # PR27: repeats-per-cell submitted on this run (1 = single-shot) — the
+    # results matrix groups trial cells under one config × model header.
+    trials: int = 1
     # PR5: the ?rubric_version= filter echoed back (None = newest-wins view).
     selected_rubric_version: int | None = None
     # Every rubric version of the run + score counts — drives the UI's
@@ -674,6 +680,7 @@ def get_run_results(
                 harness_config=sb.harness_config or {},
                 name=sb.name,
                 model=sandbox_model(sb.harness_config or {}, run.model_name),
+                trial_index=trial_index(sb.harness_config),
                 status=sb.status,
                 terminal_reason=sb.terminal_reason,
                 empty_workspace=sb.id in empty_ws,
@@ -712,6 +719,7 @@ def get_run_results(
         run_id=run.id,
         status=run.status,
         model_name=run.model_name,
+        trials=getattr(run, "trials", None) or cfg.get("trials") or 1,
         models=run_models(cfg, run.model_name),
         evaluator_model=cfg.get("evaluator_model"),
         same_model_eval=cfg.get("same_model_eval"),

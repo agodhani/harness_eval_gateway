@@ -110,6 +110,27 @@ def harnesses() -> list[dict[str, Any]]:
     return manifests
 
 
+def supported_model_options(name: str) -> frozenset[str]:
+    """PR27 — the ``model_options`` keys adapter ``name`` actually honors.
+
+    Read off the manifest's ``model_options`` list (miniloop + the ``prompt``
+    pseudo-adapter support all four; codex maps ``reasoning``; the remaining
+    CLIs declare none). Unknown/absent manifests → empty set — callers drop
+    unsupported keys with a submit-time warning rather than guessing.
+    """
+    manifest: dict[str, Any] | None = None
+    if name in ADAPTERS:
+        manifest = adapter_manifest(ADAPTERS[name], name)
+    elif name in no_sandbox_adapter_names():
+        from orchestrator import prompt_cell
+
+        manifest = dict(prompt_cell.MANIFEST)
+    raw = (manifest or {}).get("model_options")
+    if not isinstance(raw, list):
+        return frozenset()
+    return frozenset(str(k) for k in raw)
+
+
 def parse_terminal_state(adapter: ModuleType, logs: str) -> str | None:
     """Adapter-agnostic terminal-state extraction from container logs.
 

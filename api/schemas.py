@@ -118,6 +118,44 @@ class EventOut(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class ModelOptions(BaseModel):
+    """PR27 — optional per-config model-sampling knobs.
+
+    Honored where the adapter exposes the equivalent control (miniloop and
+    the ``prompt`` pseudo-adapter map all four into the chat-completions
+    request; adapters report their supported keys via
+    ``MANIFEST["model_options"]`` / ``GET /api/harnesses``). Keys the
+    selected adapter does NOT support are dropped at submit (the persisted
+    cell only carries honored keys) and called out in the submit response's
+    ``warnings`` — never silently applied.
+    Unknown keys are rejected here (``extra="forbid"``) so typos 422 rather
+    than silently no-op.
+
+    ``reasoning`` maps to the request-level ``reasoning_effort`` hint
+    (e.g. ``none``/``low``/``medium``/``high``) — a free-form bounded string
+    since provider vocabularies differ.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    seed: int | None = Field(default=None, ge=0)
+    max_tokens: int | None = Field(default=None, ge=1, le=131_072)
+    reasoning: str | None = Field(default=None, max_length=32)
+
+    @field_validator("reasoning", mode="before")
+    @classmethod
+    def _normalize_reasoning(cls, v: object) -> object:
+        if isinstance(v, str):
+            v = v.strip().lower()
+            return v or None
+        return v
+
+    def provided(self) -> dict[str, Any]:
+        """The keys the submitter actually set (non-None)."""
+        return self.model_dump(exclude_none=True)
+
+
 class HarnessConfigIn(BaseModel):
     """One sandbox configuration in a run's comparison matrix.
 
@@ -145,6 +183,9 @@ class HarnessConfigIn(BaseModel):
     system_prompt_extra: str | None = Field(default=None, max_length=8000)
     name: str | None = Field(default=None, max_length=64)
     model: str | None = Field(default=None, max_length=255)
+    # PR27: optional model-sampling knobs; keys the adapter doesn't support
+    # are dropped with a submit-time warning (see ModelOptions).
+    model_options: ModelOptions | None = None
 
     @field_validator("name", "model", mode="before")
     @classmethod
@@ -198,12 +239,18 @@ class RunCreate(BaseModel):
         Field(default=None, max_length=255)
     )
     budgets: BudgetsIn = Field(default_factory=BudgetsIn)
+    # PR27 — repeats per matrix cell: every effective config × model cell
+    # spawns this many sandboxes (``trial_index`` 1..N stamped on each) so
+    # results report mean ± sd instead of single samples. 1 = pre-PR27.
+    trials: int = Field(default=1, ge=1, le=8)
 
     @model_validator(mode="after")
     def _normalize_models(self) -> RunCreate:
         """Dedupe/blank-drop ``models`` (model_name always wins), then cap
         the expanded matrix — 8 configs × 8 models would spawn 64 sandboxes.
-        A config pinned via ``model`` expands to one cell, not len(models)."""
+        A config pinned via ``model`` expands to one cell, not len(models).
+        PR27: ``trials`` multiplies every cell, so the cap applies to the
+        post-trial sandbox count."""
         if self.models is not None:
             seen = {self.model_name}
             cleaned: list[str] = []
@@ -215,11 +262,12 @@ class RunCreate(BaseModel):
         model_count = 1 + len(self.models or [])
         pinned = sum(1 for hc in self.harness_configs if hc.model)
         cells = pinned + (len(self.harness_configs) - pinned) * model_count
-        if cells > MAX_MATRIX_CELLS:
+        sandboxes = cells * self.trials
+        if sandboxes > MAX_MATRIX_CELLS:
             raise ValueError(
-                f"run matrix would spawn {cells} sandboxes "
+                f"run matrix would spawn {sandboxes} sandboxes "
                 f"({len(self.harness_configs)} configs × "
-                f"{model_count} models); "
+                f"{model_count} models × {self.trials} trials); "
                 f"max is {MAX_MATRIX_CELLS}"
             )
         return self
@@ -264,6 +312,8 @@ class RunOut(BaseModel):
     status: str
     task_prompt: str
     model_name: str
+    # PR27: repeats per matrix cell submitted on this run (1 = single-shot).
+    trials: int = 1
     config: dict[str, Any]
     # True when the evaluator model equals ANY participant model — the UI
     # flags this so users notice non-independent judging.
@@ -473,6 +523,12 @@ class SandboxAnalytics(BaseModel):
     sandbox_id: uuid.UUID
     # Config label from the sandbox row (PR1 named harness configs).
     name: str | None = None
+    # PR27: which repeat of its config × model cell this sandbox is
+    # (``harness_config.trial_index``; 0/None semantics = untrialed run).
+    trial_index: int | None = None
+    # PR27: stable key identifying the config × model cell — equal across
+    # the cell's trials (harness_config minus ``trial_index``, serialized).
+    cell: str = ""
     # Human label mirroring the results-matrix header (adapter · packs;
     # includes the model on multi-model runs — PR14).
     label: str = ""
@@ -532,6 +588,37 @@ class ModelAnalytics(BaseModel):
     evaluator: EvaluatorActivity | None = None
 
 
+class CellAnalytics(BaseModel):
+    """PR27 — per-cell rollup: one entry per distinct config × model
+    combination (the trial group). Same metric aggregation as
+    ``ModelAnalytics`` plus the trial-score variance columns the results
+    matrix reports (sample sd, n−1 denominator; ``overall_sd`` is null when
+    fewer than two trials produced an overall score).
+    """
+
+    # ``SandboxAnalytics.cell`` group key + the shared config label.
+    cell: str
+    label: str = ""
+    model: str = ""
+    sandbox_count: int = 0
+    llm_turns: int = 0
+    tokens: TokenUsage = Field(default_factory=TokenUsage)
+    latency_ms: LatencyStats = Field(default_factory=LatencyStats)
+    tool_calls: ToolCallStats = Field(default_factory=ToolCallStats)
+    skill_calls: SkillCallStats = Field(default_factory=SkillCallStats)
+    shell_commands: int = 0
+    file_ops: int = 0
+    test_executions: int = 0
+    errors: int = 0
+    wall_clock_seconds: float = 0.0
+    estimated_cost_usd: float | None = None
+    evaluator: EvaluatorActivity | None = None
+    # Score-variance columns across this cell's trials.
+    overall_mean: float | None = None
+    overall_sd: float | None = None
+    overall_n: int = 0
+
+
 class RunAnalytics(BaseModel):
     """GET /api/runs/{run_id}/analytics response."""
 
@@ -547,6 +634,9 @@ class RunAnalytics(BaseModel):
     # PR14: participant-model rollups (one entry per model in the run's
     # matrix; a single entry for single-model runs).
     models: list[ModelAnalytics] = Field(default_factory=list)
+    # PR27: per-cell (config × model) rollups — one entry per trial group,
+    # carrying the score-variance columns (overall mean ± sd, n).
+    cells: list[CellAnalytics] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

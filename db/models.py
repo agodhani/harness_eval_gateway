@@ -50,6 +50,10 @@ class Run(Base):
     status: Mapped[str] = mapped_column(String(32), default="submitted", index=True)
     task_prompt: Mapped[str] = mapped_column(Text)
     model_name: Mapped[str] = mapped_column(String(255))
+    # PR27 — repeats per matrix cell (1–8): every effective config × model
+    # cell spawns ``trials`` sandboxes, each stamped
+    # ``harness_config.trial_index`` (1-based). Default 1 = pre-PR27 shape.
+    trials: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     # Harness configs, skill packs, evaluator model — shape refined in F1/F2.
     config: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

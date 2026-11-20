@@ -13,13 +13,25 @@ Single-model runs expand to exactly the submitted ``harness_configs``
 cell with ``model`` injected into the cell's harness-config dict so the
 sandbox row self-describes which model it ran.
 
+PR27 adds a third axis — ``trials``: every effective config × model cell is
+replicated N times, each replica stamped ``trial_index`` (1-based; the key
+is absent entirely when ``trials == 1``, matching the ``model``-injection
+pattern so single-shot runs stay bit-identical to pre-PR27). Trials of one
+cell stay adjacent (cell-major ordering) so a run's sandbox list groups
+each cell's repeats together.
+
 Pure functions only — safe to import from both ``api.*`` and ``orchestrator.*``.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping
 from typing import Any
+
+#: JSON key carrying the 1-based repeat index on an expanded cell's
+#: harness-config dict (absent on single-trial runs).
+TRIAL_INDEX_KEY = "trial_index"
 
 
 def _clean(model: object) -> str:
@@ -62,6 +74,8 @@ def expanded_configs(
     harness_configs: Iterable[Mapping[str, Any]],
     models: Iterable[object] | None,
     default_model: str,
+    *,
+    trials: int = 1,
 ) -> list[dict[str, Any]]:
     """Expand ``harness_configs`` into per-sandbox config dicts.
 
@@ -75,31 +89,45 @@ def expanded_configs(
     position when it's a listed model, appended in config order otherwise.
     Identical expanded cells collapse (e.g. a pin onto a model the same
     config would reach via expansion anyway).
+
+    ``trials`` (PR27) then replicates every cell N times — a 1-based
+    ``trial_index`` stamps each replica, cell-major so a cell's repeats
+    stay adjacent. ``trials <= 1`` emits no key at all (unchanged
+    pre-PR27 shape).
     """
     model_list = participant_models(default_model, models)
     configs = [dict(hc) for hc in harness_configs]
     if len(model_list) <= 1:
-        return configs
-    cells: list[dict[str, Any]] = []
-    listed = set(model_list)
-    for model in model_list:
-        for hc in configs:
-            pin = _clean(hc.get("model"))
-            if pin:
-                if pin == model:
-                    cells.append(hc)
-            else:
-                cells.append({**hc, "model": model})
-    cells.extend(
-        hc
-        for hc in configs
-        if (pin := _clean(hc.get("model"))) and pin not in listed
-    )
-    deduped: list[dict[str, Any]] = []
+        cells = configs
+    else:
+        cells = []
+        listed = set(model_list)
+        for model in model_list:
+            for hc in configs:
+                pin = _clean(hc.get("model"))
+                if pin:
+                    if pin == model:
+                        cells.append(hc)
+                else:
+                    cells.append({**hc, "model": model})
+        cells.extend(
+            hc
+            for hc in configs
+            if (pin := _clean(hc.get("model"))) and pin not in listed
+        )
+        deduped: list[dict[str, Any]] = []
+        for cell in cells:
+            if cell not in deduped:
+                deduped.append(cell)
+        cells = deduped
+    trials = max(1, int(trials or 1))
+    if trials <= 1:
+        return cells
+    out: list[dict[str, Any]] = []
     for cell in cells:
-        if cell not in deduped:
-            deduped.append(cell)
-    return deduped
+        for trial in range(1, trials + 1):
+            out.append({**cell, TRIAL_INDEX_KEY: trial})
+    return out
 
 
 def sandbox_model(harness_config: Mapping[str, Any] | None, default_model: str) -> str:
@@ -107,3 +135,34 @@ def sandbox_model(harness_config: Mapping[str, Any] | None, default_model: str) 
     (PR14 multi-model matrix) else the run's primary ``model_name``."""
     override = _clean((harness_config or {}).get("model"))
     return override or _clean(default_model)
+
+
+def trial_index(harness_config: Mapping[str, Any] | None) -> int | None:
+    """The 1-based repeat index stamped on a trialed cell (PR27).
+
+    ``None`` on untrialed sandboxes (trials=1 runs and rows predating
+    PR27) — callers treat it as "trial 1 of 1" for display.
+    """
+    raw = (harness_config or {}).get(TRIAL_INDEX_KEY)
+    if raw is None:
+        return None
+    try:
+        idx = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return idx if idx > 0 else None
+
+
+def cell_key(harness_config: Mapping[str, Any] | None) -> str:
+    """Stable identity of a sandbox's config × model cell (PR27).
+
+    The harness-config dict minus ``trial_index``, serialized with sorted
+    keys — every trial of one cell produces the identical key, which is
+    what results/analytics group on to report mean ± sd across repeats.
+    """
+    cfg = {
+        k: v
+        for k, v in (harness_config or {}).items()
+        if k != TRIAL_INDEX_KEY
+    }
+    return json.dumps(cfg, sort_keys=True, default=str)
