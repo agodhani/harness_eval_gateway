@@ -297,26 +297,30 @@ export default function GridView({
 
   // Winner-card cost/time come from the F9 analytics endpoint — fetched
   // lazily here so the grid stays self-contained (AnalyticsSection keeps
-  // its own copy + price-model toggle).
+  // its own copy + price-model toggle). `sandboxes` arrives as a new
+  // array on every parent refresh, so a non-terminal run's 5s poll keeps
+  // cost/clock as fresh as the scores beside them; refetches stay silent
+  // (no "…" flicker) and a failed one keeps the last good values.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       await Promise.resolve(); // async context — no setState-in-effect
       if (cancelled) return;
-      setAnalyticsState("loading"); // run switch resets stale cost/clock
       try {
         const a = await getRunAnalytics(runId);
         if (cancelled) return;
         setAnalytics(new Map(a.sandboxes.map((s) => [s.sandbox_id, s])));
         setAnalyticsState("ready");
       } catch {
-        if (!cancelled) setAnalyticsState("failed");
+        if (!cancelled) {
+          setAnalyticsState((s) => (s === "ready" ? s : "failed"));
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [runId]);
+  }, [runId, sandboxes]);
 
   const grid = useMemo(
     () => buildScoreGrid(sandboxes, models, dimensionKeys, specMap),
