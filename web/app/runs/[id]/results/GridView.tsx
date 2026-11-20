@@ -39,10 +39,17 @@ import { Badge, InfoNote } from "@/components/ui";
 const r1 = (v: number) => Math.round(v * 10) / 10;
 const r2 = (v: number) => Math.round(v * 100) / 100;
 
-/** `0.75` → `75%` (1dp under 10% reads "8.3%", else whole). */
+/** `0.75` → `75%` (1dp under 10% reads "8.3%", else whole). Floored/capped
+ * so a sub-perfect mean never prints "100%" nor a nonzero one "0.0%". */
 function formatRate(rate: number): string {
+  if (rate <= 0) return "0%";
+  if (rate >= 1) return "100%";
   const pct = rate * 100;
-  return `${pct < 10 && pct !== Math.round(pct) ? pct.toFixed(1) : Math.round(pct)}%`;
+  if (pct < 10) {
+    const dp = Math.floor(pct * 10) / 10;
+    return dp > 0 ? `${dp}%` : "<0.1%";
+  }
+  return `${Math.min(99, Math.round(pct))}%`;
 }
 
 /** Cost cell text — mean per sandbox across priced members; "unpriced"
@@ -123,7 +130,14 @@ function WinnerCard({
         {cell.meanOverall != null ? (
           <div className="winner__stat">
             <span className="winner__value">{r1(cell.meanOverall)}</span>
-            <span className="winner__label">judge overall</span>
+            <span className="winner__label">
+              judge overall
+              {cell.nOverall > 1 ? ` · mean of ${cell.nOverall}` : ""}
+              {cell.nOverall < cell.n
+                ? ` (${cell.nOverall}/${cell.n} scored)`
+                : ""}
+              {cell.sdOverall != null ? ` ±${r2(cell.sdOverall)}` : ""}
+            </span>
           </div>
         ) : null}
         {delta != null && runnerUp ? (
@@ -172,6 +186,10 @@ function WinnerCard({
           runner-up: <b>{runnerUp.rowLabel}</b> ×{" "}
           <span className="mono">{runnerUp.model}</span> — weighted{" "}
           {r1(runnerUp.meanWeighted!)}
+          {runnerUp.nWeighted > 1 ? ` · mean of ${runnerUp.nWeighted}` : ""}
+          {runnerUp.nWeighted < runnerUp.n
+            ? ` (${runnerUp.nWeighted}/${runnerUp.n} scored)`
+            : ""}
         </div>
       ) : null}
     </div>
@@ -238,6 +256,9 @@ function GridCellView({
           {disp.basis === "overall" && cell.meanWeighted != null ? (
             <span className="grid-cell__sub grid-cell__sub--w">
               w {r1(cell.meanWeighted)}
+              {cell.nWeighted < cell.n
+                ? ` (${cell.nWeighted} scored)`
+                : ""}
             </span>
           ) : null}
           {isWinner ? <span className="grid-cell__crown">★</span> : null}
