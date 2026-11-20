@@ -23,7 +23,8 @@ static key covers stays unpriced (null cost, never a fallback rate).
 from __future__ import annotations
 
 import fnmatch
-from typing import TYPE_CHECKING, Iterable
+from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 from sqlalchemy import select

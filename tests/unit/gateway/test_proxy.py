@@ -940,3 +940,135 @@ def test_ingest_forward_failure_returns_502(
         "/internal/done", json={"summary": "x"}, headers=_auth(_cred())
     )
     assert resp.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# PR28 — per-sandbox token gate
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_budget_exceeded_by_claim(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    """Cred's own sandbox over its per-cell cap → 429 limit=sandbox_tokens,
+    even though the run budget is nowhere near its ceiling."""
+    from db.models import Sandbox
+
+    run_id, sandbox_id = uuid.uuid4(), uuid.uuid4()
+    session = get_session_factory()()
+    try:
+        session.add(Run(id=run_id, task_prompt="test", model_name="test-model"))
+        session.flush()
+        session.add(
+            Sandbox(
+                id=sandbox_id,
+                run_id=run_id,
+                harness_config={"adapter": "miniloop"},
+                status="running",
+            )
+        )
+        session.add(
+            Event(
+                run_id=run_id,
+                sandbox_id=sandbox_id,
+                source="gateway",
+                type="llm_response",
+                payload={"usage": {"total_tokens": 100}},
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    cred = _cred(
+        run_id=run_id,
+        sandbox_id=sandbox_id,
+        max_tokens=10_000,  # run ceiling far away — only the cell cap can trip
+        sandbox_max_tokens=50,
+    )
+    resp = gw_client.post(
+        "/v1/chat/completions",
+        json={**_CHAT_BODY, "max_tokens": 10},
+        headers=_auth(cred),
+    )
+    assert resp.status_code == 429
+    err = resp.json()["error"]
+    assert err["type"] == "budget_exceeded"
+    assert err["limit"] == "sandbox_tokens"
+    assert err["used_tokens"] == 100
+    assert err["budget"] == 50
+    assert upstream["seen"] == []  # gated before any upstream traffic
+    payload = emitted[0]["payload"]
+    assert payload["reason"] == "budget_exceeded"
+    assert payload["limit"] == "sandbox_tokens"
+
+
+def test_sandbox_budget_ignores_sibling_usage(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    """A sibling sandbox's usage doesn't count toward THIS cred's per-cell
+    cap — the whole point of the gate."""
+    from db.models import Sandbox
+
+    run_id, sb_mine, sb_other = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    session = get_session_factory()()
+    try:
+        session.add(Run(id=run_id, task_prompt="test", model_name="test-model"))
+        session.flush()
+        session.add_all(
+            [
+                Sandbox(
+                    id=sid,
+                    run_id=run_id,
+                    harness_config={"adapter": "miniloop"},
+                    status="running",
+                )
+                for sid in (sb_mine, sb_other)
+            ]
+        )
+        session.add(
+            Event(
+                run_id=run_id,
+                sandbox_id=sb_other,  # the SIBLING burned the tokens
+                source="gateway",
+                type="llm_response",
+                payload={"usage": {"total_tokens": 5000}},
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    cred = _cred(
+        run_id=run_id,
+        sandbox_id=sb_mine,
+        max_tokens=10_000,
+        sandbox_max_tokens=50,
+    )
+    resp = gw_client.post(
+        "/v1/chat/completions",
+        json={**_CHAT_BODY, "max_tokens": 10},
+        headers=_auth(cred),
+    )
+    # my sandbox used 0 < 50 → passes the per-cell gate (sibling can't starve it)
+    assert resp.status_code == 200
+    assert len(upstream["seen"]) == 1
+
+
+def test_service_cred_skips_sandbox_gate(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    """sandbox_id=None creds (rubric/eval/service) carry no claim and are
+    exempt — the run ceiling still applies."""
+    cred = mint_cred(
+        run_id=uuid.uuid4(),
+        sandbox_id=None,
+        secret=SECRET,
+        ttl_seconds=3600,
+        max_tokens=10_000,
+        sandbox_max_tokens=1,  # claim exists but no sandbox scope → gate skipped
+    )
+    resp = gw_client.post(
+        "/v1/chat/completions", json=_CHAT_BODY, headers=_auth(cred)
+    )
+    assert resp.status_code == 200

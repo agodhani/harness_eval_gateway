@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import select
 
 from db.models import Artifact, Event, Sandbox
@@ -420,3 +421,167 @@ async def test_already_terminal_sandbox_returns_reason(
     reason = await _watch(session_factory, settings, fake_runtime, run.id, sb.id)
     assert reason == "agent_done"
     assert fake_runtime.stopped == []
+
+
+# ---------------------------------------------------------------------------
+# PR28 — per-sandbox token + cost caps
+# ---------------------------------------------------------------------------
+
+
+async def test_sandbox_token_budget_terminates(
+    session_factory, settings, fake_runtime
+) -> None:
+    """The cell's OWN total crossing sandbox_token_budget terminates it —
+    siblings' tokens don't count toward the cap."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    other = make_sandbox(session_factory, run.id, status="running")
+    # sibling burns a pile — must NOT count toward sb's cap
+    _add_event(
+        session_factory, run.id, other.id, "llm_response",
+        {"usage": {"total_tokens": 9000}},
+    )
+    _add_event(
+        session_factory, run.id, sb.id, "llm_response",
+        {"usage": {"total_tokens": 500}},
+    )
+    fake_runtime.status_map[str(sb.id)] = {"status": "running", "exit_code": None}
+
+    reason = await _watch(
+        session_factory, settings, fake_runtime, run.id, sb.id,
+        budgets={"wall_clock_seconds": 3600, "sandbox_token_budget": 500},
+    )
+    assert reason == "budget_exceeded"
+    assert _get_sandbox(session_factory, sb.id).terminal_reason == "budget_exceeded"
+    term = next(
+        p for p in _checkpoint_payloads(session_factory, sb.id)
+        if p.get("stage") == "terminate"
+    )
+    assert term["reason"] == "budget_exceeded"
+    assert term["limit"] == "sandbox_tokens"
+    assert term["used_tokens"] == 500
+    assert term["budget"] == 500
+
+
+async def test_sandbox_token_budget_under_cap_keeps_running(
+    session_factory, settings, fake_runtime
+) -> None:
+    """Under the cap the poll does nothing — the container's own exit decides."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    _add_event(
+        session_factory, run.id, sb.id, "llm_response",
+        {"usage": {"total_tokens": 400}},
+    )
+    states = iter(
+        [{"status": "running", "exit_code": None}, {"status": "exited", "exit_code": 0}]
+    )
+    fake_runtime.status_map[str(sb.id)] = lambda: next(states)
+    fake_runtime.logs_map[str(sb.id)] = RESULT_LINE("agent_done") + "\n"
+
+    reason = await _watch(
+        session_factory, settings, fake_runtime, run.id, sb.id,
+        budgets={"wall_clock_seconds": 3600, "sandbox_token_budget": 500},
+    )
+    assert reason == "agent_done"
+
+
+async def test_cost_budget_terminates_priced_model(
+    session_factory, settings, fake_runtime
+) -> None:
+    """max_cost_usd prices the sandbox's own traffic each poll; gpt-4o at
+    $2.5/$10 per Mtok → 1M in + 100k out = $3.50 trips a $3.00 cap."""
+    run = make_run(
+        session_factory, status="running", config=run_config(), model_name="gpt-4o"
+    )
+    sb = make_sandbox(session_factory, run.id, status="running")
+    _add_event(
+        session_factory, run.id, sb.id, "llm_response",
+        {
+            "usage": {
+                "prompt_tokens": 1_000_000,
+                "completion_tokens": 100_000,
+                "total_tokens": 1_100_000,
+            }
+        },
+    )
+    fake_runtime.status_map[str(sb.id)] = {"status": "running", "exit_code": None}
+
+    reason = await _watch(
+        session_factory, settings, fake_runtime, run.id, sb.id,
+        budgets={"wall_clock_seconds": 3600, "max_cost_usd": 3.00},
+    )
+    assert reason == "budget_exceeded"
+    term = next(
+        p for p in _checkpoint_payloads(session_factory, sb.id)
+        if p.get("stage") == "terminate"
+    )
+    assert term["limit"] == "cost"
+    assert term["estimated_cost_usd"] == pytest.approx(3.5)
+    assert term["budget_usd"] == 3.0
+
+
+async def test_cost_budget_prices_via_model_prices_row(
+    session_factory, settings, fake_runtime
+) -> None:
+    """The cap uses the LAYERED table — a model_prices glob can price a model
+    the static table never heard of."""
+    from db.models import ModelPriceRow
+
+    with session_factory() as s:
+        s.add(
+            ModelPriceRow(
+                model_glob="pr28-mon-*",
+                input_per_mtok_usd=100.0,
+                output_per_mtok_usd=100.0,
+                source="user",
+            )
+        )
+        s.commit()
+    run = make_run(
+        session_factory, status="running", config=run_config(), model_name="pr28-mon-7b"
+    )
+    sb = make_sandbox(session_factory, run.id, status="running")
+    # 100k in @ $100/Mtok → $10 — way over a $5 cap.
+    _add_event(
+        session_factory, run.id, sb.id, "llm_response",
+        {"usage": {"prompt_tokens": 100_000, "completion_tokens": 0, "total_tokens": 100_000}},
+    )
+    fake_runtime.status_map[str(sb.id)] = {"status": "running", "exit_code": None}
+
+    reason = await _watch(
+        session_factory, settings, fake_runtime, run.id, sb.id,
+        budgets={"wall_clock_seconds": 3600, "max_cost_usd": 5.0},
+    )
+    assert reason == "budget_exceeded"
+    term = next(
+        p for p in _checkpoint_payloads(session_factory, sb.id)
+        if p.get("stage") == "terminate"
+    )
+    assert term["limit"] == "cost"
+
+
+async def test_cost_budget_unpriced_model_cannot_trip(
+    session_factory, settings, fake_runtime
+) -> None:
+    """PR21 honesty: an unlisted model has no honest rate — the cap can't
+    trip it no matter how many tokens it burns (never guessed)."""
+    run = make_run(
+        session_factory, status="running", config=run_config(), model_name="test-model"
+    )
+    sb = make_sandbox(session_factory, run.id, status="running")
+    _add_event(
+        session_factory, run.id, sb.id, "llm_response",
+        {"usage": {"prompt_tokens": 10**9, "completion_tokens": 0, "total_tokens": 10**9}},
+    )
+    states = iter(
+        [{"status": "running", "exit_code": None}, {"status": "exited", "exit_code": 0}]
+    )
+    fake_runtime.status_map[str(sb.id)] = lambda: next(states)
+    fake_runtime.logs_map[str(sb.id)] = RESULT_LINE("agent_done") + "\n"
+
+    reason = await _watch(
+        session_factory, settings, fake_runtime, run.id, sb.id,
+        budgets={"wall_clock_seconds": 3600, "max_cost_usd": 0.000001},
+    )
+    assert reason == "agent_done"

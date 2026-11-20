@@ -6,7 +6,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from db.models import Event, Run
+from db.models import Event, Run, Sandbox
 from gateway import metering
 from gateway.config import get_settings
 from gateway.creds import CredClaims
@@ -118,3 +118,106 @@ def test_usage_from_response() -> None:
     assert metering.usage_from_response({})["total_tokens"] == 0
     assert metering.usage_from_response(None)["total_tokens"] == 0
     assert metering.usage_from_response({"usage": "nope"})["total_tokens"] == 0
+
+
+# ---------------------------------------------------------------------------
+# PR28 — per-sandbox usage totals + cred claim
+# ---------------------------------------------------------------------------
+
+
+def _add_sandbox_event(
+    session: Session,
+    run_id: uuid.UUID,
+    sandbox_id: uuid.UUID,
+    type_: str,
+    payload: dict,
+) -> None:
+    _ensure_run(session, run_id)
+    # events.sandbox_id is a real FK — the parent Sandbox row must exist.
+    if session.get(Sandbox, sandbox_id) is None:
+        session.add(
+            Sandbox(
+                id=sandbox_id,
+                run_id=run_id,
+                harness_config={"adapter": "miniloop"},
+                status="running",
+            )
+        )
+        session.flush()
+    session.add(
+        Event(
+            run_id=run_id,
+            sandbox_id=sandbox_id,
+            source="gateway",
+            type=type_,
+            payload=payload,
+        )
+    )
+
+
+def test_llm_usage_totals_sums_all_token_fields() -> None:
+    session = _session()
+    run_id = uuid.uuid4()
+    usage = {
+        "prompt_tokens": 100,
+        "completion_tokens": 40,
+        "cache_read_input_tokens": 30,
+        "total_tokens": 140,
+    }
+    _add_event(session, run_id, "llm_response", {"usage": usage})
+    _add_event(
+        session,
+        run_id,
+        "llm_response",
+        {"usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}},
+    )
+    session.commit()
+    try:
+        totals = metering.llm_usage_totals(session, run_id)
+        assert totals == {
+            "prompt_tokens": 150,
+            "completion_tokens": 50,
+            "cache_read_tokens": 30,
+            "total_tokens": 200,
+        }
+    finally:
+        session.close()
+
+
+def test_llm_usage_totals_scoped_to_one_sandbox() -> None:
+    """The per-cell gate meters only the cred's own sandbox — a sibling's
+    usage can't starve it."""
+    session = _session()
+    run_id = uuid.uuid4()
+    sb_a, sb_b = uuid.uuid4(), uuid.uuid4()
+    _add_sandbox_event(
+        session, run_id, sb_a, "llm_response",
+        {"usage": {"prompt_tokens": 60, "completion_tokens": 20, "total_tokens": 80}},
+    )
+    _add_sandbox_event(
+        session, run_id, sb_b, "llm_response",
+        {"usage": {"prompt_tokens": 900, "completion_tokens": 100, "total_tokens": 1000}},
+    )
+    session.commit()
+    try:
+        a = metering.llm_usage_totals(session, run_id, sandbox_id=sb_a)
+        assert a["total_tokens"] == 80
+        assert metering.tokens_used(session, run_id, sandbox_id=sb_a) == 80
+        # run scope still sees both cells
+        assert metering.tokens_used(session, run_id) == 1080
+    finally:
+        session.close()
+
+
+def test_sandbox_token_budget_reads_claim() -> None:
+    claims = CredClaims(
+        run_id=str(uuid.uuid4()),
+        sandbox_id=str(uuid.uuid4()),
+        iat=0,
+        exp=1,
+        sandbox_max_tokens=12_000,
+    )
+    assert metering.sandbox_token_budget(claims) == 12_000
+    # service/eval creds mint no claim → exempt from the per-cell gate
+    service = CredClaims(run_id=str(uuid.uuid4()), sandbox_id=None, iat=0, exp=1)
+    assert metering.sandbox_token_budget(service) is None

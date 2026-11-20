@@ -10,8 +10,8 @@ deletes what it created (the api's :memory: sqlite is shared per-process).
 from __future__ import annotations
 
 import json
-import uuid
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 import pytest
