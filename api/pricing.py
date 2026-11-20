@@ -90,6 +90,7 @@ def estimate_cost_usd(
     if cache_rate is None or cache_read_tokens <= 0:
         billable_input = input_tokens
         cached = 0
+        cache_rate = 0.0
     else:
         cached = min(cache_read_tokens, input_tokens)
         billable_input = input_tokens - cached
