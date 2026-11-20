@@ -1353,3 +1353,341 @@ def test_results_same_second_passes_newest_inserted_wins(
         "score": 3.0, "rationale": "v1 rescore pass"
     }
     assert sb1["rubric_version"] == 1
+
+
+# ---------------------------------------------------------------------------
+# PR34 — artifact file browser + side-by-side diff
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def browsed_run(session_factory, artifact_root):
+    """Run + two sandbox workspaces + one prompt cell, all as REAL artifact
+    dirs at the conventional ``<root>/<run>/<sandbox>`` layout (no
+    ``artifact_path`` needed — the browse root resolves conventionally)."""
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="build 2048", model_name="m", config={}, status="done"
+        )
+        s.add(run)
+        s.flush()
+
+        def mk(name: str, cfg: dict[str, Any]) -> Sandbox:
+            sb = Sandbox(
+                run_id=run.id,
+                name=name,
+                harness_config=cfg,
+                status="done",
+                terminal_reason="agent_done",
+            )
+            s.add(sb)
+            s.flush()
+            return sb
+
+        sb1 = mk("one", {"adapter": "miniloop"})
+        sb2 = mk("two", {"adapter": "miniloop"})
+        sbp = mk("prompt", {"adapter": "prompt"})
+        s.commit()
+        ids = (run.id, sb1.id, sb2.id, sbp.id)
+    finally:
+        s.close()
+    run_id, sb1_id, sb2_id, sbp_id = ids
+
+    def art_dir(sb_id: uuid.UUID) -> Path:
+        return artifact_root / str(run_id) / str(sb_id)
+
+    ws1 = art_dir(sb1_id) / "workspace"
+    (ws1 / "src").mkdir(parents=True)
+    (ws1 / "index.html").write_text(
+        '<h1>2048</h1>\n<script src="game.js"></script>\n'
+    )
+    (ws1 / "src" / "app.py").write_text("print('a')\n")
+    (ws1 / "README.md").write_text("readme one\n")
+    (ws1 / ".env.local").write_text("KEY=1\n")
+
+    ws2 = art_dir(sb2_id) / "workspace"
+    ws2.mkdir(parents=True)
+    (ws2 / "index.html").write_text(
+        '<h1>2048!</h1>\n<script src="game.js"></script>\n'
+    )
+    (ws2 / "solo.txt").write_text("only in b\n")
+
+    pdir = art_dir(sbp_id)
+    pdir.mkdir(parents=True)
+    (pdir / "output.txt").write_text("the whole answer\n")
+    (pdir / "meta.json").write_text('{"adapter": "prompt"}\n')
+
+    return {
+        "run": run_id,
+        "sb1": sb1_id,
+        "sb2": sb2_id,
+        "sbp": sbp_id,
+        "root": artifact_root,
+        "ws1": ws1,
+        "ws2": ws2,
+        "pdir": pdir,
+    }
+
+
+def test_files_list_workspace(client: TestClient, browsed_run) -> None:
+    """Listing a real artifact tree returns dirs + files with sizes."""
+    resp = client.get(f"/api/sandboxes/{browsed_run['sb1']}/files")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["sandbox_id"] == str(browsed_run["sb1"])
+    assert body["root"] == "workspace"
+    assert body["truncated"] is False
+    by_path = {e["path"]: e for e in body["entries"]}
+    assert set(by_path) == {"index.html", "README.md", ".env.local", "src", "src/app.py"}
+    assert by_path["src"] == {"path": "src", "kind": "dir", "size": None}
+    assert by_path["index.html"]["kind"] == "file"
+    assert by_path["index.html"]["size"] == len(
+        b'<h1>2048</h1>\n<script src="game.js"></script>\n'
+    )
+    # sorted, deterministic order
+    assert [e["path"] for e in body["entries"]] == sorted(by_path)
+
+
+def test_files_list_prompt_cell(client: TestClient, browsed_run) -> None:
+    """Prompt cells have no workspace/ — the artifact root is browsed so
+    output.txt surfaces alongside meta/transcript."""
+    body = client.get(f"/api/sandboxes/{browsed_run['sbp']}/files").json()
+    assert body["root"] == "artifact"
+    names = {e["path"] for e in body["entries"]}
+    assert {"output.txt", "meta.json"} <= names
+
+
+def test_files_list_404(
+    client: TestClient, browsed_run, session_factory
+) -> None:
+    assert client.get(f"/api/sandboxes/{uuid.uuid4()}/files").status_code == 404
+    # a sandbox row with no artifact dir on disk
+    s = session_factory()
+    try:
+        sb = Sandbox(
+            run_id=browsed_run["run"], harness_config={}, status="done"
+        )
+        s.add(sb)
+        s.commit()
+        sid = sb.id
+    finally:
+        s.close()
+    assert client.get(f"/api/sandboxes/{sid}/files").status_code == 404
+
+
+def test_files_list_excludes_noise(client: TestClient, browsed_run) -> None:
+    """Same exclusions as the workspace ZIP: VCS internals, caches,
+    vendored deps, venvs — at any depth. Hidden FILES still list."""
+    ws1 = browsed_run["ws1"]
+    (ws1 / ".git").mkdir()
+    (ws1 / ".git" / "config").write_text("x")
+    (ws1 / "__pycache__").mkdir()
+    (ws1 / "__pycache__" / "a.cpython-312.pyc").write_text("x")
+    (ws1 / "node_modules").mkdir()
+    (ws1 / "node_modules" / "pkg.js").write_text("x")
+    (ws1 / "app.pyc").write_text("x")
+
+    body = client.get(f"/api/sandboxes/{browsed_run['sb1']}/files").json()
+    names = {e["path"] for e in body["entries"]}
+    assert ".git" not in names
+    assert ".git/config" not in names
+    assert "__pycache__" not in names
+    assert "node_modules" not in names
+    assert "app.pyc" not in names
+    assert ".env.local" in names  # hidden files DO list (zip parity)
+
+
+def test_files_list_bounded(
+    client: TestClient, browsed_run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Depth + entry caps truncate the listing instead of walking forever."""
+    monkeypatch.setattr(results_router, "_BROWSE_MAX_DEPTH", 1)
+    body = client.get(f"/api/sandboxes/{browsed_run['sb1']}/files").json()
+    names = {e["path"] for e in body["entries"]}
+    assert "src" in names and "src/app.py" not in names
+    assert body["truncated"] is True
+
+    monkeypatch.setattr(results_router, "_BROWSE_MAX_DEPTH", 8)
+    monkeypatch.setattr(results_router, "_BROWSE_MAX_ENTRIES", 3)
+    body = client.get(f"/api/sandboxes/{browsed_run['sb1']}/files").json()
+    assert len(body["entries"]) <= 3
+    assert body["truncated"] is True
+
+
+def test_files_read_text_and_download(client: TestClient, browsed_run) -> None:
+    text = '<h1>2048</h1>\n<script src="game.js"></script>\n'
+    resp = client.get(f"/api/sandboxes/{browsed_run['sb1']}/files/index.html")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["path"] == "index.html"
+    assert body["binary"] is False
+    assert body["truncated"] is False
+    assert body["text"] == text
+    assert body["size"] == len(text.encode())
+
+    dl = client.get(
+        f"/api/sandboxes/{browsed_run['sb1']}/files/src/app.py",
+        params={"download": "1"},
+    )
+    assert dl.status_code == 200
+    assert dl.content == b"print('a')\n"
+    assert "app.py" in dl.headers.get("content-disposition", "")
+
+
+def test_files_read_caps_size(
+    client: TestClient, browsed_run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file longer than the text cap returns its head + truncated."""
+    monkeypatch.setattr(results_router, "_FILE_TEXT_CAP_BYTES", 8)
+    body = client.get(
+        f"/api/sandboxes/{browsed_run['sb1']}/files/index.html"
+    ).json()
+    assert body["truncated"] is True
+    assert body["text"] == "<h1>2048"
+    assert body["size"] > 8
+
+
+def test_files_read_binary_and_prompt_output(
+    client: TestClient, browsed_run
+) -> None:
+    """Binary content → binary flag + null text; prompt-cell output.txt is
+    readable through the same endpoint at the artifact root."""
+    png = browsed_run["ws1"] / "icon.png"
+    png.write_bytes(b"\x89PNG\x00\x0d\x0a\x1a\x0a")
+    body = client.get(
+        f"/api/sandboxes/{browsed_run['sb1']}/files/icon.png"
+    ).json()
+    assert body["binary"] is True
+    assert body["text"] is None
+
+    body = client.get(
+        f"/api/sandboxes/{browsed_run['sbp']}/files/output.txt"
+    ).json()
+    assert body["binary"] is False
+    assert body["text"] == "the whole answer\n"
+
+
+def test_files_traversal_404(client: TestClient, browsed_run) -> None:
+    """The browse root is jailed exactly like the download path."""
+    outside = browsed_run["root"].parent / "secret.txt"
+    outside.write_text("secret")
+    try:
+        sb1 = browsed_run["sb1"]
+        # %2e%2e survives client-side URL normalization — escapes the jail.
+        assert (
+            client.get(
+                f"/api/sandboxes/{sb1}/files/"
+                "%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fsecret.txt"
+            ).status_code
+            == 404
+        )
+        # escape into the SIBLING sandbox's workspace: inside ARTIFACT_ROOT
+        # but outside this sandbox's browse root → still 404.
+        sb2 = browsed_run["sb2"]
+        assert (
+            client.get(
+                f"/api/sandboxes/{sb1}/files/"
+                f"..%2f..%2f{sb2}%2fworkspace%2findex.html"
+            ).status_code
+            == 404
+        )
+    finally:
+        outside.unlink()
+    sb1 = browsed_run["sb1"]
+    # absolute path → treated as in-root relative → not found → 404
+    assert (
+        client.get(f"/api/sandboxes/{sb1}/files/%2fetc%2fpasswd").status_code
+        == 404
+    )
+    # a directory is not a file
+    assert client.get(f"/api/sandboxes/{sb1}/files/src").status_code == 404
+    # missing file
+    assert client.get(f"/api/sandboxes/{sb1}/files/nope.txt").status_code == 404
+
+
+def test_files_diff(client: TestClient, browsed_run) -> None:
+    """?diff=<other> renders a server-side unified diff for text files."""
+    resp = client.get(
+        f"/api/sandboxes/{browsed_run['sb1']}/files/index.html",
+        params={"diff": str(browsed_run["sb2"])},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["identical"] is False
+    assert body["a_missing"] is False and body["b_missing"] is False
+    assert body["binary"] is False
+    diff = body["diff"]
+    assert diff.startswith("--- a/index.html\n+++ b/index.html\n@@")
+    assert '-<h1>2048</h1>' in diff
+    assert '+<h1>2048!</h1>' in diff
+    assert ' <script src="game.js"></script>' in diff  # context line
+
+
+def test_files_diff_identical(client: TestClient, browsed_run) -> None:
+    """Byte-equal files → identical flag, empty diff body."""
+    (browsed_run["ws2"] / "README.md").write_text("readme one\n")
+    body = client.get(
+        f"/api/sandboxes/{browsed_run['sb1']}/files/README.md",
+        params={"diff": str(browsed_run["sb2"])},
+    ).json()
+    assert body["identical"] is True
+    assert body["diff"] == ""
+
+
+def test_files_diff_missing_side(client: TestClient, browsed_run) -> None:
+    """A path on only one side diffs against empty — full +/- body."""
+    # solo.txt lives only in sb2: diffing FROM sb1 shows all-added.
+    body = client.get(
+        f"/api/sandboxes/{browsed_run['sb1']}/files/solo.txt",
+        params={"diff": str(browsed_run["sb2"])},
+    ).json()
+    assert body["a_missing"] is True and body["b_missing"] is False
+    assert "+only in b" in body["diff"]
+
+    # reverse direction → all-removed.
+    body = client.get(
+        f"/api/sandboxes/{browsed_run['sb2']}/files/solo.txt",
+        params={"diff": str(browsed_run["sb1"])},
+    ).json()
+    assert body["a_missing"] is False and body["b_missing"] is True
+    assert "-only in b" in body["diff"]
+
+    # a file on NEITHER side → 404.
+    assert (
+        client.get(
+            f"/api/sandboxes/{browsed_run['sb1']}/files/nope.py",
+            params={"diff": str(browsed_run["sb2"])},
+        ).status_code
+        == 404
+    )
+
+
+def test_files_diff_cross_root(client: TestClient, browsed_run) -> None:
+    """Prompt-cell artifact root diffs against a workspace browse root —
+    output.txt exists on one side only."""
+    body = client.get(
+        f"/api/sandboxes/{browsed_run['sbp']}/files/output.txt",
+        params={"diff": str(browsed_run["sb1"])},
+    ).json()
+    assert body["a_missing"] is False and body["b_missing"] is True
+    assert "-the whole answer" in body["diff"]
+
+
+def test_files_diff_unknown_and_binary(client: TestClient, browsed_run) -> None:
+    sb1, sb2 = browsed_run["sb1"], browsed_run["sb2"]
+    # unknown other sandbox → 404
+    assert (
+        client.get(
+            f"/api/sandboxes/{sb1}/files/index.html",
+            params={"diff": str(uuid.uuid4())},
+        ).status_code
+        == 404
+    )
+    # a binary side → binary flag, empty diff (never garbage)
+    (browsed_run["ws1"] / "icon.png").write_bytes(b"\x89PNG\x00\x0d")
+    body = client.get(
+        f"/api/sandboxes/{sb1}/files/icon.png", params={"diff": str(sb2)}
+    ).json()
+    assert body["binary"] is True
+    assert body["diff"] == ""

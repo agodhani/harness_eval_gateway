@@ -22,11 +22,25 @@ PR5 (re-score + rubric edits) adds:
   artifacts (terminal runs only), optionally pinned to a rubric version, a
   sandbox subset, or a different judge model.
 
+PR34 adds the artifact file browser + side-by-side diff:
+
+- ``GET /api/sandboxes/{sandbox_id}/files`` — jailed, depth/entry-bounded
+  listing of the artifact ``workspace/`` (prompt cells and other
+  workspace-less artifacts browse the artifact root itself, where
+  ``output.txt``/transcript/meta live).
+- ``GET /api/sandboxes/{sandbox_id}/files/{path}`` — size-capped text read
+  as JSON (``binary`` flag on undecodable content), ``?download=1`` for a
+  FileResponse download, or ``?diff=<other_sandbox_id>`` for a server-side
+  unified diff of that path across two sandboxes' browse roots. Path
+  resolution is jailed to the browse root — traversal attempts 404 exactly
+  like the artifact-download path.
+
 Pydantic models live here (not api/schemas.py) per Phase-2 ownership split.
 """
 
 from __future__ import annotations
 
+import difflib
 import io
 import json
 import os
@@ -51,7 +65,11 @@ from orchestrator import events as orch_events
 from orchestrator import runner, state_machine
 from orchestrator.matrix import run_models, sandbox_model
 from orchestrator.rubric import RubricContent, create_rubric_version
-from sandbox.preview import ScanCache, resolve_artifact_dir
+from sandbox.preview import (
+    ScanCache,
+    resolve_artifact_dir,
+    resolve_workspace_dir,
+)
 from sandbox.thumbnails import THUMB_FILENAME, THUMB_META_FILENAME
 from scoring.exec import exec_summary_dict
 from scoring.render import ANALYSIS_JSON_FILENAME
@@ -1047,3 +1065,366 @@ def download_artifact(artifact_id: UUID, session: DbSession) -> Response:
         )
 
     return FileResponse(path, filename=path.name)
+
+
+# ---------------------------------------------------------------------------
+# PR34 — artifact file browser + side-by-side diff
+# ---------------------------------------------------------------------------
+
+#: Browse bounds — the artifact workspace is candidate-authored, so every
+#: probe is bounded: listing walks at most ``_BROWSE_MAX_DEPTH`` levels and
+#: ``_BROWSE_MAX_ENTRIES`` rows (``truncated`` flags the cut), a text read
+#: caps at ``_FILE_TEXT_CAP_BYTES``, and a diff caps each side's input at
+#: ``_DIFF_SIDE_CAP_BYTES`` + the rendered output at ``_DIFF_MAX_LINES``.
+_BROWSE_MAX_DEPTH = 8
+_BROWSE_MAX_ENTRIES = 5000
+_FILE_TEXT_CAP_BYTES = 256 * 1024
+_DIFF_SIDE_CAP_BYTES = 1024 * 1024
+_DIFF_MAX_LINES = 10_000
+
+
+class FileEntry(BaseModel):
+    """One browsable path inside the artifact root — ``path`` is POSIX-style
+    relative; ``size`` is None for dirs."""
+
+    path: str
+    kind: str  # "file" | "dir"
+    size: int | None = None
+
+
+class FileListOut(BaseModel):
+    """Bounded listing for one sandbox's artifact browse root."""
+
+    sandbox_id: UUID
+    # "workspace" — the snapshot workspace dir; "artifact" — the artifact
+    # dir itself (prompt cells + workspace-less artifacts: output.txt,
+    # transcript.log, meta.json, analysis.json, generated_tests/…).
+    root: str
+    entries: list[FileEntry] = Field(default_factory=list)
+    truncated: bool = False
+
+
+class FileContentOut(BaseModel):
+    """Size-capped text read of one artifact file — ``text`` is None when
+    the content is binary (NUL bytes in the read head); the UI offers the
+    ``?download=1`` variant instead."""
+
+    sandbox_id: UUID
+    path: str
+    size: int
+    truncated: bool = False
+    binary: bool = False
+    text: str | None = None
+
+
+class FileDiffOut(BaseModel):
+    """Server-side unified diff of one path across two sandboxes' browse
+    roots (``sandbox_id`` = ``a``/left, ``other_sandbox_id`` = ``b``/right).
+
+    A path absent on one side diffs against empty (all +/-) — a path
+    existing on NEITHER side 404s before this is built. ``binary`` means a
+    side carried NUL bytes; ``diff`` stays empty then (the UI offers
+    downloads). ``truncated`` covers an over-cap input side OR an output
+    longer than ``_DIFF_MAX_LINES``.
+    """
+
+    sandbox_id: UUID
+    other_sandbox_id: UUID
+    path: str
+    a_missing: bool = False
+    b_missing: bool = False
+    binary: bool = False
+    identical: bool = False
+    truncated: bool = False
+    diff: str = ""
+
+
+def _browse_root(jail: Path, sandbox: Sandbox) -> tuple[Path, str] | None:
+    """The browsable root for a sandbox's artifact, jailed under ARTIFACT_ROOT.
+
+    ``workspace/`` wins when present (the snapshot the agent produced); a
+    workspace-less artifact (prompt cells — ``output.txt`` at the artifact
+    root — or pre-snapshot failures) browses the artifact dir itself so the
+    submission + transcript/meta stay inspectable. Returns ``(root, kind)``
+    or None when no artifact dir resolves inside the jail.
+    """
+    ws = resolve_workspace_dir(
+        jail=jail,
+        run_id=str(sandbox.run_id),
+        sandbox_id=str(sandbox.id),
+        artifact_path=sandbox.artifact_path,
+    )
+    if ws is not None:
+        return ws, "workspace"
+    art = resolve_artifact_dir(
+        jail=jail,
+        run_id=str(sandbox.run_id),
+        sandbox_id=str(sandbox.id),
+        artifact_path=sandbox.artifact_path,
+    )
+    if art is not None:
+        return art, "artifact"
+    return None
+
+
+def _resolve_in_root(root: Path, rel: str) -> tuple[Path, str] | None:
+    """Jailed join — ``rel`` must resolve to a regular file inside ``root``.
+
+    Returns ``(absolute, posix_relative)``. ``..`` segments escaping the
+    root, absolute paths that escape, nonexistent paths, and dirs all
+    return None → the endpoint 404s exactly like the artifact-download jail.
+    A ``..`` that stays inside the root (``src/../index.html``) resolves
+    fine — it never escapes the jail.
+    """
+    rel = rel.strip("/")
+    if not rel:
+        return None
+    try:
+        resolved = (root / rel).resolve()
+    except OSError:
+        return None
+    if resolved != root and root not in resolved.parents:
+        return None
+    try:
+        if not resolved.is_file():
+            return None
+    except OSError:
+        return None
+    return resolved, resolved.relative_to(root).as_posix()
+
+
+def _list_root_entries(root: Path) -> tuple[list[FileEntry], bool]:
+    """Depth/entry-bounded walk of ``root`` → ``(entries, truncated)``.
+
+    Same exclusions as the workspace ZIP (``.git``/``__pycache__``/
+    ``node_modules``/``.venv`` dirs at any depth, ``*.pyc`` files) — the
+    browser shows the artifact, not its noise. Symlinks are never followed
+    or listed (candidate content could point outside the jail).
+    """
+    entries: list[FileEntry] = []
+    truncated = False
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = Path(dirpath).relative_to(root)
+        depth = len(rel_dir.parts)
+        if depth > 0:
+            entries.append(
+                FileEntry(path=rel_dir.as_posix(), kind="dir", size=None)
+            )
+            if len(entries) >= _BROWSE_MAX_ENTRIES:
+                truncated = True
+                break
+        # Prune noise dirs at any depth + symlinked dirs (never descended,
+        # but keep them out of the walk for clarity).
+        dirnames[:] = sorted(
+            d
+            for d in dirnames
+            if d not in _ZIP_EXCLUDED_DIRS
+            and not (Path(dirpath) / d).is_symlink()
+        )
+        if depth >= _BROWSE_MAX_DEPTH:
+            if dirnames or filenames:
+                truncated = True
+            dirnames[:] = []
+            continue
+        for name in sorted(filenames):
+            if name in _ZIP_EXCLUDED_DIRS or name.endswith(".pyc"):
+                continue
+            p = Path(dirpath) / name
+            if p.is_symlink() or not p.is_file():
+                continue
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            rel = name if depth == 0 else (rel_dir / name).as_posix()
+            entries.append(FileEntry(path=rel, kind="file", size=size))
+            if len(entries) >= _BROWSE_MAX_ENTRIES:
+                truncated = True
+                break
+        if truncated:
+            break
+    entries.sort(key=lambda e: e.path)
+    return entries[:_BROWSE_MAX_ENTRIES], truncated
+
+
+def _read_text_capped(path: Path) -> tuple[str | None, bool, int]:
+    """``(text, truncated, size)`` — ``text`` is None when the read head
+    carries NUL bytes (binary). Reads at most ``_FILE_TEXT_CAP_BYTES + 1``;
+    a mid-codepoint cut decodes with ``errors="replace"`` so a large text
+    file is never mislabeled binary."""
+    size = path.stat().st_size
+    with path.open("rb") as fh:
+        data = fh.read(_FILE_TEXT_CAP_BYTES + 1)
+    truncated = len(data) > _FILE_TEXT_CAP_BYTES
+    body = data[:_FILE_TEXT_CAP_BYTES]
+    if b"\x00" in body:
+        return None, truncated, size
+    return body.decode("utf-8", errors="replace"), truncated, size
+
+
+def _diff_side(file_path: Path | None) -> tuple[list[str] | None, bool, bool]:
+    """One side of a file diff → ``(lines, binary, truncated_input)``.
+
+    ``file_path`` None (absent on that side) → empty side — the diff
+    renders the other side as all +/-. A NUL-carrying side flips
+    ``binary`` so the caller returns no diff at all instead of garbage.
+    """
+    if file_path is None:
+        return None, False, False
+    try:
+        with file_path.open("rb") as fh:
+            data = fh.read(_DIFF_SIDE_CAP_BYTES + 1)
+    except OSError:
+        return None, False, False
+    truncated = len(data) > _DIFF_SIDE_CAP_BYTES
+    body = data[:_DIFF_SIDE_CAP_BYTES]
+    if b"\x00" in body:
+        return None, True, truncated
+    return body.decode("utf-8", errors="replace").splitlines(), False, truncated
+
+
+def _file_diff(
+    session: Session,
+    sandbox: Sandbox,
+    root: Path,
+    other_id: UUID,
+    rel: str,
+) -> FileDiffOut:
+    """``?diff=<other>`` — unified diff of ``rel`` across both browse roots."""
+    other = session.get(Sandbox, other_id)
+    if other is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="other sandbox not found",
+        )
+    other_resolved = _browse_root(_artifact_jail(), other)
+    other_root = other_resolved[0] if other_resolved is not None else None
+
+    a_found = _resolve_in_root(root, rel)
+    b_found = _resolve_in_root(other_root, rel) if other_root is not None else None
+    if a_found is None and b_found is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="file not found on either sandbox",
+        )
+    resolved = a_found or b_found
+    assert resolved is not None  # the 404 above guarantees one side
+    rel_posix = resolved[1]
+
+    a_lines, a_binary, a_trunc = _diff_side(a_found[0] if a_found else None)
+    b_lines, b_binary, b_trunc = _diff_side(b_found[0] if b_found else None)
+
+    common = {
+        "sandbox_id": sandbox.id,
+        "other_sandbox_id": other_id,
+        "path": rel_posix,
+        "a_missing": a_found is None,
+        "b_missing": b_found is None,
+    }
+    if a_binary or b_binary:
+        return FileDiffOut(
+            **common, binary=True, truncated=a_trunc or b_trunc
+        )
+
+    identical = a_lines is not None and b_lines is not None and a_lines == b_lines
+    diff_text = ""
+    out_truncated = a_trunc or b_trunc
+    if not identical:
+        lines = list(
+            difflib.unified_diff(
+                a_lines or [],
+                b_lines or [],
+                fromfile=f"a/{rel_posix}",
+                tofile=f"b/{rel_posix}",
+                n=3,
+                lineterm="",
+            )
+        )
+        if len(lines) > _DIFF_MAX_LINES:
+            lines = lines[:_DIFF_MAX_LINES]
+            out_truncated = True
+        diff_text = "\n".join(lines)
+    return FileDiffOut(
+        **common,
+        identical=identical,
+        truncated=out_truncated,
+        diff=diff_text,
+    )
+
+
+@router.get("/api/sandboxes/{sandbox_id}/files", response_model=FileListOut)
+def list_sandbox_files(sandbox_id: UUID, session: DbSession) -> FileListOut:
+    """PR34 — jailed, depth/entry-bounded listing of the sandbox artifact.
+
+    Root = ``workspace/`` when the snapshot exists, else the artifact dir
+    (prompt cells: ``output.txt`` + transcript + meta live there).
+    """
+    sandbox = session.get(Sandbox, sandbox_id)
+    if sandbox is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="sandbox not found"
+        )
+    resolved = _browse_root(_artifact_jail(), sandbox)
+    if resolved is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="sandbox has no browsable artifact",
+        )
+    root, kind = resolved
+    entries, truncated = _list_root_entries(root)
+    return FileListOut(
+        sandbox_id=sandbox_id, root=kind, entries=entries, truncated=truncated
+    )
+
+
+@router.get("/api/sandboxes/{sandbox_id}/files/{path:path}", response_model=None)
+def get_sandbox_file(
+    sandbox_id: UUID,
+    path: str,
+    session: DbSession,
+    download: bool = False,
+    diff: UUID | None = None,
+) -> Response | FileContentOut | FileDiffOut:
+    """PR34 — read one browsed file, or diff it across sandboxes.
+
+    Default → :class:`FileContentOut` (size-capped text, ``binary`` flag on
+    undecodable content). ``?download=1`` → FileResponse attachment.
+    ``?diff=<other_sandbox_id>`` → :class:`FileDiffOut` unified diff of the
+    same path in both browse roots. Traversal → 404, same jail doctrine as
+    the artifact download.
+    """
+    sandbox = session.get(Sandbox, sandbox_id)
+    if sandbox is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="sandbox not found"
+        )
+    resolved = _browse_root(_artifact_jail(), sandbox)
+    if resolved is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="sandbox has no browsable artifact",
+        )
+    root, _kind = resolved
+
+    if diff is not None:
+        return _file_diff(session, sandbox, root, diff, path)
+
+    found = _resolve_in_root(root, path)
+    if found is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+        )
+    file_path, rel_posix = found
+
+    if download:
+        return FileResponse(file_path, filename=file_path.name)
+
+    text, truncated, size = _read_text_capped(file_path)
+    return FileContentOut(
+        sandbox_id=sandbox_id,
+        path=rel_posix,
+        size=size,
+        truncated=truncated,
+        binary=text is None,
+        text=text,
+    )
