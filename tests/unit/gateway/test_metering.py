@@ -221,3 +221,50 @@ def test_sandbox_token_budget_reads_claim() -> None:
     # service/eval creds mint no claim → exempt from the per-cell gate
     service = CredClaims(run_id=str(uuid.uuid4()), sandbox_id=None, iat=0, exp=1)
     assert metering.sandbox_token_budget(service) is None
+
+
+def test_usage_from_anthropic_preserves_cache_read_split() -> None:
+    """PR28: Anthropic's cache_read_input_tokens folds into prompt AND rides
+    separately — a declared cache rate can bill the discounted share."""
+    usage = metering.usage_from_anthropic(
+        {
+            "usage": {
+                "input_tokens": 70,
+                "cache_read_input_tokens": 30,
+                "output_tokens": 10,
+            }
+        }
+    )
+    assert usage == {
+        "prompt_tokens": 100,
+        "completion_tokens": 10,
+        "total_tokens": 110,
+        "cache_read_input_tokens": 30,
+    }
+
+
+def test_usage_from_response_preserves_cached_tokens() -> None:
+    """OpenAI prompt_tokens_details.cached_tokens (already inside
+    prompt_tokens) surfaces as cache_read_input_tokens."""
+    usage = metering.usage_from_response(
+        {
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+                "prompt_tokens_details": {"cached_tokens": 40},
+            }
+        }
+    )
+    assert usage["cache_read_input_tokens"] == 40
+    assert usage["prompt_tokens"] == 100  # still the full prompt side
+
+
+def test_usage_dicts_omit_cache_key_when_zero() -> None:
+    """No reported cache share → no key (payloads stay 3-field like before)."""
+    assert "cache_read_input_tokens" not in metering.usage_from_anthropic(
+        {"usage": {"input_tokens": 10, "output_tokens": 5}}
+    )
+    assert "cache_read_input_tokens" not in metering.usage_from_response(
+        {"usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+    )

@@ -134,23 +134,38 @@ def usage_from_response(response_json: Any) -> dict[str, int]:
     prompt = _int(usage.get("prompt_tokens"))
     completion = _int(usage.get("completion_tokens"))
     total = _int(usage.get("total_tokens")) or prompt + completion
-    return {
+    out: dict[str, int] = {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": total,
     }
+    # PR28: OpenAI's ``prompt_tokens`` already includes cached_tokens — the
+    # split rides separately so a declared cache-read rate can bill them.
+    details = usage.get("prompt_tokens_details")
+    cache = _int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+    if cache > 0:
+        out["cache_read_input_tokens"] = cache
+    return out
 
 
 def _to_int(v: Any) -> int:
     return v if isinstance(v, int) and not isinstance(v, bool) else 0
 
 
-def _usage_dict(prompt: int, completion: int) -> dict[str, int]:
-    return {
+def _usage_dict(
+    prompt: int, completion: int, *, cache_read: int = 0
+) -> dict[str, int]:
+    usage = {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": prompt + completion,
     }
+    # PR28: the cache-read split rides the usage payload only when the
+    # provider reported it — analytics/metering read the same field to bill
+    # those (already-folded-into-prompt) tokens at a declared cache rate.
+    if cache_read > 0:
+        usage["cache_read_input_tokens"] = cache_read
+    return usage
 
 
 def usage_from_anthropic(response_json: Any) -> dict[str, int]:
@@ -158,11 +173,13 @@ def usage_from_anthropic(response_json: Any) -> dict[str, int]:
     usage = response_json.get("usage") if isinstance(response_json, dict) else None
     if not isinstance(usage, dict):
         usage = {}
-    # Input-side tokens: fresh input plus cache-read/context tokens.
-    prompt = _to_int(usage.get("input_tokens")) + _to_int(
-        usage.get("cache_read_input_tokens")
+    # Input-side tokens: fresh input plus cache-read/context tokens; the
+    # cache-read share also rides separately for cache-rate billing (PR28).
+    cache_read = _to_int(usage.get("cache_read_input_tokens"))
+    prompt = _to_int(usage.get("input_tokens")) + cache_read
+    return _usage_dict(
+        prompt, _to_int(usage.get("output_tokens")), cache_read=cache_read
     )
-    return _usage_dict(prompt, _to_int(usage.get("output_tokens")))
 
 
 def usage_from_responses_api(response_json: Any) -> dict[str, int]:
@@ -177,8 +194,13 @@ def usage_from_responses_api(response_json: Any) -> dict[str, int]:
         usage = None
     if not isinstance(usage, dict):
         usage = {}
+    details = usage.get("input_tokens_details")
     return _usage_dict(
-        _to_int(usage.get("input_tokens")), _to_int(usage.get("output_tokens"))
+        _to_int(usage.get("input_tokens")),
+        _to_int(usage.get("output_tokens")),
+        cache_read=_to_int(details.get("cached_tokens"))
+        if isinstance(details, dict)
+        else 0,
     )
 
 
@@ -251,6 +273,7 @@ def _scan_metered_body(
     if saw_sse:
         anthropic_in = 0
         anthropic_out = 0
+        anthropic_cache = 0
         anthropic_usage_seen = False
         for obj in objects:
             _collect_error(obj)
@@ -260,9 +283,9 @@ def _scan_metered_body(
                     u = (obj.get("message") or {}).get("usage")
                     if isinstance(u, dict):
                         anthropic_usage_seen = True
-                        anthropic_in += _to_int(u.get("input_tokens")) + _to_int(
-                            u.get("cache_read_input_tokens")
-                        )
+                        frame_cache = _to_int(u.get("cache_read_input_tokens"))
+                        anthropic_cache += frame_cache
+                        anthropic_in += _to_int(u.get("input_tokens")) + frame_cache
                         anthropic_out += _to_int(u.get("output_tokens"))
                 elif etype == "message_delta":
                     u = obj.get("usage")
@@ -307,7 +330,9 @@ def _scan_metered_body(
                         if isinstance(t, str):
                             chars += len(t)
         if api == "anthropic" and anthropic_usage_seen:
-            usage = _usage_dict(anthropic_in, anthropic_out)
+            usage = _usage_dict(
+                anthropic_in, anthropic_out, cache_read=anthropic_cache
+            )
         return usage, chars, errors
 
     # --- non-SSE body: buffered JSON response (or garbage) ---
