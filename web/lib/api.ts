@@ -251,12 +251,20 @@ export interface Budgets {
   max_iters: number;
   token_budget: number;
   wall_clock_seconds: number;
+  /** PR28: optional per-sandbox token cap (null/undefined = no per-cell
+   * limit — a hot cell then only draws down the shared run ceiling). */
+  sandbox_token_budget?: number | null;
+  /** PR28: optional per-sandbox estimated-cost cap in USD. Only bites on
+   * priced models — unpriced cells have no honest rate to bill against. */
+  max_cost_usd?: number | null;
 }
 
 export const DEFAULT_BUDGETS: Budgets = {
   max_iters: 50,
   token_budget: 200_000,
   wall_clock_seconds: 3600,
+  sandbox_token_budget: null,
+  max_cost_usd: null,
 };
 
 export interface RunCreate {
@@ -741,10 +749,13 @@ export function rescoreRun(runId: string, body: RescoreIn = {}): Promise<Rescore
 // analytics (F9)
 // ---------------------------------------------------------------------------
 
-/** USD-per-million-token rate for one model; `local` = free/local inference. */
+/** USD-per-million-token rate for one model; `local` = free/local inference.
+ * `cache_read_per_mtok_usd` (PR28): discounted rate for cache-read input
+ * tokens — absent/null bills them at the input rate. */
 export interface ModelPrice {
   input_per_mtok_usd: number;
   output_per_mtok_usd: number;
+  cache_read_per_mtok_usd?: number | null;
   local?: boolean;
 }
 
@@ -845,13 +856,60 @@ export function getRunAnalytics(runId: string, priceModel?: string): Promise<Run
   );
 }
 
-/** Client-side cost estimate: tokens × rate. Mirrors api/pricing.py. */
+/** fnmatch-style glob test mirroring api/pricing.py::glob_matches —
+ * case-insensitive; a pattern with no "/" never matches a vendor/model id. */
+export function globMatch(pattern: string, model: string): boolean {
+  const pat = pattern.trim().toLowerCase();
+  const name = model.trim().toLowerCase();
+  if (!pat || !name) return false;
+  if (name.includes("/") && !pat.includes("/")) return false;
+  // translate fnmatch (* ? [seq]) to a regex — same semantics as Python's;
+  // a malformed pattern (e.g. unmatched "[") just fails to match.
+  try {
+    const re = new RegExp(
+      "^" +
+        pat
+          .replace(/[.+^${}()|\\]/g, "\\$&")
+          .replace(/\*/g, ".*")
+          .replace(/\?/g, ".") +
+        "$",
+    );
+    return re.test(name);
+  } catch {
+    return false;
+  }
+}
+
+/** Resolve a model to its rate in a merged price_table — mirrors
+ * PriceBook.key_for: exact key first (covers shadowed static keys), then
+ * glob-char keys in insertion order (the merged dict appends model_prices
+ * rows in declaration order after the static keys). */
+export function matchPrice(
+  model: string | null | undefined,
+  table: Record<string, ModelPrice>,
+): ModelPrice | undefined {
+  if (!model) return undefined;
+  const direct = table[model];
+  if (direct) return direct;
+  for (const key of Object.keys(table)) {
+    if (/[*?[]/.test(key) && globMatch(key, model)) return table[key];
+  }
+  return undefined;
+}
+
+/** Client-side cost estimate: tokens × rate. Mirrors api/pricing.py —
+ * cache-read tokens (inside `input`) bill at the cache rate when one is
+ * declared, else at the input rate. */
 export function estimateCostUsd(
   price: ModelPrice,
-  tokens: { input: number; output: number },
+  tokens: { input: number; output: number; cache_read?: number },
 ): number {
+  const cacheRate = price.cache_read_per_mtok_usd;
+  const cached =
+    cacheRate == null ? 0 : Math.min(tokens.cache_read ?? 0, tokens.input);
   return (
-    (tokens.input * price.input_per_mtok_usd +
+    ((tokens.input - cached) * price.input_per_mtok_usd +
+      cached * (cacheRate ?? 0) +
       tokens.output * price.output_per_mtok_usd) /
     1_000_000
   );
@@ -1352,4 +1410,74 @@ export function deleteRun(runId: string): Promise<RunDeleteOut> {
   return request<RunDeleteOut>(`/api/runs/${encodeURIComponent(runId)}`, {
     method: "DELETE",
   });
+}
+
+// ---------------------------------------------------------------------------
+// prices (PR28 — user-editable glob rate table layered over the static one)
+// ---------------------------------------------------------------------------
+
+/** One `model_prices` row — `model_glob` is an fnmatch pattern (`gpt-4*`);
+ * rows match in declaration order, first hit wins over the static table. */
+export interface PriceEntry {
+  id: string;
+  model_glob: string;
+  input_per_mtok_usd: number;
+  output_per_mtok_usd: number;
+  cache_read_per_mtok_usd: number | null;
+  local: boolean;
+  /** "user" (PUT /api/prices — never overwritten by sync) | "openrouter". */
+  source: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PricesOut {
+  prices: PriceEntry[];
+  /** Static fallback layer under the user table. */
+  static: Record<string, ModelPrice>;
+  /** POST /api/prices/sync is meaningful only when openrouter is configured. */
+  sync_available: boolean;
+}
+
+export interface PriceUpsert {
+  model_glob: string;
+  input_per_mtok_usd: number;
+  output_per_mtok_usd: number;
+  cache_read_per_mtok_usd?: number | null;
+  local?: boolean;
+}
+
+export interface PriceSyncOut {
+  synced: number;
+  added: number;
+  updated: number;
+  skipped_user: number;
+  skipped_unpriced: number;
+  remote_count: number;
+  prices: PriceEntry[];
+}
+
+export function getPrices(): Promise<PricesOut> {
+  return request<PricesOut>("/api/prices");
+}
+
+/** Upsert a user rate by `model_glob` — matching row keeps its
+ * declaration-order position, its rate updates. */
+export function upsertPrice(body: PriceUpsert): Promise<PriceEntry> {
+  return request<PriceEntry>("/api/prices", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+export function deletePrice(id: string): Promise<void> {
+  return request<void>(`/api/prices/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Pull OpenRouter /models pricing into model_prices (via the gateway's
+ * pass-through — the api never talks to providers directly). */
+export function syncPrices(): Promise<PriceSyncOut> {
+  return request<PriceSyncOut>("/api/prices/sync", { method: "POST" });
 }

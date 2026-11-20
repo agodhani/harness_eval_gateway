@@ -25,7 +25,10 @@ import {
   getRunResults,
   getRunTrends,
   harnessConfigLabel,
+  matchPrice,
   TERMINAL_RUN_STATUSES,
+  type ModelPrice,
+  type PriceEntry,
   type RunAnalytics,
   type RunOut,
   type RunResults,
@@ -42,6 +45,7 @@ import {
   Loading,
   statusTone,
 } from "@/components/ui";
+import AddRate from "@/components/AddRate";
 import {
   C,
   ColoredBars,
@@ -89,6 +93,10 @@ export default function AnalysisClient({ runId }: { runId: string }) {
   const [fatal, setFatal] = useState<string | null>(null);
   const [notes, setNotes] = useState<{ results?: string; analytics?: string; trends?: string }>({});
   const [priceModel, setPriceModel] = useState<string | null>(null);
+  // PR28: rates added inline via "+ add rate" merge into the picker table —
+  // the analytics payload was fetched before they existed (they persist
+  // server-side as model_prices rows for the next fetch).
+  const [extraPrices, setExtraPrices] = useState<Record<string, ModelPrice>>({});
 
   const refresh = useCallback(
     async (silent = true) => {
@@ -233,6 +241,13 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     [sbs],
   );
 
+  /** PR28: the effective picker table — server price_table plus rates added
+   * inline this session (persisted server-side as model_prices rows). */
+  const priceTable = useMemo(
+    () => ({ ...(data.analytics?.price_table ?? {}), ...extraPrices }),
+    [data.analytics, extraPrices],
+  );
+
   // Cost recompute — mirrors the server: an explicit pick reprices every
   // sandbox uniformly; auto ("") costs each sandbox at its OWN model's
   // rate (PR14 — SandboxAnalytics.price_model is the server-resolved key,
@@ -240,9 +255,9 @@ export default function AnalysisClient({ runId }: { runId: string }) {
   const priceFor = useCallback(
     (sb: { price_model?: string | null }) => {
       const key = priceModel ?? sb.price_model;
-      return key ? data.analytics?.price_table?.[key] : undefined;
+      return key ? priceTable[key] : undefined;
     },
-    [data.analytics, priceModel],
+    [priceTable, priceModel],
   );
   const evaluatorModel =
     data.results?.evaluator_model ??
@@ -250,16 +265,17 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     data.run?.model_name ??
     data.analytics?.model_name ??
     null;
-  // Judge price mirrors the server: the evaluator model's own rate when
-  // listed, else the explicit pick (what-if) — unlisted and unpicked means
-  // unpriced, never another model's rate (PR21).
+  // Judge price mirrors the server: the evaluator model's own resolved rate
+  // (glob-aware via matchPrice, PR28), else the explicit pick (what-if) —
+  // unlisted and unpicked means unpriced, never another model's rate (PR21).
   const evalPrice = useMemo(() => {
-    const table = data.analytics?.price_table;
-    if (!table) return undefined;
-    if (evaluatorModel && table[evaluatorModel]) return table[evaluatorModel];
-    if (priceModel && table[priceModel]) return table[priceModel];
+    if (evaluatorModel) {
+      const p = matchPrice(evaluatorModel, priceTable);
+      if (p) return p;
+    }
+    if (priceModel && priceTable[priceModel]) return priceTable[priceModel];
     return undefined;
-  }, [data.analytics, evaluatorModel, priceModel]);
+  }, [priceTable, evaluatorModel, priceModel]);
 
   const costRows: Row[] = useMemo(
     () =>
@@ -493,30 +509,47 @@ export default function AnalysisClient({ runId }: { runId: string }) {
           title="Estimated cost per sandbox"
           className="card--flush"
           actions={
-            <label className="row" style={{ gap: "0.4rem", fontSize: "0.8rem" }}>
-              <span className="faint">at</span>
-              <select
-                className="select"
-                style={{ width: "auto", padding: "0.3rem 0.5rem", fontSize: "0.8rem" }}
-                value={priceModel ?? ""}
-                onChange={(e) => setPriceModel(e.target.value || null)}
-                aria-label="Estimated cost at"
-              >
-                <option value="">auto — per-model</option>
-                {Object.entries(data.analytics?.price_table ?? {}).map(([name, p]) => (
-                  <option key={name} value={name}>
-                    {p.local ? `${name} (local — $0)` : name}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <div className="row" style={{ gap: "0.6rem", flexWrap: "wrap" }}>
+              <label className="row" style={{ gap: "0.4rem", fontSize: "0.8rem" }}>
+                <span className="faint">at</span>
+                <select
+                  className="select"
+                  style={{ width: "auto", padding: "0.3rem 0.5rem", fontSize: "0.8rem" }}
+                  value={priceModel ?? ""}
+                  onChange={(e) => setPriceModel(e.target.value || null)}
+                  aria-label="Estimated cost at"
+                >
+                  <option value="">auto — per-model</option>
+                  {Object.entries(priceTable).map(([name, p]) => (
+                    <option key={name} value={name}>
+                      {p.local ? `${name} (local — $0)` : name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <AddRate
+                suggestGlob={sbs.find((sb) => sb.price_model == null)?.model ?? ""}
+                onAdded={(entry: PriceEntry) => {
+                  setExtraPrices((m) => ({
+                    ...m,
+                    [entry.model_glob]: {
+                      input_per_mtok_usd: entry.input_per_mtok_usd,
+                      output_per_mtok_usd: entry.output_per_mtok_usd,
+                      cache_read_per_mtok_usd: entry.cache_read_per_mtok_usd,
+                      local: entry.local,
+                    },
+                  }));
+                  setPriceModel(entry.model_glob);
+                }}
+              />
+            </div>
           }
         >
           {notes.analytics && !data.analytics ? (
             <InfoNote>Metrics unavailable: {notes.analytics}</InfoNote>
           ) : sbs.length === 0 ? (
             <EmptyState>No sandbox metrics yet.</EmptyState>
-          ) : priceModel && data.analytics?.price_table?.[priceModel]?.local ? (
+          ) : priceModel && priceTable[priceModel]?.local ? (
             <InfoNote>
               Local model — $0 participant spend at <code>{priceModel}</code>. Pick a
               priced model above for an API-equivalent estimate.

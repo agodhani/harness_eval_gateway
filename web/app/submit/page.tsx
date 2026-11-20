@@ -406,6 +406,13 @@ export default function SubmitPage() {
       errs.max_iters = "max_iters must be 1–1000.";
     if (budgets.token_budget < 1000)
       errs.token_budget = "token_budget must be ≥ 1000 (per-run).";
+    if (
+      budgets.sandbox_token_budget != null &&
+      budgets.sandbox_token_budget < 1000
+    )
+      errs.sandbox_token_budget = "sandbox_token_budget must be ≥ 1000 when set.";
+    if (budgets.max_cost_usd != null && !(budgets.max_cost_usd > 0))
+      errs.max_cost_usd = "max_cost_usd must be > 0 when set.";
     if (budgets.wall_clock_seconds < 60 || budgets.wall_clock_seconds > 86400)
       errs.wall_clock_seconds = "wall_clock_seconds must be 60–86400.";
     if (sandboxCount > MAX_MATRIX_CELLS)
@@ -981,6 +988,62 @@ export default function SubmitPage() {
                     disabled={submitting}
                   />
                   {fieldErrors.wall_clock_seconds ? <span className="field__error">{fieldErrors.wall_clock_seconds}</span> : null}
+                </div>
+              </div>
+              <div className="input-row" style={{ marginTop: "0.6rem" }}>
+                <div className="field">
+                  <label className="field__label" htmlFor="sandbox_token_budget">
+                    Token budget per sandbox <span className="faint">(optional)</span>
+                  </label>
+                  <input
+                    id="sandbox_token_budget"
+                    className="input"
+                    type="number"
+                    min={1000}
+                    step={1000}
+                    placeholder="unset — shares the run budget"
+                    value={budgets.sandbox_token_budget ?? ""}
+                    onChange={(e) =>
+                      setBudgets({
+                        ...budgets,
+                        sandbox_token_budget:
+                          e.target.value === "" ? null : Number(e.target.value),
+                      })
+                    }
+                    disabled={submitting}
+                  />
+                  <span className="dim-desc">
+                    PR28: caps each cell&apos;s own tokens — a runaway cell starves
+                    itself, not its siblings.
+                  </span>
+                  {fieldErrors.sandbox_token_budget ? <span className="field__error">{fieldErrors.sandbox_token_budget}</span> : null}
+                </div>
+                <div className="field">
+                  <label className="field__label" htmlFor="max_cost_usd">
+                    Max cost per sandbox (USD) <span className="faint">(optional)</span>
+                  </label>
+                  <input
+                    id="max_cost_usd"
+                    className="input"
+                    type="number"
+                    min={0}
+                    step="any"
+                    placeholder="unset — no spend cap"
+                    value={budgets.max_cost_usd ?? ""}
+                    onChange={(e) =>
+                      setBudgets({
+                        ...budgets,
+                        max_cost_usd:
+                          e.target.value === "" ? null : Number(e.target.value),
+                      })
+                    }
+                    disabled={submitting}
+                  />
+                  <span className="dim-desc">
+                    Priced models only — each cell&apos;s estimated spend at list
+                    prices; unpriced models can&apos;t trip it.
+                  </span>
+                  {fieldErrors.max_cost_usd ? <span className="field__error">{fieldErrors.max_cost_usd}</span> : null}
                 </div>
               </div>
             </div>
