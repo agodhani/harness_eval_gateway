@@ -42,6 +42,10 @@ MANIFEST = {
     "llm_protocol": "openai-chat-completions",
     "cli": "python -m miniloop",
     "requires": ["gateway:/v1/chat/completions"],
+    # PR27: every ModelOptions key maps to an env knob the agent reads
+    # (MINILOOP_TEMPERATURE / MINILOOP_SEED / MAX_TOKENS /
+    # MINILOOP_REASONING_EFFORT → request-body fields).
+    "model_options": ["temperature", "seed", "max_tokens", "reasoning"],
 }
 
 
@@ -86,8 +90,14 @@ def env(
     max_tokens: int | None = None,
     skillpacks_root: str = "/opt/skillpacks",
     system_prompt_extra: str | None = None,
+    model_options: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Environment variables the miniloop agent reads (see agent.AgentConfig)."""
+    opts = dict(model_options or {})
+    # model_options.max_tokens reuses the MAX_TOKENS knob; the explicit
+    # ``max_tokens`` kwarg (evaluator/judge calls) wins when both are set.
+    if max_tokens is None and (mt := opts.get("max_tokens")) is not None:
+        max_tokens = int(mt)
     out = {
         "GATEWAY_BASE_URL": gateway_url,
         "GATEWAY_CRED": cred,
@@ -114,6 +124,13 @@ def env(
         out["MAX_TOKENS"] = str(max_tokens)
     if system_prompt_extra:
         out["SYSTEM_PROMPT_EXTRA"] = system_prompt_extra
+    # PR27 model_options → env knobs (AgentConfig.from_env reads them).
+    if (t := opts.get("temperature")) is not None:
+        out["MINILOOP_TEMPERATURE"] = str(t)
+    if (s := opts.get("seed")) is not None:
+        out["MINILOOP_SEED"] = str(s)
+    if r := opts.get("reasoning"):
+        out["MINILOOP_REASONING_EFFORT"] = str(r)
     return out
 
 
@@ -155,6 +172,7 @@ def launch(task: dict[str, Any]) -> dict[str, Any]:
         max_tokens=task.get("max_tokens"),
         skillpacks_root=task.get("skillpacks_root", "/opt/skillpacks"),
         system_prompt_extra=task.get("system_prompt_extra"),
+        model_options=task.get("model_options"),
     )
     return {
         "cmd": ["python", "-m", "miniloop"],

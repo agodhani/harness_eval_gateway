@@ -79,6 +79,10 @@ class AgentConfig:
     max_iters: int = 50
     max_tokens: int = 4096
     temperature: float = 0.2
+    # PR27 model_options (env knobs — see adapter.env): request-body ``seed``
+    # (None = key omitted) and ``reasoning_effort`` override.
+    seed: int | None = None
+    reasoning_effort: str = "none"
     num_ctx: int = 32768
     keep_alive: str = "30m"
     compact_ratio: float = 0.7
@@ -130,6 +134,18 @@ class AgentConfig:
             )
         except ValueError:
             request_timeout = 960.0
+        try:
+            temperature = float(env.get("MINILOOP_TEMPERATURE", "0.2"))
+        except ValueError:
+            temperature = 0.2
+        try:
+            seed_raw = (env.get("MINILOOP_SEED") or "").strip()
+            seed = int(seed_raw) if seed_raw else None
+        except ValueError:
+            seed = None
+        reasoning_effort = (
+            env.get("MINILOOP_REASONING_EFFORT") or "none"
+        ).strip() or "none"
 
         return cls(
             gateway_base_url=base,
@@ -141,6 +157,9 @@ class AgentConfig:
             ingest_token=(env.get("INGEST_TOKEN") or "").strip() or None,
             max_iters=max_iters,
             max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
+            reasoning_effort=reasoning_effort,
             system_prompt_extra=(env.get("SYSTEM_PROMPT_EXTRA") or "").strip(),
             nudge_retries=nudge_retries,
             request_timeout=request_timeout,
@@ -176,6 +195,8 @@ class HttpChatClient:
         num_ctx: int = 32768,
         keep_alive: str = "30m",
         max_tokens: int = 4096,
+        seed: int | None = None,
+        reasoning_effort: str = "none",
     ) -> None:
         headers = {"Content-Type": "application/json"}
         if cred:
@@ -191,13 +212,15 @@ class HttpChatClient:
             "temperature": temperature,
             # "none" asks reasoning-capable upstreams (e.g. qwen3) to skip
             # thinking blocks; unknown fields are ignored by Ollama.
-            "reasoning_effort": "none",
+            "reasoning_effort": reasoning_effort,
             "num_ctx": num_ctx,
             "keep_alive": keep_alive,
             "max_tokens": max_tokens,
             # Ollama extension: disables qwen3-style thinking when supported.
             "think": False,
         }
+        if seed is not None:
+            self._params["seed"] = seed
         if extra_body:
             self._params.update(extra_body)
 
@@ -652,6 +675,8 @@ def main(argv: list[str] | None = None) -> int:
             num_ctx=cfg.num_ctx,
             keep_alive=cfg.keep_alive,
             max_tokens=cfg.max_tokens,
+            seed=cfg.seed,
+            reasoning_effort=cfg.reasoning_effort,
         )
         ctx = ToolContext(workspace=cfg.workspace, emitter=emitter, skills=skills)
         agent = Agent(
