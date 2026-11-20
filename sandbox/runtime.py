@@ -92,6 +92,11 @@ class SpawnResult:
     container_id: str
     container_name: str
     image: str
+    #: PR24 — content hash of the workspace's seed copy, or None when the
+    #: spec carried no ``seed_host_path`` (unseeded run). The orchestrator
+    #: records it as ``harness_config.seed_sha`` — identical values across
+    #: the matrix prove identical starting bytes.
+    seed_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -376,6 +381,17 @@ class SandboxRuntime:
         ws.mkdir(parents=True, exist_ok=True)
         ws = ws.resolve()
 
+        # PR24 — task-input seed: populate the workspace from the prepared
+        # seed tree BEFORE the container starts. ``copy_seed`` returns the
+        # copied tree's content hash — the same bytes land in every cell,
+        # proven by the identical ``seed_sha`` the orchestrator stamps on
+        # each sandbox's harness_config.
+        seed_sha: str | None = None
+        if spec.seed_host_path is not None:
+            from sandbox.seeds import copy_seed
+
+            seed_sha = copy_seed(Path(spec.seed_host_path), ws)
+
         env = {**_DEFAULT_ENV, **spec.env}
         args = [
             "run",
@@ -456,6 +472,7 @@ class SandboxRuntime:
             container_id=container_id,
             container_name=name,
             image=spec.image,
+            seed_sha=seed_sha,
         )
 
     def _write_state(

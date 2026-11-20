@@ -173,6 +173,72 @@ class BudgetsIn(BaseModel):
 MAX_MATRIX_CELLS = 32
 
 
+class TaskInputsIn(BaseModel):
+    """PR24 — optional task inputs seeding every sandbox workspace.
+
+    Exactly one source:
+
+    - ``repo_url`` — a PUBLIC git repo (https:// only), shallow-cloned at
+      ``ref`` (branch/tag/commit sha; remote HEAD when omitted). The clone
+      is pinned at submit-visible precision: provisioning records the
+      resolved sha in ``harness_config.seed.resolved_sha``.
+    - ``archive_id`` — an upload id from ``POST /api/uploads`` (a zip/tar
+      archive staged under ``<data>/uploads/<id>/``).
+
+    The run spec's ``task_inputs`` is persisted verbatim into ``run.config``;
+    provisioning materializes it once under ``<data>/seeds/<run_id>/`` and
+    copies it into every matrix cell's workspace before the agent starts —
+    identical bytes per cell, proven by the recorded ``seed_sha``.
+
+    Preset-task note (feat/pr22-presets): the preset frontmatter hint for
+    this is ``seed`` — ``seed: <repo-url>`` maps to ``{"repo_url": ...}``.
+    """
+
+    repo_url: Annotated[str, StringConstraints(strip_whitespace=True)] | None = (
+        Field(default=None, max_length=2000)
+    )
+    ref: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, max_length=255
+    )
+    archive_id: Annotated[str, StringConstraints(strip_whitespace=True)] | None = (
+        Field(default=None, max_length=64)
+    )
+
+    @field_validator("repo_url")
+    @classmethod
+    def _repo_url_https(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not v.startswith("https://"):
+            raise ValueError(
+                "repo_url must be an https:// URL — public git only "
+                "(no ssh://, git://, or file:// seeds)"
+            )
+        return v
+
+    @field_validator("archive_id")
+    @classmethod
+    def _archive_id_uuid(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        try:
+            return str(uuid.UUID(v))
+        except ValueError:
+            raise ValueError("archive_id must be an upload id (uuid) from POST /api/uploads") from None
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> TaskInputsIn:
+        has_repo = bool(self.repo_url)
+        has_archive = bool(self.archive_id)
+        if has_repo == has_archive:
+            raise ValueError(
+                "task_inputs takes exactly one source: repo_url OR archive_id"
+            )
+        if self.ref and not has_repo:
+            raise ValueError("ref only applies to repo_url seeds")
+        return self
+
+
 class RunCreate(BaseModel):
     """POST /api/runs body — one evaluation submission."""
 
@@ -198,6 +264,9 @@ class RunCreate(BaseModel):
         Field(default=None, max_length=255)
     )
     budgets: BudgetsIn = Field(default_factory=BudgetsIn)
+    # PR24 — seed every sandbox workspace from a repo or uploaded archive.
+    # None = the historical empty-workspace behavior.
+    task_inputs: TaskInputsIn | None = None
 
     @model_validator(mode="after")
     def _normalize_models(self) -> RunCreate:
@@ -310,6 +379,23 @@ class RunDeleteOut(BaseModel):
     """
 
     status: Literal["cancelled", "deleted"]
+
+
+# ---------------------------------------------------------------------------
+# PR24 — task-input archive uploads (api/routers/uploads.py)
+# ---------------------------------------------------------------------------
+
+
+class UploadOut(BaseModel):
+    """A staged task-input archive — ``id`` is the token
+    ``RunCreate.task_inputs.archive_id`` consumes."""
+
+    id: uuid.UUID
+    filename: str  # original upload name (display only — never a path part)
+    size: int  # raw archive bytes
+    sha256: str  # raw archive bytes hash
+    kind: str  # detected "zip" | "tar"
+    uploaded_at: str
 
 
 # ---------------------------------------------------------------------------

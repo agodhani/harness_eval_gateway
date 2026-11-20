@@ -39,6 +39,7 @@ from orchestrator import events as orch_events
 from orchestrator import pacing, provision, runner, state_machine
 from orchestrator.matrix import participant_models, run_models
 from orchestrator.rubric import RubricContent
+from sandbox import seeds
 from skillpack_import.store import imported_root
 
 log = logging.getLogger(__name__)
@@ -165,6 +166,25 @@ def _validate_harness_configs(body: RunCreate) -> None:
         )
 
 
+def _validate_task_inputs(body: RunCreate) -> None:
+    """PR24 — reject a ``task_inputs.archive_id`` that doesn't resolve to a
+    staged upload BEFORE the run persists (the schema already enforced the
+    shape; this checks the store — a dangling id would otherwise only fail
+    at provisioning time)."""
+    ti = body.task_inputs
+    if ti is None or not ti.archive_id:
+        return
+    root = seeds.uploads_root(get_settings())
+    if seeds.resolve_upload_archive(root, ti.archive_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"task_inputs.archive_id {ti.archive_id!r} does not match a "
+                "staged upload — POST the archive to /api/uploads first"
+            ),
+        )
+
+
 # ---------------------------------------------------------------------------
 # endpoints
 # ---------------------------------------------------------------------------
@@ -174,6 +194,7 @@ def _validate_harness_configs(body: RunCreate) -> None:
 async def create_run(body: RunCreate, session: DbSession) -> RunOut:
     """Submit a run: persist the spec, kick off rubric drafting in background."""
     _validate_harness_configs(body)
+    _validate_task_inputs(body)
     # Best-effort provider-catalog check — warnings on absent models, a hard
     # 422 on provider-reported tool-capability mismatches. Catalog fetch
     # failures skip validation entirely (offline tolerance).
@@ -197,6 +218,15 @@ async def create_run(body: RunCreate, session: DbSession) -> RunOut:
         "models": models,
         "evaluator_model": evaluator_model,
         "budgets": body.budgets.model_dump(),
+        # PR24: the seed spec — only present on seeded runs (unseeded keeps
+        # the legacy config shape). Provisioning materializes it once and
+        # copies it into every cell's workspace; results echo it back so
+        # the UI can show what seeded the run.
+        **(
+            {"task_inputs": body.task_inputs.model_dump(exclude_none=True)}
+            if body.task_inputs is not None
+            else {}
+        ),
     }
     # Judge == any participant model flags non-independent scoring; pins
     # count as participants even when outside the run's model list.
@@ -374,16 +404,23 @@ def _hard_delete_run(session: Session, run: Run) -> None:
     session.execute(delete(Run).where(Run.id == run.id))
 
 
-def _remove_artifact_dir(run_id: uuid.UUID) -> None:
-    """Best-effort ``<ARTIFACT_ROOT>/<run_id>/`` removal — jailed like the
-    download endpoint; a failure only leaves files behind, never 500s."""
+def _remove_data_dir(jail: Path, run_id: uuid.UUID, *, label: str) -> None:
+    """Best-effort ``<jail>/<run_id>/`` removal — jailed like the download
+    endpoint; a failure only leaves files behind, never 500s."""
     try:
-        jail = Path(get_settings().ARTIFACT_ROOT).resolve()
         target = (jail / str(run_id)).resolve()
         if target != jail and jail in target.parents and target.is_dir():
             shutil.rmtree(target)
     except OSError:
-        log.warning("could not remove artifact dir for run %s", run_id, exc_info=True)
+        log.warning("could not remove %s dir for run %s", label, run_id, exc_info=True)
+
+
+def _remove_artifact_dir(run_id: uuid.UUID) -> None:
+    """Best-effort removal of the run's data-tree dirs — artifacts AND the
+    materialized seed (PR24: ``<data>/seeds/<run_id>/``)."""
+    artifact_jail = Path(get_settings().ARTIFACT_ROOT).resolve()
+    _remove_data_dir(artifact_jail, run_id, label="artifact")
+    _remove_data_dir(artifact_jail.parent / "seeds", run_id, label="seed")
 
 
 @router.delete("/{run_id}")

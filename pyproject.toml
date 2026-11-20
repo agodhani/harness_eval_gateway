@@ -13,6 +13,7 @@ dependencies = [
     "pydantic-settings>=2.16.2",
     "pytest>=9.2.0",
     "pytest-asyncio>=1.4.1.post1",
+    "python-multipart>=0.0.34",
     "sqlalchemy>=2",
     "uvicorn[standard]>=0.54.0",
 ]
