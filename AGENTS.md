@@ -37,6 +37,9 @@ adapters are added.
   with an identical clean initial repo/workspace as its siblings.
 - **Harness adapter** — per-harness plugin: knows how to install, configure,
   launch, observe, and terminate a given agent CLI inside a sandbox.
+- **Prompt cell** — a no-sandbox matrix cell (`adapter: "prompt"`): one
+  gateway-metered chat call from the orchestrator process, no container.
+  Same sandbox row / cred / artifact / evaluation / scoring pipeline.
 - **AI gateway** — lightweight custom proxy; the only egress route for model
   traffic. Metering, event capture, cost accounting, budget enforcement.
 - **Event** — structured, timestamped record (LLM request/response, tool call,
@@ -235,6 +238,25 @@ gateway's worst-case silent hold on one call — (1 +
 `UPSTREAM_RETRY_ATTEMPTS`) × `UPSTREAM_TIMEOUT_SECONDS` + total retry
 backoff (~915s under the shipped defaults) — an agent that gives up
 first abandons a call the gateway is still paying for upstream.
+
+**Pseudo-adapter (PR25):** `prompt` is selectable (manifest +
+`selectable_adapter_names()`) but has NO adapter module — it is absent
+from `adapter_names()` and `get_adapter("prompt")` raises a no-sandbox
+`KeyError`. Matrix cells with `adapter == "prompt"` skip `spawn_one`
+entirely and route to `orchestrator/prompt_cell.py::run_prompt_cell`,
+which runs the ordinary sandbox row through a single
+`{GATEWAY_URL}/v1/chat/completions` call on a sandbox-scoped cred (one
+retry on upstream 5xx/timeout; 4xx fails immediately), writes
+`output.txt` + `meta.json` + `transcript.log` into the standard
+artifact dir, emits `run_started` + `terminal_state` +
+`sandbox_finalized`, and finishes `done`/`harness_complete`. The run's
+`wall_clock_seconds` bounds the cell like a container cap — a monotonic
+deadline cancels an in-flight call and skips the remaining retry
+(terminal `timeout`, reason `wall_clock`). Prompt and
+container cells interleave in one run; evaluation receives
+`prompt_output_path` so `output.txt` stages as the submission.
+`system_prompt_extra` becomes a `system` message. Preview/thumbnail
+endpoints 404 early for prompt cells.
 
 **Default skill packs** (named presets, vendored under `skillpacks/`):
 `superpowers`, `mattpocock-skills`, `spec-kit`.
@@ -631,7 +653,7 @@ or tests change.
   grouped/stacked bars + a composed bar-line trend under React 19 / Next 16;
   themed via hexes mirroring globals.css tokens (no CSS-var reads). The
   cross-run trends endpoint (`GET /api/analytics/runs`) prices each point's
-  cells at their own model's rate (unlisted → the run's resolved rate)
+  cells at their own model's rate (unlisted → unpriced, null cost)
   unless `?price_model=` forces uniform
   repricing — same "estimate, not billing" framing as F9.
 - **Rubric versions are immutable** (F14): post-run edits INSERT a new
@@ -665,6 +687,17 @@ or tests change.
   (≤64, whitespace-normalized) lands on `sandboxes.name`; `spawn_one` fills
   blanks with `<adapter>-<shortid>` once the UUID exists. All UI surfaces
   read the column — no per-component re-derivation to drift.
+- **Unlisted models are unpriced, not fallback-priced (PR21)** —
+  `resolve_price_model` returns `None` for models absent from
+  `PRICE_TABLE`; analytics emit `price_model`/`estimated_cost_usd`/
+  `evaluator_cost_usd` = null (never the first table entry's rate) and the
+  UI renders "unpriced". Explicit `?price_model=` still reprices uniformly;
+  unknown keys stay 422. Same audit batch: run-detail controls mirror
+  DELETE semantics (cancel only `submitted`/`rubric_review`/`queued`;
+  terminal runs hard-delete), the runs list paginates via `?offset`
+  ("Load more"), landing copy describes the config × model matrix, and the
+  results `total` row is the weighted scale-normalised aggregate
+  (`web/lib/scoreMath.ts`), not a raw Σ.
 
 ## Working conventions
 

@@ -549,7 +549,8 @@ class EvaluatorActivity(BaseModel):
     llm_turns: int = 0
     tokens: TokenUsage = Field(default_factory=TokenUsage)
     errors: int = 0
-    estimated_cost_usd: float = 0.0
+    # None when the evaluator model isn't in the price table (unpriced).
+    estimated_cost_usd: float | None = None
 
 
 class SandboxAnalytics(BaseModel):
@@ -564,9 +565,10 @@ class SandboxAnalytics(BaseModel):
     harness_config: dict[str, Any] = Field(default_factory=dict)
     # PR14: the participant model this sandbox ran (config ``model`` cell,
     # else the run's ``model_name``) + the price-table key its
-    # ``estimated_cost_usd`` was computed at.
+    # ``estimated_cost_usd`` was computed at — None when the model isn't
+    # listed (unpriced, PR21 — never a guessed rate).
     model: str = ""
-    price_model: str = ""
+    price_model: str | None = None
     status: str
     terminal_reason: str | None = None
     # Monitor flagged a done-ish terminal state on an empty workspace
@@ -583,7 +585,7 @@ class SandboxAnalytics(BaseModel):
     test_executions: int = 0
     errors: int = 0
     wall_clock_seconds: float = 0.0
-    estimated_cost_usd: float = 0.0
+    estimated_cost_usd: float | None = None
     evaluator: EvaluatorActivity | None = None
 
 
@@ -599,7 +601,8 @@ class ModelAnalytics(BaseModel):
     model: str
     # Price-table key this model's ``estimated_cost_usd`` was computed at
     # (its own rate in auto mode, the uniform ``?price_model=`` otherwise).
-    price_model: str = ""
+    # None when the model isn't listed (unpriced, PR21).
+    price_model: str | None = None
     sandbox_count: int = 0
     llm_turns: int = 0
     tokens: TokenUsage = Field(default_factory=TokenUsage)
@@ -611,7 +614,7 @@ class ModelAnalytics(BaseModel):
     test_executions: int = 0
     errors: int = 0
     wall_clock_seconds: float = 0.0
-    estimated_cost_usd: float = 0.0
+    estimated_cost_usd: float | None = None
     evaluator: EvaluatorActivity | None = None
 
 
@@ -622,7 +625,7 @@ class RunAnalytics(BaseModel):
     model_name: str
     # The explicit ``?price_model=`` repricing basis, or None for auto mode —
     # each sandbox (and model rollup) costed at its OWN model's listed rate,
-    # falling back to the run's resolved rate for unlisted models. Mirrors
+    # unpriced (null cost) for unlisted models. Mirrors
     # ``RunTrends.price_model``.
     price_model: str | None = None
     price_table: dict[str, ModelPrice] = Field(default_factory=dict)
@@ -676,12 +679,15 @@ class RunTrendPoint(BaseModel):
     evaluator_errors: int = 0
     # Which price_table entry ``estimated_cost_usd`` was computed at —
     # the explicit param, or the run's resolved rate in auto mode. None
-    # when auto mode priced cells at mixed per-model rates (no single key).
+    # when auto mode priced cells at mixed per-model rates (no single key)
+    # or when some cell is unpriced.
     price_model: str | None = None
-    estimated_cost_usd: float = 0.0
+    # Participant cost; None when any cell's model isn't listed — a partial
+    # total would read as complete, so the honest answer is "unpriced".
+    estimated_cost_usd: float | None = None
     # Judge tokens priced at the evaluator model's rate when it's listed,
-    # else the run's resolved rate (explicit param or resolved fallback).
-    evaluator_cost_usd: float = 0.0
+    # else the explicit ``?price_model=`` rate. None when unpriced.
+    evaluator_cost_usd: float | None = None
     # Mean of the run's ``overall`` score rows; None when unscored.
     mean_overall_score: float | None = None
 

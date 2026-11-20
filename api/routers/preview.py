@@ -67,6 +67,7 @@ from api.deps import get_db
 from db.models import Run, Sandbox
 from orchestrator import runner
 from orchestrator.events import emit
+from orchestrator.prompt_cell import is_prompt_config
 from sandbox.preview import (
     PURPOSE_PREVIEW,
     PURPOSE_THUMB,
@@ -301,6 +302,20 @@ def _find_sandbox(session: Session, run_id: UUID, sandbox_id: UUID) -> Sandbox:
     return sb
 
 
+def _guard_prompt_cell(sb: Sandbox) -> None:
+    """PR25: prompt cells produce no workspace — preview/thumbnail stacks
+    have nothing to serve. Fail fast with a specific reason rather than the
+    generic "no snapshot workspace" the resolve step would also yield."""
+    if is_prompt_config(sb.harness_config):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "prompt-only sandbox: the cell ran no container and has no "
+                "previewable workspace (its output.txt is downloadable)"
+            ),
+        )
+
+
 def _jail() -> Path:
     return Path(get_settings().ARTIFACT_ROOT).resolve()
 
@@ -344,6 +359,7 @@ async def start_preview(
     body: Annotated[PreviewStart | None, Body()] = None,
 ) -> PreviewOut:
     sb = _find_sandbox(session, run_id, sandbox_id)
+    _guard_prompt_cell(sb)
     mgr = get_preview_manager()
 
     existing = await asyncio.to_thread(mgr.list, sandbox_id=str(sandbox_id))
@@ -527,6 +543,7 @@ async def capture_thumbnail(
     chromium timeout); ``ThumbnailError`` → 502, no partial outputs.
     """
     sb = _find_sandbox(session, run_id, sandbox_id)
+    _guard_prompt_cell(sb)
     jail = _jail()
     # The write target is the same resolve_artifact_dir the GET/DELETE
     # paths probe — deriving it from workspace.parent would diverge when

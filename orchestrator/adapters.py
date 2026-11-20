@@ -35,6 +35,11 @@ ADAPTERS: dict[str, ModuleType] = {
 
 def get_adapter(name: str) -> ModuleType:
     """Return the adapter module for ``name``; raises KeyError if unknown."""
+    if name in no_sandbox_adapter_names():
+        raise KeyError(
+            f"{name!r} is a no-sandbox pseudo-adapter (PR25) — it has no "
+            "spawnable module; prompt cells route to orchestrator/prompt_cell.py"
+        )
     try:
         return ADAPTERS[name]
     except KeyError:
@@ -45,6 +50,23 @@ def get_adapter(name: str) -> ModuleType:
 
 def adapter_names() -> list[str]:
     return sorted(ADAPTERS)
+
+
+def no_sandbox_adapter_names() -> list[str]:
+    """Pseudo-adapter names selectable at submit that never spawn (PR25).
+
+    Imported lazily — ``orchestrator.prompt_cell`` pulls in ``provision``,
+    which imports this module.
+    """
+    from orchestrator import prompt_cell
+
+    return [prompt_cell.ADAPTER_NAME]
+
+
+def selectable_adapter_names() -> list[str]:
+    """Every valid ``harness_configs[].adapter`` at submit — real adapters
+    plus no-sandbox pseudo-adapters."""
+    return sorted({*adapter_names(), *no_sandbox_adapter_names()})
 
 
 def adapter_image(adapter: ModuleType, fallback: str) -> str:
@@ -76,8 +98,16 @@ def adapter_manifest(adapter: ModuleType, name: str) -> dict[str, Any]:
 
 
 def harnesses() -> list[dict[str, Any]]:
-    """Manifest list for ``GET /api/harnesses`` — registered adapter order."""
-    return [adapter_manifest(ADAPTERS[name], name) for name in adapter_names()]
+    """Manifest list for ``GET /api/harnesses`` — registered adapter order,
+    then no-sandbox pseudo-adapter manifests (PR25) so the submit form can
+    group them separately."""
+    from orchestrator import prompt_cell
+
+    manifests = [
+        adapter_manifest(ADAPTERS[name], name) for name in adapter_names()
+    ]
+    manifests.append(dict(prompt_cell.MANIFEST))
+    return manifests
 
 
 def parse_terminal_state(adapter: ModuleType, logs: str) -> str | None:

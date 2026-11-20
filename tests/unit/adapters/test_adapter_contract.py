@@ -249,8 +249,33 @@ def test_adapter_image_resolution() -> None:
 
 def test_harnesses_manifests() -> None:
     manifests = {m["name"]: m for m in orch.harnesses()}
-    assert set(manifests) == set(REGISTERED)
+    # Registered adapters + the PR25 prompt pseudo-adapter manifest.
+    assert set(manifests) == set(REGISTERED) | {"prompt"}
     for name in CLI_ADAPTERS:
         m = manifests[name]
         for key in ("display_name", "llm_protocol", "image", "requires"):
             assert m.get(key), f"{name} manifest missing {key}"
+
+
+# ---------------------------------------------------------------------------
+# PR25 — prompt pseudo-adapter (no-sandbox matrix cells)
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_is_selectable_but_not_spawnable() -> None:
+    """``prompt`` validates at submit but is deliberately absent from the
+    spawnable registry — it has no adapter module (the contract surface
+    above iterates ``adapter_names()``)."""
+    assert "prompt" in orch.selectable_adapter_names()
+    assert "prompt" in orch.no_sandbox_adapter_names()
+    assert "prompt" not in orch.adapter_names()
+    with pytest.raises(KeyError, match="no-sandbox"):
+        orch.get_adapter("prompt")
+
+
+def test_prompt_manifest_marks_no_sandbox() -> None:
+    m = next(m for m in orch.harnesses() if m["name"] == "prompt")
+    assert m["no_sandbox"] is True
+    for key in ("display_name", "llm_protocol", "description", "requires"):
+        assert m.get(key), f"prompt manifest missing {key}"
+    assert m["llm_protocol"] == "openai-chat-completions"

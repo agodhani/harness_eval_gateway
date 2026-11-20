@@ -46,6 +46,15 @@ export const TERMINAL_RUN_STATUSES: readonly string[] = [
   "cancelled",
 ];
 
+/** Statuses DELETE /api/runs/{id} cancels (nothing spawned yet). Runs in
+ * provisioning/running/evaluating 409 — in-flight sandbox teardown isn't
+ * supported; terminal runs hard-delete instead. */
+export const CANCELLABLE_RUN_STATUSES: readonly string[] = [
+  "submitted",
+  "rubric_review",
+  "queued",
+];
+
 export type SandboxStatus =
   | "provisioning"
   | "running"
@@ -133,7 +142,12 @@ export const ADAPTERS: readonly string[] = [
   "codex",
   "deepseek",
   "pi",
+  "prompt",
 ];
+
+/** PR25 pseudo-adapters that never spawn a container — offline fallback
+ * for {@link HarnessManifest.no_sandbox} when the API is unreachable. */
+export const NO_SANDBOX_ADAPTERS: readonly string[] = ["prompt"];
 
 /** Adapter manifest as served by GET /api/harnesses (Phase 2.5). */
 export interface HarnessManifest {
@@ -146,6 +160,8 @@ export interface HarnessManifest {
   install?: string;
   image?: string;
   requires?: string[];
+  /** PR25: pseudo-adapter — the cell runs one gateway call, no container. */
+  no_sandbox?: boolean;
   [key: string]: unknown;
 }
 
@@ -216,6 +232,19 @@ export interface HarnessConfig {
   /** PR14: pin this config to a single participant model, overriding the
    * run's model list for this config (one cell at the pinned model). */
   model?: string | null;
+}
+
+/** PR25: no-sandbox pseudo-adapters run a single model call and stage
+ * nothing — a skill_packs selection left over from a previous adapter
+ * pick must not ship on a prompt cell (the backend ignores it, but the
+ * payload shouldn't claim packs it never used). */
+export function sanitizeHarnessConfigs(
+  configs: HarnessConfig[],
+  isNoSandbox: (adapter: string) => boolean,
+): HarnessConfig[] {
+  return configs.map((c) =>
+    isNoSandbox(c.adapter) ? { ...c, skill_packs: [] } : c,
+  );
 }
 
 export interface Budgets {
@@ -743,12 +772,14 @@ export interface SkillCallStats {
 }
 
 /** Judge traffic attributed to the sandbox's stream (eval creds reuse the
- * participant sandbox_id); partitioned out of participant metrics. */
+ * participant sandbox_id); partitioned out of participant metrics.
+ * `estimated_cost_usd` is null when the evaluator model is unpriced (PR21 —
+ * unlisted models get no guessed rate). */
 export interface EvaluatorActivity {
   llm_turns: number;
   tokens: { input: number; output: number; total: number };
   errors: number;
-  estimated_cost_usd: number;
+  estimated_cost_usd: number | null;
 }
 
 export interface SandboxAnalytics {
@@ -758,9 +789,10 @@ export interface SandboxAnalytics {
   label: string;
   harness_config: Record<string, unknown>;
   /** PR14: participant model this sandbox ran + the price-table key its
-   * estimated_cost_usd was computed at. */
+   * estimated_cost_usd was computed at — null when the model isn't listed
+   * (unpriced, PR21). */
   model: string;
-  price_model: string;
+  price_model: string | null;
   status: string;
   terminal_reason: string | null;
   llm_turns: number;
@@ -773,14 +805,14 @@ export interface SandboxAnalytics {
   test_executions: number;
   errors: number;
   wall_clock_seconds: number;
-  estimated_cost_usd: number;
+  estimated_cost_usd: number | null;
   evaluator: EvaluatorActivity | null;
 }
 
 /** PR14 — per-model rollup across a run's sandboxes (compare-by-model). */
 export interface ModelAnalytics {
   model: string;
-  price_model: string;
+  price_model: string | null;
   sandbox_count: number;
   llm_turns: number;
   tokens: TokenUsage;
@@ -792,7 +824,7 @@ export interface ModelAnalytics {
   test_executions: number;
   errors: number;
   wall_clock_seconds: number;
-  estimated_cost_usd: number;
+  estimated_cost_usd: number | null;
   evaluator: EvaluatorActivity | null;
 }
 
@@ -849,11 +881,14 @@ export interface RunTrendPoint {
   evaluator_errors: number;
   /** Price-table key `estimated_cost_usd` was computed at — the explicit
    * param or the run's resolved rate; null when auto mode mixed per-model
-   * rates (no single honest key). */
+   * rates (no single honest key) or the point is unpriced. */
   price_model: string | null;
-  estimated_cost_usd: number;
-  /** Judge tokens priced at the evaluator model's rate when listed. */
-  evaluator_cost_usd: number;
+  /** Participant cost; null when any cell's model is unpriced (PR21 — a
+   * partial total would read as the run's full cost). */
+  estimated_cost_usd: number | null;
+  /** Judge tokens priced at the evaluator model's rate when listed; null
+   * when the evaluator model is unpriced. */
+  evaluator_cost_usd: number | null;
   /** Mean of the run's `overall` score rows; null when unscored. */
   mean_overall_score: number | null;
 }

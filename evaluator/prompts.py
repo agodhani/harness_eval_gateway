@@ -69,6 +69,7 @@ def build_eval_prompt(
     *,
     terminal_reason: str | None = None,
     prior_error: str | None = None,
+    submission_note: str | None = None,
 ) -> str:
     """Render EVAL_PROMPT.md — the judge's self-contained brief.
 
@@ -78,7 +79,10 @@ def build_eval_prompt(
     still judged on its merits. ``prior_error`` (error-feedback retry) is
     the previous attempt's ``eval_scores_failed`` detail — a judge respawned
     with the SAME prompt flakes identically, so the failure mode is spelled
-    out with an explicit output-shape reminder.
+    out with an explicit output-shape reminder. ``submission_note`` (PR25)
+    replaces the default "candidate submission" bullet for non-workspace
+    submissions — a prompt cell's staged ``output.txt`` needs different
+    framing so the judge doesn't hunt for a code repo.
     """
     summary = str(rubric.get("summary") or "").strip()
     term_line = (
@@ -98,6 +102,15 @@ before or after it — then read it back and fix it before calling `done`.
         if prior
         else ""
     )
+    submission_line = (
+        submission_note
+        if submission_note
+        else (
+            "**The candidate submission** — the files at the workspace root. "
+            "This is what the agent produced. **Do NOT modify, fix, or add "
+            "to these files.**"
+        )
+    )
     return f"""# Evaluation task — score the candidate submission
 
 You are a **strict, impartial evaluator** for a coding-agent benchmark. A
@@ -107,8 +120,7 @@ scoring. Your job is to read the rubric and the submission, then produce
 
 ## What is in this workspace (read-only inputs)
 
-- **The candidate submission** — the files at the workspace root. This is
-  what the agent produced. **Do NOT modify, fix, or add to these files.**
+- {submission_line}
 - **`rubric.json`** — the frozen rubric (full JSON, including task-specific
   `criteria`). Read it first.
 - **`ANALYSIS.md`** *(if present)* — objective measurements collected from

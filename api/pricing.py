@@ -7,6 +7,10 @@ models carry ``local=True`` + zero rates so the UI can label them
 The table is a module constant so tests (and the analytics router) can
 assert/iterate it directly. Rates are ballpark list prices — they power
 *estimates* for harness comparison, not invoices.
+
+Models absent from the table are **unpriced** (PR21): resolvers return
+``None`` and analytics emit a null cost rather than billing unknown traffic
+at an arbitrary fallback rate.
 """
 
 from __future__ import annotations
@@ -23,8 +27,6 @@ class ModelPrice(BaseModel):
     local: bool = False
 
 
-# Insertion order matters: the first entry is the fallback price model when a
-# run's model isn't listed and no explicit ?price_model= is given.
 PRICE_TABLE: dict[str, ModelPrice] = {
     "claude-sonnet-4.5": ModelPrice(input_per_mtok_usd=3.0, output_per_mtok_usd=15.0),
     "claude-opus-4.1": ModelPrice(input_per_mtok_usd=15.0, output_per_mtok_usd=75.0),
@@ -48,10 +50,11 @@ def resolve_price_model(price_model: str | None, run_model: str) -> str | None:
     """Pick the price-table key to cost a run at.
 
     ``price_model`` (the query param) wins when supplied and known; otherwise
-    the run's own model when it's in the table; otherwise the first table
-    entry. Returns None when an explicit ``price_model`` isn't in the table —
-    the router turns that into a 422.
+    the run's own model when it's in the table. Returns None when the
+    resolved model isn't listed — an unknown explicit ``price_model`` becomes
+    a 422, while an unlisted run model means *unpriced*: no cost estimate is
+    produced rather than billing the traffic at another model's rate.
     """
     if price_model is not None:
         return price_model if price_model in PRICE_TABLE else None
-    return run_model if run_model in PRICE_TABLE else next(iter(PRICE_TABLE))
+    return run_model if run_model in PRICE_TABLE else None

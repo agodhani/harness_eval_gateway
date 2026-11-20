@@ -434,7 +434,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   re-probe). Directory
   artifact downloads ship as ZIPs that filter `.git`, `__pycache__`,
   `*.pyc`, `node_modules`, `.venv` at any depth (download-side only — the
-  raw workspace on disk is untouched).
+  raw workspace on disk is untouched). **PR21:** the runs list paginates
+  via `?offset`/`?limit` (50-row pages + "Load more", poll refetches the
+  loaded head window), and run-detail action controls mirror DELETE
+  semantics — "Cancel run" renders only for `submitted`/`rubric_review`/
+  `queued`, terminal runs get "Delete run" (hard delete), in-flight
+  statuses show neither.
 - **Where:** `web/app/runs/` (list, detail, `results/`), results components,
   `api/routers/results.py` (results + scores + artifact-download endpoints)
 - **Verify:**
@@ -470,7 +475,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   selectors: merged mode toggles the sandbox filter (same state as the
   toolbar dropdown, whose options gain adapter labels); split mode (PR10)
   assigns the sandbox to a comparison lane instead. The strip refreshes
-  every 15s while the run is non-terminal.
+  every 15s while the run is non-terminal. **PR21 cost honesty:** models
+  absent from `PRICE_TABLE` are *unpriced* — `price_model`/
+  `estimated_cost_usd`/`evaluator_cost_usd` come back null rather than
+  billed at the first table entry's rate; an explicit `?price_model=`
+  still reprices uniformly (unknown key → 422). Every UI cost surface
+  renders "unpriced", never $0 or a stand-in model name.
 - **Where:** `api/pricing.py`, `api/routers/analytics.py`, response schemas
   in `api/schemas.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx`,
   `web/lib/api.ts` (`getRunAnalytics`, `estimateCostUsd`),
@@ -781,8 +791,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   + F8 scores, using **recharts** (v3.10.x — React-19-compatible, lightweight
   enough for the plain-CSS theme; palette hexes mirror the globals.css
   tokens in `analysis/charts.tsx`). Cards: score-by-rubric-dimension
-  (grouped horizontal bars + "Σ leader" line), tool-call mix (stacked,
-  top-7 tools + `other`), tokens in/out (stacked), LLM latency
+  (grouped horizontal bars + "weighted total leader" line), tool-call mix
+  (stacked, top-7 tools + `other`), tokens in/out (stacked), LLM latency
   (avg/p95/max), estimated cost per sandbox (price-model dropdown →
   client-side recompute, same trick as AnalyticsSection — local models show
   a note instead of empty bars), participant-vs-evaluator spend split
@@ -790,14 +800,21 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   cross-run trends ComposedChart (stacked participant+evaluator token bars
   + mean-overall-score line on a right 0–10 axis; newest 20 runs, current
   run accent-highlighted, hover shows run meta). The results score matrix
-  also gains a **totals row** (Σ dimension scores, `total`) — distinct from
-  the judge-reported `overall` — with the max cell flagged `leader`.
+  also gains a **totals row** (`total`) — distinct from the judge-reported
+  `overall` — with the max cell flagged `leader`. PR21 makes the total
+  honest: `web/lib/scoreMath.ts` computes a weighted, scale-normalised
+  aggregate — Σ ((score − min)/(max − min)) × weight over Σ weight,
+  rescaled to 0–10 — honouring each rubric dimension's `weight` +
+  `min_score`/`max_score` instead of a raw Σ; the analysis page's leader
+  line uses the same helper.
 - **API:** `GET /api/analytics/runs?limit=&price_model=` →
   `RunTrends{price_model|null, price_table, points[]}` — per-run roll-up of
   the same participant/evaluator event split (eval boundary per sandbox),
   latest-`overall`-score-per-sandbox mean, participant + judge tokens,
   errors, cost. No `price_model` → each point's participant cells costed
-  at their own model's listed rate (unlisted → the run's resolved rate;
+  at their own model's listed rate (PR21: any unlisted cell model makes
+  the whole point unpriced — `estimated_cost_usd:null`, since a partial
+  total would read as complete;
   `RunTrends.price_model:null` "auto" — a point's own `price_model` is the
   single applied key, or null when cells priced at mixed rates); with it →
   uniform repricing.
@@ -807,7 +824,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   endpoint), `api/schemas.py` (`RunTrendPoint`, `RunTrends`),
   `web/app/runs/[id]/analysis/` (`page.tsx`, `AnalysisClient.tsx`,
   `charts.tsx`), `web/app/runs/[id]/results/ResultsClient.tsx` (`row-total`
-  + `dimTotals`/`maxTotal` memos), `web/lib/api.ts` (`getRunTrends`,
+  + `dimTotals`/`maxTotal` memos), `web/lib/scoreMath.ts` (weighted-total
+  helper) + `web/lib/scoreMath.test.ts`, `web/lib/api.ts` (`getRunTrends`,
   `RunTrendPoint`, `RunTrends`), `web/lib/format.ts` (`formatNum`,
   `formatUsd`), `web/app/globals.css` (`.analysis-grid`, `.chart-tip`,
   `.chart-legend`, `.row-total`/`.score-cell--leader`), nav links in
@@ -820,7 +838,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     (120 chars), `limit` bounds (1/0/101), 422 unknown price_model, null
     mean for unscored runs.
   - API: `curl localhost:8001/api/analytics/runs?limit=20`
-  - UI: results page → matrix `total` row sums match the dimension columns
+  - UI: results page → matrix `total` row shows the weighted 0–10 aggregate
     and flags the leader; run detail → "Analysis →" → all cards render on a
     scored run; cost dropdown reprices the cost + split charts client-side.
 - **Depends on:** F6 (events), F7 (scores), F8 (results page), F9
@@ -1113,6 +1131,78 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     appears → click → live preview opens.
 - **Depends on:** F12 (preview stack, purpose label plumbing, jailed
   workspace resolution), F8 (results page)
+
+### F18 — Prompt-only matrix cells (no-sandbox adapter) ✅
+
+**What:** a pseudo-adapter `prompt` that makes a single LLM call per
+matrix cell with zero Docker containers — widening the matrix beyond
+coding agents to business-task evals (extraction, summarisation, Q&A,
+classification) while reusing the same creds, metering, artifacts,
+timeline, evaluation, and results pipeline.
+
+**Why:** the matrix already expands `configs × models`; prompt cells add
+a row type that answers "what does the model itself do with this prompt"
+— baseline-vs-harness comparisons and non-coding tasks that have no
+workspace to produce.
+
+- `prompt` appears in `/api/harnesses` + the submit picker under the
+  **No sandbox** group (manifest `no_sandbox: true`, no image/cli), but
+  is NOT in `adapter_names()` — `get_adapter("prompt")` raises a
+  no-sandbox `KeyError` and spawn-side lookups can't smuggle a
+  container-less cell into `spawn_one`.
+- Cell flow (`orchestrator/prompt_cell.py::run_prompt_cell`): create the
+  ordinary `Sandbox` row → mint the normal sandbox-scoped gateway cred
+  → `emit run_started` → POST `{GATEWAY_URL}/v1/chat/completions` with
+  `Bearer <cred>` — one retry on upstream 5xx/timeout only; 4xx fails
+  immediately. Gateway emits `llm_request`/`llm_response` + metering as
+  usual. Assistant text → `output.txt` (+ `meta.json` +
+  `transcript.log`) under the standard artifact dir; `sandbox_finalized`
+  + `terminal_state` events + `done`/`harness_complete` close the cell.
+- `harness_configs[].system_prompt_extra` lands as a `system` message
+  before the task prompt.
+- Mixed runs interleave: prompt cells resolve inline, container cells
+  spawn+monitor in the same loop; evaluation runs once all cells are
+  terminal, with `prompt_output_path` pointing the evaluator at
+  `output.txt`.
+- Evaluator: `evaluate_sandbox(prompt_output_path=...)` stages
+  `output.txt` as the submission (no workspace required); EVAL_PROMPT
+  frames it as a prompt output. Missing output stages empty — judged,
+  not infra-failed. Static/exec/generated-test collectors degrade to
+  `skipped` on `.txt`-only submissions.
+- Results/preview: the `output` artifact kind downloads via the existing
+  endpoint; results rows report `previewable: false` and the preview +
+  thumbnail endpoints 404 early for prompt cells (before any workspace
+  scan). The web results page shows output text inline + download,
+  suppressing preview affordances.
+- Files: `orchestrator/prompt_cell.py`, `orchestrator/adapters.py`
+  (pseudo-manifest + `no_sandbox_adapter_names()`),
+  `orchestrator/lifecycle.py` (prompt branch + all-cells-fail early
+  exit), `evaluator/evaluate.py` + `evaluator/prompts.py`
+  (`prompt_output_path`), `api/routers/runs.py` (validation),
+  `api/routers/preview.py` (guards), `web/lib/api.ts`,
+  `web/app/submit/page.tsx` (group), `web/app/runs/[id]/results/*`
+  (output view + preview suppression).
+- Tests:
+  - `tests/unit/orchestrator/test_prompt_cell.py` — request shape, cred
+    scope, single retry on 5xx/timeout, artifact/meta/events/finalize,
+    failure paths.
+  - `tests/unit/orchestrator/test_lifecycle.py::test_lifecycle_prompt_only_run`
+    + `test_lifecycle_mixed_prompt_and_container` — zero spawns, mixed
+    routing, all-fail → run failed.
+  - `tests/unit/adapters/test_adapter_contract.py` — selectable-but-not-
+    spawnable + manifest keys.
+  - `tests/unit/api/test_harnesses.py`, `test_runs.py`, `test_results.py`,
+    `test_preview.py` — manifest surface, submit validation, output
+    artifact/download + previewable:false, preview/thumbnail 404s.
+  - `tests/unit/evaluator/test_evaluate.py` — output.txt staging,
+    missing-output empty stage, analysis persistence.
+- Verify: `uv run pytest tests/unit/orchestrator/test_prompt_cell.py
+  tests/unit/orchestrator/test_lifecycle.py -k prompt -q`; manual:
+  submit a `prompt × 3 models` run → no containers started (docker ps),
+  three `output.txt` artifacts, scores land, cost/tokens metered;
+  results page shows output inline with preview absent.
+- **Depends on:** F16 (config × model matrix expansion), F3 (gateway
+  creds/metering), F7 (evaluator staging), F8/F12 (results + preview).
 
 ## Implementation sequence
 
