@@ -265,6 +265,24 @@ def test_create_run_multi_adapter(api) -> None:
     assert adapters == ["miniloop", "claude_code", "codex", "deepseek", "pi", "aider"]
 
 
+def test_create_run_prompt_adapter_validates(api) -> None:
+    """PR25: the no-sandbox ``prompt`` pseudo-adapter is a valid
+    ``harness_configs[].adapter`` — selectable without a registry module."""
+    data = _post_run(
+        api.client,
+        _valid_body(
+            harness_configs=[
+                {"adapter": "prompt", "system_prompt_extra": "be terse"},
+                {"adapter": "prompt"},
+                {"adapter": "miniloop"},
+            ]
+        ),
+    )
+    hcs = data["config"]["harness_configs"]
+    assert [hc["adapter"] for hc in hcs] == ["prompt", "prompt", "miniloop"]
+    assert hcs[0]["system_prompt_extra"] == "be terse"
+
+
 def test_create_run_harness_config_names(api) -> None:
     """PR1: optional per-config name survives submit -> run.config round-trip."""
     body = _valid_body(

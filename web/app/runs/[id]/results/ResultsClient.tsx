@@ -48,6 +48,7 @@ import {
   WarnNote,
 } from "@/components/ui";
 import AnalyticsSection from "./AnalyticsSection";
+import OutputView from "./OutputView";
 import PreviewControls from "./PreviewControls";
 import RescoreControls from "./RescoreControls";
 
@@ -799,9 +800,18 @@ export default function ResultsClient({ runId }: { runId: string }) {
                   </thead>
                   <tbody>
                     {sandboxes.map((sb) => {
+                      const arts = sb.artifacts ?? [];
+                      const kindById = new Map(arts.map((a) => [a.id, a.kind]));
                       const artifactIds =
-                        sb.artifact_ids ??
-                        (sb.artifacts ?? []).map((a) => a.id).filter(Boolean);
+                        arts.length > 0
+                          ? arts.map((a) => a.id).filter(Boolean)
+                          : (sb.artifact_ids ?? []);
+                      // PR25 prompt cells: the downloadable output.txt IS
+                      // the submission — expose an inline read next to the
+                      // download chips.
+                      const outputArt = arts.find((a) => a.kind === "output");
+                      const promptCell =
+                        sb.harness_config?.adapter === "prompt";
                       return (
                         <tr key={sb.sandbox_id}>
                           <td className="num" title={sb.sandbox_id}>
@@ -826,9 +836,15 @@ export default function ResultsClient({ runId }: { runId: string }) {
                                     href={artifactDownloadUrl(id)}
                                     title={`Download artifact ${id}`}
                                   >
-                                    ⬇ {shortId(id)}
+                                    ⬇ {kindById.get(id) ?? shortId(id)}
                                   </a>
                                 ))}
+                                {outputArt ? (
+                                  <OutputView
+                                    artifactId={outputArt.id}
+                                    filename={outputArt.path?.split("/").pop() || "output.txt"}
+                                  />
+                                ) : null}
                               </div>
                             ) : (
                               <span className="faint" style={{ fontSize: "0.8rem" }}>
@@ -839,7 +855,15 @@ export default function ResultsClient({ runId }: { runId: string }) {
                             )}
                           </td>
                           <td>
-                            {sb.artifact_path ? (
+                            {promptCell ? (
+                              <span
+                                className="faint"
+                                style={{ fontSize: "0.8rem" }}
+                                title="Prompt cells ran no container — there is no workspace to preview"
+                              >
+                                no preview — prompt cell
+                              </span>
+                            ) : sb.artifact_path ? (
                               <PreviewControls
                                 runId={runId}
                                 sandboxId={sb.sandbox_id}
