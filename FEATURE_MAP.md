@@ -1212,11 +1212,13 @@ workspace to produce.
 thing bugfix / refactor / analysis evals need. Exactly one source:
 
 - `repo_url` + optional `ref` — a PUBLIC git repo (`https://` only —
-  ssh/git/file schemes rejected at the schema), materialized by
-  `git init` + `fetch --depth 1 origin <ref|HEAD>` + `checkout FETCH_HEAD`
-  under a wall-clock cap (`SEED_GIT_TIMEOUT_SECONDS`, default 300s; one
-  code path covers branches, tags, and raw shas). The resolved sha is
-  recorded (`harness_config.seed.resolved_sha`) so the pin is auditable.
+  ssh/git/file schemes, embedded credentials, and option-shaped refs
+  rejected at the schema), materialized by `git init` +
+  `fetch --depth 1 origin <ref|HEAD>` + `checkout FETCH_HEAD` under one
+  wall-clock deadline spanning the sequence (`SEED_GIT_TIMEOUT_SECONDS`,
+  default 300s; one code path covers branches, tags, and raw shas; git
+  runs hermetic to host gitconfig). The resolved sha is recorded
+  (`harness_config.seed.resolved_sha`) so the pin is auditable.
 - `archive_id` — an upload id from `POST /api/uploads` → staged at
   `<data>/uploads/<uuid>/archive<suffix>` + `meta.json` under a raw-byte
   cap (`UPLOAD_MAX_BYTES`, 256 MiB). The client filename is display-only
@@ -1246,10 +1248,12 @@ rigged before it starts.
   upload ids are uuids resolved jailed under `uploads_root`; archive
   members must be regular files/dirs with clean relative POSIX names —
   absolute paths, `..` segments, drive roots, backslash separators, NULs,
-  symlinks/hardlinks/devices/fifos all rejected at BOTH upload time
-  (`check_archive`, no extraction) and extraction (`extract_archive`
-  writes bytes manually, never `extractall`, under `SEED_MAX_BYTES` /
-  `SEED_MAX_FILES` decompression caps). A single common top-level dir is
+  symlinks/hardlinks/devices/fifos, and encrypted members all rejected at
+  BOTH upload time (`check_archive`, no extraction — declared member
+  sizes are also checked against `SEED_MAX_BYTES` / `SEED_MAX_FILES` so a
+  staged upload can't fail at provisioning) and extraction
+  (`extract_archive` writes bytes manually, never `extractall`, under the
+  same caps). A single common top-level dir is
   flattened (`proj/x` → `x`) so the workspace mirrors the repo root like
   a clone does. Post-materialization, `_drop_escapee_links` unlinks any
   symlink resolving outside the seed root (a warning lands on the seed

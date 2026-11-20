@@ -6,10 +6,12 @@ docs). Run-spec schemas (F1) and results schemas (F8) land with their routers.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -178,8 +180,9 @@ class TaskInputsIn(BaseModel):
 
     Exactly one source:
 
-    - ``repo_url`` — a PUBLIC git repo (https:// only), shallow-cloned at
-      ``ref`` (branch/tag/commit sha; remote HEAD when omitted). The clone
+    - ``repo_url`` — a PUBLIC git repo (https:// only, no embedded
+      credentials), shallow-cloned at ``ref`` (branch/tag/commit sha;
+      remote HEAD when omitted). The clone
       is pinned at submit-visible precision: provisioning records the
       resolved sha in ``harness_config.seed.resolved_sha``.
     - ``archive_id`` — an upload id from ``POST /api/uploads`` (a zip/tar
@@ -213,6 +216,26 @@ class TaskInputsIn(BaseModel):
             raise ValueError(
                 "repo_url must be an https:// URL — public git only "
                 "(no ssh://, git://, or file:// seeds)"
+            )
+        # Embedded userinfo would authenticate a private clone AND the
+        # secret would persist verbatim in run.config / sandbox rows.
+        if "@" in urlsplit(v).netloc:
+            raise ValueError(
+                "repo_url must not embed credentials — public git only"
+            )
+        return v
+
+    @field_validator("ref")
+    @classmethod
+    def _ref_safe(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        # A ref like "--tags" or "--upload-pack=…" would be parsed as a git
+        # OPTION, not a refspec, at `git fetch … origin <ref>`.
+        if v.startswith("-") or re.fullmatch(r"[A-Za-z0-9._/-]+", v) is None:
+            raise ValueError(
+                "ref must be a branch, tag, or commit sha "
+                "([A-Za-z0-9._/-] only, no leading '-')"
             )
         return v
 

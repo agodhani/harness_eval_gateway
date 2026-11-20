@@ -70,8 +70,9 @@ async def upload_archive(
     """Stage a task-input archive under ``<data>/uploads/<id>/``.
 
     422 on a missing/unsupported filename or an archive whose members are
-    unsafe (traversal, absolute paths, links/specials, empty); 413 when the
-    file exceeds ``UPLOAD_MAX_BYTES``.
+    unsafe (traversal, absolute paths, links/specials, encrypted, empty, or
+    over the seed size/file caps); 413 when the file exceeds
+    ``UPLOAD_MAX_BYTES``.
     """
     settings = get_settings()
     filename = (file.filename or "").strip()
@@ -119,9 +120,19 @@ async def upload_archive(
         raise
 
     # Member safety scan (no extraction) — traversal, absolute paths, links,
-    # specials, empty archives all reject here and nothing is kept.
+    # specials, encrypted/empty archives all reject here and nothing is kept.
+    # The same seed size/file caps extraction enforces are checked against
+    # declared member sizes so a staged upload can't fail at provisioning.
     try:
-        kind = seeds.check_archive(staged)
+        kind = seeds.check_archive(
+            staged,
+            max_bytes=int(
+                getattr(settings, "SEED_MAX_BYTES", seeds.DEFAULT_SEED_MAX_BYTES)
+            ),
+            max_files=int(
+                getattr(settings, "SEED_MAX_FILES", seeds.DEFAULT_SEED_MAX_FILES)
+            ),
+        )
     except seeds.SeedError as e:
         shutil.rmtree(upload_dir, ignore_errors=True)
         raise HTTPException(

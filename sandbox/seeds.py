@@ -42,12 +42,14 @@ import shutil
 import stat
 import subprocess
 import tarfile
+import time
 import zipfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import IO, Any
+from urllib.parse import urlsplit
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +78,7 @@ DEFAULT_SEED_MAX_FILES = 20_000
 DEFAULT_GIT_TIMEOUT_SECONDS = 300.0
 
 _DRIVE_RE = re.compile(r"^[A-Za-z]:$")
+_REF_RE = re.compile(r"[A-Za-z0-9._/-]+")
 
 
 class SeedError(RuntimeError):
@@ -210,6 +213,10 @@ def _iter_zip_members(archive: Path) -> Iterator[_Member]:
             if info.is_dir():
                 yield _Member(relpath=rel, is_dir=True, size=0)
                 continue
+            if info.flag_bits & 0x1:
+                raise SeedError(
+                    f"archive member is encrypted — rejected: {info.filename!r}"
+                )
             # Zip symlinks: unix mode in the high 16 bits of external_attr.
             if stat.S_IFMT(info.external_attr >> 16) == stat.S_IFLNK:
                 raise SeedError(
@@ -277,14 +284,32 @@ def _iter_members(archive: Path) -> Iterator[_Member]:
     return _iter_tar_members(archive)
 
 
-def check_archive(archive: Path) -> str:
-    """Upload-time safety pass — walks member names/types without writing a
-    byte. Returns the detected ``"zip"``/``"tar"`` kind; SeedError on
-    unreadable archives, unsafe members, or an archive with no files."""
+def check_archive(
+    archive: Path,
+    *,
+    max_bytes: int = DEFAULT_SEED_MAX_BYTES,
+    max_files: int = DEFAULT_SEED_MAX_FILES,
+) -> str:
+    """Upload-time safety pass — walks member names/types/declared sizes
+    without writing a byte. Returns the detected ``"zip"``/``"tar"`` kind;
+    SeedError on unreadable archives, unsafe members, an archive with no
+    files, or a declared file size/count over the same caps extraction
+    enforces — a staged upload can never turn unusable at provisioning."""
     count = 0
+    total = 0
     for member in _iter_members(archive):
-        if not member.is_dir:
-            count += 1
+        if member.is_dir:
+            continue
+        total += member.size
+        if member.size > max_bytes or total > max_bytes:
+            raise SeedError(
+                f"archive exceeds the seed size cap ({max_bytes} bytes)"
+            )
+        count += 1
+        if count > max_files:
+            raise SeedError(
+                f"archive exceeds the seed file cap ({max_files} files)"
+            )
     if count == 0:
         raise SeedError("archive contains no extractable files")
     return _archive_kind(archive)
@@ -355,6 +380,12 @@ def _git(argv: list[str], *, timeout: float | None = None) -> str:
         # `true` binary answers nothing instantly.
         "GIT_ASKPASS": "true",
         "SSH_ASKPASS": "true",
+        # Hermetic to host gitconfig — an ambient url.*.insteadOf could
+        # rewrite the https URL to file://, and core.hooksPath /
+        # credential.helper would run host config during fetch+checkout.
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
     }
     try:
         proc = subprocess.run(
@@ -380,11 +411,20 @@ def _git(argv: list[str], *, timeout: float | None = None) -> str:
 
 
 def git_runner(timeout: float | None = None) -> Callable[[list[str]], str]:
-    """The production git runner — one subprocess per argv, ``timeout``
-    seconds per call (None = uncapped)."""
+    """The production git runner — one subprocess per argv. ``timeout`` is
+    ONE deadline spanning every call through the returned runner (the whole
+    init + fetch + checkout sequence), not a per-command budget (None =
+    uncapped)."""
+    deadline = None if timeout is None else time.monotonic() + timeout
 
     def run(argv: list[str]) -> str:
-        return _git(argv, timeout=timeout)
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise SeedError(
+                f"git seed timed out — the {timeout}s fetch+checkout "
+                "budget is exhausted"
+            )
+        return _git(argv, timeout=remaining)
 
     return run
 
@@ -413,6 +453,19 @@ def _clone_repo(
         raise SeedError(
             f"repo_url must be an https:// URL — got {url!r} "
             "(public git only; no ssh/file:// schemes)"
+        )
+    try:
+        netloc = urlsplit(url).netloc
+    except ValueError:
+        netloc = ""
+    if not netloc or "@" in netloc:
+        raise SeedError(
+            f"repo_url is malformed or embeds credentials — got {url!r} "
+            "(public git only; no userinfo)"
+        )
+    if ref is not None and (ref.startswith("-") or _REF_RE.fullmatch(ref) is None):
+        raise SeedError(
+            f"invalid git ref {ref!r} — branch, tag, or commit sha only"
         )
     dest.mkdir(parents=True, exist_ok=True)
     runner(["init", "-q", str(dest)])
@@ -449,7 +502,7 @@ def hash_tree(root: Path) -> str:
                 if not p.is_symlink():
                     continue
                 rel = p.relative_to(root).as_posix()
-                h.update(rel.encode("utf-8"))
+                h.update(rel.encode("utf-8", "surrogateescape"))
                 h.update(b"\0")
                 h.update(b"L\0")
                 h.update(os.readlink(p).encode("utf-8", "surrogateescape"))
@@ -462,7 +515,7 @@ def hash_tree(root: Path) -> str:
                 rel = p.relative_to(root).as_posix()
             except ValueError:
                 continue
-            h.update(rel.encode("utf-8"))
+            h.update(rel.encode("utf-8", "surrogateescape"))
             h.update(b"\0")
             try:
                 if p.is_symlink():

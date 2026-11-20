@@ -103,6 +103,9 @@ def api(session_factory, tmp_path: Path, monkeypatch):
         ARTIFACT_ROOT=tmp_path / "data" / "artifacts",
         UPLOADS_DIR=tmp_path / "data" / "uploads",
         UPLOAD_MAX_BYTES=1024 * 1024,  # 1 MiB — small enough to trip 413 cheaply
+        # Seed member caps small enough to trip 422s with in-test archives.
+        SEED_MAX_BYTES=2048,
+        SEED_MAX_FILES=64,
     )
     (tmp_path / "skillpacks").mkdir()
 
@@ -253,6 +256,23 @@ def test_upload_rejects_absolute_and_special_members(api) -> None:
     assert resp.status_code == 422
 
 
+def test_upload_rejects_members_over_seed_caps(api) -> None:
+    """A ≤UPLOAD_MAX_BYTES archive whose DECLARED member sizes exceed the
+    seed caps 422s at upload — the same caps extraction enforces, so a
+    staged upload can never fail at provisioning."""
+    big = _zip_bytes({"blob.bin": b"x" * 4096})
+    assert len(big) < api.settings.UPLOAD_MAX_BYTES  # passes the raw cap
+    resp = api.client.post(
+        "/api/uploads",
+        files={"file": ("big.zip", big, "application/zip")},
+    )
+    assert resp.status_code == 422
+    assert "size cap" in resp.json()["detail"]
+    root = Path(api.settings.UPLOADS_DIR)
+    staged = list(root.iterdir()) if root.is_dir() else []
+    assert staged == []  # nothing kept
+
+
 def test_upload_over_cap_is_413(api) -> None:
     """The cap counts RAW upload bytes (pre-extraction) — incompressible
     random content keeps the multipart file itself over the 1 MiB test cap."""
@@ -328,6 +348,9 @@ def test_create_run_dangling_archive_id_422(api) -> None:
         {"ref": "v1"},  # neither source
         {"repo_url": "git://github.com/a/b"},  # non-https scheme
         {"repo_url": "ssh://git@github.com/a/b"},
+        {"repo_url": "https://user:pw@github.com/a/b"},  # embedded credentials
+        {"repo_url": "https://github.com/a/b", "ref": "--tags"},  # option-shaped ref
+        {"repo_url": "https://github.com/a/b", "ref": "has space"},
         {"archive_id": "not-a-uuid"},
         {"archive_id": str(uuid.uuid4()), "ref": "v1"},  # ref w/o repo
     ],

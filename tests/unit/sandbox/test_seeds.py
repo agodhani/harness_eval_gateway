@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import tarfile
 import zipfile
@@ -181,6 +182,36 @@ def test_extract_archive_size_and_file_caps(tmp_path: Path) -> None:
         seeds.extract_archive(big, tmp_path / "o2", max_files=1)
 
 
+def test_check_archive_enforces_the_same_member_caps(tmp_path: Path) -> None:
+    """Upload-check must catch what extraction would reject — a staged
+    upload can never turn unusable at provisioning."""
+    p = tmp_path / "big.zip"
+    p.write_bytes(_zip_bytes({"a.bin": b"x" * 1024, "b.bin": b"y" * 1024}))
+    assert seeds.check_archive(p) == "zip"  # under the defaults
+    with pytest.raises(seeds.SeedError, match="size cap"):
+        seeds.check_archive(p, max_bytes=1500)
+    with pytest.raises(seeds.SeedError, match="file cap"):
+        seeds.check_archive(p, max_files=1)
+
+
+def test_check_archive_and_extract_reject_encrypted_zip(tmp_path: Path) -> None:
+    """An encrypted zip member passes no extraction — it must fail at check
+    time too (the 422 boundary), not as a surprise RuntimeError later."""
+    raw = bytearray(_zip_bytes({"x.py": "1"}))
+    assert raw[:4] == b"PK\x03\x04"
+    raw[6] |= 0x01  # local header flag bit 0 = encrypted
+    cd = raw.find(b"PK\x01\x02")
+    assert cd > 0
+    raw[cd + 8] |= 0x01  # central-directory flag
+    p = tmp_path / "enc.zip"
+    p.write_bytes(bytes(raw))
+    with pytest.raises(seeds.SeedError, match="encrypted"):
+        seeds.check_archive(p)
+    with pytest.raises(seeds.SeedError, match="encrypted"):
+        seeds.extract_archive(p, tmp_path / "out")
+    assert not (tmp_path / "out" / "x.py").exists()
+
+
 # ---------------------------------------------------------------------------
 # hash_tree + copy_seed
 # ---------------------------------------------------------------------------
@@ -330,6 +361,77 @@ def test_prepare_run_seed_drops_escapee_symlinks(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # prepare_run_seed — git path (faked subprocess)
 # ---------------------------------------------------------------------------
+
+
+def test_git_runner_isolates_host_config(monkeypatch) -> None:
+    """git must run hermetic to host gitconfig — an ambient insteadOf or
+    hooksPath would bypass the https-only public-clone gate."""
+    seen: dict = {}
+
+    def fake_run(args, **kwargs):
+        seen["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(args, 0, "ok\n", "")
+
+    monkeypatch.setattr(seeds.subprocess, "run", fake_run)
+    assert seeds._git(["status"], timeout=5) == "ok\n"
+    env = seen["env"]
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert env["GIT_CONFIG_SYSTEM"] == os.devnull
+
+
+def test_git_runner_timeout_is_one_deadline_across_calls(monkeypatch) -> None:
+    """SEED_GIT_TIMEOUT_SECONDS caps the whole fetch+checkout sequence, so
+    a drip-feeding remote can't hold it for N × cap."""
+    spawned: list = []
+
+    def fake_run(*args, **kwargs):
+        spawned.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(seeds.subprocess, "run", fake_run)
+    runner = seeds.git_runner(0)  # budget already exhausted at creation
+    with pytest.raises(seeds.SeedError, match="timed out"):
+        runner(["status"])
+    assert spawned == []  # no subprocess ever launched
+
+
+def test_prepare_run_seed_rejects_credentialed_repo_url(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def fake_git(argv: list[str]) -> str:
+        calls.append(list(argv))
+        return ""
+
+    with pytest.raises(seeds.SeedError, match="credential"):
+        seeds.prepare_run_seed(
+            "run-c",
+            {"repo_url": "https://user:secret@github.com/acme/proj"},
+            seed_root=tmp_path / "seeds",
+            uploads=tmp_path / "uploads",
+            git_runner=fake_git,
+        )
+    assert calls == []
+
+
+def test_prepare_run_seed_rejects_option_shaped_ref(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def fake_git(argv: list[str]) -> str:
+        calls.append(list(argv))
+        return ""
+
+    for bad_ref in ("--tags", "--upload-pack=/bin/x", "ref with space"):
+        with pytest.raises(seeds.SeedError, match="ref"):
+            seeds.prepare_run_seed(
+                "run-r",
+                {"repo_url": "https://github.com/acme/proj", "ref": bad_ref},
+                seed_root=tmp_path / "seeds",
+                uploads=tmp_path / "uploads",
+                git_runner=fake_git,
+            )
+    assert calls == []  # no git invocation ever saw the hostile ref
 
 
 def test_prepare_run_seed_git_clone_pinned_ref(tmp_path: Path) -> None:
