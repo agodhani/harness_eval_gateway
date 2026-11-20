@@ -1204,6 +1204,90 @@ workspace to produce.
 - **Depends on:** F16 (config × model matrix expansion), F3 (gateway
   creds/metering), F7 (evaluator staging), F8/F12 (results + preview).
 
+### F19 — Trials per cell + per-config model options (PR27) ✅
+
+**What:** every effective config × model matrix cell repeats `trials`
+times (1–8, default 1) so results report mean ± sample sd with `n`
+instead of a single sample; each harness config may carry
+`model_options` (`temperature`, `seed`, `max_tokens`, `reasoning`) that
+adapters honor where they expose the equivalent control.
+
+**Why:** a one-shot sample per cell can't rank harness/model combos
+defensibly — small models are stochastic. Repeated trials give the
+score distribution; model options make the comparison axis itself
+configurable per cell (e.g. temperature sweeps).
+
+- `RunCreate.trials` (int, 1–8, default 1) persists on `runs.trials`
+  (migration `d7e9f1a3b5c7`) and `config["trials"]`; the 32-sandbox
+  matrix cap applies to the post-trial count
+  (`configs × models × trials`).
+- Expansion (`orchestrator/matrix.py::expanded_configs`) runs
+  model-major first, then stamps a 1-based `trial_index` on each replica
+  cell-major — a cell's trials stay adjacent. `trials=1` emits no key
+  (pre-PR27 shape); `trial_index`/`cell_key` helpers read the stamp and
+  group identity (config minus `trial_index`, serialized sorted).
+  Lifecycle reads `run.trials` (column wins; `config["trials"]` covers
+  pre-column specs). Prompt pseudo-cells replicate identically.
+- Sandbox names append ` · tN` after the model suffix
+  (`cfg · model · t3`) — provision truncates the label side, never the
+  tail (`sandboxes.name` is String(255)).
+- `HarnessConfigIn.model_options` is a closed schema (`extra="forbid"`,
+  per-key bounds; `reasoning` normalizes to lowercase and maps to the
+  request-level `reasoning_effort`). Submit filters keys against
+  `orchestrator.adapters.supported_model_options` (each adapter's
+  `MANIFEST["model_options"]`, surfaced on `GET /api/harnesses`):
+  unsupported keys are dropped from the persisted cell + advisory
+  `warnings` on the response — never a 422. Support today: `miniloop` +
+  `prompt` all four; `codex` `reasoning` only (→
+  `model_reasoning_effort` config); `claude_code`/`pi`/`deepseek`/
+  `aider` none.
+- Miniloop maps options to env knobs `MINILOOP_TEMPERATURE`,
+  `MINILOOP_SEED`, `MAX_TOKENS`, `MINILOOP_REASONING_EFFORT`
+  (`AgentConfig.from_env` → request-body fields; the explicit
+  `max_tokens` kwarg outranks `model_options.max_tokens`). `prompt`
+  cells fold supported options into the chat-completions body. `cli_env`
+  takes `model_options` across the CLI contract.
+- Results API returns `trials` on the run + `trial_index` per sandbox;
+  the results matrix groups trials under one config × model header
+  showing `mean ± sd (n=N)` (sample sd, n−1 — null under 2 scored
+  trials; unscored trials drop out of `n`) with expandable per-trial
+  rows keeping rationales/artifacts. The by-model rollup reads
+  `mean overall (±sd, n=…)`.
+- Analytics adds per-sandbox `cell`/`trial_index` and a `cells` rollup
+  (`overall_mean`/`overall_sd`/`overall_n`, pooled metrics across the
+  cell's trials) plus a by-cell table view; the analysis page gains a
+  "Score variance by cell" table. Web helpers in
+  `web/lib/trialGroups.ts` (`cellKey`/`groupByCell`/`meanSd`/
+  `fmtMeanSd`/`stripTrialSuffix`).
+- Submit UI: a `trials` stepper (1–8) plus advanced per-config
+  model-options controls annotated with each adapter's supported set;
+  submit warnings surface dropped keys. `resubmit` carries both fields.
+- Files: `api/schemas.py` (`ModelOptions`, `RunCreate.trials`,
+  `CellAnalytics`), `api/routers/runs.py` (persist + filter + warnings),
+  `api/routers/analytics.py` + `results.py` (`trial_index`/`cell`/
+  `cells`), `orchestrator/{matrix,lifecycle,provision,prompt_cell,
+  adapters}.py`, `adapters/common/contract.py` (`cli_env` signature),
+  `adapters/{miniloop,codex,claude_code,pi,deepseek,aider}`,
+  `db/models.py` + `db/migrations/versions/d7e9f1a3b5c7_runs_trials.py`,
+  `web/lib/{api,trialGroups,resubmit}.ts`, `web/app/submit/page.tsx`,
+  `web/app/runs/[id]/results/{ResultsClient,AnalyticsSection}.tsx`,
+  `web/app/runs/[id]/analysis/AnalysisClient.tsx`, `web/app/globals.css`.
+- Tests: `test_matrix.py` (N-count, 1-based cell-major stamp,
+  `cell_key`/`trial_index`), `test_provision.py` (` · tN` naming +
+  truncation, model_options → miniloop env), `test_analytics.py`
+  (hand-worked mean ± sd = 7.667 ± 1.528 on scores 6/8/9, scored-only
+  `n`), `test_runs.py` (trials persist/bounds/cap, options kept-
+  supported/dropped-unsupported/422-unknown, whole-map removal),
+  `tests/unit/adapters/miniloop/test_adapter.py` (env knobs, kwarg
+  precedence), `tests/unit/db/test_migrations.py` (head +
+  up/down).
+- Verify: `uv run pytest tests/unit -q`; manual — submit a 2-config
+  run at trials=3 → six ` · tN` sandboxes; results matrix shows one
+  column per cell with `mean ± sd (n=3)` + expandable trials; a codex
+  config with `temperature` submits 201 with a drop warning.
+- **Depends on:** F16 (config × model matrix), F8/F9 (results +
+  analytics), F18 (prompt cells replicate through the same path).
+
 ## Implementation sequence
 
 **Phase 0 — foundation (sequential):** F0 scaffold + base schema.
