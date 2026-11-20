@@ -251,12 +251,20 @@ export interface Budgets {
   max_iters: number;
   token_budget: number;
   wall_clock_seconds: number;
+  /** PR28: optional per-sandbox token cap (null/undefined = no per-cell
+   * limit — a hot cell then only draws down the shared run ceiling). */
+  sandbox_token_budget?: number | null;
+  /** PR28: optional per-sandbox estimated-cost cap in USD. Only bites on
+   * priced models — unpriced cells have no honest rate to bill against. */
+  max_cost_usd?: number | null;
 }
 
 export const DEFAULT_BUDGETS: Budgets = {
   max_iters: 50,
   token_budget: 200_000,
   wall_clock_seconds: 3600,
+  sandbox_token_budget: null,
+  max_cost_usd: null,
 };
 
 export interface RunCreate {
@@ -741,10 +749,13 @@ export function rescoreRun(runId: string, body: RescoreIn = {}): Promise<Rescore
 // analytics (F9)
 // ---------------------------------------------------------------------------
 
-/** USD-per-million-token rate for one model; `local` = free/local inference. */
+/** USD-per-million-token rate for one model; `local` = free/local inference.
+ * `cache_read_per_mtok_usd` (PR28): discounted rate for cache-read input
+ * tokens — absent/null bills them at the input rate. */
 export interface ModelPrice {
   input_per_mtok_usd: number;
   output_per_mtok_usd: number;
+  cache_read_per_mtok_usd?: number | null;
   local?: boolean;
 }
 
@@ -834,6 +845,9 @@ export interface RunAnalytics {
   /** Explicit ?price_model= basis, or null for auto per-model pricing. */
   price_model: string | null;
   price_table: Record<string, ModelPrice>;
+  /** model_prices row globs in declaration (first-match) order — lets
+   * matchPriceKey replay key_for's rows-before-static layering. */
+  price_globs?: string[];
   sandboxes: SandboxAnalytics[];
   /** PR14: participant-model rollups (one per model in the run's matrix). */
   models: ModelAnalytics[];
@@ -845,13 +859,113 @@ export function getRunAnalytics(runId: string, priceModel?: string): Promise<Run
   );
 }
 
-/** Client-side cost estimate: tokens × rate. Mirrors api/pricing.py. */
+/** fnmatch-style glob test mirroring api/pricing.py::glob_matches —
+ * case-insensitive; a pattern with no "/" never matches a vendor/model id.
+ * The translator ports Python's fnmatch.translate: `*`/`?` wildcards,
+ * `[seq]` character classes with `[!seq]` negation (a leading "]" inside a
+ * class is a literal), and an unclosed "[" matching the literal text —
+ * where a naive escape-everything pass inverts [!seq] semantics and
+ * throws on a dangling bracket. */
+export function globMatch(pattern: string, model: string): boolean {
+  const pat = pattern.trim().toLowerCase();
+  const name = model.trim().toLowerCase();
+  if (!pat || !name) return false;
+  if (name.includes("/") && !pat.includes("/")) return false;
+  let re = "^";
+  let i = 0;
+  while (i < pat.length) {
+    const c = pat[i++];
+    if (c === "*") {
+      re += ".*";
+    } else if (c === "?") {
+      re += ".";
+    } else if (c === "[") {
+      // scan the class body: "!" negates, a leading "]" is a literal
+      let j = i;
+      if (j < pat.length && pat[j] === "!") j++;
+      if (j < pat.length && pat[j] === "]") j++;
+      while (j < pat.length && pat[j] !== "]") j++;
+      if (j >= pat.length) {
+        re += "\\["; // unclosed "[" — fnmatch treats it as the literal char
+      } else {
+        // escape \ and ] inside the class (JS needs \] for a literal "]"),
+        // then apply fnmatch's "!" → "^" negation; a leading ^/[ also
+        // needs escaping so it can't re-negate or nest a class
+        let stuff = pat.slice(i, j).replace(/[\\\]]/g, "\\$&");
+        if (stuff.startsWith("!")) {
+          stuff = "^" + stuff.slice(1);
+        } else if (stuff.startsWith("^") || stuff.startsWith("[")) {
+          stuff = "\\" + stuff;
+        }
+        re += `[${stuff}]`;
+        i = j + 1;
+      }
+    } else {
+      re += c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  re += "$";
+  try {
+    return new RegExp(re).test(name);
+  } catch {
+    return false;
+  }
+}
+
+/** Resolve a model to its effective price-table KEY — mirrors
+ * PriceBook.key_for: the FIRST row glob (declaration order —
+ * RunAnalytics.price_globs, plus rates added inline this session) that
+ * glob-matches the model wins, else the model itself when it's a key in
+ * the merged table (the static layer — a row glob equal to it already won
+ * above), else undefined (unlisted → unpriced, PR21). The row rate sits
+ * at table[key]; row ordering can't be recovered from the merged table
+ * alone (literal rows are indistinguishable from static keys), which is
+ * why price_globs rides the response. */
+export function matchPriceKey(
+  model: string | null | undefined,
+  table: Record<string, ModelPrice>,
+  rowGlobs: readonly string[],
+): string | undefined {
+  if (!model) return undefined;
+  for (const g of rowGlobs) {
+    if (Object.hasOwn(table, g) && globMatch(g, model)) return g;
+  }
+  return Object.hasOwn(table, model) ? model : undefined;
+}
+
+/** Resolve an explicit price pick to its effective price-table key —
+ * mirrors api/pricing.py::resolve_price_model: a pick naming a
+ * model_prices row glob (case-insensitively — the same row identity
+ * upsert/sync use) selects THAT row's rate so an earlier broader glob
+ * can't shadow it; any other pick resolves like a model through
+ * matchPriceKey's rows-first layering. Unresolvable → undefined (the
+ * server 422s it; the client renders "unpriced"). */
+export function resolvePricePick(
+  pick: string | null | undefined,
+  table: Record<string, ModelPrice>,
+  rowGlobs: readonly string[],
+): string | undefined {
+  if (!pick) return undefined;
+  const lower = pick.toLowerCase();
+  const row = rowGlobs.find((g) => g.toLowerCase() === lower);
+  return row ?? matchPriceKey(pick, table, rowGlobs);
+}
+
+/** Client-side cost estimate: tokens × rate. Mirrors api/pricing.py —
+ * cache-read tokens (inside `input`) bill at the cache rate when one is
+ * declared, else at the input rate. A non-positive cache_read counts
+ * zero cached tokens, matching estimate_cost_usd's guard. */
 export function estimateCostUsd(
   price: ModelPrice,
-  tokens: { input: number; output: number },
+  tokens: { input: number; output: number; cache_read?: number },
 ): number {
+  const cacheRate = price.cache_read_per_mtok_usd;
+  const cacheRead = tokens.cache_read ?? 0;
+  const cached =
+    cacheRate == null || cacheRead <= 0 ? 0 : Math.min(cacheRead, tokens.input);
   return (
-    (tokens.input * price.input_per_mtok_usd +
+    ((tokens.input - cached) * price.input_per_mtok_usd +
+      cached * (cacheRate ?? 0) +
       tokens.output * price.output_per_mtok_usd) /
     1_000_000
   );
@@ -1352,4 +1466,74 @@ export function deleteRun(runId: string): Promise<RunDeleteOut> {
   return request<RunDeleteOut>(`/api/runs/${encodeURIComponent(runId)}`, {
     method: "DELETE",
   });
+}
+
+// ---------------------------------------------------------------------------
+// prices (PR28 — user-editable glob rate table layered over the static one)
+// ---------------------------------------------------------------------------
+
+/** One `model_prices` row — `model_glob` is an fnmatch pattern (`gpt-4*`);
+ * rows match in declaration order, first hit wins over the static table. */
+export interface PriceEntry {
+  id: string;
+  model_glob: string;
+  input_per_mtok_usd: number;
+  output_per_mtok_usd: number;
+  cache_read_per_mtok_usd: number | null;
+  local: boolean;
+  /** "user" (PUT /api/prices — never overwritten by sync) | "openrouter". */
+  source: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PricesOut {
+  prices: PriceEntry[];
+  /** Static fallback layer under the user table. */
+  static: Record<string, ModelPrice>;
+  /** POST /api/prices/sync is meaningful only when openrouter is configured. */
+  sync_available: boolean;
+}
+
+export interface PriceUpsert {
+  model_glob: string;
+  input_per_mtok_usd: number;
+  output_per_mtok_usd: number;
+  cache_read_per_mtok_usd?: number | null;
+  local?: boolean;
+}
+
+export interface PriceSyncOut {
+  synced: number;
+  added: number;
+  updated: number;
+  skipped_user: number;
+  skipped_unpriced: number;
+  remote_count: number;
+  prices: PriceEntry[];
+}
+
+export function getPrices(): Promise<PricesOut> {
+  return request<PricesOut>("/api/prices");
+}
+
+/** Upsert a user rate by `model_glob` — matching row keeps its
+ * declaration-order position, its rate updates. */
+export function upsertPrice(body: PriceUpsert): Promise<PriceEntry> {
+  return request<PriceEntry>("/api/prices", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+export function deletePrice(id: string): Promise<void> {
+  return request<void>(`/api/prices/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Pull OpenRouter /models pricing into model_prices (via the gateway's
+ * pass-through — the api never talks to providers directly). */
+export function syncPrices(): Promise<PriceSyncOut> {
+  return request<PriceSyncOut>("/api/prices/sync", { method: "POST" });
 }

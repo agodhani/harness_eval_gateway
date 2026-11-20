@@ -13,12 +13,17 @@ import {
   ApiError,
   estimateCostUsd,
   getRunAnalytics,
+  matchPriceKey,
+  resolvePricePick,
   type ModelAnalytics,
+  type ModelPrice,
+  type PriceEntry,
   type RunAnalytics,
   type SandboxAnalytics,
 } from "@/lib/api";
 import { formatDuration, formatNum, formatUsd, shortId } from "@/lib/format";
 import { Badge, Card, InfoNote, statusTone } from "@/components/ui";
+import AddRate from "@/components/AddRate";
 
 function errMsg(err: unknown): string {
   if (err instanceof ApiError) return err.detail;
@@ -64,6 +69,10 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
   // null = auto: each column costed at its own model's rate (server
   // resolved); a price-table key reprices every column uniformly (what-if).
   const [priceModel, setPriceModel] = useState<string | null>(null);
+  // PR28: rates added inline via "+ add rate" — the response's price_table
+  // was fetched before they existed, so they're merged in client-side and
+  // also persist server-side for the next fetch.
+  const [extraPrices, setExtraPrices] = useState<Record<string, ModelPrice>>({});
   // PR14: "sandbox" = per-cell metrics; "model" = per-model rollup. Only
   // offered when the run actually spans >1 participant model.
   const [view, setView] = useState<"sandbox" | "model">("sandbox");
@@ -96,6 +105,31 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
   const columns: Column[] = byModel
     ? (current?.models ?? [])
     : (current?.sandboxes ?? []);
+  // PR28: the effective picker table — server price_table plus rates added
+  // inline this session (they persist as model_prices rows; on refetch the
+  // server's layered book returns them anyway).
+  const priceTable: Record<string, ModelPrice> = {
+    ...(current?.price_table ?? {}),
+    ...extraPrices,
+  };
+  // Row globs in declaration order — the fetched list plus rates added
+  // inline this session (a new row lands at the end of the book's scan).
+  const priceGlobs = [
+    ...(current?.price_globs ?? []),
+    ...Object.keys(extraPrices),
+  ];
+  // An explicit pick resolves like the server's resolve_price_model — a
+  // verbatim row glob (any case) selects that row; a model-like pick goes
+  // through the row-glob scan so an earlier glob can shadow a static key.
+  const resolvedPick = priceModel
+    ? resolvePricePick(priceModel, priceTable, priceGlobs)
+    : undefined;
+  // Prefill the add-rate glob from a column whose model resolved no rate
+  // — through the SAME matcher auto mode uses, so a just-saved glob is
+  // what lifts the column out of "unpriced".
+  const unpricedModel = columns.find(
+    (c) => matchPriceKey(c.model, priceTable, priceGlobs) === undefined,
+  )?.model;
 
   if (current === null) {
     if (loadedFor !== runId) return null; // still loading — page shows spinners
@@ -175,15 +209,19 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
     {
       label: "estimated cost",
       hint: priceModel
-        ? `at ${priceModel}`
+        ? `at ${resolvedPick ?? priceModel}`
         : "auto — per-model rates · unlisted = unpriced",
       cell: (col) => {
         // Explicit pick reprices every column uniformly (what-if); auto
-        // uses each column's own resolved rate (PR14 per-model pricing).
-        // A null key is an unlisted model (PR21) — unpriced, never billed
-        // at a guessed rate.
-        const rateKey = priceModel ?? col.price_model;
-        const p = rateKey ? current.price_table[rateKey] : undefined;
+        // resolves each column's model through the layered book itself
+        // (row globs first — including rates added inline this session,
+        // which the fetch-time col.price_model can't see — then the
+        // static fallback). An unmatched key is an unlisted model (PR21)
+        // — unpriced, never billed at a guessed rate.
+        const rateKey = priceModel
+          ? resolvedPick
+          : matchPriceKey(col.model, priceTable, priceGlobs);
+        const p = rateKey ? priceTable[rateKey] : undefined;
         if (!p) {
           return (
             <span
@@ -248,7 +286,7 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
               <option value="">
                 auto — per-model rates
               </option>
-              {Object.entries(current.price_table).map(([name, p]) => (
+              {Object.entries(priceTable).map(([name, p]) => (
                 <option key={name} value={name}>
                   {p.local
                     ? `${name} (local — $0)`
@@ -257,6 +295,22 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
               ))}
             </select>
           </label>
+          <AddRate
+            suggestGlob={unpricedModel ?? ""}
+            onAdded={(entry: PriceEntry) => {
+              setExtraPrices((m) => ({
+                ...m,
+                [entry.model_glob]: {
+                  input_per_mtok_usd: entry.input_per_mtok_usd,
+                  output_per_mtok_usd: entry.output_per_mtok_usd,
+                  cache_read_per_mtok_usd: entry.cache_read_per_mtok_usd,
+                  local: entry.local,
+                },
+              }));
+              // select the new rate — the what-if reprice is why it exists
+              setPriceModel(entry.model_glob);
+            }}
+          />
         </div>
       }
     >

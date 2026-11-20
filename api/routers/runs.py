@@ -11,6 +11,7 @@ Handlers are ``async def`` because they call ``asyncio.create_task`` (via
 from __future__ import annotations
 
 import logging
+import math
 import shutil
 import uuid
 from datetime import UTC, datetime
@@ -176,6 +177,15 @@ def _validate_harness_configs(body: RunCreate) -> None:
 async def create_run(body: RunCreate, session: DbSession) -> RunOut:
     """Submit a run: persist the spec, kick off rubric drafting in background."""
     _validate_harness_configs(body)
+    # gt=0 accepts inf — a non-finite cap would silently never trip (and a
+    # field-level rejection serializes the echoed body into the 422 → 500).
+    if body.budgets.max_cost_usd is not None and not math.isfinite(
+        body.budgets.max_cost_usd
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="budgets.max_cost_usd must be a finite number",
+        )
     # Best-effort provider-catalog check — warnings on absent models, a hard
     # 422 on provider-reported tool-capability mismatches. Catalog fetch
     # failures skip validation entirely (offline tolerance).

@@ -261,7 +261,10 @@ def test_desktop_capture_dead_app_reports_exit(
     artifact_dir = jail / "run1" / "sb1"
     ws = artifact_dir / "workspace"
     ws.mkdir(parents=True)
-    (ws / "main.py").write_text("import pygame\nthis is not python\n")
+    # NB: "this is = not python" is a REAL SyntaxError — the tempting
+    # "this is not python" is a valid `x is not y` expression that
+    # compiles and dies at runtime as a NameError instead.
+    (ws / "main.py").write_text("import pygame\nthis is = not python\n")
 
     mgr = PreviewManager(
         runtime=SandboxRuntime(), image=desktop_image, ttl_seconds=300

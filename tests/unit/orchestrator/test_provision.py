@@ -374,3 +374,71 @@ async def test_spawn_one_missing_run_returns_none(session_factory, settings, fak
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# PR28 — budgets_for per-cell caps + mint_sandbox_cred claim
+# ---------------------------------------------------------------------------
+
+
+def test_budgets_for_carries_per_cell_caps() -> None:
+    """sandbox_token_budget + max_cost_usd flow from run config to the
+    monitor's budget dict (and through to the minted cred)."""
+    from db.models import Run
+
+    run = Run(
+        task_prompt="t",
+        model_name="m",
+        config={
+            "budgets": {
+                "max_iters": 10,
+                "token_budget": 100_000,
+                "wall_clock_seconds": 600,
+                "sandbox_token_budget": 30_000,
+                "max_cost_usd": 0.05,
+            }
+        },
+    )
+    b = provision.budgets_for(run)
+    assert b["sandbox_token_budget"] == 30_000
+    assert b["max_cost_usd"] == 0.05
+    assert b["token_budget"] == 100_000
+
+
+def test_budgets_for_defaults_no_per_cell_caps() -> None:
+    from db.models import Run
+
+    run = Run(task_prompt="t", model_name="m", config={"budgets": {}})
+    b = provision.budgets_for(run)
+    assert b["sandbox_token_budget"] is None
+    assert b["max_cost_usd"] is None
+
+
+def test_mint_sandbox_cred_carries_sandbox_cap() -> None:
+    """The per-cell ceiling mints into the cred — the gateway enforces it
+    per request so a hot cell starves itself, not the run."""
+    budgets = {
+        "wall_clock_seconds": 100,
+        "token_budget": 50_000,
+        "sandbox_token_budget": 12_000,
+    }
+    cred = mint_sandbox_cred(
+        run_id=uuid.uuid4(),
+        sandbox_id=uuid.uuid4(),
+        secret="s3cr3t",
+        budgets=budgets,
+    )
+    claims = verify_cred(cred, secret="s3cr3t")
+    assert claims.max_tokens == 50_000  # run ceiling
+    assert claims.sandbox_max_tokens == 12_000  # per-cell ceiling
+
+
+def test_mint_sandbox_cred_no_sandbox_cap_when_unset() -> None:
+    budgets = {"wall_clock_seconds": 100, "token_budget": 50_000}
+    cred = mint_sandbox_cred(
+        run_id=uuid.uuid4(),
+        sandbox_id=uuid.uuid4(),
+        secret="s3cr3t",
+        budgets=budgets,
+    )
+    assert verify_cred(cred, secret="s3cr3t").sandbox_max_tokens is None
