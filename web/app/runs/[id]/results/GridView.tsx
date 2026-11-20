@@ -287,13 +287,20 @@ export default function GridView({
   dimensionKeys: string[];
   specMap: Map<string, DimSpec>;
 }) {
-  const [analytics, setAnalytics] = useState<Map<
-    string,
-    SandboxAnalytics
-  > | null>(null);
-  const [analyticsState, setAnalyticsState] = useState<
-    "loading" | "ready" | "failed"
-  >("loading");
+  // Result is keyed to the runId it was fetched for — ResultsClient keeps
+  // this mounted across client-side run navigation, so an unkeyed map
+  // would show run A's cost/clock against run B's cells (every lookup
+  // misses → a false "unpriced") while B's fetch is in flight, and a
+  // failed B fetch would keep A's "ready" values indefinitely.
+  const [analyticsResult, setAnalyticsResult] = useState<{
+    runId: string;
+    map: Map<string, SandboxAnalytics>;
+    state: "ready" | "failed";
+  } | null>(null);
+  const forThisRun = analyticsResult?.runId === runId ? analyticsResult : null;
+  const analytics = forThisRun?.map ?? null;
+  const analyticsState: "loading" | "ready" | "failed" =
+    forThisRun?.state ?? "loading";
 
   // Winner-card cost/time come from the F9 analytics endpoint — fetched
   // lazily here so the grid stays self-contained (AnalyticsSection keeps
@@ -309,11 +316,16 @@ export default function GridView({
       try {
         const a = await getRunAnalytics(runId);
         if (cancelled) return;
-        setAnalytics(new Map(a.sandboxes.map((s) => [s.sandbox_id, s])));
-        setAnalyticsState("ready");
+        setAnalyticsResult({
+          runId,
+          map: new Map(a.sandboxes.map((s) => [s.sandbox_id, s])),
+          state: "ready",
+        });
       } catch {
         if (!cancelled) {
-          setAnalyticsState((s) => (s === "ready" ? s : "failed"));
+          setAnalyticsResult((prev) =>
+            prev?.runId === runId ? prev : { runId, map: new Map(), state: "failed" },
+          );
         }
       }
     })();
