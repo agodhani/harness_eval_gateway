@@ -61,7 +61,9 @@ export default function AddRate({
       return;
     }
     const cr = cacheRead.trim();
-    const cache = cr === "" ? null : Number(cr);
+    // local rows never bill — a stale cache rate typed before the box was
+    // checked must not ship (the API also 422s local + any nonzero rate).
+    const cache = local || cr === "" ? null : Number(cr);
     if (cache !== null && !(Number.isFinite(cache) && cache >= 0)) {
       setError("cache-read rate must be a number ≥ 0 ($/Mtok)");
       return;

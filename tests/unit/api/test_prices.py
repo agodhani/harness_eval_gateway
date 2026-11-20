@@ -131,6 +131,45 @@ def test_put_rejects_non_finite_rate(client: TestClient) -> None:
         assert resp.status_code == 422, f"{field}=Infinity must be rejected"
 
 
+def test_put_rejects_local_with_nonzero_rate(client: TestClient) -> None:
+    """local renders "local — $0" on every surface — a nonzero rate beside
+    it is silent billing under a free label, so PUT refuses rather than
+    coercing (zero/null rates stay valid, see the next test)."""
+    for field in (
+        "input_per_mtok_usd",
+        "output_per_mtok_usd",
+        "cache_read_per_mtok_usd",
+    ):
+        resp = _put(client, model_glob="pr28-localx-*", local=True, **{field: 5.0})
+        assert resp.status_code == 422, f"local + {field}=5 must be rejected"
+        assert "local" in resp.json()["detail"][0]["msg"]
+
+
+def test_put_local_with_zero_or_null_rates_ok(
+    client: TestClient, session_factory: sessionmaker[Session], cleanup_globs
+) -> None:
+    """Explicit zeros and an absent cache rate carry no lie — local + all
+    zero/null rates upserts fine."""
+    glob = "pr28-local-zero-*"
+    cleanup_globs.append(glob)
+    resp = _put(
+        client,
+        model_glob=glob,
+        local=True,
+        input_per_mtok_usd=0,
+        output_per_mtok_usd=0.0,
+        cache_read_per_mtok_usd=0,
+    )
+    assert resp.status_code == 200
+    row = resp.json()
+    assert row["local"] is True
+    assert row["cache_read_per_mtok_usd"] == 0.0
+    # omitted fields default to 0/None — equally valid beside local
+    resp = _put(client, model_glob=glob, local=True)
+    assert resp.status_code == 200
+    assert resp.json()["cache_read_per_mtok_usd"] is None
+
+
 def test_put_upserts_case_insensitive(
     client: TestClient, session_factory: sessionmaker[Session], cleanup_globs
 ) -> None:

@@ -8,7 +8,9 @@ available under the current provider config.
 ``PUT /api/prices`` upserts a user rate by ``model_glob`` (the row's glob is
 the price key analytics resolves — ``gpt-4*`` reprices every ``gpt-4o*`` cell
 at once). User rows layer OVER the static table; deleting one restores the
-static fallback for whatever it covered.
+static fallback for whatever it covered. ``local=true`` marks free inference
+— every surface renders the row "local — $0" — so PUT 422s it beside any
+nonzero rate rather than billing money under a free label.
 
 ``DELETE /api/prices/{id}`` removes one row.
 
@@ -33,7 +35,13 @@ from typing import Annotated, Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -70,7 +78,13 @@ class PriceEntryOut(BaseModel):
 
 
 class PriceUpsertIn(BaseModel):
-    """PUT /api/prices body — create or replace the rate for ``model_glob``."""
+    """PUT /api/prices body — create or replace the rate for ``model_glob``.
+
+    ``local`` marks free inference (every surface renders the row
+    "local — $0"), so pairing it with a nonzero rate is refused rather
+    than coerced — accepting it would bill money under a free label.
+    Zero/null rates stay valid.
+    """
 
     model_glob: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
         min_length=1, max_length=255
@@ -80,6 +94,26 @@ class PriceUpsertIn(BaseModel):
     # Nullable like the column: absent/null bills cached input at the input rate.
     cache_read_per_mtok_usd: float | None = Field(default=None, ge=0)
     local: bool = False
+
+    @model_validator(mode="after")
+    def _local_forbids_nonzero_rates(self) -> PriceUpsertIn:
+        if not self.local:
+            return self
+        nonzero = [
+            name
+            for name, rate in (
+                ("input_per_mtok_usd", self.input_per_mtok_usd),
+                ("output_per_mtok_usd", self.output_per_mtok_usd),
+                ("cache_read_per_mtok_usd", self.cache_read_per_mtok_usd),
+            )
+            if rate
+        ]
+        if nonzero:
+            raise ValueError(
+                "local rows are never billed — rates must be 0 or null "
+                f"(nonzero: {', '.join(nonzero)})"
+            )
+        return self
 
 
 class PricesOut(BaseModel):

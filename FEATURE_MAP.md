@@ -1244,7 +1244,9 @@ workspace to produce.
   static `PRICE_TABLE`: a glob hit is the price key analytics resolves
   (and a valid `?price_model=` pick); a glob equal to a static key
   shadows it. `cache_read_per_mtok_usd` NULL bills cached input at the
-  input rate; `local` marks free inference. A bare (no `/`) glob never
+  input rate; `local` marks free inference — PUT 422s `local` beside any
+  nonzero rate (the pickers render "local — $0"), so free rows can't
+  silently bill. A bare (no `/`) glob never
   matches `vendor/model` ids — write `openai/*` deliberately.
 - **`POST /api/prices/sync`** — pulls the OpenRouter `/models` catalog
   THROUGH the gateway (`x-heg-provider: openrouter` service-cred

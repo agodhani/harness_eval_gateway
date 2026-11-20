@@ -708,7 +708,9 @@ or tests change.
   (`created_at, id` declaration order, first match wins) layer OVER
   `api.pricing.PRICE_TABLE` via `PriceBook`; a bare (no `/`) glob never
   matches `vendor/model` ids. `PUT /api/prices` upserts user rows
-  (never clobbered by sync); `POST /api/prices/sync` maps OpenRouter
+  (never clobbered by sync) — `local` marks free inference, so PUT 422s
+  it beside any nonzero rate rather than billing under a "local — $0"
+  label; `POST /api/prices/sync` maps OpenRouter
   `/models` `pricing.*` USD-per-token strings to per-Mtok rates through
   the gateway's `x-heg-provider` override — entries with no parseable
   rate are skipped rather than priced-free. Per-cell budgets:
