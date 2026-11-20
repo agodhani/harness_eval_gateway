@@ -1790,3 +1790,23 @@ def test_files_diff_identical_requires_full_equality(
     ).json()
     assert body["identical"] is False
     assert body["truncated"] is True
+
+
+def test_files_list_unreadable_dir_flags_truncated(
+    client: TestClient, browsed_run
+) -> None:
+    """A chmod-0 directory can't be scandir'd — the walk's onerror flags
+    ``truncated`` so the subtree is reported as cut, never silently absent."""
+    locked = browsed_run["ws1"] / "src" / "locked"
+    locked.mkdir()
+    (locked / "hidden.txt").write_text("x")
+    locked.chmod(0)
+    try:
+        if os.access(locked, os.R_OK | os.X_OK):
+            pytest.skip("privileged run — chmod 0 dir still listable")
+        body = client.get(f"/api/sandboxes/{browsed_run['sb1']}/files").json()
+        names = {e["path"] for e in body["entries"]}
+        assert "src/locked/hidden.txt" not in names
+        assert body["truncated"] is True
+    finally:
+        locked.chmod(0o755)

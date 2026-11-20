@@ -1215,11 +1215,19 @@ def _list_root_entries(root: Path) -> tuple[list[FileEntry], bool]:
     Same exclusions as the workspace ZIP (``.git``/``__pycache__``/
     ``node_modules``/``.venv`` dirs at any depth, ``*.pyc`` files) — the
     browser shows the artifact, not its noise. Symlinks are never followed
-    or listed (candidate content could point outside the jail).
+    or listed (candidate content could point outside the jail). A scandir
+    failure (a chmod-0 candidate dir survives ``docker cp`` tar
+    extraction) flags ``truncated`` — an unlistable subtree must not
+    vanish silently.
     """
     entries: list[FileEntry] = []
     truncated = False
-    for dirpath, dirnames, filenames in os.walk(root):
+
+    def _walk_failed(_err: OSError) -> None:
+        nonlocal truncated
+        truncated = True
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_walk_failed):
         rel_dir = Path(dirpath).relative_to(root)
         depth = len(rel_dir.parts)
         if depth > 0:
