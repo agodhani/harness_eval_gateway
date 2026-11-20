@@ -433,12 +433,14 @@ async def update_preset(slug: str, body: PresetUpdate, session: DbSession) -> Pr
             "description",
             "category",
             "tags",
-            "suggested_adapter",
-            "suggested_models",
         ):
             value = getattr(body, field_name)
             if value is not None:
                 setattr(row, field_name, value)
+                changed = True
+        for field_name in ("suggested_adapter", "suggested_models"):
+            if field_name in body.model_fields_set:
+                setattr(row, field_name, getattr(body, field_name))
                 changed = True
         if changed:
             row.revision = (row.revision or 1) + 1

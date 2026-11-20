@@ -47,9 +47,6 @@ _SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
 _TRAILING_NUM_RE = re.compile(r"^(.*?)-(\d+)$")
 
 _FRONTMATTER_REQUIRED = ("slug", "title", "category")
-_FRONTMATTER_SCALARS = ("slug", "title", "description", "category", "suggested_adapter")
-_FRONTMATTER_LISTS = ("tags", "suggested_models")
-_FRONTMATTER_OBJECTS = ("suggested_rubric", "suite")
 
 
 class PresetError(Exception):

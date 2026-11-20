@@ -123,6 +123,7 @@ export default function SubmitPage() {
   // it submittable (offline resubmit — the server resolves it).
   const [presetSlug, setPresetSlug] = useState<string | null>(null);
   const [presets, setPresets] = useState<TaskPreset[] | null>(null);
+  const [presetsFailed, setPresetsFailed] = useState(false);
   const [presetQuery, setPresetQuery] = useState("");
   const [presetCategory, setPresetCategory] = useState("");
   const [presetNotice, setPresetNotice] = useState<string | null>(null);
@@ -364,6 +365,7 @@ export default function SubmitPage() {
       .catch(() => {
         /* API down — preset mode stays selectable but unverifiable;
            a staged preset_ref still submits (server resolves it). */
+        if (!cancelled) setPresetsFailed(true);
       });
     return () => {
       cancelled = true;
@@ -850,7 +852,15 @@ export default function SubmitPage() {
                   )}
                 </>
               ) : presets === null ? (
-                <Loading label="Loading presets…" />
+                presetsFailed ? (
+                  <WarnNote>
+                    Preset library unavailable — a preset slug can still be
+                    submitted (the server resolves it), or switch to a custom
+                    prompt.
+                  </WarnNote>
+                ) : (
+                  <Loading label="Loading presets…" />
+                )
               ) : (
                 <EmptyState>
                   No presets in the library — switch to a custom prompt.
