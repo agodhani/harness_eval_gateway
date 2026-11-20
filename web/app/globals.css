@@ -1715,6 +1715,137 @@ table.matrix {
 }
 
 /* ==========================================================================
+   PR31 — config × model heatmap grid + winner card
+   ========================================================================== */
+
+.grid-view {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  padding: 0.7rem;
+}
+
+/* Winner card — the top weighted cell with its cost/time/pass-rate. */
+.winner {
+  border: 1px solid color-mix(in srgb, var(--green) 40%, var(--border));
+  background: color-mix(in srgb, var(--green) 6%, var(--surface));
+  padding: 0.7rem 0.9rem;
+}
+.winner--empty {
+  border-color: var(--border);
+  background: var(--surface);
+  font-size: 0.8rem;
+}
+.winner__head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.winner__name {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+.winner__model {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+.winner__stats {
+  display: flex;
+  gap: 1.6rem;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+.winner__stat {
+  display: flex;
+  flex-direction: column;
+  min-width: 70px;
+}
+.winner__value {
+  font-family: var(--mono);
+  font-size: 1.15rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.winner__value--delta {
+  color: var(--green);
+}
+.winner__label {
+  font-size: 0.68rem;
+  color: var(--text-faint);
+  margin-top: 0.1rem;
+}
+.winner__runnerup {
+  margin-top: 0.5rem;
+  font-size: 0.76rem;
+}
+
+/* Heatmap table — reuses .matrix chrome; cells carry the color fill. */
+.grid-table thead th {
+  min-width: 120px;
+}
+.grid-table th.grid-corner {
+  min-width: 160px;
+  font-size: 0.68rem;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.grid-table .grid-colhead {
+  text-align: center;
+  font-size: 0.74rem;
+}
+.grid-table th.grid-rowhead {
+  background: var(--surface-2);
+  font-weight: 550;
+  min-width: 160px;
+}
+td.grid-cell {
+  position: relative;
+  text-align: center;
+  min-width: 110px;
+  vertical-align: middle;
+  padding: 0.55rem 0.6rem;
+}
+td.grid-cell--empty {
+  background: transparent;
+}
+td.grid-cell--winner {
+  outline: 2px solid var(--green);
+  outline-offset: -2px;
+}
+.grid-cell__score {
+  display: block;
+  font-family: var(--mono);
+  font-size: 1.25rem;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.grid-cell__sub {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  color: var(--text-dim);
+  margin-top: 0.1rem;
+}
+.grid-cell__sub--w {
+  color: var(--text-faint);
+}
+.grid-cell__crown {
+  position: absolute;
+  top: 0.2rem;
+  right: 0.3rem;
+  font-size: 0.7rem;
+  color: var(--green);
+}
+.grid-legend {
+  font-size: 0.74rem;
+  margin: 0;
+}
+
+/* ==========================================================================
    Definition lists / misc detail rendering
    ========================================================================== */
 
