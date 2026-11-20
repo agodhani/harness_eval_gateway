@@ -653,10 +653,6 @@ class PresetOut(BaseModel):
     revision: int = 1
     suggested_adapter: str | None = None
     suggested_models: list[str] = Field(default_factory=list)
-    # Forward-declared for PR23 (rubric library) / PR26 (suites) — the
-    # columns exist; null until those features populate them.
-    suggested_rubric: dict[str, Any] | None = None
-    suite: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     # Library-browse aggregates — every run whose preset_ref matches the
@@ -748,8 +744,8 @@ class PresetLeaderboardEntry(BaseModel):
     """One row of a preset leaderboard — mean ``overall`` score pooled over
     every scored sandbox cell in the bucket across all runs on the preset."""
 
-    key: str  # group key — model name, or the config label
-    label: str  # display label (same as key today; kept for richer labels)
+    key: str  # group key — model name, or ``name:<name>`` / ``cfg:<adapter>|<packs>|<extra>``
+    label: str  # display label — model name, or ``adapter · packs [· +prompt]`` / config name
     adapter: str | None = None  # config board only: the grouped adapter
     name: str | None = None  # config board only: PR1 config name when set
     mean_overall_score: float

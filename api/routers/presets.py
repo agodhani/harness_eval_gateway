@@ -106,8 +106,6 @@ def _preset_out(
         revision=preset.revision,
         suggested_adapter=preset.suggested_adapter,
         suggested_models=preset.suggested_models,
-        suggested_rubric=preset.suggested_rubric,
-        suite=preset.suite,
         created_at=preset.created_at,
         updated_at=preset.updated_at,
         runs_count=runs_count,

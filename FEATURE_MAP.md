@@ -1127,7 +1127,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - **vendored** — Markdown files under `task_presets/<slug>.md` (commit-
     ted, read-only at runtime, `TASK_PRESETS_DIR` configurable). YAML-
     frontmatter-ish metadata (slug/title/description/category/tags/
-    suggested_adapter/suggested_models/suggested_rubric/suite) parsed by
+    suggested_adapter/suggested_models) parsed by
     the same stdlib frontmatter parser as skillpacks
     (`adapters/miniloop/skills.py` — flow-style values like
     `tags: [a, b]`, no YAML block lists); the body below `---` is the

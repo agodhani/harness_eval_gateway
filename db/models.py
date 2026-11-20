@@ -197,8 +197,6 @@ class TaskPreset(Base):
     rows in this table are always ``source="user"`` and share the vendored
     slug namespace (creation rejects vendored-name collisions). ``revision``
     bumps on every PATCH and is what ``runs.preset_revision`` snapshots.
-    ``suggested_rubric`` (PR23) and ``suite`` (PR26) land as populated columns
-    later — they exist now so later PRs don't re-migrate the table.
     """
 
     __tablename__ = "task_presets"
@@ -220,8 +218,6 @@ class TaskPreset(Base):
     # keys so vendored and user presets read uniformly in PresetOut.
     suggested_adapter: Mapped[str | None] = mapped_column(String(64))
     suggested_models: Mapped[list[Any] | None] = mapped_column(JSONType)
-    suggested_rubric: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
-    suite: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

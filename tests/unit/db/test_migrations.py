@@ -99,8 +99,6 @@ def test_task_presets_upgrade_downgrade(sqlite_url: str) -> None:
         "revision",
         "suggested_adapter",
         "suggested_models",
-        "suggested_rubric",
-        "suite",
         "created_at",
         "updated_at",
     } <= preset_cols

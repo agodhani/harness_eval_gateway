@@ -1355,8 +1355,6 @@ export interface TaskPreset {
   revision: number;
   suggested_adapter: string | null;
   suggested_models: string[];
-  suggested_rubric: Record<string, unknown> | null;
-  suite: Record<string, unknown> | null;
   created_at: string | null;
   updated_at: string | null;
   /** Library browse aggregates — runs whose preset_ref matches + the

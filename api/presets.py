@@ -6,7 +6,7 @@ freeform prompt. Two sources share ONE slug namespace:
 - **vendored** — ``task_presets/<slug>.md`` at the repo root: a YAML-ish
   frontmatter block (``slug`` — which must equal the filename stem —
   ``title``, ``description``, ``category``, ``tags``, optional
-  ``suggested_adapter``/``suggested_models``/``suggested_rubric``/``suite``)
+  ``suggested_adapter``/``suggested_models``)
   followed by a markdown body that IS the task prompt. Committed + baked
   into the api image like ``skillpacks/``.
 - **user** — ``task_presets`` table rows created via
@@ -21,7 +21,6 @@ link is provenance, the stored prompt is the comparison contract.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -89,8 +88,6 @@ class Preset:
     revision: int = 1
     suggested_adapter: str | None = None
     suggested_models: list[str] = field(default_factory=list)
-    suggested_rubric: dict[str, Any] | None = None
-    suite: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -167,23 +164,6 @@ def _list_value(value: Any) -> list[str]:
     return out
 
 
-def _object_value(value: Any) -> dict[str, Any] | None:
-    """Nested frontmatter objects — the mini-parser yields strings, so a
-    vendored file expresses an object as an inline JSON literal."""
-    if isinstance(value, dict):
-        return dict(value)
-    if isinstance(value, str):
-        text = value.strip()
-        if text.startswith("{"):
-            try:
-                parsed = json.loads(text)
-            except ValueError:
-                return None
-            if isinstance(parsed, dict):
-                return parsed
-    return None
-
-
 def parse_preset_md(text: str, *, filename: str) -> Preset:
     """Parse one ``<slug>.md`` preset file into a vendored ``Preset``.
 
@@ -224,8 +204,6 @@ def parse_preset_md(text: str, *, filename: str) -> Preset:
         revision=1,
         suggested_adapter=_scalar(meta.get("suggested_adapter")) or None,
         suggested_models=_list_value(meta.get("suggested_models")),
-        suggested_rubric=_object_value(meta.get("suggested_rubric")),
-        suite=_object_value(meta.get("suite")),
     )
 
 
@@ -293,8 +271,6 @@ def user_to_preset(row: TaskPreset) -> Preset:
         revision=row.revision or 1,
         suggested_adapter=row.suggested_adapter,
         suggested_models=[str(m) for m in (row.suggested_models or [])],
-        suggested_rubric=row.suggested_rubric,
-        suite=row.suite,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

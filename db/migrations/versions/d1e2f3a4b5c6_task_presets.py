@@ -10,8 +10,6 @@ PR22 — task preset library. ``task_presets`` stores USER-saved presets
 ``runs.preset_ref`` + ``runs.preset_revision`` snapshot which preset (and
 which revision of it) a submitted run's task_prompt came from — provenance
 for preset-scoped grouping, leaderboards, and score-over-time views.
-``suggested_rubric`` (PR23) and ``suite`` (PR26) are declared now so those
-PRs populate columns instead of re-migrating.
 
 Merge note: parallel PRs may add migrations off the same parent
 (``a2b3c4d5e6f7``). Whichever lands second must re-point ``down_revision``
@@ -47,8 +45,6 @@ def upgrade() -> None:
         sa.Column("revision", sa.Integer(), nullable=False, server_default="1"),
         sa.Column("suggested_adapter", sa.String(length=64), nullable=True),
         sa.Column("suggested_models", JSONB, nullable=True),
-        sa.Column("suggested_rubric", JSONB, nullable=True),
-        sa.Column("suite", JSONB, nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.UniqueConstraint("slug", name="uq_task_presets_slug"),
