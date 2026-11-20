@@ -1261,7 +1261,11 @@ configurable per cell (e.g. temperature sweeps).
   `fmtMeanSd`/`stripTrialSuffix`).
 - Submit UI: a `trials` stepper (1–8) plus advanced per-config
   model-options controls annotated with each adapter's supported set;
-  submit warnings surface dropped keys. `resubmit` carries both fields.
+  submit warnings surface dropped keys. Reasoning-effort options are
+  adapter-scoped — codex offers `minimal|low|medium|high|xhigh` (its
+  `model_reasoning_effort` vocabulary; `max`/`none` fail codex's config
+  parse), pass-through adapters keep the broader list. `resubmit` carries
+  both fields.
 - Files: `api/schemas.py` (`ModelOptions`, `RunCreate.trials`,
   `CellAnalytics`), `api/routers/runs.py` (persist + filter + warnings),
   `api/routers/analytics.py` + `results.py` (`trial_index`/`cell`/

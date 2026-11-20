@@ -125,8 +125,9 @@ class ModelOptions(BaseModel):
     the ``prompt`` pseudo-adapter map all four into the chat-completions
     request; adapters report their supported keys via
     ``MANIFEST["model_options"]`` / ``GET /api/harnesses``). Keys the
-    selected adapter does NOT support are dropped at provisioning and called
-    out in the submit response's ``warnings`` — never silently applied.
+    selected adapter does NOT support are dropped at submit (the persisted
+    cell only carries honored keys) and called out in the submit response's
+    ``warnings`` — never silently applied.
     Unknown keys are rejected here (``extra="forbid"``) so typos 422 rather
     than silently no-op.
 
