@@ -110,6 +110,7 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
   );
   const byModel = view === "model" && multiModel;
   const byCell = view === "cell" && hasTrialCells;
+  const bySandbox = !byModel && !byCell;
   const columns: Column[] = byModel
     ? (current?.models ?? [])
     : byCell
@@ -127,24 +128,26 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
   if (current.sandboxes.length === 0) return null;
 
   const rows: Row[] = [
-    {
-      label: "score (overall)",
-      hint: byCell
-        ? "mean ±sd (n) across the cell's trials"
-        : "per-cell trial-group rollup only",
-      cell: (col) =>
-        isCellCol(col) && col.overall_mean != null ? (
-          <span className="mono" style={{ fontSize: "0.8rem" }}>
-            {fmtMeanSd({
-              mean: col.overall_mean,
-              sd: col.overall_sd,
-              n: col.overall_n,
-            })}
-          </span>
-        ) : (
-          <span className="score-na">—</span>
-        ),
-    },
+    ...(byCell
+      ? [
+          {
+            label: "score (overall)",
+            hint: "mean ±sd (n) across the cell's trials",
+            cell: (col: Column) =>
+              isCellCol(col) && col.overall_mean != null ? (
+                <span className="mono" style={{ fontSize: "0.8rem" }}>
+                  {fmtMeanSd({
+                    mean: col.overall_mean,
+                    sd: col.overall_sd,
+                    n: col.overall_n,
+                  })}
+                </span>
+              ) : (
+                <span className="score-na">—</span>
+              ),
+          },
+        ]
+      : []),
     {
       label: "wall clock",
       // By-model rollups sum member cells' event spans — parallel cells
@@ -258,8 +261,8 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
               <button
                 type="button"
                 role="tab"
-                aria-selected={!byModel}
-                className={`seg__btn${byModel ? "" : " seg__btn--active"}`}
+                aria-selected={bySandbox}
+                className={`seg__btn${bySandbox ? " seg__btn--active" : ""}`}
                 onClick={() => setView("sandbox")}
               >
                 per sandbox
@@ -280,8 +283,8 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
               <button
                 type="button"
                 role="tab"
-                aria-selected={!byCell}
-                className={`seg__btn${byCell ? "" : " seg__btn--active"}`}
+                aria-selected={bySandbox}
+                className={`seg__btn${bySandbox ? " seg__btn--active" : ""}`}
                 onClick={() => setView("sandbox")}
               >
                 per sandbox
