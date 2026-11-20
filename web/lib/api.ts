@@ -860,24 +860,53 @@ export function getRunAnalytics(runId: string, priceModel?: string): Promise<Run
 }
 
 /** fnmatch-style glob test mirroring api/pricing.py::glob_matches —
- * case-insensitive; a pattern with no "/" never matches a vendor/model id. */
+ * case-insensitive; a pattern with no "/" never matches a vendor/model id.
+ * The translator ports Python's fnmatch.translate: `*`/`?` wildcards,
+ * `[seq]` character classes with `[!seq]` negation (a leading "]" inside a
+ * class is a literal), and an unclosed "[" matching the literal text —
+ * where a naive escape-everything pass inverts [!seq] semantics and
+ * throws on a dangling bracket. */
 export function globMatch(pattern: string, model: string): boolean {
   const pat = pattern.trim().toLowerCase();
   const name = model.trim().toLowerCase();
   if (!pat || !name) return false;
   if (name.includes("/") && !pat.includes("/")) return false;
-  // translate fnmatch (* ? [seq]) to a regex — same semantics as Python's;
-  // a malformed pattern (e.g. unmatched "[") just fails to match.
+  let re = "^";
+  let i = 0;
+  while (i < pat.length) {
+    const c = pat[i++];
+    if (c === "*") {
+      re += ".*";
+    } else if (c === "?") {
+      re += ".";
+    } else if (c === "[") {
+      // scan the class body: "!" negates, a leading "]" is a literal
+      let j = i;
+      if (j < pat.length && pat[j] === "!") j++;
+      if (j < pat.length && pat[j] === "]") j++;
+      while (j < pat.length && pat[j] !== "]") j++;
+      if (j >= pat.length) {
+        re += "\\["; // unclosed "[" — fnmatch treats it as the literal char
+      } else {
+        // escape \ and ] inside the class (JS needs \] for a literal "]"),
+        // then apply fnmatch's "!" → "^" negation; a leading ^/[ also
+        // needs escaping so it can't re-negate or nest a class
+        let stuff = pat.slice(i, j).replace(/[\\\]]/g, "\\$&");
+        if (stuff.startsWith("!")) {
+          stuff = "^" + stuff.slice(1);
+        } else if (stuff.startsWith("^") || stuff.startsWith("[")) {
+          stuff = "\\" + stuff;
+        }
+        re += `[${stuff}]`;
+        i = j + 1;
+      }
+    } else {
+      re += c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  re += "$";
   try {
-    const re = new RegExp(
-      "^" +
-        pat
-          .replace(/[.+^${}()|\\]/g, "\\$&")
-          .replace(/\*/g, ".*")
-          .replace(/\?/g, ".") +
-        "$",
-    );
-    return re.test(name);
+    return new RegExp(re).test(name);
   } catch {
     return false;
   }

@@ -408,10 +408,16 @@ export default function SubmitPage() {
       errs.token_budget = "token_budget must be ≥ 1000 (per-run).";
     if (
       budgets.sandbox_token_budget != null &&
-      budgets.sandbox_token_budget < 1000
+      !(Number.isFinite(budgets.sandbox_token_budget) &&
+        budgets.sandbox_token_budget >= 1000)
     )
+      // Number.isFinite first — "1e999" parses to Infinity, passes range
+      // checks, then JSON.stringify silently emits null (cap dropped).
       errs.sandbox_token_budget = "sandbox_token_budget must be ≥ 1000 when set.";
-    if (budgets.max_cost_usd != null && !(budgets.max_cost_usd > 0))
+    if (
+      budgets.max_cost_usd != null &&
+      !(Number.isFinite(budgets.max_cost_usd) && budgets.max_cost_usd > 0)
+    )
       errs.max_cost_usd = "max_cost_usd must be > 0 when set.";
     if (budgets.wall_clock_seconds < 60 || budgets.wall_clock_seconds > 86400)
       errs.wall_clock_seconds = "wall_clock_seconds must be 60–86400.";

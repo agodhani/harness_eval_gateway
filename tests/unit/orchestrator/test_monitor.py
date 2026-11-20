@@ -259,6 +259,44 @@ async def test_wall_clock_deadline_timeout(session_factory, settings, fake_runti
 
 
 async def test_budget_error_event_terminates(session_factory, settings, fake_runtime) -> None:
+    """The gateway's own budget-gate event — the PRIMARY sandbox_tokens
+    enforcement path — terminates the cell AND forwards which limit fired
+    into the terminate checkpoint (same contract as the poll path)."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    _add_event(
+        session_factory, run.id, sb.id, "error",
+        {
+            "stage": "budget",
+            "reason": "budget_exceeded",
+            "http_status": 429,
+            "limit": "sandbox_tokens",
+            "used_tokens": 1234,
+            "budget": 1000,
+        },
+    )
+    fake_runtime.status_map[str(sb.id)] = {"status": "running", "exit_code": None}
+
+    reason = await _watch(session_factory, settings, fake_runtime, run.id, sb.id)
+    assert reason == "budget_exceeded"
+    row = _get_sandbox(session_factory, sb.id)
+    assert row.status == "failed"
+    assert row.terminal_reason == "budget_exceeded"
+    term = next(
+        p for p in _checkpoint_payloads(session_factory, sb.id)
+        if p.get("stage") == "terminate"
+    )
+    assert term["reason"] == "budget_exceeded"
+    assert term["limit"] == "sandbox_tokens"
+    assert term["used_tokens"] == 1234
+    assert term["budget"] == 1000
+
+
+async def test_budget_error_event_without_limit_still_terminates(
+    session_factory, settings, fake_runtime
+) -> None:
+    """A pre-PR28 style gate event (no limit/usage fields) still terminates
+    budget_exceeded — the checkpoint just omits the optional detail keys."""
     run = make_run(session_factory, status="running", config=run_config())
     sb = make_sandbox(session_factory, run.id, status="running")
     _add_event(
@@ -269,9 +307,12 @@ async def test_budget_error_event_terminates(session_factory, settings, fake_run
 
     reason = await _watch(session_factory, settings, fake_runtime, run.id, sb.id)
     assert reason == "budget_exceeded"
-    row = _get_sandbox(session_factory, sb.id)
-    assert row.status == "failed"
-    assert row.terminal_reason == "budget_exceeded"
+    term = next(
+        p for p in _checkpoint_payloads(session_factory, sb.id)
+        if p.get("stage") == "terminate"
+    )
+    assert term["reason"] == "budget_exceeded"
+    assert "limit" not in term
 
 
 async def test_upstream_429_is_not_budget_exceeded(

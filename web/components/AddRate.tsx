@@ -51,13 +51,18 @@ export default function AddRate({
     }
     const inp = local ? 0 : Number(input);
     const out = local ? 0 : Number(output);
-    if (!local && (!(inp >= 0) || !(out >= 0))) {
+    // isFinite — "1e999" parses to Infinity, passes `>= 0`, then
+    // JSON.stringify emits null (a "saved" rate with no rate).
+    if (
+      !local &&
+      (!(Number.isFinite(inp) && inp >= 0) || !(Number.isFinite(out) && out >= 0))
+    ) {
       setError("input/output rates must be numbers ≥ 0 ($/Mtok)");
       return;
     }
     const cr = cacheRead.trim();
     const cache = cr === "" ? null : Number(cr);
-    if (cache !== null && !(cache >= 0)) {
+    if (cache !== null && !(Number.isFinite(cache) && cache >= 0)) {
       setError("cache-read rate must be a number ≥ 0 ($/Mtok)");
       return;
     }

@@ -115,15 +115,22 @@ def _gateway_error_verdict(
     session_factory: sessionmaker[Session],
     run_id: uuid.UUID,
     sandbox_id: uuid.UUID,
-) -> str | None:
-    """Terminal reason implied by this sandbox's gateway ``error`` events.
+) -> tuple[str, dict[str, Any] | None] | None:
+    """``(terminal_reason, detail)`` implied by this sandbox's gateway
+    ``error`` events.
 
     Two distinct 429 sources used to be conflated here (any error event with
     ``http_status==429`` → ``budget_exceeded``), which mislabeled upstream
     provider rate-limits as budget exhaustion:
 
     - ``stage="budget"`` / ``reason="budget_exceeded"`` — the gateway's OWN
-      run-token-budget gate → ``budget_exceeded``.
+      run/sandbox token-budget gate → ``budget_exceeded``. The gate's error
+      payload already records which line it fired at — ``limit`` ∈
+      ``run_tokens``/``sandbox_tokens`` plus ``used_tokens``/``budget`` —
+      so this is the PRIMARY enforcement path for the sandbox claim; the
+      poll below is the backstop. ``detail`` forwards those fields so the
+      terminate checkpoint carries ``payload.limit`` exactly like the
+      poll-path checkpoints do.
     - ``stage="upstream"`` — the provider failed the call (rate-limit 429,
       5xx, unreachable). ≥ ``UPSTREAM_ERROR_THRESHOLD`` → ``error``; a lone
       transient blip doesn't kill a healthy sandbox.
@@ -144,11 +151,16 @@ def _gateway_error_verdict(
             payload.get("reason") == "budget_exceeded"
             or payload.get("stage") == "budget"
         ):
-            return "budget_exceeded"
+            detail = {
+                key: payload[key]
+                for key in ("limit", "used_tokens", "budget")
+                if payload.get(key) is not None
+            }
+            return "budget_exceeded", detail or None
         if payload.get("stage") == "upstream":
             upstream_errors += 1
     if upstream_errors >= UPSTREAM_ERROR_THRESHOLD:
-        return "error"
+        return "error", None
     return None
 
 
@@ -538,12 +550,14 @@ async def watch_sandbox(
             #    then run-wide token total
             verdict = _gateway_error_verdict(session_factory, run_id, sandbox_id)
             if verdict is not None:
+                reason, detail = verdict
                 return await _terminate(
                     session_factory=session_factory,
                     runtime=runtime,
                     run_id=run_id,
                     sandbox_id=sandbox_id,
-                    reason=verdict,
+                    reason=reason,
+                    detail=detail,
                 )
             if token_budget:
                 used = _run_tokens_used(session_factory, run_id)

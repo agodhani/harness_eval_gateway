@@ -255,15 +255,16 @@ export default function AnalysisClient({ runId }: { runId: string }) {
   );
 
   // Cost recompute — mirrors the server: an explicit pick reprices every
-  // sandbox uniformly; auto ("") costs each sandbox at its OWN model's
-  // rate (PR14 — SandboxAnalytics.price_model is the server-resolved key,
-  // null when the model is unlisted → unpriced, PR21).
+  // sandbox uniformly; auto ("") resolves each sandbox's model through the
+  // layered book itself (row globs first — including rates added inline
+  // this session, which the fetch-time sb.price_model can't see — then
+  // the static fallback; unlisted → unpriced, PR21).
   const priceFor = useCallback(
-    (sb: { price_model?: string | null }) => {
-      const key = priceModel ?? sb.price_model;
+    (sb: { model: string; price_model?: string | null }) => {
+      const key = priceModel ?? matchPriceKey(sb.model, priceTable, priceGlobs);
       return key ? priceTable[key] : undefined;
     },
-    [priceTable, priceModel],
+    [priceTable, priceModel, priceGlobs],
   );
   const evaluatorModel =
     data.results?.evaluator_model ??
@@ -536,7 +537,13 @@ export default function AnalysisClient({ runId }: { runId: string }) {
                 </select>
               </label>
               <AddRate
-                suggestGlob={sbs.find((sb) => sb.price_model == null)?.model ?? ""}
+                suggestGlob={
+                  sbs.find(
+                    (sb) =>
+                      matchPriceKey(sb.model, priceTable, priceGlobs) ===
+                      undefined,
+                  )?.model ?? ""
+                }
                 onAdded={(entry: PriceEntry) => {
                   setExtraPrices((m) => ({
                     ...m,

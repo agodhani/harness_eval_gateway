@@ -16,7 +16,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { matchPriceKey, type ModelPrice } from "./api.ts";
+import { globMatch, matchPriceKey, type ModelPrice } from "./api.ts";
 
 const rate = (n: number): ModelPrice => ({
   input_per_mtok_usd: n,
@@ -90,5 +90,68 @@ describe("matchPriceKey", () => {
 
   test("a glob row still covers a differently-cased model", () => {
     assert.equal(matchPriceKey("CLAUDE-SONNET-4.5", TABLE, GLOBS), "claude-*");
+  });
+});
+
+// globMatch ports Python's fnmatch semantics — oracles below derived from
+// fnmatch.fnmatchcase behavior: [!seq] is a NEGATED class, a leading "]"
+// inside a class is a literal, and an unclosed "[" matches literal text.
+describe("globMatch", () => {
+  test("* and ? wildcards", () => {
+    assert.equal(globMatch("gpt-4*", "gpt-4o-mini"), true);
+    assert.equal(globMatch("gpt-4?", "gpt-4o"), true);
+    assert.equal(globMatch("gpt-4?", "gpt-4o-mini"), false);
+  });
+
+  test("[seq] matches exactly one char in the set; [a-z] ranges work", () => {
+    // a class consumes ONE char — "modelv2" is model + TWO chars → no.
+    assert.equal(globMatch("model[v12]", "modelv"), true);
+    assert.equal(globMatch("model[v12]", "model1"), true);
+    assert.equal(globMatch("model[v12]", "modelx"), false);
+    assert.equal(globMatch("model[v12]", "modelv2"), false);
+    assert.equal(globMatch("model-[a-c]", "model-b"), true);
+    assert.equal(globMatch("model-[a-c]", "model-d"), false);
+  });
+
+  test("[!seq] NEGATES the class (fnmatch semantics)", () => {
+    // modelc: "c" ∉ {a,b} → matches — the naive regex pass inverted this
+    // ([!ab] as a JS class would match literal !, a, b).
+    assert.equal(globMatch("model[!ab]", "modelc"), true);
+    assert.equal(globMatch("model[!ab]", "model!"), true);
+    assert.equal(globMatch("model[!ab]", "modela"), false);
+    assert.equal(globMatch("model[!ab]", "modelb"), false);
+  });
+
+  test("a leading ] inside the class is a literal", () => {
+    // Python: glob "[]a]" = class matching "]" or "a".
+    assert.equal(globMatch("m[]a]", "m]"), true);
+    assert.equal(globMatch("m[]a]", "ma"), true);
+    assert.equal(globMatch("m[]a]", "mb"), false);
+  });
+
+  test("an unclosed [ matches the literal text", () => {
+    // Python: "model[v2" has no closing "]" → the "[" is literal.
+    assert.equal(globMatch("model[v2", "model[v2"), true);
+    assert.equal(globMatch("model[v2", "modelv2"), false);
+  });
+
+  test("case-insensitive; bare pattern never spans a vendor/ id", () => {
+    assert.equal(globMatch("GPT-4*", "gpt-4o"), true);
+    assert.equal(globMatch("gpt-4*", "openai/gpt-4o"), false);
+    assert.equal(globMatch("*/gpt-4o", "openai/gpt-4o"), true);
+  });
+
+  test("matchPriceKey sees [seq] rows through globMatch", () => {
+    const table = { ...TABLE, "acme-[v2]*": rate(4) };
+    assert.equal(
+      matchPriceKey("acme-v2x-7b", table, ["acme-[v2]*"]),
+      "acme-[v2]*",
+    );
+    // "x" ∉ {v,2} → no match (and "v3x" DOES match — v is in the class)
+    assert.equal(
+      matchPriceKey("acme-v3x-7b", table, ["acme-[v2]*"]),
+      "acme-[v2]*",
+    );
+    assert.equal(matchPriceKey("acme-x3-7b", table, ["acme-[v2]*"]), undefined);
   });
 });

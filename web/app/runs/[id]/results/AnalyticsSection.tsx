@@ -13,6 +13,7 @@ import {
   ApiError,
   estimateCostUsd,
   getRunAnalytics,
+  matchPriceKey,
   type ModelAnalytics,
   type ModelPrice,
   type PriceEntry,
@@ -110,8 +111,18 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
     ...(current?.price_table ?? {}),
     ...extraPrices,
   };
-  // Prefill the add-rate glob from a column whose model resolved no rate.
-  const unpricedModel = columns.find((c) => c.price_model == null)?.model;
+  // Row globs in declaration order — the fetched list plus rates added
+  // inline this session (a new row lands at the end of the book's scan).
+  const priceGlobs = [
+    ...(current?.price_globs ?? []),
+    ...Object.keys(extraPrices),
+  ];
+  // Prefill the add-rate glob from a column whose model resolved no rate
+  // — through the SAME matcher auto mode uses, so a just-saved glob is
+  // what lifts the column out of "unpriced".
+  const unpricedModel = columns.find(
+    (c) => matchPriceKey(c.model, priceTable, priceGlobs) === undefined,
+  )?.model;
 
   if (current === null) {
     if (loadedFor !== runId) return null; // still loading — page shows spinners
@@ -195,10 +206,13 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
         : "auto — per-model rates · unlisted = unpriced",
       cell: (col) => {
         // Explicit pick reprices every column uniformly (what-if); auto
-        // uses each column's own resolved rate (PR14 per-model pricing).
-        // A null key is an unlisted model (PR21) — unpriced, never billed
-        // at a guessed rate.
-        const rateKey = priceModel ?? col.price_model;
+        // resolves each column's model through the layered book itself
+        // (row globs first — including rates added inline this session,
+        // which the fetch-time col.price_model can't see — then the
+        // static fallback). An unmatched key is an unlisted model (PR21)
+        // — unpriced, never billed at a guessed rate.
+        const rateKey =
+          priceModel ?? matchPriceKey(col.model, priceTable, priceGlobs);
         const p = rateKey ? priceTable[rateKey] : undefined;
         if (!p) {
           return (
