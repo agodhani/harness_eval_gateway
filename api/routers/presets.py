@@ -30,7 +30,6 @@ leaderboards and the trend but stay in the run list.
 
 from __future__ import annotations
 
-import logging
 from typing import Annotated
 from uuid import UUID
 
@@ -54,8 +53,6 @@ from api.schemas import (
 from db.models import Run, Sandbox, Score, TaskPreset
 from evaluator.scores import OVERALL_DIMENSION
 from orchestrator.matrix import sandbox_model
-
-log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/presets", tags=["presets"])
 
@@ -199,7 +196,8 @@ def _config_key(harness_config: dict) -> tuple[str, str]:
     A PR1 named config groups by its name — that's the stable comparison
     axis across runs. Unnamed configs group by adapter + pack set +
     prompt-extra (``model`` deliberately excluded — the model board owns
-    that axis), displayed ``adapter · packs`` like the results matrix.
+    that axis), displayed ``adapter · packs`` like the results matrix,
+    with a ``+prompt`` marker when a prompt-extra distinguishes the group.
     """
     hc = harness_config or {}
     adapter = str(hc.get("adapter") or hc.get("harness") or "?")
@@ -210,6 +208,8 @@ def _config_key(harness_config: dict) -> tuple[str, str]:
     extra = str(hc.get("system_prompt_extra") or "")
     key = f"cfg:{adapter}|{','.join(sorted(packs))}|{extra}"
     label = " · ".join([adapter, *packs]) if packs else adapter
+    if extra:
+        label += " · +prompt"
     return key, label
 
 

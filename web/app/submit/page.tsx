@@ -431,13 +431,13 @@ export default function SubmitPage() {
     if (sugg.length > 0) {
       setModelRows((rs) => {
         const out = [...rs];
-        sugg.forEach((m, i) => {
-          if (i < out.length) {
-            if (!out[i].model.trim()) out[i] = { ...out[i], model: m };
-          } else if (out.length < MAX_MODEL_ROWS) {
-            out.push({ key: nextKey++, provider: defaultProvider, model: m });
-          }
-        });
+        let si = 0;
+        for (let i = 0; i < out.length && si < sugg.length; i++) {
+          if (!out[i].model.trim()) out[i] = { ...out[i], model: sugg[si++] };
+        }
+        while (si < sugg.length && out.length < MAX_MODEL_ROWS) {
+          out.push({ key: nextKey++, provider: defaultProvider, model: sugg[si++] });
+        }
         return out;
       });
     }
