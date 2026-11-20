@@ -958,3 +958,56 @@ def test_results_preview_candidates_server_and_gui(
         {"entry": "game.py", "type": "desktop"},
         {"entry": "app.py", "type": "python-server"},
     ]
+
+
+# ---------------------------------------------------------------------------
+# PR25 — prompt cells have no preview
+# ---------------------------------------------------------------------------
+
+
+def _prompt_sandbox(session_factory, run_id):
+    """A done prompt-cell sandbox with an artifact dir (output, no ws)."""
+    s = session_factory()
+    try:
+        sb = Sandbox(
+            run_id=run_id,
+            harness_config={"adapter": "prompt"},
+            status="done",
+            terminal_reason="harness_complete",
+        )
+        s.add(sb)
+        s.commit()
+        return sb.id
+    finally:
+        s.close()
+
+
+def test_prompt_cell_preview_404s_before_scan(
+    client: TestClient, run, session_factory, artifact_root, fake_manager
+) -> None:
+    """The prompt guard fails fast — no workspace probe, no spawn call."""
+    sb_id = _prompt_sandbox(session_factory, run["run_id"])
+    # even WITH files on disk the adapter check fires first
+    adir = artifact_root / str(run["run_id"]) / str(sb_id)
+    adir.mkdir(parents=True)
+    (adir / "output.txt").write_text("answer")
+    (adir / "workspace").mkdir()
+    (adir / "workspace" / "index.html").write_text("<h1>x</h1>")
+
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{sb_id}/preview"
+    )
+    assert resp.status_code == 404
+    assert "prompt" in resp.json()["detail"].lower()
+    assert fake_manager.spawn_calls == []
+
+
+def test_prompt_cell_thumbnail_404s(
+    client: TestClient, run, session_factory, artifact_root, fake_manager
+) -> None:
+    sb_id = _prompt_sandbox(session_factory, run["run_id"])
+    resp = client.post(
+        f"/api/runs/{run['run_id']}/sandboxes/{sb_id}/thumbnail"
+    )
+    assert resp.status_code == 404
+    assert "prompt" in resp.json()["detail"].lower()

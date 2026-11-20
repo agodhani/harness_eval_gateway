@@ -133,7 +133,12 @@ export const ADAPTERS: readonly string[] = [
   "codex",
   "deepseek",
   "pi",
+  "prompt",
 ];
+
+/** PR25 pseudo-adapters that never spawn a container — offline fallback
+ * for {@link HarnessManifest.no_sandbox} when the API is unreachable. */
+export const NO_SANDBOX_ADAPTERS: readonly string[] = ["prompt"];
 
 /** Adapter manifest as served by GET /api/harnesses (Phase 2.5). */
 export interface HarnessManifest {
@@ -146,6 +151,8 @@ export interface HarnessManifest {
   install?: string;
   image?: string;
   requires?: string[];
+  /** PR25: pseudo-adapter — the cell runs one gateway call, no container. */
+  no_sandbox?: boolean;
   [key: string]: unknown;
 }
 
@@ -216,6 +223,19 @@ export interface HarnessConfig {
   /** PR14: pin this config to a single participant model, overriding the
    * run's model list for this config (one cell at the pinned model). */
   model?: string | null;
+}
+
+/** PR25: no-sandbox pseudo-adapters run a single model call and stage
+ * nothing — a skill_packs selection left over from a previous adapter
+ * pick must not ship on a prompt cell (the backend ignores it, but the
+ * payload shouldn't claim packs it never used). */
+export function sanitizeHarnessConfigs(
+  configs: HarnessConfig[],
+  isNoSandbox: (adapter: string) => boolean,
+): HarnessConfig[] {
+  return configs.map((c) =>
+    isNoSandbox(c.adapter) ? { ...c, skill_packs: [] } : c,
+  );
 }
 
 export interface Budgets {

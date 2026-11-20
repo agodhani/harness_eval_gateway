@@ -379,6 +379,76 @@ def test_run_results_404(client: TestClient) -> None:
     assert resp.status_code == 404
 
 
+def test_run_results_prompt_cell_output(
+    client: TestClient, session_factory, artifact_root
+) -> None:
+    """PR25: a prompt cell's artifact dir (output.txt + meta — no
+    workspace) surfaces the ``output`` artifact for download, reports
+    ``previewable=False``, and never flags ``empty_workspace``."""
+    art_dir = artifact_root / "runp" / "sbp"
+    art_dir.mkdir(parents=True)
+    (art_dir / "output.txt").write_text("the whole answer")
+    (art_dir / "meta.json").write_text('{"adapter": "prompt"}')
+    (art_dir / "transcript.log").write_text("call transcript")
+
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="q",
+            model_name="m",
+            config={},
+            status="done",
+        )
+        s.add(run)
+        s.flush()
+        sb = Sandbox(
+            run_id=run.id,
+            harness_config={"adapter": "prompt"},
+            status="done",
+            terminal_reason="harness_complete",
+            artifact_path=str(art_dir),
+        )
+        s.add(sb)
+        s.flush()
+        for kind, name in (
+            ("output", "output.txt"),
+            ("transcript", "transcript.log"),
+            ("meta", "meta.json"),
+        ):
+            s.add(
+                Artifact(
+                    sandbox_id=sb.id,
+                    kind=kind,
+                    path=str(art_dir / name),
+                    size_bytes=(art_dir / name).stat().st_size,
+                )
+            )
+        s.commit()
+        run_id, sb_id = run.id, sb.id
+    finally:
+        s.close()
+
+    resp = client.get(f"/api/runs/{run_id}/results")
+    assert resp.status_code == 200
+    row = next(
+        x for x in resp.json()["sandboxes"] if x["sandbox_id"] == str(sb_id)
+    )
+    assert {a["kind"] for a in row["artifacts"]} == {
+        "output",
+        "transcript",
+        "meta",
+    }
+    assert row["previewable"] is False
+    assert row["preview_candidates"] == []
+    assert row["empty_workspace"] is False
+
+    # the output artifact downloads as the plain file
+    out_id = next(a["id"] for a in row["artifacts"] if a["kind"] == "output")
+    dl = client.get(f"/api/artifacts/{out_id}/download")
+    assert dl.status_code == 200
+    assert dl.content == b"the whole answer"
+
+
 def test_run_results_multi_model(client: TestClient, session_factory) -> None:
     """PR14: per-sandbox model + run-level models list on a model matrix."""
     s = session_factory()
