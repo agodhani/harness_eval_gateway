@@ -126,6 +126,100 @@ describe("configRowLabel", () => {
   });
 });
 
+describe("row-label disambiguation", () => {
+  test("configs differing only by `system_prompt_extra` get distinct labels", () => {
+    const sandboxes = [
+      sb({
+        score: 5,
+        model: "m1",
+        harness_config: {
+          adapter: "miniloop",
+          system_prompt_extra: "be terse",
+        },
+      }),
+      sb({
+        score: 5,
+        model: "m1",
+        harness_config: {
+          adapter: "miniloop",
+          system_prompt_extra: "be verbose",
+        },
+      }),
+      // A row missing the differing key keeps the bare label — still
+      // distinct from its hinted siblings.
+      sb({ score: 5, model: "m1", harness_config: { adapter: "miniloop" } }),
+    ];
+    const grid = buildScoreGrid(sandboxes, ["m1"], DIM_KEYS, SPEC);
+    assert.equal(grid.rows.length, 3);
+    const labels = grid.rows.map((r) => r.label);
+    assert.equal(new Set(labels).size, 3);
+    assert.equal(labels[0], "miniloop · system_prompt_extra='be terse'");
+    assert.equal(labels[1], "miniloop · system_prompt_extra='be verbose'");
+    assert.equal(labels[2], "miniloop");
+    // The detail line carries the same hint; the winner card's rowLabel
+    // attribution inherits the disambiguated label.
+    assert.equal(grid.rows[0].detail, labels[0]);
+    assert.equal(grid.cells[0].rowLabel, labels[0]);
+    assert.equal(grid.cells[1].rowLabel, labels[1]);
+  });
+
+  test("different `name`s never collide — the name wins, no hint", () => {
+    const grid = buildScoreGrid(
+      [
+        sb({
+          score: 5,
+          model: "m1",
+          harness_config: {
+            adapter: "miniloop",
+            name: "terse",
+            system_prompt_extra: "be terse",
+          },
+        }),
+        sb({
+          score: 5,
+          model: "m1",
+          harness_config: {
+            adapter: "miniloop",
+            name: "verbose",
+            system_prompt_extra: "be verbose",
+          },
+        }),
+      ],
+      ["m1"],
+      DIM_KEYS,
+      SPEC,
+    );
+    assert.deepEqual(
+      grid.rows.map((r) => r.label),
+      ["terse", "verbose"],
+    );
+  });
+
+  test("already-unique rows keep plain `adapter · packs` labels", () => {
+    const grid = buildScoreGrid(
+      [
+        sb({
+          score: 5,
+          model: "m1",
+          harness_config: { adapter: "a", system_prompt_extra: "x" },
+        }),
+        sb({
+          score: 5,
+          model: "m1",
+          harness_config: { adapter: "b", system_prompt_extra: "x" },
+        }),
+      ],
+      ["m1"],
+      DIM_KEYS,
+      SPEC,
+    );
+    assert.deepEqual(
+      grid.rows.map((r) => r.label),
+      ["a", "b"],
+    );
+  });
+});
+
 describe("buildScoreGrid", () => {
   test("assembles an 8-config × 4-model grid (32 cells)", () => {
     const models = ["m1", "m2", "m3", "m4"];

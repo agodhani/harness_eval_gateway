@@ -91,6 +91,58 @@ export function configRowLabel(
   return name || configRowDetail(hc);
 }
 
+/** One differing config value quoted into a row label — truncated like
+ * the PR22 preset-leaderboard `extra` hint. */
+function hintValue(v: unknown): string {
+  const s = typeof v === "string" ? v : stableStringify(v);
+  return `'${s.length <= 24 ? s : `${s.slice(0, 24)}…`}'`;
+}
+
+/**
+ * Rows sharing a label would be indistinguishable on the grid and the
+ * winner card — two configs can differ only in keys the label doesn't
+ * surface (`system_prompt_extra`, the MVP comparison axis) with no
+ * `name` set. Quote each colliding row's differing keys into its label +
+ * detail; `#n` ordinals break any residual tie from truncated hints.
+ */
+function disambiguateRowLabels(
+  rows: GridRow[],
+  hcByKey: Map<string, Record<string, unknown>>,
+): void {
+  const byLabel = new Map<string, GridRow[]>();
+  for (const row of rows) {
+    const g = byLabel.get(row.label);
+    if (g) g.push(row);
+    else byLabel.set(row.label, [row]);
+  }
+  for (const group of byLabel.values()) {
+    if (group.length < 2) continue;
+    const hcs = group.map((r) => hcByKey.get(r.key)!);
+    const keys = new Set<string>();
+    for (const hc of hcs) for (const k of Object.keys(hc)) keys.add(k);
+    const differing = [...keys].sort().filter((k) => {
+      const v0 = stableStringify(hcs[0][k]);
+      return hcs.some((hc) => stableStringify(hc[k]) !== v0);
+    });
+    const seen = new Map<string, number>();
+    for (let i = 0; i < group.length; i++) {
+      const row = group[i];
+      const hint = differing
+        .filter((k) => Object.prototype.hasOwnProperty.call(hcs[i], k))
+        .map((k) => `${k}=${hintValue(hcs[i][k])}`)
+        .join(" · ");
+      const suffix = hint ? ` · ${hint}` : "";
+      let label = row.label + suffix;
+      const dupes = seen.get(label) ?? 0;
+      seen.set(label, dupes + 1);
+      if (dupes > 0) label = `${label} #${dupes + 1}`;
+      row.label = label;
+      row.detail += suffix;
+      for (const cell of row.cells.values()) cell.rowLabel = label;
+    }
+  }
+}
+
 /** Mean + population sd (÷n — the spread of THIS cell's members, not a
  * sample estimate) over the finite values, plus the contributing count;
  * empty → all null/0. sd is null under 2 contributors (a lone value has
@@ -164,7 +216,9 @@ export interface ScoreGrid {
  * (e.g. a config pinned to one model); sandbox-observed models missing
  * from the list append as extra columns. `dimKeys`/`specMap` are the same
  * PR21 inputs the matrix's totals row uses — the grid never invents a
- * second weighting.
+ * second weighting. Rows that would share a label get their differing
+ * config keys quoted into it so every row — and the winner card — stays
+ * attributable.
  */
 export function buildScoreGrid(
   sandboxes: SandboxResult[],
@@ -180,6 +234,9 @@ export function buildScoreGrid(
 
   const rows: GridRow[] = [];
   const rowByKey = new Map<string, GridRow>();
+  /** First-seen stripped config per row — the label-disambiguation
+   * pass's diff input (members share it by definition of the row key). */
+  const rowHc = new Map<string, Record<string, unknown>>();
   const cells: GridCell[] = [];
 
   for (const sb of sandboxes) {
@@ -196,6 +253,7 @@ export function buildScoreGrid(
         cells: new Map(),
       };
       rowByKey.set(key, row);
+      rowHc.set(key, stripCellKeys(sb.harness_config));
       rows.push(row);
     }
     let cell = row.cells.get(model);
@@ -218,6 +276,8 @@ export function buildScoreGrid(
     }
     cell.sandboxes.push(sb);
   }
+
+  disambiguateRowLabels(rows, rowHc);
 
   for (const cell of cells) {
     cell.n = cell.sandboxes.length;
