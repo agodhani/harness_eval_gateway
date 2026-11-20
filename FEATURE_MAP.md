@@ -1269,7 +1269,7 @@ workspace to produce.
   `orchestrator/provision.py` (`budgets_for`, `mint_sandbox_cred`),
   `orchestrator/monitor.py` (per-cell poll checks + terminate detail),
   `api/routers/analytics.py` (book-resolved keys), `web/lib/api.ts`
-  (prices fns, `globMatch`/`matchPrice`, cache-aware `estimateCostUsd`),
+  (prices fns, `globMatch`/`matchPriceKey`, cache-aware `estimateCostUsd`),
   `web/components/AddRate.tsx`, `web/app/submit/page.tsx`,
   `web/app/runs/[id]/results/AnalyticsSection.tsx`,
   `web/app/runs/[id]/analysis/AnalysisClient.tsx`.

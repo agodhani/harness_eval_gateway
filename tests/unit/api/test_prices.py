@@ -121,6 +121,40 @@ def test_put_rejects_negative_rate(client: TestClient) -> None:
     assert resp.status_code == 422
 
 
+def test_put_rejects_non_finite_rate(client: TestClient) -> None:
+    """An infinite rate can't be stored — it would bill every cell at it
+    (NaN is already refused by ge=0). stdlib json.loads accepts the bare
+    literal, so the value reaches the endpoint's finite check."""
+    for field in (
+        "input_per_mtok_usd",
+        "output_per_mtok_usd",
+        "cache_read_per_mtok_usd",
+    ):
+        resp = client.put(
+            "/api/prices",
+            content=f'{{"model_glob": "pr28-inf-*", "{field}": Infinity}}',
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 422, f"{field}=Infinity must be rejected"
+
+
+def test_put_upserts_case_insensitive(
+    client: TestClient, session_factory: sessionmaker[Session], cleanup_globs
+) -> None:
+    """Glob matching is case-insensitive, so a differently-cased PUT must
+    update the SAME row — a second row would be shadowed by the first in
+    declaration order and never take effect."""
+    glob = "pr28-case-*"
+    cleanup_globs.append(glob)
+    first = _put(client, model_glob=glob, input_per_mtok_usd=1.0).json()
+    second = _put(client, model_glob="PR28-CASE-*", input_per_mtok_usd=4.0).json()
+    assert second["id"] == first["id"]
+    assert second["input_per_mtok_usd"] == 4.0
+    assert second["model_glob"] == glob  # stored glob keeps its casing
+    globs = [r["model_glob"].lower() for r in client.get("/api/prices").json()["prices"]]
+    assert globs.count(glob) == 1
+
+
 def test_delete_price(
     client: TestClient, session_factory: sessionmaker[Session], cleanup_globs
 ) -> None:
@@ -181,6 +215,8 @@ def test_put_row_reprices_analytics(
     assert cell["estimated_cost_usd"] == pytest.approx(13.0)
     # the glob also lands in the response price_table for the picker
     assert body["price_table"][glob]["input_per_mtok_usd"] == 10.0
+    # …and in price_globs (declaration order) for client-side key_for replay
+    assert body["price_globs"][-1] == glob
 
 
 # ---------------------------------------------------------------------------
@@ -335,3 +371,58 @@ def test_sync_maps_cache_read_rate(
     req = mock_gateway[0]
     assert req.headers.get("x-heg-provider") == "openrouter"
     assert req.headers.get("authorization", "").startswith("Bearer heg.")
+
+
+def test_sync_case_variant_id_and_non_finite_rates(
+    client: TestClient,
+    session_factory: sessionmaker[Session],
+    cleanup_globs,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog id differing only in case still collides with the existing
+    row (glob matching is case-insensitive — a second row would be a
+    shadowed duplicate), and non-finite catalog rates are skipped like any
+    other unparseable pricing."""
+    monkeypatch.setattr(get_settings(), "UPSTREAM_PROVIDER", "openrouter")
+    cleanup_globs.append("pr28-sync/casey")
+    _put(client, model_glob="pr28-sync/casey", input_per_mtok_usd=7.0)
+
+    def dispatch(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/models"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "PR28-SYNC/CASEY",
+                        "pricing": {"prompt": "0.000003", "completion": "0.000004"},
+                    },
+                    {
+                        "id": "pr28-sync/nan",
+                        "pricing": {"prompt": "nan", "completion": "nan"},
+                    },
+                ]
+            },
+        )
+
+    async def _dep() -> AsyncIterator[httpx.AsyncClient]:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(dispatch), base_url="http://gateway.test"
+        ) as c:
+            yield c
+
+    app.dependency_overrides[get_gateway_client] = _dep
+    try:
+        body = client.post("/api/prices/sync").json()
+    finally:
+        app.dependency_overrides.pop(get_gateway_client, None)
+
+    # the case-variant id hit the existing user row — protected, not duplicated
+    assert body["skipped_user"] == 1
+    assert body["added"] == 0
+    # a NaN rate is as unusable as a missing one — skipped, never persisted
+    assert body["skipped_unpriced"] == 1
+    rows = {r["model_glob"]: r for r in body["prices"]}
+    assert rows["pr28-sync/casey"]["input_per_mtok_usd"] == 7.0
+    assert "PR28-SYNC/CASEY" not in rows
+    assert "pr28-sync/nan" not in rows

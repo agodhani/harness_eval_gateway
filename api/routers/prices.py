@@ -26,6 +26,7 @@ are never clobbered.
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from datetime import datetime
 from typing import Annotated, Any
@@ -33,7 +34,7 @@ from typing import Annotated, Any
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from api.config import get_settings
@@ -142,7 +143,7 @@ def _per_mtok(value: Any) -> float | None:
         rate = float(value)
     except (TypeError, ValueError):
         return None
-    if rate < 0:
+    if not math.isfinite(rate) or rate < 0:
         return None
     return rate * 1_000_000
 
@@ -164,9 +165,25 @@ def upsert_price(body: PriceUpsertIn, session: DbSession) -> PriceEntryOut:
     (first-match scan order) while its rate updates; editing a synced row
     flips its source to ``user`` so catalog sync never overwrites it.
     """
+    # Post-parse check: a field-level inf rejection would serialize the
+    # echoed body into the 422 payload → 500 (ge=0 already covers NaN).
+    if any(
+        rate is not None and not math.isfinite(rate)
+        for rate in (
+            body.input_per_mtok_usd,
+            body.output_per_mtok_usd,
+            body.cache_read_per_mtok_usd,
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="rates must be finite numbers",
+        )
     row = (
         session.execute(
-            select(ModelPriceRow).where(ModelPriceRow.model_glob == body.model_glob)
+            select(ModelPriceRow)
+            .where(func.lower(ModelPriceRow.model_glob) == body.model_glob.lower())
+            .order_by(ModelPriceRow.created_at, ModelPriceRow.id)
         )
         .scalars()
         .first()
@@ -239,7 +256,9 @@ async def sync_prices(session: DbSession, client: GatewayClient) -> PriceSyncOut
     data = body.get("data") if isinstance(body, dict) else None
     entries = [m for m in (data if isinstance(data, list) else []) if isinstance(m, dict)]
 
-    existing = {r.model_glob: r for r in _price_rows(session)}
+    existing: dict[str, ModelPriceRow] = {}
+    for r in _price_rows(session):
+        existing.setdefault(r.model_glob.lower(), r)
     added = updated = skipped_user = skipped_unpriced = 0
     for entry in entries[:_MAX_SYNC_ROWS]:
         mid = entry.get("id")
@@ -254,14 +273,14 @@ async def sync_prices(session: DbSession, client: GatewayClient) -> PriceSyncOut
             # half-priced model is the guessing PR28 exists to kill.
             skipped_unpriced += 1
             continue
-        row = existing.get(mid.strip())
+        row = existing.get(mid.strip().lower())
         if row is not None and row.source == "user":
             skipped_user += 1
             continue
         if row is None:
             row = ModelPriceRow(model_glob=mid.strip(), source="openrouter")
             session.add(row)
-            existing[row.model_glob] = row
+            existing[row.model_glob.lower()] = row
             added += 1
         else:
             updated += 1

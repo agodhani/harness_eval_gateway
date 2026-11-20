@@ -25,7 +25,7 @@ import {
   getRunResults,
   getRunTrends,
   harnessConfigLabel,
-  matchPrice,
+  matchPriceKey,
   TERMINAL_RUN_STATUSES,
   type ModelPrice,
   type PriceEntry,
@@ -247,6 +247,12 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     () => ({ ...(data.analytics?.price_table ?? {}), ...extraPrices }),
     [data.analytics, extraPrices],
   );
+  /** Row globs in declaration order — the fetched list plus rates added
+   * inline this session (they land at the end, a new row's position). */
+  const priceGlobs = useMemo(
+    () => [...(data.analytics?.price_globs ?? []), ...Object.keys(extraPrices)],
+    [data.analytics, extraPrices],
+  );
 
   // Cost recompute — mirrors the server: an explicit pick reprices every
   // sandbox uniformly; auto ("") costs each sandbox at its OWN model's
@@ -265,17 +271,19 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     data.run?.model_name ??
     data.analytics?.model_name ??
     null;
-  // Judge price mirrors the server: the evaluator model's own resolved rate
-  // (glob-aware via matchPrice, PR28), else the explicit pick (what-if) —
-  // unlisted and unpicked means unpriced, never another model's rate (PR21).
+  // Judge price mirrors the server: the evaluator model's own resolved
+  // rate (glob-aware via matchPriceKey, PR28), else the explicit pick
+  // (what-if) — unlisted and unpicked means unpriced, never another
+  // model's rate (PR21).
+  const evalKey = useMemo(
+    () => matchPriceKey(evaluatorModel, priceTable, priceGlobs),
+    [evaluatorModel, priceTable, priceGlobs],
+  );
   const evalPrice = useMemo(() => {
-    if (evaluatorModel) {
-      const p = matchPrice(evaluatorModel, priceTable);
-      if (p) return p;
-    }
+    if (evalKey !== undefined) return priceTable[evalKey];
     if (priceModel && priceTable[priceModel]) return priceTable[priceModel];
     return undefined;
-  }, [priceTable, evaluatorModel, priceModel]);
+  }, [evalKey, priceTable, priceModel]);
 
   const costRows: Row[] = useMemo(
     () =>
@@ -607,12 +615,7 @@ export default function AnalysisClient({ runId }: { runId: string }) {
               <p className="chart-legend">
                 judge{" "}
                 {evalPrice
-                  ? `priced at ${
-                      evaluatorModel &&
-                      (data.analytics?.price_table ?? {})[evaluatorModel]
-                        ? evaluatorModel
-                        : (priceModel ?? "the picked rate")
-                    }`
+                  ? `priced at ${evalKey ?? priceModel ?? "the picked rate"}`
                   : "unpriced (evaluator model not in the price table)"}{" "}
                 · participant at {priceModel ?? "each model's own rate"}
               </p>

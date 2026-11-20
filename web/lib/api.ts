@@ -845,6 +845,9 @@ export interface RunAnalytics {
   /** Explicit ?price_model= basis, or null for auto per-model pricing. */
   price_model: string | null;
   price_table: Record<string, ModelPrice>;
+  /** model_prices row globs in declaration (first-match) order — lets
+   * matchPriceKey replay key_for's rows-before-static layering. */
+  price_globs?: string[];
   sandboxes: SandboxAnalytics[];
   /** PR14: participant-model rollups (one per model in the run's matrix). */
   models: ModelAnalytics[];
@@ -880,21 +883,25 @@ export function globMatch(pattern: string, model: string): boolean {
   }
 }
 
-/** Resolve a model to its rate in a merged price_table — mirrors
- * PriceBook.key_for: exact key first (covers shadowed static keys), then
- * glob-char keys in insertion order (the merged dict appends model_prices
- * rows in declaration order after the static keys). */
-export function matchPrice(
+/** Resolve a model to its effective price-table KEY — mirrors
+ * PriceBook.key_for: the FIRST row glob (declaration order —
+ * RunAnalytics.price_globs, plus rates added inline this session) that
+ * glob-matches the model wins, else the model itself when it's a key in
+ * the merged table (the static layer — a row glob equal to it already won
+ * above), else undefined (unlisted → unpriced, PR21). The row rate sits
+ * at table[key]; row ordering can't be recovered from the merged table
+ * alone (literal rows are indistinguishable from static keys), which is
+ * why price_globs rides the response. */
+export function matchPriceKey(
   model: string | null | undefined,
   table: Record<string, ModelPrice>,
-): ModelPrice | undefined {
+  rowGlobs: readonly string[],
+): string | undefined {
   if (!model) return undefined;
-  const direct = table[model];
-  if (direct) return direct;
-  for (const key of Object.keys(table)) {
-    if (/[*?[]/.test(key) && globMatch(key, model)) return table[key];
+  for (const g of rowGlobs) {
+    if (Object.hasOwn(table, g) && globMatch(g, model)) return g;
   }
-  return undefined;
+  return Object.hasOwn(table, model) ? model : undefined;
 }
 
 /** Client-side cost estimate: tokens × rate. Mirrors api/pricing.py —

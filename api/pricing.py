@@ -126,6 +126,11 @@ class PriceBook:
         self._rows = list(rows)
         self._by_glob = {r.model_glob: r for r in self._rows}
 
+    def globs(self) -> list[str]:
+        """Row globs in declaration (first-match) order — the scan
+        ``key_for`` runs before the static-layer fallback."""
+        return [r.model_glob for r in self._rows]
+
     def key_for(self, model: str | None) -> str | None:
         """Price key for ``model``: first matching glob, static key, or None."""
         if not model:

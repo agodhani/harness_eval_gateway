@@ -555,6 +555,10 @@ class RunAnalytics(BaseModel):
     # ``RunTrends.price_model``.
     price_model: str | None = None
     price_table: dict[str, ModelPrice] = Field(default_factory=dict)
+    # The ``model_prices`` row globs in declaration (first-match) order —
+    # client-side repricing replays ``key_for``'s rows-before-static
+    # layering against ``price_table`` with them.
+    price_globs: list[str] = Field(default_factory=list)
     sandboxes: list[SandboxAnalytics] = Field(default_factory=list)
     # PR14: participant-model rollups (one entry per model in the run's
     # matrix; a single entry for single-model runs).

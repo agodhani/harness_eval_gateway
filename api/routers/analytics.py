@@ -519,6 +519,7 @@ def get_run_analytics(
         model_name=run.model_name,
         price_model=explicit_key,
         price_table=book.table(),
+        price_globs=book.globs(),
         sandboxes=out,
         models=models_out,
     )
