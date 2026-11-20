@@ -17,8 +17,10 @@ static fallback for whatever it covered.
 override — the api never talks to providers directly, so the request rides
 the same provider/auth path as metering traffic). OpenRouter ``pricing.*``
 values are USD PER TOKEN strings; they're stored as per-Mtok rates to match
-the rest of the table. Sync only touches ``source="openrouter"`` rows —
-``user`` rows are never clobbered.
+the rest of the table. Entries missing either the prompt or the completion
+rate are skipped (a half-priced model is as dishonest as a free-priced
+paid one). Sync only touches ``source="openrouter"`` rows — ``user`` rows
+are never clobbered.
 """
 
 from __future__ import annotations
@@ -199,11 +201,11 @@ async def sync_prices(session: DbSession, client: GatewayClient) -> PriceSyncOut
     Rides the gateway's ``/v1/models`` pass-through with an
     ``x-heg-provider: openrouter`` service-cred override (service creds are
     the only cred class the override gate accepts — same pattern as
-    ``GET /api/models?provider=``). Entries with no parseable prompt or
-    completion rate are skipped — inserting a zero rate would price a
-    probably-paid model as free, which is the guessing PR28 exists to kill.
-    Existing ``source="user"`` rows (even when the glob equals a remote id)
-    are never overwritten.
+    ``GET /api/models?provider=``). Entries missing a parseable prompt OR
+    completion rate are skipped — inserting a zero or half rate would
+    price a probably-paid model as free, which is the guessing PR28
+    exists to kill. Existing ``source="user"`` rows (even when the glob
+    equals a remote id) are never overwritten.
     """
     settings = get_settings()
     if not _openrouter_configured(settings):
@@ -247,7 +249,9 @@ async def sync_prices(session: DbSession, client: GatewayClient) -> PriceSyncOut
         pricing = pricing if isinstance(pricing, dict) else {}
         inp = _per_mtok(pricing.get("prompt"))
         out = _per_mtok(pricing.get("completion"))
-        if inp is None and out is None:
+        if inp is None or out is None:
+            # Either side missing → skip rather than bill it $0 — a
+            # half-priced model is the guessing PR28 exists to kill.
             skipped_unpriced += 1
             continue
         row = existing.get(mid.strip())

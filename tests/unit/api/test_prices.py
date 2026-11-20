@@ -206,6 +206,10 @@ def _openrouter_catalog() -> dict[str, Any]:
             },
             {"id": "pr28-sync/free", "pricing": {"prompt": "0", "completion": "0"}},
             {"id": "pr28-sync/no-pricing"},  # → skipped_unpriced
+            {  # only one side priced → skipped (a half rate is a guess)
+                "id": "pr28-sync/half",
+                "pricing": {"prompt": "0.000001"},
+            },
         ]
     }
 
@@ -264,11 +268,13 @@ def test_sync_maps_catalog_to_per_mtok(
     resp = client.post("/api/prices/sync")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["remote_count"] == 4
+    assert body["remote_count"] == 5
     # alpha collides with the user row → skipped; beta + free sync
     assert body["added"] == 2
     assert body["skipped_user"] == 1
-    assert body["skipped_unpriced"] == 1  # no-pricing entry
+    # no-pricing entry + half-priced entry (one side missing → a half
+    # rate would be a guess, so it's skipped too)
+    assert body["skipped_unpriced"] == 2
 
     rows = {r["model_glob"]: r for r in body["prices"]}
     beta = rows["pr28-sync/beta"]
