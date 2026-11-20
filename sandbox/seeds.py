@@ -440,6 +440,22 @@ def hash_tree(root: Path) -> str:
     h = hashlib.sha256()
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames.sort()
+        # Dir symlinks are listed (never descended — followlinks=False):
+        # hash each one's target text like a file link so the link itself
+        # is content, not invisible.
+        for name in sorted(dirnames):
+            p = Path(dirpath) / name
+            try:
+                if not p.is_symlink():
+                    continue
+                rel = p.relative_to(root).as_posix()
+                h.update(rel.encode("utf-8"))
+                h.update(b"\0")
+                h.update(b"L\0")
+                h.update(os.readlink(p).encode("utf-8", "surrogateescape"))
+                h.update(b"\0")
+            except OSError:
+                continue
         for name in sorted(filenames):
             p = Path(dirpath) / name
             try:
