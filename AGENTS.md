@@ -698,6 +698,20 @@ or tests change.
   ("Load more"), landing copy describes the config × model matrix, and the
   results `total` row is the weighted scale-normalised aggregate
   (`web/lib/scoreMath.ts`), not a raw Σ.
+- **Config × model heatmap + winner card (PR31)** — the results page's
+  score card has a `matrix | grid` toggle; the grid
+  (`web/app/runs/[id]/results/GridView.tsx` + pure transform
+  `web/lib/gridMatrix.ts`, `node --test`-covered) folds sandboxes into
+  config rows × model cols. Row identity = `harness_config` minus
+  per-cell `model`/trial keys — the sandbox `name` is unique per sandbox
+  and must NOT be the group key. Cells show mean judge `overall` ±sd
+  (same-(config, model) repeats are the cell's trials — PR27 needs no
+  special-casing) on a fixed 0–10 red→amber→green scale; the `w` sub-line
+  is the PR21 weighted total (same `specMap`/`dimensionKeys` the totals
+  row uses — no second weighting). The winner card ranks cells by mean
+  weighted total only (a judge `overall` alone can't win), with runner-up
+  Δ, est. cost/wall clock (F9 analytics — "unpriced"/"—", never $0) and
+  mean pass-rate (`generated_tests.pass_rate` → `exec` tests).
 
 ## Working conventions
 
