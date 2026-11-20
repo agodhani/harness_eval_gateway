@@ -14,6 +14,7 @@ import {
   estimateCostUsd,
   getRunAnalytics,
   matchPriceKey,
+  resolvePricePick,
   type ModelAnalytics,
   type ModelPrice,
   type PriceEntry,
@@ -117,6 +118,12 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
     ...(current?.price_globs ?? []),
     ...Object.keys(extraPrices),
   ];
+  // An explicit pick resolves like the server's resolve_price_model — a
+  // verbatim row glob (any case) selects that row; a model-like pick goes
+  // through the row-glob scan so an earlier glob can shadow a static key.
+  const resolvedPick = priceModel
+    ? resolvePricePick(priceModel, priceTable, priceGlobs)
+    : undefined;
   // Prefill the add-rate glob from a column whose model resolved no rate
   // — through the SAME matcher auto mode uses, so a just-saved glob is
   // what lifts the column out of "unpriced".
@@ -202,7 +209,7 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
     {
       label: "estimated cost",
       hint: priceModel
-        ? `at ${priceModel}`
+        ? `at ${resolvedPick ?? priceModel}`
         : "auto — per-model rates · unlisted = unpriced",
       cell: (col) => {
         // Explicit pick reprices every column uniformly (what-if); auto
@@ -211,8 +218,9 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
         // which the fetch-time col.price_model can't see — then the
         // static fallback). An unmatched key is an unlisted model (PR21)
         // — unpriced, never billed at a guessed rate.
-        const rateKey =
-          priceModel ?? matchPriceKey(col.model, priceTable, priceGlobs);
+        const rateKey = priceModel
+          ? resolvedPick
+          : matchPriceKey(col.model, priceTable, priceGlobs);
         const p = rateKey ? priceTable[rateKey] : undefined;
         if (!p) {
           return (

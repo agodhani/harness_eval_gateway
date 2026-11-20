@@ -933,6 +933,24 @@ export function matchPriceKey(
   return Object.hasOwn(table, model) ? model : undefined;
 }
 
+/** Resolve an explicit price pick to its effective price-table key —
+ * mirrors api/pricing.py::resolve_price_model: a pick naming a
+ * model_prices row glob (case-insensitively — the same row identity
+ * upsert/sync use) selects THAT row's rate so an earlier broader glob
+ * can't shadow it; any other pick resolves like a model through
+ * matchPriceKey's rows-first layering. Unresolvable → undefined (the
+ * server 422s it; the client renders "unpriced"). */
+export function resolvePricePick(
+  pick: string | null | undefined,
+  table: Record<string, ModelPrice>,
+  rowGlobs: readonly string[],
+): string | undefined {
+  if (!pick) return undefined;
+  const lower = pick.toLowerCase();
+  const row = rowGlobs.find((g) => g.toLowerCase() === lower);
+  return row ?? matchPriceKey(pick, table, rowGlobs);
+}
+
 /** Client-side cost estimate: tokens × rate. Mirrors api/pricing.py —
  * cache-read tokens (inside `input`) bill at the cache rate when one is
  * declared, else at the input rate. A non-positive cache_read counts

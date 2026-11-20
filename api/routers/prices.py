@@ -262,7 +262,12 @@ async def sync_prices(session: DbSession, client: GatewayClient) -> PriceSyncOut
     added = updated = skipped_user = skipped_unpriced = 0
     for entry in entries[:_MAX_SYNC_ROWS]:
         mid = entry.get("id")
-        if not isinstance(mid, str) or not mid.strip():
+        if not isinstance(mid, str):
+            continue
+        mid = mid.strip()
+        # model_glob is String(255) — an oversized id can't persist, so
+        # skip it like a malformed entry rather than failing the commit.
+        if not mid or len(mid) > 255:
             continue
         pricing = entry.get("pricing")
         pricing = pricing if isinstance(pricing, dict) else {}
@@ -273,12 +278,12 @@ async def sync_prices(session: DbSession, client: GatewayClient) -> PriceSyncOut
             # half-priced model is the guessing PR28 exists to kill.
             skipped_unpriced += 1
             continue
-        row = existing.get(mid.strip().lower())
+        row = existing.get(mid.lower())
         if row is not None and row.source == "user":
             skipped_user += 1
             continue
         if row is None:
-            row = ModelPriceRow(model_glob=mid.strip(), source="openrouter")
+            row = ModelPriceRow(model_glob=mid, source="openrouter")
             session.add(row)
             existing[row.model_glob.lower()] = row
             added += 1

@@ -26,6 +26,7 @@ import {
   getRunTrends,
   harnessConfigLabel,
   matchPriceKey,
+  resolvePricePick,
   TERMINAL_RUN_STATUSES,
   type ModelPrice,
   type PriceEntry,
@@ -253,6 +254,13 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     () => [...(data.analytics?.price_globs ?? []), ...Object.keys(extraPrices)],
     [data.analytics, extraPrices],
   );
+  // An explicit pick resolves like the server's resolve_price_model — a
+  // verbatim row glob (any case) selects that row; a model-like pick goes
+  // through the row-glob scan so an earlier glob can shadow a static key.
+  const resolvedPick = useMemo(
+    () => resolvePricePick(priceModel, priceTable, priceGlobs),
+    [priceModel, priceTable, priceGlobs],
+  );
 
   // Cost recompute — mirrors the server: an explicit pick reprices every
   // sandbox uniformly; auto ("") resolves each sandbox's model through the
@@ -261,10 +269,12 @@ export default function AnalysisClient({ runId }: { runId: string }) {
   // the static fallback; unlisted → unpriced, PR21).
   const priceFor = useCallback(
     (sb: { model: string; price_model?: string | null }) => {
-      const key = priceModel ?? matchPriceKey(sb.model, priceTable, priceGlobs);
+      const key = priceModel
+        ? resolvedPick
+        : matchPriceKey(sb.model, priceTable, priceGlobs);
       return key ? priceTable[key] : undefined;
     },
-    [priceTable, priceModel, priceGlobs],
+    [priceTable, priceModel, priceGlobs, resolvedPick],
   );
   const evaluatorModel =
     data.results?.evaluator_model ??
@@ -282,9 +292,9 @@ export default function AnalysisClient({ runId }: { runId: string }) {
   );
   const evalPrice = useMemo(() => {
     if (evalKey !== undefined) return priceTable[evalKey];
-    if (priceModel && priceTable[priceModel]) return priceTable[priceModel];
+    if (resolvedPick !== undefined) return priceTable[resolvedPick];
     return undefined;
-  }, [evalKey, priceTable, priceModel]);
+  }, [evalKey, priceTable, resolvedPick]);
 
   const costRows: Row[] = useMemo(
     () =>
@@ -564,9 +574,9 @@ export default function AnalysisClient({ runId }: { runId: string }) {
             <InfoNote>Metrics unavailable: {notes.analytics}</InfoNote>
           ) : sbs.length === 0 ? (
             <EmptyState>No sandbox metrics yet.</EmptyState>
-          ) : priceModel && priceTable[priceModel]?.local ? (
+          ) : resolvedPick !== undefined && priceTable[resolvedPick]?.local ? (
             <InfoNote>
-              Local model — $0 participant spend at <code>{priceModel}</code>. Pick a
+              Local model — $0 participant spend at <code>{resolvedPick}</code>. Pick a
               priced model above for an API-equivalent estimate.
             </InfoNote>
           ) : !costRows.some((r) => Number(r.value) > 0) ? (
@@ -622,9 +632,9 @@ export default function AnalysisClient({ runId }: { runId: string }) {
               <p className="chart-legend">
                 judge{" "}
                 {evalPrice
-                  ? `priced at ${evalKey ?? priceModel ?? "the picked rate"}`
+                  ? `priced at ${evalKey ?? resolvedPick ?? "the picked rate"}`
                   : "unpriced (evaluator model not in the price table)"}{" "}
-                · participant at {priceModel ?? "each model's own rate"}
+                · participant at {resolvedPick ?? priceModel ?? "each model's own rate"}
               </p>
             </>
           )}

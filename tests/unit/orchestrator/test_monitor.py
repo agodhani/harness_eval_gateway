@@ -315,6 +315,50 @@ async def test_budget_error_event_without_limit_still_terminates(
     assert "limit" not in term
 
 
+async def test_budget_error_verdict_reports_earliest_gate_trip(
+    session_factory, settings, fake_runtime
+) -> None:
+    """When a sandbox accumulates budget events under two limits (the cell
+    trips sandbox_tokens, keeps retrying, then the shared run ceiling
+    fires), the terminate checkpoint deterministically reports the
+    EARLIEST trip — the cap that first throttled the cell."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    _add_event(
+        session_factory, run.id, sb.id, "error",
+        {
+            "stage": "budget",
+            "reason": "budget_exceeded",
+            "http_status": 429,
+            "limit": "sandbox_tokens",
+            "used_tokens": 1234,
+            "budget": 1000,
+        },
+    )
+    _add_event(
+        session_factory, run.id, sb.id, "error",
+        {
+            "stage": "budget",
+            "reason": "budget_exceeded",
+            "http_status": 429,
+            "limit": "run_tokens",
+            "used_tokens": 999999,
+            "budget": 500000,
+        },
+    )
+    fake_runtime.status_map[str(sb.id)] = {"status": "running", "exit_code": None}
+
+    reason = await _watch(session_factory, settings, fake_runtime, run.id, sb.id)
+    assert reason == "budget_exceeded"
+    term = next(
+        p for p in _checkpoint_payloads(session_factory, sb.id)
+        if p.get("stage") == "terminate"
+    )
+    assert term["limit"] == "sandbox_tokens"
+    assert term["used_tokens"] == 1234
+    assert term["budget"] == 1000
+
+
 async def test_upstream_429_is_not_budget_exceeded(
     session_factory, settings, fake_runtime
 ) -> None:

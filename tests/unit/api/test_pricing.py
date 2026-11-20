@@ -151,6 +151,17 @@ def test_resolve_explicit_pick_names_its_own_row() -> None:
     assert book.key_for("acme-7b") == "*"
 
 
+def test_resolve_explicit_pick_names_row_case_insensitively() -> None:
+    """A case-variant pick still names the row — row identity is
+    case-insensitive (upsert and glob matching both are), so an earlier
+    broader glob can't shadow it through casing alone."""
+    book = PriceBook([_row("*", inp=1.0), _row("acme-*", inp=9.0)])
+    assert resolve_price_model("ACME-*", "whatever", book) == "acme-*"
+    # the resolved key prices at that row's rate
+    price = book.price_for("ACME-*")
+    assert price is not None and price.input_per_mtok_usd == 9.0
+
+
 def test_resolve_run_model_via_book() -> None:
     book = PriceBook([_row("qwen*")])
     assert resolve_price_model(None, "qwen3:8b", book) == "qwen*"

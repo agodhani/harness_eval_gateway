@@ -20,6 +20,7 @@ import {
   estimateCostUsd,
   globMatch,
   matchPriceKey,
+  resolvePricePick,
   type ModelPrice,
 } from "./api.ts";
 
@@ -95,6 +96,46 @@ describe("matchPriceKey", () => {
 
   test("a glob row still covers a differently-cased model", () => {
     assert.equal(matchPriceKey("CLAUDE-SONNET-4.5", TABLE, GLOBS), "claude-*");
+  });
+});
+
+// resolvePricePick mirrors api/pricing.py::resolve_price_model — the
+// explicit-pick contract:
+//   1. a pick naming a model_prices row glob (case-insensitively — row
+//      identity is) selects THAT row, so an earlier broader glob can't
+//      shadow it;
+//   2. any other pick resolves like a model through the layered book.
+// Oracles are derived from those rules — e.g. picking a static key that a
+// row glob covers resolves to the GLOB, while picking the glob itself (in
+// any casing) keeps the row's own key.
+describe("resolvePricePick", () => {
+  const PICK_TABLE: Record<string, ModelPrice> = {
+    "gpt-4o": rate(2.5),
+    "*": rate(0.5),
+    "acme-*": rate(9),
+  };
+  const PICK_GLOBS = ["*", "acme-*"];
+
+  test("a verbatim row-glob pick selects that row, unshadowed by earlier globs", () => {
+    assert.equal(resolvePricePick("acme-*", PICK_TABLE, PICK_GLOBS), "acme-*");
+  });
+
+  test("a case-variant row pick still names the row", () => {
+    // server: price_model.lower() in _by_glob → the row's own glob
+    assert.equal(resolvePricePick("ACME-*", PICK_TABLE, PICK_GLOBS), "acme-*");
+  });
+
+  test("a model-like pick resolves through the book — earlier glob shadows a static key", () => {
+    // server: key_for("gpt-4o") hits the "*" row before the static layer
+    assert.equal(resolvePricePick("gpt-4o", PICK_TABLE, PICK_GLOBS), "*");
+    // with no covering row, the static key is its own pick
+    assert.equal(resolvePricePick("gpt-4o", TABLE, GLOBS), "gpt-4o");
+  });
+
+  test("an unlisted pick resolves to no key", () => {
+    assert.equal(resolvePricePick("nope-1b", TABLE, GLOBS), undefined);
+    assert.equal(resolvePricePick(null, TABLE, GLOBS), undefined);
+    assert.equal(resolvePricePick(undefined, TABLE, GLOBS), undefined);
   });
 });
 

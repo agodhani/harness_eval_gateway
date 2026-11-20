@@ -124,7 +124,12 @@ class PriceBook:
 
     def __init__(self, rows: Iterable[ModelPriceRow]) -> None:
         self._rows = list(rows)
-        self._by_glob = {r.model_glob: r for r in self._rows}
+        # Row identity is case-insensitive (upsert matches on lower(),
+        # glob_matches lowercases both sides) — so is the by-glob index;
+        # first-declared wins like the key_for scan.
+        self._by_glob: dict[str, ModelPriceRow] = {}
+        for r in self._rows:
+            self._by_glob.setdefault(r.model_glob.lower(), r)
 
     def globs(self) -> list[str]:
         """Row globs in declaration (first-match) order — the scan
@@ -144,7 +149,7 @@ class PriceBook:
         """Rate for a resolved key — a row's glob first, then the static key."""
         if key is None:
             return None
-        row = self._by_glob.get(key)
+        row = self._by_glob.get(key.lower())
         if row is not None:
             return _row_price(row)
         return PRICE_TABLE.get(key)
@@ -184,20 +189,21 @@ def resolve_price_model(
     """Pick the price-table key to cost a run at.
 
     ``price_model`` (the query param) wins when supplied and known. A pick
-    naming a ``model_prices`` row glob verbatim selects that row's rate —
-    the pick names the row itself, so an earlier broader glob must not
-    shadow it. Any other pick resolves like a model through the layered
-    book (glob hit → the glob, static key → itself); the run's own model
-    resolves the same way when no pick is supplied. Returns None when the
-    resolved model isn't listed — an unknown explicit ``price_model``
-    becomes a 422, while an unlisted run model means *unpriced*: no cost
-    estimate is produced rather than billing the traffic at another
-    model's rate.
+    naming a ``model_prices`` row glob (case-insensitively — the same row
+    identity upsert and sync match on) selects that row's rate — the pick
+    names the row itself, so an earlier broader glob must not shadow it.
+    Any other pick resolves like a model through the layered book (glob
+    hit → the glob, static key → itself); the run's own model resolves
+    the same way when no pick is supplied. Returns None when the resolved
+    model isn't listed — an unknown explicit ``price_model`` becomes a
+    422, while an unlisted run model means *unpriced*: no cost estimate is
+    produced rather than billing the traffic at another model's rate.
     """
     if book is None:
         book = PriceBook(())
     if price_model is not None:
-        if price_model in book._by_glob:
-            return price_model
+        row = book._by_glob.get(price_model.lower())
+        if row is not None:
+            return row.model_glob
         return book.key_for(price_model)
     return book.key_for(run_model)

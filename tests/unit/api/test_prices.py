@@ -472,3 +472,54 @@ def test_sync_case_variant_id_and_non_finite_rates(
     assert rows["pr28-sync/casey"]["input_per_mtok_usd"] == 7.0
     assert "PR28-SYNC/CASEY" not in rows
     assert "pr28-sync/nan" not in rows
+
+
+def test_sync_skips_oversized_model_id(
+    client: TestClient,
+    session_factory: sessionmaker[Session],
+    cleanup_globs,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog id longer than ``model_glob``'s String(255) can't persist
+    — it must be skipped like a malformed entry, not fail the commit and
+    lose the whole sync."""
+    monkeypatch.setattr(get_settings(), "UPSTREAM_PROVIDER", "openrouter")
+    cleanup_globs.append("pr28-sync/fits")
+
+    def dispatch(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/models"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "pr28-sync/" + "x" * 300,
+                        "pricing": {"prompt": "0.000001", "completion": "0.000001"},
+                    },
+                    {
+                        "id": "pr28-sync/fits",
+                        "pricing": {"prompt": "0.000001", "completion": "0.000001"},
+                    },
+                ]
+            },
+        )
+
+    async def _dep() -> AsyncIterator[httpx.AsyncClient]:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(dispatch), base_url="http://gateway.test"
+        ) as c:
+            yield c
+
+    app.dependency_overrides[get_gateway_client] = _dep
+    try:
+        resp = client.post("/api/prices/sync")
+    finally:
+        app.dependency_overrides.pop(get_gateway_client, None)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # the oversized id was skipped; the valid sibling still persisted
+    assert body["added"] == 1
+    globs = [r["model_glob"] for r in body["prices"]]
+    assert "pr28-sync/fits" in globs
+    assert not any(len(g) > 255 for g in globs)

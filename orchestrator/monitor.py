@@ -137,11 +137,13 @@ def _gateway_error_verdict(
     """
     with session_factory() as session:
         payloads = session.execute(
-            select(Event.payload).where(
+            select(Event.payload)
+            .where(
                 Event.run_id == run_id,
                 Event.sandbox_id == sandbox_id,
                 Event.type == "error",
             )
+            .order_by(Event.id)
         ).scalars().all()
     upstream_errors = 0
     for payload in payloads:
