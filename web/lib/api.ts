@@ -259,6 +259,16 @@ export const DEFAULT_BUDGETS: Budgets = {
   wall_clock_seconds: 3600,
 };
 
+/** PR24 — task inputs seeding every sandbox workspace. Exactly one source:
+ * `repo_url` (public https git, shallow-fetched at `ref`) or `archive_id`
+ * (a POST /api/uploads id). Absent = empty workspace (legacy behavior). */
+export interface TaskInputs {
+  repo_url?: string | null;
+  /** branch/tag/sha the seed pins to — repo_url seeds only. */
+  ref?: string | null;
+  archive_id?: string | null;
+}
+
 export interface RunCreate {
   task_prompt: string;
   model_name: string;
@@ -268,6 +278,7 @@ export interface RunCreate {
   harness_configs: HarnessConfig[];
   evaluator_model?: string | null;
   budgets?: Budgets;
+  task_inputs?: TaskInputs | null;
 }
 
 export interface RunConfig {
@@ -277,7 +288,19 @@ export interface RunConfig {
   evaluator_model?: string | null;
   budgets?: Budgets;
   same_model_eval?: boolean;
+  task_inputs?: TaskInputs | null;
   [key: string]: unknown;
+}
+
+/** PR24 — a staged task-input archive (POST /api/uploads response). `id` is
+ * what `RunCreate.task_inputs.archive_id` consumes. */
+export interface UploadOut {
+  id: string;
+  filename: string;
+  size: number;
+  sha256: string;
+  kind: "zip" | "tar" | string;
+  uploaded_at: string;
 }
 
 export interface SandboxOut {
@@ -613,6 +636,34 @@ function qs(params: Record<string, string | number | undefined | null>): string 
 
 export function createRun(body: RunCreate): Promise<RunOut> {
   return request<RunOut>("/api/runs", { method: "POST", body: JSON.stringify(body) });
+}
+
+// ---------------------------------------------------------------------------
+// uploads (PR24 — task-input archives)
+// ---------------------------------------------------------------------------
+
+/** Stage a zip/tar task-input archive → `UploadOut.id` for
+ * `task_inputs.archive_id`. Sends multipart FormData — NOT through
+ * `request()` (which pins a JSON Content-Type; the browser must set the
+ * multipart boundary itself). */
+export async function uploadArchive(file: File): Promise<UploadOut> {
+  const body = new FormData();
+  body.append("file", file);
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/api/uploads`, {
+      method: "POST",
+      headers: { Accept: "application/json" },
+      body,
+    });
+  } catch (err) {
+    throw new ApiError(
+      0,
+      `cannot reach API at ${API_BASE} — is the backend running? (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+  if (!res.ok) throw await parseError(res);
+  return (await res.json()) as UploadOut;
 }
 
 export interface ListRunsOptions {

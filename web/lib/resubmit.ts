@@ -11,7 +11,7 @@
  * (type-stripped) compatible; sessionStorage access is guarded so the
  * module is safe to import during SSR/prerender.
  */
-import type { Budgets, HarnessConfig, RunOut } from "./api.ts";
+import type { Budgets, HarnessConfig, RunOut, TaskInputs } from "./api.ts";
 
 /** Everything the submit form needs to re-create a run's spec. */
 export interface ResubmitSpec {
@@ -21,6 +21,10 @@ export interface ResubmitSpec {
   evaluator_model: string | null;
   harness_configs: HarnessConfig[];
   budgets: Budgets | null;
+  /** PR24: the run's seed spec — repo seeds restore fully; archive seeds
+   * restore as an already-staged upload id (the staged bytes persist
+   * server-side under data/uploads). */
+  task_inputs?: TaskInputs | null;
 }
 
 const STORAGE_KEY = "heg:resubmit-spec";
@@ -50,6 +54,7 @@ export function specFromRun(run: RunOut): ResubmitSpec {
       model: c.model ?? null,
     })),
     budgets: cfg.budgets ?? null,
+    task_inputs: (cfg.task_inputs as TaskInputs | null | undefined) ?? null,
   };
 }
 
