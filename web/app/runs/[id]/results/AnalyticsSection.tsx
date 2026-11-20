@@ -33,7 +33,7 @@ function errMsg(err: unknown): string {
 type Column = SandboxAnalytics | ModelAnalytics | CellAnalytics;
 
 function isCellCol(c: Column): c is CellAnalytics {
-  return "cell" in c;
+  return "sandbox_count" in c && "cell" in c;
 }
 
 function isModelCol(c: Column): c is ModelAnalytics {

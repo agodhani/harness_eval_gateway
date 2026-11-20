@@ -644,9 +644,10 @@ export default function ResultsClient({ runId }: { runId: string }) {
             </Badge>
           ))}
         </div>
-        {first?.name ? (
-          <div className="dim-name" title={first.name}>
-            {stripTrialSuffix(first.name)}
+        {typeof first?.harness_config?.name === "string" &&
+        first.harness_config.name.trim() ? (
+          <div className="dim-name" title={first?.name ?? undefined}>
+            {stripTrialSuffix(first?.name)}
           </div>
         ) : null}
         <div className="dim-desc">{harnessConfigLabel(first?.harness_config)}</div>
