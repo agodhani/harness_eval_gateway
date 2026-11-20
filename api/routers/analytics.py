@@ -9,8 +9,9 @@
 - ``ttft_ms`` (avg/p95/max of the payload's first-byte timing) and
   ``avg_tokens_per_sec`` (mean per-call output throughput) — PR30 speed
   axis; events predating the fields contribute no sample, and cache
-  replays emit a null ``tokens_per_sec`` so a replay can't masquerade as
-  measured model speed.
+  replays are excluded from both stats entirely (a replay's timings
+  measure the store's serve time, not the model — the gateway nulls
+  ``tokens_per_sec`` on replays for the same reason).
 - ``tool_calls.by_tool`` merges every per-tool signal without double
   counting: ``tool_call`` events (miniloop, translated streams) plus
   hook-sourced ``tool_result`` outcomes (claude_code PostToolUse, pi's
@@ -155,16 +156,19 @@ class _Agg:
                 self.tokens.cache_read += t.cache_read
                 self.tokens.total += t.total
                 lat = _int(payload.get("latency_ms"))
-                if lat:
+                if lat > 0:
                     self.latencies.append(lat)
+                cached = bool(payload.get("cached"))
                 ttft = _int(payload.get("ttft_ms"))
-                if ttft:
+                if ttft > 0 and not cached:
                     self.ttfts.append(ttft)
                 tps = payload.get("tokens_per_sec")
                 if (
-                    isinstance(tps, (int, float))
+                    not cached
+                    and isinstance(tps, (int, float))
                     and not isinstance(tps, bool)
                     and math.isfinite(tps)
+                    and tps >= 0
                 ):
                     self.toks_per_sec.append(float(tps))
             case "tool_call":

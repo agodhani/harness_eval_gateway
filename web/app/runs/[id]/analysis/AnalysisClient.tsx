@@ -35,6 +35,7 @@ import {
   type RunResults,
   type RunTrends,
 } from "@/lib/api";
+import { latencyChartRows, speedChartRows } from "@/lib/analysisRows";
 import { formatNum, formatUsd, shortId } from "@/lib/format";
 import { dimensionSpecMap, weightedDimTotal } from "@/lib/scoreMath";
 import { fmtMeanSd } from "@/lib/trialGroups";
@@ -239,30 +240,11 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     [sbs],
   );
 
-  const latencyRows: Row[] = useMemo(
-    () =>
-      sbs.map((sb) => ({
-        name: shortId(sb.sandbox_id),
-        // PR30: ttft stats — absent on pre-speed-metrics backends.
-        ttft_avg: sb.ttft_ms?.avg ?? 0,
-        ttft_p95: sb.ttft_ms?.p95 ?? 0,
-        avg: sb.latency_ms.avg ?? 0,
-        p95: sb.latency_ms.p95 ?? 0,
-        max: sb.latency_ms.max ?? 0,
-      })),
-    [sbs],
-  );
+  const latencyRows: Row[] = useMemo(() => latencyChartRows(sbs), [sbs]);
 
   // PR30 speed axis: mean output tok/s per cell — the model-comparison
   // chart for how fast each lane actually generates.
-  const speedRows: Row[] = useMemo(
-    () =>
-      sbs.map((sb) => ({
-        name: shortId(sb.sandbox_id),
-        tps: sb.avg_tokens_per_sec ?? 0,
-      })),
-    [sbs],
-  );
+  const speedRows: Row[] = useMemo(() => speedChartRows(sbs), [sbs]);
 
   /** PR28: the effective picker table — server price_table plus rates added
    * inline this session (persisted server-side as model_prices rows). */

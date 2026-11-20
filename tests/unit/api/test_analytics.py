@@ -252,6 +252,140 @@ def test_speed_metrics_per_sandbox_and_model_rollup(
     assert model_row["avg_tokens_per_sec"] == pytest.approx(60.0)
 
 
+def test_cached_replay_stays_off_the_speed_axis(
+    client: TestClient, session_factory: sessionmaker[Session]
+) -> None:
+    """A cache replay's ttft_ms is the store's lookup time (~ms), not
+    model speed — like the nulled tokens_per_sec it must not sample the
+    comparison stats. Oracle: only the live call's 120ms counts (the
+    pre-fix read would average in the 2ms replay → ~61ms), and a
+    cache-only lane reports null stats rather than an ~3ms "instant"
+    first-byte time."""
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="x", model_name="qwen3:8b", config={}, status="done"
+        )
+        s.add(run)
+        s.flush()
+        live = Sandbox(
+            run_id=run.id, harness_config={"adapter": "miniloop"}, status="done"
+        )
+        replay = Sandbox(
+            run_id=run.id, harness_config={"adapter": "miniloop"}, status="done"
+        )
+        s.add_all([live, replay])
+        s.flush()
+
+        def resp(sb, ts, latency, ttft, tps, cached=False):
+            payload = {
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+                "latency_ms": latency,
+                "ttft_ms": ttft,
+                "tokens_per_sec": tps,
+                "http_status": 200,
+            }
+            if cached:
+                payload["cached"] = True
+            return _ev(
+                run.id,
+                sandbox_id=sb.id,
+                type_="llm_response",
+                ts=ts,
+                payload=payload,
+            )
+
+        s.add_all(
+            [
+                resp(live, T0, 500, 120, 10.0),
+                resp(live, T0 + timedelta(seconds=1), 2, 2, None, cached=True),
+                resp(replay, T0, 3, 3, None, cached=True),
+            ]
+        )
+        s.commit()
+        run_id, live_id, replay_id = run.id, live.id, replay.id
+    finally:
+        s.close()
+
+    body = _get(client, run_id)
+    rows = {r["sandbox_id"]: r for r in body["sandboxes"]}
+    live_row = rows[str(live_id)]
+    # replays still count as traffic — just not as measured speed
+    assert live_row["llm_turns"] == 2
+    assert live_row["ttft_ms"] == {"avg": 120.0, "p95": 120.0, "max": 120.0}
+    assert live_row["avg_tokens_per_sec"] == pytest.approx(10.0)
+    replay_row = rows[str(replay_id)]
+    assert replay_row["ttft_ms"] == {"avg": None, "p95": None, "max": None}
+    assert replay_row["avg_tokens_per_sec"] is None
+    # sibling site: the pooled model rollup excludes the replay too
+    (model_row,) = body["models"]
+    assert model_row["ttft_ms"] == {"avg": 120.0, "p95": 120.0, "max": 120.0}
+    assert model_row["avg_tokens_per_sec"] == pytest.approx(10.0)
+
+
+def test_malformed_speed_fields_do_not_poison_stats(
+    client: TestClient, session_factory: sessionmaker[Session]
+) -> None:
+    """Speed fields bypass ingest normalization, so the sampling guards
+    them: negative latency/ttft and negative or non-finite tok/s are
+    dropped rather than dragging avg/p95/max below zero. Oracle: only the
+    sane response's values appear in every stat."""
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="x", model_name="qwen3:8b", config={}, status="done"
+        )
+        s.add(run)
+        s.flush()
+        sb = Sandbox(
+            run_id=run.id, harness_config={"adapter": "miniloop"}, status="done"
+        )
+        s.add(sb)
+        s.flush()
+
+        def resp(ts, latency, ttft, tps):
+            return _ev(
+                run.id,
+                sandbox_id=sb.id,
+                type_="llm_response",
+                ts=ts,
+                payload={
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                        "total_tokens": 15,
+                    },
+                    "latency_ms": latency,
+                    "ttft_ms": ttft,
+                    "tokens_per_sec": tps,
+                    "http_status": 200,
+                },
+            )
+
+        s.add_all(
+            [
+                resp(T0, -500, -5, -3.0),
+                resp(T0 + timedelta(seconds=1), 400, 90, 25.0),
+                resp(T0 + timedelta(seconds=2), 600, 110, float("inf")),
+            ]
+        )
+        s.commit()
+        run_id = run.id
+    finally:
+        s.close()
+
+    body = _get(client, run_id)
+    (row,) = body["sandboxes"]
+    assert row["llm_turns"] == 3
+    assert row["latency_ms"] == {"avg": 500.0, "p95": 600.0, "max": 600.0}
+    assert row["ttft_ms"] == {"avg": 100.0, "p95": 110.0, "max": 110.0}
+    assert row["avg_tokens_per_sec"] == pytest.approx(25.0)
+
+
 def test_terminal_reason_falls_back_to_event(
     client: TestClient, analytics_run
 ) -> None:
