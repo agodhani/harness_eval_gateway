@@ -1223,12 +1223,12 @@ def _list_root_entries(root: Path) -> tuple[list[FileEntry], bool]:
         rel_dir = Path(dirpath).relative_to(root)
         depth = len(rel_dir.parts)
         if depth > 0:
-            entries.append(
-                FileEntry(path=rel_dir.as_posix(), kind="dir", size=None)
-            )
             if len(entries) >= _BROWSE_MAX_ENTRIES:
                 truncated = True
                 break
+            entries.append(
+                FileEntry(path=rel_dir.as_posix(), kind="dir", size=None)
+            )
         # Prune noise dirs at any depth + symlinked dirs (never descended,
         # but keep them out of the walk for clarity).
         dirnames[:] = sorted(
@@ -1249,11 +1249,11 @@ def _list_root_entries(root: Path) -> tuple[list[FileEntry], bool]:
             size = _browsable_file(dirpath, name)
             if size is None:
                 continue
-            rel = name if depth == 0 else (rel_dir / name).as_posix()
-            entries.append(FileEntry(path=rel, kind="file", size=size))
             if len(entries) >= _BROWSE_MAX_ENTRIES:
                 truncated = True
                 break
+            rel = name if depth == 0 else (rel_dir / name).as_posix()
+            entries.append(FileEntry(path=rel, kind="file", size=size))
         if truncated:
             break
     entries.sort(key=lambda e: e.path)

@@ -1744,6 +1744,22 @@ def test_files_unreadable_404(client: TestClient, browsed_run) -> None:
         locked.chmod(0o644)
 
 
+def test_files_list_entry_cap_flags_only_on_cut(
+    client: TestClient, browsed_run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The entry cap flags ``truncated`` only when a browsable entry is
+    actually cut — a tree with exactly cap entries isn't truncated."""
+    total = 5  # index.html, README.md, .env.local, src, src/app.py
+    monkeypatch.setattr(results_router, "_BROWSE_MAX_ENTRIES", total)
+    body = client.get(f"/api/sandboxes/{browsed_run['sb1']}/files").json()
+    assert len(body["entries"]) == total
+    assert body["truncated"] is False
+    monkeypatch.setattr(results_router, "_BROWSE_MAX_ENTRIES", total - 1)
+    body = client.get(f"/api/sandboxes/{browsed_run['sb1']}/files").json()
+    assert len(body["entries"]) == total - 1
+    assert body["truncated"] is True
+
+
 def test_files_list_depth_cutoff_counts_only_browsable(
     client: TestClient, browsed_run, monkeypatch: pytest.MonkeyPatch
 ) -> None:

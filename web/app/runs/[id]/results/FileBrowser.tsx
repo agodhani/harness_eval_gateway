@@ -438,6 +438,12 @@ export default function FileBrowser({
                       </div>
                     ) : diff.identical ? (
                       <div className="fb-note">Files are identical.</div>
+                    ) : diff.diff === "" && !diff.a_missing && !diff.b_missing ? (
+                      <div className="fb-note">
+                        Files differ but produce no line-level diff — the
+                        difference is in line endings
+                        {diff.truncated ? " or beyond the diff cap" : ""}.
+                      </div>
                     ) : (
                       <pre className="code fb-pre">
                         {diffLines.map((l, i) => (
