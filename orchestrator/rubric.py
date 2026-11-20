@@ -695,7 +695,17 @@ async def draft_rubric(
                 run_id=run.id,
                 sandbox_id=None,
                 secret=settings.GATEWAY_CRED_SECRET,
-                ttl_seconds=3600,
+                ttl_seconds=int(
+                    max(
+                        3600,
+                        _env_float(
+                            "RUBRIC_GEN_TIMEOUT_SECONDS",
+                            DEFAULT_GEN_TIMEOUT_SECONDS,
+                        )
+                        * (1 + _env_int("RUBRIC_GEN_RETRIES", DEFAULT_GEN_RETRIES))
+                        + 300,
+                    )
+                ),
                 max_tokens=used + int(settings.EVAL_TOKEN_BUDGET),
             )
             model = settings.RUBRIC_MODEL or run.model_name
