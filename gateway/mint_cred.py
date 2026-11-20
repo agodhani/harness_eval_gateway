@@ -55,7 +55,13 @@ def main(argv: list[str] | None = None) -> int:
         "--max-tokens",
         type=int,
         default=None,
-        help="per-cred token budget override (default: DEFAULT_RUN_TOKEN_BUDGET)",
+        help="per-cred RUN token budget override (default: DEFAULT_RUN_TOKEN_BUDGET)",
+    )
+    parser.add_argument(
+        "--sandbox-max-tokens",
+        type=int,
+        default=None,
+        help="PR28 per-sandbox token cap claim (the run's sandbox_token_budget)",
     )
     parser.add_argument(
         "--secret",
@@ -71,6 +77,7 @@ def main(argv: list[str] | None = None) -> int:
         secret=secret,
         ttl_seconds=args.ttl_seconds,
         max_tokens=args.max_tokens,
+        sandbox_max_tokens=args.sandbox_max_tokens,
     )
     print(cred)
     return 0

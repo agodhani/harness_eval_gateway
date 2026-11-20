@@ -40,24 +40,70 @@ def uuid_or_none(value: str | uuid.UUID | None) -> uuid.UUID | None:
         return None
 
 
-def tokens_used(session: Session, run_id: uuid.UUID) -> int:
-    """Sum ``payload.usage.total_tokens`` over a run's ``llm_response`` events.
+def llm_usage_totals(
+    session: Session,
+    run_id: uuid.UUID,
+    *,
+    sandbox_id: uuid.UUID | None = None,
+) -> dict[str, int]:
+    """Sum ``payload.usage.{prompt,completion,cache_read,total}_tokens`` over
+    a run's ``llm_response`` events, optionally scoped to one sandbox.
 
     Uses dialect-aware JSON extraction (``->>``/``json_extract`` via
     SQLAlchemy's JSON comparator) so it works on Postgres and sqlite alike.
+    ``cache_read_tokens`` sums ``cache_read_input_tokens`` (Anthropic's
+    field name) — the prompt side already includes it, matching the
+    analytics cost math (cache tokens bill at the cache rate when a rate
+    is declared, else at the input rate).
     """
-    token_expr = cast(Event.payload["usage"]["total_tokens"].as_string(), BigInteger)
-    stmt = select(func.coalesce(func.sum(token_expr), 0)).where(
-        Event.run_id == run_id, Event.type == "llm_response"
-    )
-    return int(session.execute(stmt).scalar_one())
+
+    def _col(field: str):
+        return func.coalesce(
+            func.sum(
+                cast(Event.payload["usage"][field].as_string(), BigInteger)
+            ),
+            0,
+        )
+
+    stmt = select(
+        _col("prompt_tokens"),
+        _col("completion_tokens"),
+        _col("cache_read_input_tokens"),
+        _col("total_tokens"),
+    ).where(Event.run_id == run_id, Event.type == "llm_response")
+    if sandbox_id is not None:
+        stmt = stmt.where(Event.sandbox_id == sandbox_id)
+    prompt, completion, cache_read, total = session.execute(stmt).one()
+    return {
+        "prompt_tokens": int(prompt),
+        "completion_tokens": int(completion),
+        "cache_read_tokens": int(cache_read),
+        "total_tokens": int(total),
+    }
+
+
+def tokens_used(
+    session: Session, run_id: uuid.UUID, *, sandbox_id: uuid.UUID | None = None
+) -> int:
+    """Sum ``payload.usage.total_tokens`` over a run's ``llm_response`` events
+    (one sandbox's events when ``sandbox_id`` is given — PR28 per-cell cap)."""
+    return llm_usage_totals(session, run_id, sandbox_id=sandbox_id)["total_tokens"]
 
 
 def token_budget(claims: CredClaims, settings: GatewaySettings) -> int:
-    """Effective budget: cred ``max_tokens`` claim wins over the env default."""
+    """Effective run budget: cred ``max_tokens`` claim wins over the env default."""
     if claims.max_tokens is not None:
         return claims.max_tokens
     return settings.DEFAULT_RUN_TOKEN_BUDGET
+
+
+def sandbox_token_budget(claims: CredClaims) -> int | None:
+    """Per-sandbox cap from the cred's ``sandbox_max_tokens`` claim (PR28).
+
+    Only sandbox-scoped participant creds carry it — service/eval creds
+    mint no claim and stay exempt from the per-cell gate.
+    """
+    return claims.sandbox_max_tokens
 
 
 def max_tokens_estimate(body: dict[str, Any]) -> int:

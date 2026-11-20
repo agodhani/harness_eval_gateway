@@ -160,12 +160,24 @@ class BudgetsIn(BaseModel):
     """Termination-policy knobs for a run.
 
     ``token_budget`` is PER-RUN (the gateway meters tokens across all of a
-    run's sandboxes against one ceiling), not per-sandbox.
+    run's sandboxes against one ceiling), not per-sandbox. PR28 adds the
+    per-cell knobs — both optional, both enforced per sandbox:
+
+    - ``sandbox_token_budget`` caps each cell's OWN token total (minted as
+      the cred's ``sandbox_max_tokens`` claim for the gateway gate plus a
+      monitor poll check) — a runaway cell starves itself, not its siblings.
+    - ``max_cost_usd`` caps each cell's ESTIMATED spend, computed per poll
+      through the layered price table (api/pricing.py::PriceBook). It only
+      bites on priced models — an unpriced cell has no honest rate to bill
+      against, so the cap simply can't trip it (PR21 honesty preserved).
     """
 
     max_iters: int = Field(default=50, ge=1, le=1000)
     token_budget: int = Field(default=200_000, ge=1_000)
     wall_clock_seconds: int = Field(default=3600, ge=60, le=86_400)
+    # PR28: per-sandbox/per-cell caps; None = unset (no per-cell limit).
+    sandbox_token_budget: int | None = Field(default=None, ge=1_000)
+    max_cost_usd: float | None = Field(default=None, gt=0)
 
 
 #: PR14 — sanity cap on the expanded comparison matrix (configs × models);

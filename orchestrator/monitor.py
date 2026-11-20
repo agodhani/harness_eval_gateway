@@ -6,12 +6,18 @@
 
 1. **Deadline** — ``started_at + wall_clock_seconds`` → terminate ``timeout``.
 2. **Budget/provider** — gateway ``error`` events for this sandbox:
-   ``reason=="budget_exceeded"`` (the gateway's own run-budget 429 — its
-   signature is ``stage="budget"`` + ``reason``, NOT the bare status) →
+   ``reason=="budget_exceeded"`` (the gateway's own run/sandbox budget 429 —
+   its signature is ``stage="budget"`` + ``reason``, NOT the bare status) →
    ``budget_exceeded``. ``stage=="upstream"`` events are provider-side
    failures (rate-limit 429s, 5xx, unreachable) — ≥
-   ``UPSTREAM_ERROR_THRESHOLD`` of them terminate ``error`` instead. Run-wide
-   ``metering.tokens_used >= token_budget`` → ``budget_exceeded``.
+   ``UPSTREAM_ERROR_THRESHOLD`` of them terminate ``error`` instead. Then the
+   poll-side caps (PR28): run-wide ``metering.tokens_used >= token_budget``,
+   this-sandbox tokens ``>= sandbox_token_budget``, and this-sandbox
+   ``estimated_cost_usd >= max_cost_usd`` — each terminates
+   ``budget_exceeded`` with ``payload.limit`` = ``run_tokens`` /
+   ``sandbox_tokens`` / ``cost``. The cost cap prices the sandbox's own
+   participant model through the layered price table and only bites when a
+   rate honestly resolves — unpriced cells can't trip it (PR21).
 3. **Container state** — ``running`` → ``done_signal`` older than
    ``DONE_GRACE_SECONDS`` → terminate ``agent_done`` (safety net);
    ``exited``/``dead`` → parse ``MINILOOP_RESULT`` from logs, exit-code
@@ -43,13 +49,15 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from db.models import Artifact, Event, Sandbox
-from gateway.metering import tokens_used
+from api import pricing
+from db.models import Artifact, Event, Run, Sandbox
+from gateway.metering import llm_usage_totals, tokens_used
 from sandbox.runtime import SandboxRuntime
 
 from . import state_machine
 from .adapters import get_adapter, parse_terminal_state
 from .events import emit
+from .matrix import sandbox_model
 
 log = logging.getLogger(__name__)
 
@@ -151,12 +159,50 @@ def _run_tokens_used(
         return tokens_used(session, run_id)
 
 
+def _sandbox_tokens_used(
+    session_factory: sessionmaker[Session],
+    run_id: uuid.UUID,
+    sandbox_id: uuid.UUID,
+) -> int:
+    with session_factory() as session:
+        return tokens_used(session, run_id, sandbox_id=sandbox_id)
+
+
+def _sandbox_estimated_cost_usd(
+    session_factory: sessionmaker[Session],
+    run: Run,
+    sb: Sandbox,
+) -> float | None:
+    """Estimated USD spend for the sandbox's participant traffic (PR28).
+
+    Priced at the sandbox's own model through the layered price table —
+    returns ``None`` when the model resolves no rate (unpriced, PR21): a
+    cost cap then simply can't trip the cell instead of guessing a rate.
+    Poll-cadence traffic only, so judge-phase usage is irrelevant (the watch
+    exits before the evaluator runs).
+    """
+    model = sandbox_model(sb.harness_config or {}, run.model_name)
+    with session_factory() as session:
+        book = pricing.load_book(session)
+        usage = llm_usage_totals(session, run.id, sandbox_id=sb.id)
+    price = book.price_for(book.key_for(model))
+    if price is None:
+        return None
+    return pricing.estimate_cost_usd(
+        price,
+        input_tokens=usage["prompt_tokens"],
+        output_tokens=usage["completion_tokens"],
+        cache_read_tokens=usage["cache_read_tokens"],
+    )
+
+
 def _mark_terminating(
     session_factory: sessionmaker[Session],
     *,
     run_id: uuid.UUID,
     sandbox_id: uuid.UUID,
     reason: str,
+    detail: dict[str, Any] | None = None,
 ) -> None:
     with session_factory() as session:
         sb = session.get(Sandbox, sandbox_id)
@@ -165,12 +211,17 @@ def _mark_terminating(
                 state_machine.transition(session, sb, "terminating")
             except state_machine.InvalidTransition:
                 sb.status = "terminating"
+            payload: dict[str, Any] = {"stage": "terminate", "reason": reason}
+            if detail:
+                # Budget context (PR28): which limit fired + the numbers
+                # that tripped it — ``limit`` ∈ run_tokens|sandbox_tokens|cost.
+                payload.update(detail)
             emit(
                 session,
                 run_id=run_id,
                 sandbox_id=sandbox_id,
                 event_type="checkpoint",
-                payload={"stage": "terminate", "reason": reason},
+                payload=payload,
             )
             session.commit()
 
@@ -408,6 +459,7 @@ async def _terminate(
     run_id: uuid.UUID,
     sandbox_id: uuid.UUID,
     reason: str,
+    detail: dict[str, Any] | None = None,
 ) -> str:
     """Policy-driven stop (timeout/budget/done-grace): mark terminating, stop
     the container (keep it for snapshot), then finalize."""
@@ -416,6 +468,7 @@ async def _terminate(
         run_id=run_id,
         sandbox_id=sandbox_id,
         reason=reason,
+        detail=detail,
     )
     try:
         await asyncio.to_thread(runtime.stop, str(sandbox_id), remove=False)
@@ -447,6 +500,15 @@ async def watch_sandbox(
     sid = str(sandbox_id)
     wall_clock = float(budgets.get("wall_clock_seconds", 3600))
     token_budget = budgets.get("token_budget")
+    # PR28 per-cell caps — absent ⇒ no per-sandbox checks (pre-PR28 runs).
+    sandbox_token_budget = budgets.get("sandbox_token_budget")
+    max_cost_usd = budgets.get("max_cost_usd")
+    # The run row carries model_name for the per-sandbox cost estimate;
+    # loaded once — model_name is immutable after submit.
+    run = None
+    if max_cost_usd:
+        with session_factory() as session:
+            run = session.get(Run, run_id)
     poll = float(getattr(settings, "MONITOR_POLL_SECONDS", 5.0))
     try:
         while True:
@@ -492,6 +554,46 @@ async def watch_sandbox(
                         run_id=run_id,
                         sandbox_id=sandbox_id,
                         reason="budget_exceeded",
+                        detail={
+                            "limit": "run_tokens",
+                            "used_tokens": used,
+                            "budget": int(token_budget),
+                        },
+                    )
+            # PR28 per-sandbox token cap — the gateway claim enforces it
+            # per request; this poll is the backstop that terminates the
+            # cell when only its OWN total crosses the line.
+            if sandbox_token_budget:
+                sb_used = _sandbox_tokens_used(session_factory, run_id, sandbox_id)
+                if sb_used >= int(sandbox_token_budget):
+                    return await _terminate(
+                        session_factory=session_factory,
+                        runtime=runtime,
+                        run_id=run_id,
+                        sandbox_id=sandbox_id,
+                        reason="budget_exceeded",
+                        detail={
+                            "limit": "sandbox_tokens",
+                            "used_tokens": sb_used,
+                            "budget": int(sandbox_token_budget),
+                        },
+                    )
+            # PR28 per-sandbox cost cap — layered-price estimate each poll;
+            # unpriced cells get None and can't trip the cap (PR21 honesty).
+            if max_cost_usd and run is not None:
+                est = _sandbox_estimated_cost_usd(session_factory, run, sb)
+                if est is not None and est >= float(max_cost_usd):
+                    return await _terminate(
+                        session_factory=session_factory,
+                        runtime=runtime,
+                        run_id=run_id,
+                        sandbox_id=sandbox_id,
+                        reason="budget_exceeded",
+                        detail={
+                            "limit": "cost",
+                            "estimated_cost_usd": round(est, 6),
+                            "budget_usd": float(max_cost_usd),
+                        },
                     )
 
             # 3) container state
