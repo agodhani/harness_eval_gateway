@@ -437,13 +437,27 @@ export default function SubmitPage() {
     const sugg = p.suggested_models ?? [];
     if (sugg.length > 0) {
       setModelRows((rs) => {
+        const taken = new Set<string>();
+        for (const r of rs) {
+          const m = r.model.trim();
+          if (m) taken.add(m);
+        }
+        const fresh: string[] = [];
+        for (const s of sugg) {
+          const m = s.trim();
+          if (m && !taken.has(m)) {
+            taken.add(m);
+            fresh.push(m);
+          }
+        }
+        if (fresh.length === 0) return rs;
         const out = [...rs];
         let si = 0;
-        for (let i = 0; i < out.length && si < sugg.length; i++) {
-          if (!out[i].model.trim()) out[i] = { ...out[i], model: sugg[si++] };
+        for (let i = 0; i < out.length && si < fresh.length; i++) {
+          if (!out[i].model.trim()) out[i] = { ...out[i], model: fresh[si++] };
         }
-        while (si < sugg.length && out.length < MAX_MODEL_ROWS) {
-          out.push({ key: nextKey++, provider: defaultProvider, model: sugg[si++] });
+        while (si < fresh.length && out.length < MAX_MODEL_ROWS) {
+          out.push({ key: nextKey++, provider: defaultProvider, model: fresh[si++] });
         }
         return out;
       });
