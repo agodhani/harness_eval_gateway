@@ -166,7 +166,9 @@ def _list_stats(session: Session, slugs: set[str]) -> dict[str, tuple[int, float
         return {}
     runs = (
         session.execute(
-            select(Run).where(Run.preset_ref.in_(slugs)).order_by(Run.created_at.desc())
+            select(Run)
+            .where(Run.preset_ref.in_(slugs))
+            .order_by(Run.created_at.desc(), Run.id)
         )
         .scalars()
         .all()
@@ -255,7 +257,7 @@ async def preset_analytics(slug: str, session: DbSession) -> PresetAnalytics:
         session.execute(
             select(Run)
             .where(Run.preset_ref == preset.slug)
-            .order_by(Run.created_at.desc())
+            .order_by(Run.created_at.desc(), Run.id)
         )
         .scalars()
         .all()
