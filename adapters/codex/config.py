@@ -27,7 +27,7 @@ CONFIG_TOML_TEMPLATE = '''\
 model = "{model}"
 model_provider = "heg"
 notify = {notify_argv}
-
+{reasoning_effort}
 [model_providers.heg]
 name = "harness_eval_gateway"
 base_url = "{gateway_url}/v1"
@@ -49,12 +49,22 @@ def write_config(cfg: ShimConfig) -> Path:
     home = codex_home(cfg)
     home.mkdir(parents=True, exist_ok=True)
     config_path = home / "config.toml"
+    # PR27: model_options.reasoning → codex's ``model_reasoning_effort``
+    # config key (top-level, before the provider table). Absent → the line
+    # is empty and codex uses its default effort.
+    effort = (cfg.env.get("CODEX_MODEL_REASONING_EFFORT") or "").strip()
+    effort_line = (
+        f'model_reasoning_effort = "{_toml_escape(effort)}"\n'
+        if effort
+        else ""
+    )
     config_path.write_text(
         CONFIG_TOML_TEMPLATE.format(
             model=_toml_escape(cfg.model),
             gateway_url=_toml_escape(cfg.gateway_url),
             # JSON array syntax is a valid TOML array literal.
             notify_argv=json.dumps(NOTIFY_ARGV),
+            reasoning_effort=effort_line,
         ),
         encoding="utf-8",
     )

@@ -32,6 +32,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F17 | Artifact thumbnails (headless screenshots via the preview stack; desktop captures wait on real VNC framebuffer content, dead-app fast-fail with exit reason) | ✅ | `sandbox/thumbnails.py`, `sandbox/images/thumbnail-capture.{Dockerfile,sh}`, `sandbox/images/thumbnail-vnc.py`, `api/routers/preview.py` (`.../thumbnail`), `api/routers/results.py` (`SandboxResult.thumbnail`), `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_thumbnails.py`, `tests/unit/api/test_thumbnails.py`, `tests/integration/test_thumbnail.py` |
 | F18 | Prompt-only matrix cells (no-sandbox `prompt` adapter: one metered LLM call per cell, `output.txt` artifact, full results/eval pipeline) | ✅ | `orchestrator/prompt_cell.py`, `orchestrator/adapters.py` (pseudo-manifest), `orchestrator/lifecycle.py`, `evaluator/evaluate.py` (`prompt_output_path`), `web/app/runs/[id]/results/` (inline output view) | `tests/unit/orchestrator/test_prompt_cell.py`, `test_lifecycle.py` (prompt cases), `tests/unit/api/test_results.py` (prompt-cell cases) |
 | F19 | Artifact file browser + side-by-side diff (jailed listing/read endpoints; prompt cells browse the artifact root so `output.txt` stays reachable; server-side unified diffs) | ✅ | `api/routers/results.py` (`/api/sandboxes/{id}/files[/{path}]`), `web/app/runs/[id]/results/FileBrowser.tsx`, `web/lib/fileBrowser.ts`, `web/lib/api.ts` | `tests/unit/api/test_results.py` (PR34 section), `web/lib/fileBrowser.test.ts` |
+| F20 | Trials per cell + per-config model options (config × model × trials expansion, `mean ± sample sd (n=N)` grouped results + cell rollups, adapter-filtered `model_options`) | ✅ | `api/schemas.py`, `api/routers/{runs,results,analytics}.py`, `orchestrator/{matrix,lifecycle,provision,prompt_cell,adapters}.py`, `adapters/common/contract.py`, `db/migrations/versions/d7e9f1a3b5c7_runs_trials.py`, `web/lib/{api,trialGroups,resubmit}.ts`, `web/app/submit/page.tsx`, `web/app/runs/[id]/results/`, `web/app/runs/[id]/analysis/` | `tests/unit/orchestrator/test_matrix.py`, `test_provision.py`, `tests/unit/api/test_runs.py`, `test_analytics.py`, `tests/unit/db/test_migrations.py` |
 
 ## Feature details
 
@@ -1293,6 +1294,94 @@ workspace to produce.
 - **Depends on:** F8 (results matrix + artifact jail), F12 (`sandbox/
   preview.py` `resolve_artifact_dir`/`resolve_workspace_dir` helpers),
   F18 (prompt-cell artifact root as a browse target).
+
+### F20 — Trials per cell + per-config model options (PR27) ✅
+
+**What:** every effective config × model matrix cell repeats `trials`
+times (1–8, default 1) so results report mean ± sample sd with `n`
+instead of a single sample; each harness config may carry
+`model_options` (`temperature`, `seed`, `max_tokens`, `reasoning`) that
+adapters honor where they expose the equivalent control.
+
+**Why:** a one-shot sample per cell can't rank harness/model combos
+defensibly — small models are stochastic. Repeated trials give the
+score distribution; model options make the comparison axis itself
+configurable per cell (e.g. temperature sweeps).
+
+- `RunCreate.trials` (int, 1–8, default 1) persists on `runs.trials`
+  (migration `d7e9f1a3b5c7`) and `config["trials"]`; the 32-sandbox
+  matrix cap applies to the post-trial count
+  (`configs × models × trials`).
+- Expansion (`orchestrator/matrix.py::expanded_configs`) runs
+  model-major first, then stamps a 1-based `trial_index` on each replica
+  cell-major — a cell's trials stay adjacent. `trials=1` emits no key
+  (pre-PR27 shape); `trial_index`/`cell_key` helpers read the stamp and
+  group identity (config minus `trial_index`, serialized sorted).
+  Lifecycle reads `run.trials` (column wins; `config["trials"]` covers
+  pre-column specs). Prompt pseudo-cells replicate identically.
+- Sandbox names append ` · tN` after the model suffix
+  (`cfg · model · t3`) — provision truncates the label side, never the
+  tail (`sandboxes.name` is String(255)).
+- `HarnessConfigIn.model_options` is a closed schema (`extra="forbid"`,
+  per-key bounds; `reasoning` normalizes to lowercase and maps to the
+  request-level `reasoning_effort`). Submit filters keys against
+  `orchestrator.adapters.supported_model_options` (each adapter's
+  `MANIFEST["model_options"]`, surfaced on `GET /api/harnesses`):
+  unsupported keys are dropped from the persisted cell + advisory
+  `warnings` on the response — never a 422. Support today: `miniloop` +
+  `prompt` all four; `codex` `reasoning` only (→
+  `model_reasoning_effort` config); `claude_code`/`pi`/`deepseek`/
+  `aider` none.
+- Miniloop maps options to env knobs `MINILOOP_TEMPERATURE`,
+  `MINILOOP_SEED`, `MAX_TOKENS`, `MINILOOP_REASONING_EFFORT`
+  (`AgentConfig.from_env` → request-body fields; the explicit
+  `max_tokens` kwarg outranks `model_options.max_tokens`). `prompt`
+  cells fold supported options into the chat-completions body. `cli_env`
+  takes `model_options` across the CLI contract.
+- Results API returns `trials` on the run + `trial_index` per sandbox;
+  the results matrix groups trials under one config × model header
+  showing `mean ± sd (n=N)` (sample sd, n−1 — null under 2 scored
+  trials; unscored trials drop out of `n`) with expandable per-trial
+  rows keeping rationales/artifacts. The by-model rollup reads
+  `mean overall (±sd, n=…)`.
+- Analytics adds per-sandbox `cell`/`trial_index` and a `cells` rollup
+  (`overall_mean`/`overall_sd`/`overall_n`, pooled metrics across the
+  cell's trials) plus a by-cell table view; the analysis page gains a
+  "Score variance by cell" table. Web helpers in
+  `web/lib/trialGroups.ts` (`cellKey`/`groupByCell`/`meanSd`/
+  `fmtMeanSd`/`stripTrialSuffix`).
+- Submit UI: a `trials` stepper (1–8) plus advanced per-config
+  model-options controls annotated with each adapter's supported set;
+  submit warnings surface dropped keys. Reasoning-effort options are
+  adapter-scoped — codex offers `minimal|low|medium|high|xhigh` (its
+  `model_reasoning_effort` vocabulary; `max`/`none` fail codex's config
+  parse), pass-through adapters keep the broader list. `resubmit` carries
+  both fields.
+- Files: `api/schemas.py` (`ModelOptions`, `RunCreate.trials`,
+  `CellAnalytics`), `api/routers/runs.py` (persist + filter + warnings),
+  `api/routers/analytics.py` + `results.py` (`trial_index`/`cell`/
+  `cells`), `orchestrator/{matrix,lifecycle,provision,prompt_cell,
+  adapters}.py`, `adapters/common/contract.py` (`cli_env` signature),
+  `adapters/{miniloop,codex,claude_code,pi,deepseek,aider}`,
+  `db/models.py` + `db/migrations/versions/d7e9f1a3b5c7_runs_trials.py`,
+  `web/lib/{api,trialGroups,resubmit}.ts`, `web/app/submit/page.tsx`,
+  `web/app/runs/[id]/results/{ResultsClient,AnalyticsSection}.tsx`,
+  `web/app/runs/[id]/analysis/AnalysisClient.tsx`, `web/app/globals.css`.
+- Tests: `test_matrix.py` (N-count, 1-based cell-major stamp,
+  `cell_key`/`trial_index`), `test_provision.py` (` · tN` naming +
+  truncation, model_options → miniloop env), `test_analytics.py`
+  (hand-worked mean ± sd = 7.667 ± 1.528 on scores 6/8/9, scored-only
+  `n`), `test_runs.py` (trials persist/bounds/cap, options kept-
+  supported/dropped-unsupported/422-unknown, whole-map removal),
+  `tests/unit/adapters/miniloop/test_adapter.py` (env knobs, kwarg
+  precedence), `tests/unit/db/test_migrations.py` (head +
+  up/down).
+- Verify: `uv run pytest tests/unit -q`; manual — submit a 2-config
+  run at trials=3 → six ` · tN` sandboxes; results matrix shows one
+  column per cell with `mean ± sd (n=3)` + expandable trials; a codex
+  config with `temperature` submits 201 with a drop warning.
+- **Depends on:** F16 (config × model matrix), F8/F9 (results +
+  analytics), F18 (prompt cells replicate through the same path).
 
 ## Implementation sequence
 

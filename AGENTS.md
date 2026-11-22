@@ -728,6 +728,30 @@ or tests change.
   `mergeFileLists` reuses the PR10 merged-ordering split idiom for the
   two-lane file list (no diff dependency added). Traversal/absolute-path/
   sibling-workspace escapes 404 identically to the artifact download.
+- **PR27 — trials + per-config model options**: `RunCreate.trials` (1–8,
+  default 1) replicates every effective config × model cell N times;
+  expansion stays model-major then cell-major so a cell's `t1..tN` replicas
+  stay adjacent, each stamped `harness_config.trial_index` (the key is
+  ABSENT at trials=1 — single-shot runs stay bit-identical to pre-PR27).
+  `trial_index` lives inside the existing `harness_config` JSONB — no new
+  sandbox column; `runs.trials` is a real int column (migration
+  `d7e9f1a3b5c7`, the column wins over `config["trials"]` on old specs).
+  Sandbox names append ` · tN` after the model suffix
+  (`cfg · model · t3`), truncating the label side to fit String(255).
+  `harness_configs[].model_options` (`temperature`/`seed`/`max_tokens`/
+  `reasoning`, `extra="forbid"`) is filtered at submit against the
+  adapter's `MANIFEST["model_options"]` — unsupported keys are dropped
+  from the persisted cell and reported as advisory `warnings` (never a
+  422); miniloop + `prompt` honor all four, codex takes `reasoning` only
+  (→ `model_reasoning_effort`), other CLIs none. Miniloop maps them to
+  `MINILOOP_TEMPERATURE`/`MINILOOP_SEED`/`MAX_TOKENS`/
+  `MINILOOP_REASONING_EFFORT` env knobs → request-body fields.
+  Results/analytics group trials by `cell_key` (harness_config minus
+  `trial_index`, serialized sorted): the results matrix shows one column
+  per cell (`mean ± sd (n=N)`, sample sd n−1) with expandable per-trial
+  rows; analytics adds a `cells` rollup (`overall_mean`/`overall_sd`/
+  `overall_n` counting only scored trials) plus per-sandbox `cell`/
+  `trial_index`, and a by-cell view in the results analytics table.
 
 ## Working conventions
 

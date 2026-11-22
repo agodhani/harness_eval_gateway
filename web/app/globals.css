@@ -1706,6 +1706,24 @@ table.matrix {
   max-width: 320px;
   text-align: left;
 }
+/* PR27 — per-trial rows inside a grouped score-matrix cell. */
+.trial-list {
+  margin-top: 0.45rem;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.trial-list__row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  font-size: 0.78rem;
+}
+.trial-list__row > .mono {
+  min-width: 1.6rem;
+  font-size: 0.72rem;
+}
 .matrix tr.row-overall td,
 .table tr.row-overall td {
   background: var(--accent-soft);
