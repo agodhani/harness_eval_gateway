@@ -1537,3 +1537,96 @@ export function deletePrice(id: string): Promise<void> {
 export function syncPrices(): Promise<PriceSyncOut> {
   return request<PriceSyncOut>("/api/prices/sync", { method: "POST" });
 }
+
+// ---------------------------------------------------------------------------
+// artifact file browser + side-by-side diff (PR34)
+// ---------------------------------------------------------------------------
+
+/** One browsable path inside a sandbox's artifact browse root —
+ * `path` is POSIX-style relative; `size` is null for dirs. */
+export interface FileEntry {
+  path: string;
+  kind: "file" | "dir" | string;
+  size: number | null;
+}
+
+/** GET /api/sandboxes/{id}/files — bounded listing.
+ * `root` = "workspace" (snapshot workspace) | "artifact" (artifact dir —
+ * prompt cells / workspace-less artifacts, where output.txt lives). */
+export interface FileListOut {
+  sandbox_id: string;
+  root: string;
+  entries: FileEntry[];
+  /** Listing hit the server's depth/entry caps. */
+  truncated: boolean;
+}
+
+/** GET /api/sandboxes/{id}/files/{path} — size-capped text read.
+ * `binary` = NUL-carrying content → `text` null (offer the download). */
+export interface FileContentOut {
+  sandbox_id: string;
+  path: string;
+  size: number;
+  truncated: boolean;
+  binary: boolean;
+  text: string | null;
+}
+
+/** GET .../files/{path}?diff=<other> — unified diff across browse roots.
+ * `sandbox_id` = a/left, `other_sandbox_id` = b/right. A path absent on
+ * one side diffs against empty; `binary` sides return an empty `diff`. */
+export interface FileDiffOut {
+  sandbox_id: string;
+  other_sandbox_id: string;
+  path: string;
+  a_missing: boolean;
+  b_missing: boolean;
+  binary: boolean;
+  identical: boolean;
+  truncated: boolean;
+  diff: string;
+}
+
+function sandboxFilesPath(sandboxId: string): string {
+  return `/api/sandboxes/${encodeURIComponent(sandboxId)}/files`;
+}
+
+/** Jailed, depth/entry-bounded listing of the sandbox's artifact browse
+ * root (workspace/ when present, else the artifact dir — prompt cells). */
+export function listSandboxFiles(sandboxId: string): Promise<FileListOut> {
+  return request<FileListOut>(sandboxFilesPath(sandboxId));
+}
+
+/** Segments of `path` are encoded individually so a legitimately nested
+ * artifact path keeps its slashes (and any `..`/absolute games 404
+ * server-side anyway — the browse root is jailed). */
+function fileUrlPath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
+/** Size-capped text read of one artifact file (JSON). */
+export function getSandboxFile(
+  sandboxId: string,
+  path: string,
+): Promise<FileContentOut> {
+  return request<FileContentOut>(
+    `${sandboxFilesPath(sandboxId)}/${fileUrlPath(path)}`,
+  );
+}
+
+/** Server-side unified diff of `path` across `sandboxId` (a) and
+ * `otherId` (b). 404s when the path exists on neither side. */
+export function getSandboxFileDiff(
+  sandboxId: string,
+  path: string,
+  otherId: string,
+): Promise<FileDiffOut> {
+  return request<FileDiffOut>(
+    `${sandboxFilesPath(sandboxId)}/${fileUrlPath(path)}${qs({ diff: otherId })}`,
+  );
+}
+
+/** Absolute URL for the `?download=1` attachment of a browsed file. */
+export function sandboxFileDownloadUrl(sandboxId: string, path: string): string {
+  return `${API_BASE}${sandboxFilesPath(sandboxId)}/${fileUrlPath(path)}?download=1`;
+}

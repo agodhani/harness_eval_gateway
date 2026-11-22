@@ -721,6 +721,22 @@ or tests change.
   (no honest rate to bill against). Cache-read tokens bill at
   `cache_read_per_mtok_usd` when declared, else the input rate.
   Price pickers (results + analysis) grow rates inline via "+ add rate".
+- **Artifact file browsing is rooted per-sandbox, jailed like the download
+  (PR34/F19)** — `GET /api/sandboxes/{id}/files[/{path}]` reuses
+  `sandbox/preview.py`'s `resolve_workspace_dir`/`resolve_artifact_dir`
+  rather than `Artifact` rows: `workspace/` wins when the snapshot exists,
+  else the artifact dir itself browses (prompt cells surface `output.txt`/
+  `meta.json`/`transcript.log`; `FileListOut.root` reports which root
+  answered). Listings are depth(8)/entry(5000)-bounded with the workspace
+  ZIP's exclusions (`.git`/`node_modules`/`__pycache__`/`.venv`/`*.pyc`)
+  and never follow symlinks; text reads cap at 256 KiB and NUL-carrying
+  content returns `binary: true` + the `?download=1` FileResponse. `?diff=
+  <other>` is `difflib` server-side (a/ + b/ labels, 1 MiB per side, 10k
+  lines out, missing-side → diff vs empty) — the UI renders the unified
+  format in a `<pre>` classified by `web/lib/fileBrowser.ts`, whose
+  `mergeFileLists` reuses the PR10 merged-ordering split idiom for the
+  two-lane file list (no diff dependency added). Traversal/absolute-path/
+  sibling-workspace escapes 404 identically to the artifact download.
 
 ## Working conventions
 
@@ -737,7 +753,7 @@ or tests change.
 - `GET /api/runs/{id}/analytics?price_model=` (F9) serves per-sandbox metrics
   + estimated cost; price resolution runs through the layered
   `api/pricing.py::PriceBook` (`model_prices` glob rows over the static
-  `PRICE_TABLE`, F19 — managed via `GET/PUT/DELETE /api/prices`,
+  `PRICE_TABLE`, F20 — managed via `GET/PUT/DELETE /api/prices`,
   `POST /api/prices/sync` for OpenRouter).
   `tool_calls` merges every agent-activity signal without double counting —
   `tool_call` events, hook-sourced `tool_result` outcomes (per-name max),
