@@ -44,6 +44,12 @@ import subprocess
 import tarfile
 import time
 import zipfile
+import zlib
+
+try:
+    import lzma
+except ImportError:  # stripped builds — .tar.xz is unopenable then anyway
+    lzma = None  # type: ignore[assignment]
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -80,9 +86,31 @@ DEFAULT_GIT_TIMEOUT_SECONDS = 300.0
 _DRIVE_RE = re.compile(r"^[A-Za-z]:$")
 _REF_RE = re.compile(r"[A-Za-z0-9._/-]+")
 
+#: Compression methods ``zipfile`` can actually decompress — anything else
+#: (e.g. AES-99) is metadata at check time but a NotImplementedError crash
+#: at extract time, so the allowlist is enforced up front.
+_ZIP_READABLE_METHODS = frozenset(
+    {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA}
+)
+
 
 class SeedError(RuntimeError):
     """Any seed-prep failure — surfaces as the sandbox's spawn error."""
+
+
+#: Everything the archive stack can raise that ISN'T already a SeedError —
+#: corrupt containers, unsupported codecs, mid-stream decompression and FS
+#: failures. The archive boundary (upload check AND extraction) translates
+#: these so callers only ever see SeedError; SeedError itself is re-raised
+#: explicitly first because RuntimeError is in the tuple.
+_ARCHIVE_ERRORS = (
+    zipfile.BadZipFile,
+    tarfile.TarError,
+    EOFError,
+    OSError,
+    RuntimeError,  # NotImplementedError, missing-codec and password errors
+    zlib.error,
+) + ((lzma.LZMAError,) if lzma is not None else ())
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +121,18 @@ class SeedError(RuntimeError):
 def uploads_root(settings: Any) -> Path:
     """Root of the upload store: ``<data>/uploads`` (ARTIFACT_ROOT's sibling),
     or ``settings.UPLOADS_DIR`` when explicitly set. An empty/whitespace
-    override counts as unset (env-string foot-gun → never the cwd)."""
+    override counts as unset (env-string foot-gun → never the cwd), and a
+    relative override is rejected outright — it would resolve against the
+    process cwd, off the data tree the jail contract promises."""
     override = getattr(settings, "UPLOADS_DIR", None)
     if override is not None and str(override).strip() not in ("", "."):
-        return Path(override).resolve()
+        p = Path(override)
+        if not p.is_absolute():
+            raise SeedError(
+                "UPLOADS_DIR must be an absolute path — a relative override "
+                "resolves against the process cwd, off the data tree"
+            )
+        return p.resolve()
     return (Path(settings.ARTIFACT_ROOT).resolve().parent / "uploads").resolve()
 
 
@@ -198,10 +234,39 @@ class _Member:
     open_fn: Callable[[], IO[bytes]] | None = field(repr=False, default=None)
 
 
+def _check_member_conflicts(named: list[tuple[PurePosixPath, bool]]) -> None:
+    """Reject member sets where a file's path collides with a directory —
+    ``d/`` + ``d`` or ``d`` + ``d/x`` can't both exist on disk: extraction
+    would crash mid-write, and the common-root flatten could silently drop
+    the file. Runs on the PRE-strip member set; duplicate file entries
+    (legal in tar — last write wins) are not conflicts."""
+    files: set[PurePosixPath] = set()
+    dirs: set[PurePosixPath] = set()
+    for rel, is_dir in named:
+        under_file = any(parent in files for parent in rel.parents)
+        if under_file or (rel in files if is_dir else rel in dirs):
+            raise SeedError(
+                f"archive members conflict at {rel} — a file and a "
+                "directory can't share a path"
+            )
+        if is_dir:
+            dirs.add(rel)
+        else:
+            files.add(rel)
+        dirs.update(rel.parents)
+
+
 def _iter_zip_members(archive: Path) -> Iterator[_Member]:
     with zipfile.ZipFile(archive) as zf:
         infos = zf.infolist()
         rels = [_member_relpath(i.filename) for i in infos]
+        _check_member_conflicts(
+            [
+                (rel, info.is_dir())
+                for info, rel in zip(infos, rels, strict=True)
+                if rel is not None
+            ]
+        )
         prefix = _common_root_part([r for r in rels if r is not None])
         for info, rel in zip(infos, rels, strict=True):
             if rel is None:
@@ -222,6 +287,11 @@ def _iter_zip_members(archive: Path) -> Iterator[_Member]:
                 raise SeedError(
                     f"archive member is a symlink — rejected: {info.filename!r}"
                 )
+            if info.compress_type not in _ZIP_READABLE_METHODS:
+                raise SeedError(
+                    f"archive member uses an unsupported compression "
+                    f"method ({info.compress_type}): {info.filename!r}"
+                )
             # Hold a reference to the info + zf; the generator stays inside
             # `with` so the member remains readable while iterated.
             yield _Member(
@@ -236,6 +306,13 @@ def _iter_tar_members(archive: Path) -> Iterator[_Member]:
     with tarfile.open(archive, "r:*") as tf:
         members = tf.getmembers()
         rels = [_member_relpath(m.name) for m in members]
+        _check_member_conflicts(
+            [
+                (rel, m.isdir())
+                for m, rel in zip(members, rels, strict=True)
+                if rel is not None
+            ]
+        )
         prefix = _common_root_part([r for r in rels if r is not None])
         for m, rel in zip(members, rels, strict=True):
             if rel is None:
@@ -263,25 +340,36 @@ def _iter_tar_members(archive: Path) -> Iterator[_Member]:
 
 
 def _archive_kind(path: Path) -> str:
-    """Detect by content, not name: ``"zip"`` or ``"tar"``; SeedError else."""
-    try:
-        if zipfile.is_zipfile(path):
-            return "zip"
-    except OSError:
-        pass
-    try:
-        if tarfile.is_tarfile(path):
-            return "tar"
-    except OSError:
-        pass
+    """Detect by content, not name: ``"zip"`` or ``"tar"``; SeedError else.
+
+    ``is_tarfile`` only swallows TarError — a truncated compressed stream
+    propagates EOFError/OSError/codec errors out of it, so detection itself
+    must sit inside the same translation boundary as iteration."""
+    for probe, kind in (
+        (zipfile.is_zipfile, "zip"),
+        (tarfile.is_tarfile, "tar"),
+    ):
+        try:
+            if probe(path):
+                return kind
+        except _ARCHIVE_ERRORS:
+            continue
     raise SeedError(f"{path.name!r} is not a readable zip or tar archive")
 
 
 def _iter_members(archive: Path) -> Iterator[_Member]:
     kind = _archive_kind(archive)
-    if kind == "zip":
-        return _iter_zip_members(archive)
-    return _iter_tar_members(archive)
+    inner = (
+        _iter_zip_members(archive) if kind == "zip" else _iter_tar_members(archive)
+    )
+    try:
+        yield from inner
+    except SeedError:
+        raise
+    except _ARCHIVE_ERRORS as e:
+        raise SeedError(
+            f"{archive.name!r} is not a readable archive: {e}"
+        ) from e
 
 
 def check_archive(
@@ -293,11 +381,19 @@ def check_archive(
     """Upload-time safety pass — walks member names/types/declared sizes
     without writing a byte. Returns the detected ``"zip"``/``"tar"`` kind;
     SeedError on unreadable archives, unsafe members, an archive with no
-    files, or a declared file size/count over the same caps extraction
-    enforces — a staged upload can never turn unusable at provisioning."""
+    files, or a member size/count over the same caps extraction enforces —
+    a staged upload can never turn unusable at provisioning."""
     count = 0
+    files = 0
     total = 0
     for member in _iter_members(archive):
+        # Every materialized entry counts — an archive of empty dirs can
+        # flood inodes under the cap just like a file flood can.
+        count += 1
+        if count > max_files:
+            raise SeedError(
+                f"archive exceeds the seed file cap ({max_files} entries)"
+            )
         if member.is_dir:
             continue
         total += member.size
@@ -305,12 +401,8 @@ def check_archive(
             raise SeedError(
                 f"archive exceeds the seed size cap ({max_bytes} bytes)"
             )
-        count += 1
-        if count > max_files:
-            raise SeedError(
-                f"archive exceeds the seed file cap ({max_files} files)"
-            )
-    if count == 0:
+        files += 1
+    if files == 0:
         raise SeedError("archive contains no extractable files")
     return _archive_kind(archive)
 
@@ -337,29 +429,36 @@ def extract_archive(
     the workspace mirrors the repo's root, matching the git-clone shape.
     Only regular files and dirs survive; caps stop decompression bombs.
     """
-    root = dest.resolve()
-    dest.mkdir(parents=True, exist_ok=True)
     written = 0
+    entries = 0
     total = 0
-    for member in _iter_members(archive):
-        out = _jailed_join(root, member.relpath)
-        if member.is_dir:
-            out.mkdir(parents=True, exist_ok=True)
-            continue
-        total += member.size
-        if member.size > max_bytes or total > max_bytes:
-            raise SeedError(
-                f"archive exceeds the seed size cap ({max_bytes} bytes)"
-            )
-        written += 1
-        if written > max_files:
-            raise SeedError(
-                f"archive exceeds the seed file cap ({max_files} files)"
-            )
-        out.parent.mkdir(parents=True, exist_ok=True)
-        assert member.open_fn is not None  # files always carry a reader
-        with member.open_fn() as src, out.open("wb") as dst:
-            shutil.copyfileobj(src, dst, length=1024 * 1024)
+    try:
+        root = dest.resolve()
+        dest.mkdir(parents=True, exist_ok=True)
+        for member in _iter_members(archive):
+            entries += 1
+            if entries > max_files:
+                raise SeedError(
+                    f"archive exceeds the seed file cap ({max_files} entries)"
+                )
+            out = _jailed_join(root, member.relpath)
+            if member.is_dir:
+                out.mkdir(parents=True, exist_ok=True)
+                continue
+            total += member.size
+            if member.size > max_bytes or total > max_bytes:
+                raise SeedError(
+                    f"archive exceeds the seed size cap ({max_bytes} bytes)"
+                )
+            out.parent.mkdir(parents=True, exist_ok=True)
+            assert member.open_fn is not None  # files always carry a reader
+            with member.open_fn() as src, out.open("wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+            written += 1
+    except SeedError:
+        raise
+    except _ARCHIVE_ERRORS as e:
+        raise SeedError(f"failed to extract {archive.name!r}: {e}") from e
     if written == 0:
         raise SeedError("archive contains no extractable files")
     return written
@@ -373,20 +472,26 @@ def extract_archive(
 def _git(argv: list[str], *, timeout: float | None = None) -> str:
     """Default git runner — runs ``git`` with prompting disabled so a
     private/bad URL fails instead of hanging on an auth prompt."""
-    env = {
-        **os.environ,
-        "GIT_TERMINAL_PROMPT": "0",
-        # A GUI askpass could still pop a dialog on some platforms — the
-        # `true` binary answers nothing instantly.
-        "GIT_ASKPASS": "true",
-        "SSH_ASKPASS": "true",
-        # Hermetic to host gitconfig — an ambient url.*.insteadOf could
-        # rewrite the https URL to file://, and core.hooksPath /
-        # credential.helper would run host config during fetch+checkout.
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_CONFIG_SYSTEM": os.devnull,
-    }
+    # Ambient GIT_* env is the same channel as host gitconfig —
+    # GIT_CONFIG_KEY_n/VALUE_n can inject url.*.insteadOf or core.hooksPath,
+    # and GIT_DIR/GIT_WORK_TREE/GIT_OBJECT_DIRECTORY would redirect the
+    # whole init/fetch/checkout sequence. Strip them all, then pin ours.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            # A GUI askpass could still pop a dialog on some platforms — the
+            # `true` binary answers nothing instantly.
+            "GIT_ASKPASS": "true",
+            "SSH_ASKPASS": "true",
+            # Hermetic to host gitconfig — an ambient url.*.insteadOf could
+            # rewrite the https URL to file://, and core.hooksPath /
+            # credential.helper would run host config during fetch+checkout.
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+        }
+    )
     try:
         proc = subprocess.run(
             ["git", *argv],
@@ -455,13 +560,19 @@ def _clone_repo(
             "(public git only; no ssh/file:// schemes)"
         )
     try:
-        netloc = urlsplit(url).netloc
+        parts = urlsplit(url)
     except ValueError:
-        netloc = ""
-    if not netloc or "@" in netloc:
+        parts = None
+    if (
+        parts is None
+        or not parts.netloc
+        or "@" in parts.netloc
+        or parts.query
+        or parts.fragment
+    ):
         raise SeedError(
             f"repo_url is malformed or embeds credentials — got {url!r} "
-            "(public git only; no userinfo)"
+            "(public git only; no userinfo, query, or fragment)"
         )
     if ref is not None and (ref.startswith("-") or _REF_RE.fullmatch(ref) is None):
         raise SeedError(

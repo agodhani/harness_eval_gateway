@@ -425,6 +425,37 @@ def _remove_artifact_dir(run_id: uuid.UUID) -> None:
     _remove_data_dir(artifact_jail.parent / "seeds", run_id, label="seed")
 
 
+def _remove_staged_upload(
+    session: Session, archive_id: object, run_id: uuid.UUID
+) -> None:
+    """Best-effort removal of the deleted run's staged upload
+    (``<data>/uploads/<archive_id>/``). Skipped while another NON-terminal
+    run still references the same id — resubmit and queued siblings share
+    staged uploads, and a pending sibling would fail provisioning on a
+    dangling id. Uploads that were never linked to a run are orphaned until
+    a future retention sweep."""
+    if not isinstance(archive_id, str) or not archive_id:
+        return
+    try:
+        upload_id = uuid.UUID(archive_id)
+    except ValueError:
+        return
+    configs = session.execute(
+        select(Run.config).where(
+            Run.id != run_id,
+            Run.status.notin_(state_machine.RUN_TERMINAL),
+        )
+    ).scalars()
+    if any(
+        ((cfg or {}).get("task_inputs") or {}).get("archive_id") == archive_id
+        for cfg in configs
+    ):
+        return
+    _remove_data_dir(
+        seeds.uploads_root(get_settings()), upload_id, label="upload"
+    )
+
+
 @router.delete("/{run_id}")
 async def delete_run(run_id: uuid.UUID, session: DbSession) -> RunDeleteOut:
     """Cancel a pre-spawn run, or hard-delete a terminal one.
@@ -434,7 +465,9 @@ async def delete_run(run_id: uuid.UUID, session: DbSession) -> RunDeleteOut:
       pending rubric-draft task is cancelled and a freed queue position
       promotes the next parked run.
     - ``done`` / ``failed`` / ``cancelled`` → hard delete of the run and its
-      rows, plus best-effort ``data/artifacts/<run_id>/`` removal.
+      rows, plus best-effort data-dir removal: ``artifacts/<run_id>/``,
+      the materialized ``seeds/<run_id>/``, and its staged upload under
+      ``uploads/`` when no other non-terminal run references it.
     - ``provisioning`` / ``running`` / ``evaluating`` → 409: in-flight
       sandbox teardown is out of scope — wait for a terminal state.
     """
@@ -452,9 +485,13 @@ async def delete_run(run_id: uuid.UUID, session: DbSession) -> RunDeleteOut:
         )
 
     if run.status in state_machine.RUN_TERMINAL:
+        archive_id = ((run.config or {}).get("task_inputs") or {}).get(
+            "archive_id"
+        )
         _hard_delete_run(session, run)
         session.commit()
         _remove_artifact_dir(run_id)
+        _remove_staged_upload(session, archive_id, run_id)
         return RunDeleteOut(status="deleted")
 
     # submitted | rubric_review | queued — safe: no sandboxes exist yet and

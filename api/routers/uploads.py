@@ -139,6 +139,9 @@ async def upload_archive(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"unsafe archive: {e}",
         ) from e
+    except BaseException:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        raise
 
     meta = {
         "id": str(upload_id),

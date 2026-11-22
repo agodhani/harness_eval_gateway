@@ -217,11 +217,25 @@ class TaskInputsIn(BaseModel):
                 "repo_url must be an https:// URL — public git only "
                 "(no ssh://, git://, or file:// seeds)"
             )
-        # Embedded userinfo would authenticate a private clone AND the
-        # secret would persist verbatim in run.config / sandbox rows.
-        if "@" in urlsplit(v).netloc:
+        try:
+            parts = urlsplit(v)
+        except ValueError:
+            parts = None
+        # An empty netloc ("https://") only fails at provisioning — reject
+        # here so the bad spec never persists. Embedded userinfo would
+        # authenticate a private clone AND the secret would persist verbatim
+        # in run.config / sandbox rows — a query/fragment (pre-signed URLs)
+        # leaks the same way.
+        if (
+            parts is None
+            or not parts.netloc
+            or "@" in parts.netloc
+            or parts.query
+            or parts.fragment
+        ):
             raise ValueError(
-                "repo_url must not embed credentials — public git only"
+                "repo_url must be a plain https://<host>/<path> URL — "
+                "public git only (no userinfo, query, or fragment)"
             )
         return v
 

@@ -212,6 +212,139 @@ def test_check_archive_and_extract_reject_encrypted_zip(tmp_path: Path) -> None:
     assert not (tmp_path / "out" / "x.py").exists()
 
 
+def test_check_and_extract_translate_corrupt_zip_central_directory(
+    tmp_path: Path,
+) -> None:
+    """A zip with an intact EOCD but a corrupt later CD entry passes
+    ``is_zipfile`` (it only reads the EOCD) then dies inside ``infolist()``
+    — the boundary must surface SeedError, never raw BadZipFile."""
+    raw = bytearray(_zip_bytes({"a.txt": "1", "b.txt": "2"}))
+    first = raw.find(b"PK\x01\x02")
+    second = raw.find(b"PK\x01\x02", first + 4)
+    assert first > 0 and second > 0
+    raw[second : second + 4] = b"XX\x01\x02"  # corrupt the second CD magic
+    p = tmp_path / "corrupt.zip"
+    p.write_bytes(bytes(raw))
+    assert zipfile.is_zipfile(p)  # the premise: magic check can't save you
+    with pytest.raises(seeds.SeedError):
+        seeds.check_archive(p)
+    with pytest.raises(seeds.SeedError):
+        seeds.extract_archive(p, tmp_path / "out")
+
+
+def test_check_and_extract_translate_truncated_tar(tmp_path: Path) -> None:
+    """A tar cut inside a member's data raises tarfile.ReadError when the
+    scan tries to skip to the next header — the boundary must surface
+    SeedError, never the raw library error."""
+    raw = _tar_bytes({"a.txt": "x" * 300, "b.txt": "y" * 300, "c.txt": "3"})
+    # a.txt: hdr 0-511 + data 512-1023; b.txt: hdr 1024-1535 + data
+    # 1536-2047 — cut mid-b.txt-data so getmembers() dies skipping it.
+    p = tmp_path / "trunc.tar"
+    p.write_bytes(raw[:1636])
+    with pytest.raises(seeds.SeedError):
+        seeds.check_archive(p)
+    with pytest.raises(seeds.SeedError):
+        seeds.extract_archive(p, tmp_path / "out")
+
+
+def test_check_and_extract_translate_truncated_targz(tmp_path: Path) -> None:
+    """A .tar.gz cut mid-deflate-stream propagates EOFError even out of
+    ``tarfile.is_tarfile`` — kind DETECTION itself sits inside the same
+    SeedError boundary."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, data in (("a.txt", b"1"), ("b.txt", b"2"), ("c.txt", b"3")):
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    raw = buf.getvalue()
+    p = tmp_path / "trunc.tar.gz"
+    p.write_bytes(raw[: len(raw) // 2])
+    with pytest.raises(seeds.SeedError):
+        seeds.check_archive(p)
+    with pytest.raises(seeds.SeedError):
+        seeds.extract_archive(p, tmp_path / "out")
+
+
+def test_check_and_extract_reject_file_dir_name_conflicts(tmp_path: Path) -> None:
+    """file ``d`` + file ``d/x`` (implicit dir) or dir ``d/`` + file ``d``
+    can't coexist on disk — reject at check, never crash mid-extract. The
+    ``d`` + ``d/x`` shape is also what the flatten-strip silently dropped
+    (``x`` + ``x/y`` kept only ``y``)."""
+    zp = tmp_path / "conflict.zip"
+    zp.write_bytes(_zip_bytes({"d": "1", "d/x.py": "2"}))
+    with pytest.raises(seeds.SeedError, match="conflict"):
+        seeds.check_archive(zp)
+    with pytest.raises(seeds.SeedError, match="conflict"):
+        seeds.extract_archive(zp, tmp_path / "o1")
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        di = tarfile.TarInfo("d")
+        di.type = tarfile.DIRTYPE
+        tf.addfile(di)
+        for name, data in (("d", b"1"), ("e.py", b"2")):
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    tp = tmp_path / "conflict.tar"
+    tp.write_bytes(buf.getvalue())
+    with pytest.raises(seeds.SeedError, match="conflict"):
+        seeds.check_archive(tp)
+    with pytest.raises(seeds.SeedError, match="conflict"):
+        seeds.extract_archive(tp, tmp_path / "o2")
+
+
+def test_duplicate_file_members_are_not_conflicts(tmp_path: Path) -> None:
+    """Duplicate FILE entries are legal tar/zip content (last write wins) —
+    the conflict check must not over-reject."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for data in (b"old", b"new"):
+            ti = tarfile.TarInfo("a.py")
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    p = tmp_path / "dup.tar"
+    p.write_bytes(buf.getvalue())
+    assert seeds.check_archive(p) == "tar"
+    dest = tmp_path / "out"
+    seeds.extract_archive(p, dest)
+    assert (dest / "a.py").read_bytes() == b"new"
+
+
+def test_check_and_extract_reject_unsupported_zip_compression(
+    tmp_path: Path,
+) -> None:
+    """``z.open`` raises NotImplementedError for methods outside
+    store/deflate/bzip2/lzma (AES-99 & friends) — metadata the check must
+    reject before any staged upload reaches extraction."""
+    raw = bytearray(_zip_bytes({"x.py": "1"}))
+    raw[8:10] = (99).to_bytes(2, "little")  # local-header method field
+    cd = raw.find(b"PK\x01\x02")
+    assert cd > 0
+    raw[cd + 10 : cd + 12] = (99).to_bytes(2, "little")  # central-dir method
+    p = tmp_path / "aes.zip"
+    p.write_bytes(bytes(raw))
+    with pytest.raises(seeds.SeedError, match="compression"):
+        seeds.check_archive(p)
+    with pytest.raises(seeds.SeedError, match="compression"):
+        seeds.extract_archive(p, tmp_path / "out")
+
+
+def test_dir_members_count_toward_the_file_cap(tmp_path: Path) -> None:
+    """The cap bounds ALL materialized entries — an archive of empty dirs
+    can't flood inodes under it the way a file flood can't."""
+    members = {f"d{i}/": b"" for i in range(6)}
+    members["file.txt"] = "x"
+    p = tmp_path / "dirs.zip"
+    p.write_bytes(_zip_bytes(members))  # 6 dir + 1 file = 7 entries
+    assert seeds.check_archive(p, max_files=7) == "zip"
+    with pytest.raises(seeds.SeedError, match="file cap"):
+        seeds.check_archive(p, max_files=6)
+    with pytest.raises(seeds.SeedError, match="file cap"):
+        seeds.extract_archive(p, tmp_path / "out", max_files=6)
+
+
 # ---------------------------------------------------------------------------
 # hash_tree + copy_seed
 # ---------------------------------------------------------------------------
@@ -381,6 +514,31 @@ def test_git_runner_isolates_host_config(monkeypatch) -> None:
     assert env["GIT_CONFIG_SYSTEM"] == os.devnull
 
 
+def test_git_runner_strips_ambient_git_env(monkeypatch) -> None:
+    """GIT_* env vars are the env-based sibling of ambient gitconfig —
+    GIT_CONFIG_KEY_n/VALUE_n can inject insteadOf/hooksPath, GIT_DIR /
+    GIT_WORK_TREE redirect the whole init/fetch/checkout sequence."""
+    monkeypatch.setenv("GIT_DIR", "/evil/repo")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "/evil/hooks")
+    seen: dict = {}
+
+    def fake_run(args, **kwargs):
+        seen["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(seeds.subprocess, "run", fake_run)
+    seeds._git(["status"], timeout=5)
+    env = seen["env"]
+    assert "GIT_DIR" not in env
+    assert "GIT_CONFIG_COUNT" not in env
+    assert "GIT_CONFIG_KEY_0" not in env
+    assert "GIT_CONFIG_VALUE_0" not in env
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+
+
 def test_git_runner_timeout_is_one_deadline_across_calls(monkeypatch) -> None:
     """SEED_GIT_TIMEOUT_SECONDS caps the whole fetch+checkout sequence, so
     a drip-feeding remote can't hold it for N × cap."""
@@ -432,6 +590,35 @@ def test_prepare_run_seed_rejects_option_shaped_ref(tmp_path: Path) -> None:
                 git_runner=fake_git,
             )
     assert calls == []  # no git invocation ever saw the hostile ref
+
+
+def test_prepare_run_seed_rejects_malformed_or_secret_bearing_url(
+    tmp_path: Path,
+) -> None:
+    """Empty-netloc URLs must fail at the seed boundary, not as a spawn
+    error per cell; a query/fragment can carry a token that would persist
+    verbatim into run.config — both rejected before any git call."""
+    calls: list[list[str]] = []
+
+    def fake_git(argv: list[str]) -> str:
+        calls.append(list(argv))
+        return ""
+
+    for bad in (
+        "https://",
+        "https:///path",
+        "https://github.com/o/r?private_token=secret",
+        "https://github.com/o/r#frag",
+    ):
+        with pytest.raises(seeds.SeedError):
+            seeds.prepare_run_seed(
+                "run-b",
+                {"repo_url": bad},
+                seed_root=tmp_path / "seeds",
+                uploads=tmp_path / "uploads",
+                git_runner=fake_git,
+            )
+    assert calls == []
 
 
 def test_prepare_run_seed_git_clone_pinned_ref(tmp_path: Path) -> None:
@@ -556,6 +743,21 @@ def test_uploads_root_defaults_to_artifact_sibling(tmp_path: Path) -> None:
         },
     )()
     assert seeds.uploads_root(settings2) == (tmp_path / "custom").resolve()
+
+
+def test_uploads_root_rejects_relative_override(tmp_path: Path) -> None:
+    """A relative UPLOADS_DIR resolves against the api process cwd — off
+    the ./data mount and out of the jail contract — so it's rejected."""
+    settings = type(
+        "S",
+        (),
+        {
+            "ARTIFACT_ROOT": tmp_path / "data" / "artifacts",
+            "UPLOADS_DIR": "relative/uploads",
+        },
+    )()
+    with pytest.raises(seeds.SeedError, match="absolute"):
+        seeds.uploads_root(settings)
 
 
 def test_resolve_upload_archive_and_meta(tmp_path: Path) -> None:

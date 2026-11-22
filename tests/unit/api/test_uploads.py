@@ -273,6 +273,25 @@ def test_upload_rejects_members_over_seed_caps(api) -> None:
     assert staged == []  # nothing kept
 
 
+def test_upload_corrupt_zip_is_422_and_leaves_nothing(api) -> None:
+    """A zip whose EOCD is intact but a later central-directory entry is
+    corrupt passes the magic check then dies inside check_archive — that
+    must be a 422 (SeedError), never a 500 + orphaned staged dir."""
+    raw = bytearray(_zip_bytes({"a.txt": "1", "b.txt": "2"}))
+    first = raw.find(b"PK\x01\x02")
+    second = raw.find(b"PK\x01\x02", first + 4)
+    raw[second : second + 4] = b"XX\x01\x02"  # corrupt the second CD magic
+    resp = api.client.post(
+        "/api/uploads",
+        files={"file": ("corrupt.zip", bytes(raw), "application/zip")},
+    )
+    assert resp.status_code == 422, resp.text
+    assert "unsafe archive" in resp.json()["detail"]
+    root = Path(api.settings.UPLOADS_DIR)
+    staged = list(root.iterdir()) if root.is_dir() else []
+    assert staged == []  # nothing kept — no orphan for resolve_upload_archive
+
+
 def test_upload_over_cap_is_413(api) -> None:
     """The cap counts RAW upload bytes (pre-extraction) — incompressible
     random content keeps the multipart file itself over the 1 MiB test cap."""
@@ -349,6 +368,10 @@ def test_create_run_dangling_archive_id_422(api) -> None:
         {"repo_url": "git://github.com/a/b"},  # non-https scheme
         {"repo_url": "ssh://git@github.com/a/b"},
         {"repo_url": "https://user:pw@github.com/a/b"},  # embedded credentials
+        {"repo_url": "https://"},  # empty netloc
+        {"repo_url": "https:///path"},  # empty netloc
+        {"repo_url": "https://github.com/a/b?private_token=x"},  # query secret
+        {"repo_url": "https://github.com/a/b#frag"},  # fragment
         {"repo_url": "https://github.com/a/b", "ref": "--tags"},  # option-shaped ref
         {"repo_url": "https://github.com/a/b", "ref": "has space"},
         {"archive_id": "not-a-uuid"},
@@ -401,3 +424,60 @@ def test_results_echoes_task_inputs(api, session_factory) -> None:
         "repo_url": "https://github.com/acme/widget",
         "ref": "abc123",
     }
+
+
+# ---------------------------------------------------------------------------
+# staged-upload retention — hard-deleting a run GCs the upload it consumed
+# ---------------------------------------------------------------------------
+
+
+def test_delete_terminal_run_removes_its_staged_upload(api, session_factory) -> None:
+    """A staged upload's custody ends with the run that consumed it —
+    resubmit needs the bytes while the run lives; after hard delete the
+    dir is reclaimed (or unreferenced uploads persist until a sweep)."""
+    upload_id = _uploaded_id(api)
+    run = api.client.post(
+        "/api/runs", json=_run_body(task_inputs={"archive_id": upload_id})
+    ).json()
+    with session_factory() as s:
+        r = s.get(Run, uuid.UUID(run["id"]))
+        r.status = "done"
+        s.commit()
+    resp = api.client.delete(f"/api/runs/{run['id']}")
+    assert resp.json() == {"status": "deleted"}
+    assert not (Path(api.settings.UPLOADS_DIR) / upload_id).exists()
+
+
+def test_delete_run_keeps_upload_while_live_sibling_references_it(
+    api, session_factory
+) -> None:
+    """Runs share an archive_id across resubmit — the GC only fires when
+    no non-terminal run still references the staged bytes."""
+    upload_id = _uploaded_id(api)
+    done = api.client.post(
+        "/api/runs", json=_run_body(task_inputs={"archive_id": upload_id})
+    ).json()
+    sibling = api.client.post(
+        "/api/runs", json=_run_body(task_inputs={"archive_id": upload_id})
+    )
+    assert sibling.status_code == 201
+    with session_factory() as s:
+        r = s.get(Run, uuid.UUID(done["id"]))
+        r.status = "done"
+        s.commit()
+    resp = api.client.delete(f"/api/runs/{done['id']}")
+    assert resp.json() == {"status": "deleted"}
+    # the sibling is still non-terminal — its pending seed needs the bytes
+    assert (Path(api.settings.UPLOADS_DIR) / upload_id).exists()
+
+
+def test_cancel_pre_spawn_run_keeps_staged_upload(api, session_factory) -> None:
+    """Cancelling (not deleting) a pre-spawn run keeps the upload — the run
+    may still be resubmitted."""
+    upload_id = _uploaded_id(api)
+    run = api.client.post(
+        "/api/runs", json=_run_body(task_inputs={"archive_id": upload_id})
+    ).json()
+    resp = api.client.delete(f"/api/runs/{run['id']}")
+    assert resp.json() == {"status": "cancelled"}
+    assert (Path(api.settings.UPLOADS_DIR) / upload_id).exists()
