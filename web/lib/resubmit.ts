@@ -82,8 +82,21 @@ export function consumeResubmit(): ResubmitSpec | null {
       !spec ||
       typeof spec !== "object" ||
       typeof spec.task_prompt !== "string" ||
+      (spec.preset_ref != null && typeof spec.preset_ref !== "string") ||
       !Array.isArray(spec.models) ||
-      !Array.isArray(spec.harness_configs)
+      !spec.models.every((m) => typeof m === "string") ||
+      (spec.evaluator_model != null &&
+        typeof spec.evaluator_model !== "string") ||
+      !Array.isArray(spec.harness_configs) ||
+      !spec.harness_configs.every(
+        (c) =>
+          c &&
+          typeof c === "object" &&
+          typeof c.adapter === "string" &&
+          Array.isArray(c.skill_packs),
+      ) ||
+      (spec.budgets != null &&
+        (typeof spec.budgets !== "object" || Array.isArray(spec.budgets)))
     ) {
       return null;
     }
