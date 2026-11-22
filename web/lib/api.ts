@@ -162,6 +162,9 @@ export interface HarnessManifest {
   requires?: string[];
   /** PR25: pseudo-adapter — the cell runs one gateway call, no container. */
   no_sandbox?: boolean;
+  /** PR27: ModelOptions keys this adapter honors (absent = unknown —
+   * don't gate the UI on it). */
+  model_options?: string[];
   [key: string]: unknown;
 }
 
@@ -223,6 +226,18 @@ export function runModels(
   return out;
 }
 
+/** PR27 — per-config model-sampling knobs. Keys the selected adapter
+ * doesn't support are dropped at submit (warning on the create response)
+ * — the UI greys out keys the adapter's manifest doesn't declare. */
+export interface ModelOptions {
+  temperature?: number | null;
+  seed?: number | null;
+  max_tokens?: number | null;
+  /** Maps to the request-level reasoning_effort hint (e.g. "none", "low",
+   * "medium", "high") — provider vocabularies differ, kept free-form. */
+  reasoning?: string | null;
+}
+
 export interface HarnessConfig {
   adapter: string;
   skill_packs: string[];
@@ -232,6 +247,8 @@ export interface HarnessConfig {
   /** PR14: pin this config to a single participant model, overriding the
    * run's model list for this config (one cell at the pinned model). */
   model?: string | null;
+  /** PR27: optional model knobs honored where the adapter supports them. */
+  model_options?: ModelOptions | null;
 }
 
 /** PR25: no-sandbox pseudo-adapters run a single model call and stage
@@ -276,6 +293,8 @@ export interface RunCreate {
   harness_configs: HarnessConfig[];
   evaluator_model?: string | null;
   budgets?: Budgets;
+  /** PR27: repeats per matrix cell (1–8, default 1). */
+  trials?: number;
 }
 
 export interface RunConfig {
@@ -285,6 +304,8 @@ export interface RunConfig {
   evaluator_model?: string | null;
   budgets?: Budgets;
   same_model_eval?: boolean;
+  /** PR27: repeats per matrix cell persisted at submit. */
+  trials?: number;
   [key: string]: unknown;
 }
 
@@ -342,7 +363,12 @@ export interface RunOut {
   status: RunStatus | string;
   task_prompt: string;
   model_name: string;
+  /** PR27: repeats per matrix cell (1 = single-shot). */
+  trials?: number;
   config: RunConfig;
+  /** Submit-time advisory warnings (e.g. dropped model_options keys,
+   * model not in provider catalog) — populated on POST /api/runs only. */
+  warnings?: string[];
   same_model_eval: boolean;
   created_at: string;
   updated_at: string | null;
@@ -431,6 +457,9 @@ export interface SandboxResult {
   /** PR14: participant model this sandbox ran (config ``model`` cell else
    * the run's model_name). */
   model?: string;
+  /** PR27: which repeat of its config × model cell this sandbox is
+   * (harness_config.trial_index; null on untrialed runs). */
+  trial_index?: number | null;
   status: string;
   terminal_reason: string | null;
   artifact_path: string | null;
@@ -483,6 +512,8 @@ export interface RunResults {
   models?: string[];
   evaluator_model: string | null;
   same_model_eval: boolean | null;
+  /** PR27: repeats-per-cell submitted on this run (1 = single-shot). */
+  trials?: number;
   /** PR5: the ?rubric_version= filter echoed back (null = newest-wins). */
   selected_rubric_version?: number | null;
   /** PR5: every rubric version + score counts for the selector. */
@@ -797,6 +828,11 @@ export interface SandboxAnalytics {
   sandbox_id: string;
   /** Config label from the sandbox row (PR1 named harness configs). */
   name?: string | null;
+  /** PR27: which repeat of its cell this sandbox is (null = untrialed). */
+  trial_index?: number | null;
+  /** PR27: stable config × model cell key — identical across a cell's
+   * trials (grouped on for the per-cell variance rollup). */
+  cell?: string;
   label: string;
   harness_config: Record<string, unknown>;
   /** PR14: participant model this sandbox ran + the price-table key its
@@ -839,6 +875,32 @@ export interface ModelAnalytics {
   evaluator: EvaluatorActivity | null;
 }
 
+/** PR27 — per-cell (config × model) rollup: same metric aggregation as
+ * ModelAnalytics plus the trial-score variance columns the results matrix
+ * reports (sample sd, n−1 denominator; overall_sd null when fewer than two
+ * trials produced an overall score). */
+export interface CellAnalytics {
+  cell: string;
+  label: string;
+  model: string;
+  sandbox_count: number;
+  llm_turns: number;
+  tokens: TokenUsage;
+  latency_ms: LatencyStats;
+  tool_calls: ToolCallStats;
+  skill_calls: SkillCallStats;
+  shell_commands: number;
+  file_ops: number;
+  test_executions: number;
+  errors: number;
+  wall_clock_seconds: number;
+  estimated_cost_usd: number | null;
+  evaluator: EvaluatorActivity | null;
+  overall_mean: number | null;
+  overall_sd: number | null;
+  overall_n: number;
+}
+
 export interface RunAnalytics {
   run_id: string;
   model_name: string;
@@ -851,6 +913,8 @@ export interface RunAnalytics {
   sandboxes: SandboxAnalytics[];
   /** PR14: participant-model rollups (one per model in the run's matrix). */
   models: ModelAnalytics[];
+  /** PR27: per-cell rollups — one entry per config × model trial group. */
+  cells?: CellAnalytics[];
 }
 
 export function getRunAnalytics(runId: string, priceModel?: string): Promise<RunAnalytics> {
@@ -1442,6 +1506,33 @@ export interface SandboxResult {
   /** True when the sandbox's snapshot workspace was empty (the agent wrote
    *  nothing) — a 0-score outcome reads differently with it flagged. */
   empty_workspace?: boolean | null;
+  /** PR31: flat `exec`-signal summary (PR7 measured build/tests in the
+   *  locked heg-exec container) — feeds the results grid's pass-rate. */
+  exec?: {
+    status?: string;
+    tests_detected?: boolean;
+    tests_ok?: boolean | null;
+    tests_collected?: number;
+    tests_passed?: number;
+    tests_failed?: number;
+    coverage_percent?: number | null;
+    detail?: string | null;
+  } | null;
+  /** PR31: flat `generated_tests`-signal summary (PR8 evaluator-authored
+   *  suite run against the submission) — the preferred pass-rate signal. */
+  generated_tests?: {
+    status?: string;
+    model?: string | null;
+    tests_collected?: number;
+    tests_passed?: number;
+    pass_rate?: number | null;
+    coverage_percent?: number | null;
+    detail?: string | null;
+  } | null;
+  /** PR27 (when landed): repeat index of a matrix cell. The results grid
+   *  groups same-(config, model) members as trials regardless — this is
+   *  display-only. */
+  trial_index?: number | null;
 }
 
 export interface PreviewOut {

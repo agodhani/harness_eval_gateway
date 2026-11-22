@@ -76,6 +76,8 @@ MANIFEST: dict[str, Any] = {
     "llm_protocol": "openai-chat-completions",
     "no_sandbox": True,
     "requires": ["gateway:/v1/chat/completions"],
+    # PR27: every ModelOptions key folds straight into the request body.
+    "model_options": ["temperature", "seed", "max_tokens", "reasoning"],
 }
 
 #: Artifact filenames under <artifact_root>/<run>/<sandbox>/ — output.txt is
@@ -196,6 +198,7 @@ async def _call_gateway(
     messages: list[dict[str, str]],
     max_tokens: int,
     deadline: float,
+    model_options: dict[str, Any] | None = None,
 ) -> _CallResult:
     """One chat-completions call + ONE retry on upstream 5xx/timeout.
 
@@ -213,12 +216,21 @@ async def _call_gateway(
     """
     url = f"{gateway_url.rstrip('/')}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {cred}"}
-    body = {
+    body: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "stream": False,
     }
+    # PR27: prompt cells honor every model_options key directly — they fold
+    # into the chat-completions body (gateway passes known keys through).
+    opts = model_options or {}
+    if (t := opts.get("temperature")) is not None:
+        body["temperature"] = t
+    if (s := opts.get("seed")) is not None:
+        body["seed"] = s
+    if r := opts.get("reasoning"):
+        body["reasoning_effort"] = r
     result = _CallResult()
     started = time.monotonic()
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -618,7 +630,19 @@ async def run_prompt_cell(
         system_extra = str(
             harness_config.get("system_prompt_extra") or ""
         ).strip()
-        max_tokens = _env_int("PROMPT_CELL_MAX_TOKENS", DEFAULT_MAX_TOKENS)
+        # PR27: a configured model_options.max_tokens wins; the env knob
+        # fills in when the config didn't set the key.
+        model_options = harness_config.get("model_options")
+        opt_max_tokens = (
+            model_options.get("max_tokens")
+            if isinstance(model_options, dict)
+            else None
+        )
+        max_tokens = (
+            int(opt_max_tokens)
+            if opt_max_tokens
+            else _env_int("PROMPT_CELL_MAX_TOKENS", DEFAULT_MAX_TOKENS)
+        )
         deadline = time.monotonic() + float(budgets["wall_clock_seconds"])
         _mark_running(
             session_factory,
@@ -652,6 +676,9 @@ async def run_prompt_cell(
                 messages=messages,
                 max_tokens=max_tokens,
                 deadline=deadline,
+                model_options=model_options
+                if isinstance(model_options, dict)
+                else None,
             )
         finally:
             if own_client:

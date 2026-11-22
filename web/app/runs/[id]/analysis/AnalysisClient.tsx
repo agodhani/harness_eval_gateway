@@ -37,6 +37,7 @@ import {
 } from "@/lib/api";
 import { formatNum, formatUsd, shortId } from "@/lib/format";
 import { dimensionSpecMap, weightedDimTotal } from "@/lib/scoreMath";
+import { fmtMeanSd } from "@/lib/trialGroups";
 import {
   Badge,
   Card,
@@ -158,6 +159,13 @@ export default function AnalysisClient({ runId }: { runId: string }) {
   const resSandboxes = useMemo(
     () => (loaded ? (data.results?.sandboxes ?? []) : []),
     [loaded, data.results],
+  );
+
+  /** PR27: cells with more than one trial — the variance table only makes
+   * sense when a run actually repeated matrix cells. */
+  const trialCells = useMemo(
+    () => (data.analytics?.cells ?? []).filter((c) => c.sandbox_count > 1),
+    [data.analytics],
   );
 
   /** Stable sandbox order — analytics order, else results order — so every
@@ -455,6 +463,53 @@ export default function AnalysisClient({ runId }: { runId: string }) {
             </>
           )}
         </Card>
+
+        {trialCells.length > 0 ? (
+          <Card title="Score variance by cell" className="card--flush">
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Cell</th>
+                    <th>Model</th>
+                    <th>Trials</th>
+                    <th>Overall mean ±sd</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {trialCells.map((c) => (
+                    <tr key={c.cell}>
+                      <td>
+                        <div className="dim-name">{c.label}</div>
+                      </td>
+                      <td className="mono" style={{ fontSize: "0.82rem" }}>
+                        {c.model}
+                      </td>
+                      <td className="num">{c.sandbox_count}</td>
+                      <td className="num">
+                        {c.overall_mean != null ? (
+                          <span className="mono" style={{ fontSize: "0.82rem" }}>
+                            {fmtMeanSd({
+                              mean: c.overall_mean,
+                              sd: c.overall_sd,
+                              n: c.overall_n,
+                            })}
+                          </span>
+                        ) : (
+                          <span className="score-na">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="chart-legend">
+              Sample sd (n−1) across the cell&apos;s trial scores — null when
+              fewer than two trials were judged.
+            </p>
+          </Card>
+        ) : null}
 
         <Card title="Tool-call mix" className="card--flush">
           {notes.analytics && !data.analytics ? (

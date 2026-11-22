@@ -43,6 +43,7 @@ the point's cost unpriced (null), never a fallback rate (PR21).
 from __future__ import annotations
 
 import math
+import statistics
 from datetime import datetime
 from typing import Annotated
 from uuid import UUID
@@ -59,6 +60,7 @@ from api.pricing import (
     resolve_price_model,
 )
 from api.schemas import (
+    CellAnalytics,
     EvaluatorActivity,
     LatencyStats,
     ModelAnalytics,
@@ -72,7 +74,7 @@ from api.schemas import (
 )
 from db.models import Event, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
-from orchestrator.matrix import run_models, sandbox_model
+from orchestrator.matrix import cell_key, run_models, sandbox_model, trial_index
 
 router = APIRouter(tags=["analytics"])
 
@@ -395,6 +397,9 @@ def get_run_analytics(
         sb.id: sandbox_model(sb.harness_config or {}, run.model_name)
         for sb in sandboxes
     }
+    # PR27: cell identity per sandbox — every trial of one config × model
+    # cell shares the key; the rollup groups on it for mean ± sd variance.
+    sb_cell = {sb.id: cell_key(sb.harness_config or {}) for sb in sandboxes}
 
     # Eval boundary per sandbox (see _eval_boundaries).
     eval_start = _eval_boundaries(events)
@@ -405,16 +410,22 @@ def get_run_analytics(
     # PR14: same events accumulated per participant model for the rollup.
     participant_by_model: dict[str, _Agg] = {}
     evaluator_by_model: dict[str, _Agg] = {}
+    # PR27: per-cell accumulators for the trial-group rollup.
+    participant_by_cell: dict[str, _Agg] = {}
+    evaluator_by_cell: dict[str, _Agg] = {}
     for ev in events:
         if ev.sandbox_id is None or ev.sandbox_id not in participant:
             continue  # run-level rows / non-sandbox traffic
         model = sb_model[ev.sandbox_id]
+        cell = sb_cell[ev.sandbox_id]
         if _is_eval_event(ev, eval_start.get(ev.sandbox_id)):
             evaluator.setdefault(ev.sandbox_id, _Agg()).add(ev)
             evaluator_by_model.setdefault(model, _Agg()).add(ev)
+            evaluator_by_cell.setdefault(cell, _Agg()).add(ev)
         else:
             participant[ev.sandbox_id].add(ev)
             participant_by_model.setdefault(model, _Agg()).add(ev)
+            participant_by_cell.setdefault(cell, _Agg()).add(ev)
 
     # Judge traffic is priced at the evaluator model's rate when known —
     # judge and participant models may differ (evaluator_model is opt-in).
@@ -436,6 +447,8 @@ def get_run_analytics(
             SandboxAnalytics(
                 sandbox_id=sb.id,
                 name=sb.name,
+                trial_index=trial_index(sb.harness_config),
+                cell=sb_cell[sb.id],
                 label=_sandbox_label(sb.harness_config or {}),
                 harness_config=sb.harness_config or {},
                 model=model,
@@ -514,6 +527,85 @@ def get_run_analytics(
             )
         )
 
+    # PR27 — per-cell (config × model) rollups with score-variance columns.
+    # Overall scores are newest-wins per sandbox (same ordering as the
+    # results matrix); sd is the sample standard deviation (n−1), null when
+    # fewer than two trials produced an overall score.
+    overall_scores = (
+        session.execute(
+            select(Score.sandbox_id, Score.score)
+            .where(
+                Score.sandbox_id.in_([sb.id for sb in sandboxes]),
+                Score.dimension == OVERALL_DIMENSION,
+            )
+            .order_by(
+                Score.created_at.asc(),
+                Score.seq.asc().nulls_first(),
+                Score.rubric_version.asc().nulls_first(),
+                Score.id.asc(),
+            )
+        )
+        .all()
+        if sandboxes
+        else []
+    )
+    overall_by_sandbox: dict[UUID, float] = {}
+    for sid, sc in overall_scores:
+        overall_by_sandbox[sid] = sc  # ordered asc -> newest wins
+
+    cell_order: list[str] = []
+    cell_members: dict[str, list[Sandbox]] = {}
+    for sb in sandboxes:
+        cell = sb_cell[sb.id]
+        if cell not in cell_members:
+            cell_members[cell] = []
+            cell_order.append(cell)
+        cell_members[cell].append(sb)
+
+    cells_out: list[CellAnalytics] = []
+    for cell in cell_order:
+        members = cell_members[cell]
+        agg = participant_by_cell.get(cell, _Agg())
+        first = members[0]
+        model = sb_model[first.id]
+        price_key = _price_key(model)
+        price = book.price_for(price_key)
+        metrics = _agg_metrics(agg)
+        metrics["wall_clock_seconds"] = round(
+            sum(participant[sb.id].wall_clock_seconds() for sb in members), 3
+        )
+        scores = [overall_by_sandbox[sb.id] for sb in members if sb.id in overall_by_sandbox]
+        cells_out.append(
+            CellAnalytics(
+                cell=cell,
+                label=_sandbox_label(first.harness_config or {}),
+                model=model,
+                sandbox_count=len(members),
+                **metrics,
+                estimated_cost_usd=(
+                    round(
+                        estimate_cost_usd(
+                            price,
+                            input_tokens=agg.tokens.input,
+                            output_tokens=agg.tokens.output,
+                            cache_read_tokens=agg.tokens.cache_read,
+                        ),
+                        6,
+                    )
+                    if price is not None
+                    else None
+                ),
+                evaluator=_eval_activity(evaluator_by_cell.get(cell), eval_price),
+                overall_mean=(
+                    round(sum(scores) / len(scores), 3) if scores else None
+                ),
+                overall_sd=(
+                    round(statistics.stdev(scores), 3) if len(scores) >= 2 else None
+                ),
+                overall_n=len(scores),
+            )
+        )
+
     return RunAnalytics(
         run_id=run.id,
         model_name=run.model_name,
@@ -522,6 +614,7 @@ def get_run_analytics(
         price_globs=book.globs(),
         sandboxes=out,
         models=models_out,
+        cells=cells_out,
     )
 
 

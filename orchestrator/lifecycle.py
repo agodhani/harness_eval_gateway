@@ -82,10 +82,14 @@ def _sandbox_configs(run: Run) -> list[dict[str, Any]]:
     attribute it. Single-model runs return the raw harness_configs verbatim.
     """
     cfg = run.config or {}
+    # PR27: run.trials (column) wins; config["trials"] covers specs written
+    # before the column existed — either way an unset value means 1.
+    trials = getattr(run, "trials", None) or cfg.get("trials") or 1
     return expanded_configs(
         cfg.get("harness_configs") or [],
         cfg.get("models"),
         run.model_name,
+        trials=trials,
     )
 
 

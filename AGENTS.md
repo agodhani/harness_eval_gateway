@@ -721,6 +721,20 @@ or tests change.
   (no honest rate to bill against). Cache-read tokens bill at
   `cache_read_per_mtok_usd` when declared, else the input rate.
   Price pickers (results + analysis) grow rates inline via "+ add rate".
+- **Config × model heatmap + winner card (PR31)** — the results page's
+  score card has a `matrix | grid` toggle; the grid
+  (`web/app/runs/[id]/results/GridView.tsx` + pure transform
+  `web/lib/gridMatrix.ts`, `node --test`-covered) folds sandboxes into
+  config rows × model cols. Row identity = `harness_config` minus
+  per-cell `model`/trial keys — the sandbox `name` is unique per sandbox
+  and must NOT be the group key. Cells show mean judge `overall` ±sd
+  (same-(config, model) repeats are the cell's trials — PR27 needs no
+  special-casing) on a fixed 0–10 red→amber→green scale; the `w` sub-line
+  is the PR21 weighted total (same `specMap`/`dimensionKeys` the totals
+  row uses — no second weighting). The winner card ranks cells by mean
+  weighted total only (a judge `overall` alone can't win), with runner-up
+  Δ, est. cost/wall clock (F9 analytics — "unpriced"/"—", never $0) and
+  mean pass-rate (`generated_tests.pass_rate` → `exec` tests).
 - **Artifact file browsing is rooted per-sandbox, jailed like the download
   (PR34/F19)** — `GET /api/sandboxes/{id}/files[/{path}]` reuses
   `sandbox/preview.py`'s `resolve_workspace_dir`/`resolve_artifact_dir`
@@ -737,6 +751,30 @@ or tests change.
   `mergeFileLists` reuses the PR10 merged-ordering split idiom for the
   two-lane file list (no diff dependency added). Traversal/absolute-path/
   sibling-workspace escapes 404 identically to the artifact download.
+- **PR27 — trials + per-config model options**: `RunCreate.trials` (1–8,
+  default 1) replicates every effective config × model cell N times;
+  expansion stays model-major then cell-major so a cell's `t1..tN` replicas
+  stay adjacent, each stamped `harness_config.trial_index` (the key is
+  ABSENT at trials=1 — single-shot runs stay bit-identical to pre-PR27).
+  `trial_index` lives inside the existing `harness_config` JSONB — no new
+  sandbox column; `runs.trials` is a real int column (migration
+  `d7e9f1a3b5c7`, the column wins over `config["trials"]` on old specs).
+  Sandbox names append ` · tN` after the model suffix
+  (`cfg · model · t3`), truncating the label side to fit String(255).
+  `harness_configs[].model_options` (`temperature`/`seed`/`max_tokens`/
+  `reasoning`, `extra="forbid"`) is filtered at submit against the
+  adapter's `MANIFEST["model_options"]` — unsupported keys are dropped
+  from the persisted cell and reported as advisory `warnings` (never a
+  422); miniloop + `prompt` honor all four, codex takes `reasoning` only
+  (→ `model_reasoning_effort`), other CLIs none. Miniloop maps them to
+  `MINILOOP_TEMPERATURE`/`MINILOOP_SEED`/`MAX_TOKENS`/
+  `MINILOOP_REASONING_EFFORT` env knobs → request-body fields.
+  Results/analytics group trials by `cell_key` (harness_config minus
+  `trial_index`, serialized sorted): the results matrix shows one column
+  per cell (`mean ± sd (n=N)`, sample sd n−1) with expandable per-trial
+  rows; analytics adds a `cells` rollup (`overall_mean`/`overall_sd`/
+  `overall_n` counting only scored trials) plus per-sandbox `cell`/
+  `trial_index`, and a by-cell view in the results analytics table.
 
 ## Working conventions
 
@@ -753,7 +791,7 @@ or tests change.
 - `GET /api/runs/{id}/analytics?price_model=` (F9) serves per-sandbox metrics
   + estimated cost; price resolution runs through the layered
   `api/pricing.py::PriceBook` (`model_prices` glob rows over the static
-  `PRICE_TABLE`, F20 — managed via `GET/PUT/DELETE /api/prices`,
+  `PRICE_TABLE`, F21 — managed via `GET/PUT/DELETE /api/prices`,
   `POST /api/prices/sync` for OpenRouter).
   `tool_calls` merges every agent-activity signal without double counting —
   `tool_call` events, hook-sourced `tool_result` outcomes (per-name max),

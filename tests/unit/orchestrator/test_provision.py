@@ -377,6 +377,148 @@ async def test_spawn_one_missing_run_returns_none(session_factory, settings, fak
 
 
 # ---------------------------------------------------------------------------
+# PR27 — trials: name suffix + trial_index persisted on the row
+# ---------------------------------------------------------------------------
+
+
+async def test_spawn_one_trial_suffix_on_name(
+    session_factory, settings, fake_runtime
+) -> None:
+    """PR27: a trialed cell (trial_index in the expanded harness_config)
+    gets a `` · tN`` name suffix so same-cell siblings stay distinct."""
+    run = make_run(session_factory, status="provisioning", config=run_config())
+    sid = await spawn_one(
+        session_factory=session_factory,
+        runtime=fake_runtime,
+        run_id=run.id,
+        harness_config={
+            "adapter": "miniloop",
+            "name": "baseline",
+            "trial_index": 3,
+        },
+        settings=settings,
+    )
+    assert sid is not None
+    sb = _db_sandbox(session_factory, sid)
+    assert sb.name == "baseline · t3"
+    assert sb.harness_config["trial_index"] == 3  # persisted for downstream
+
+
+async def test_spawn_one_trial_suffix_after_model(
+    session_factory, settings, fake_runtime
+) -> None:
+    """PR27: multi-model + trials → ``<label> · <model> · t<N>``."""
+    run = make_run(session_factory, status="provisioning", config=run_config())
+    sid = await spawn_one(
+        session_factory=session_factory,
+        runtime=fake_runtime,
+        run_id=run.id,
+        harness_config={
+            "adapter": "miniloop",
+            "name": "cfg",
+            "model": "gpt-4o",
+            "trial_index": 2,
+        },
+        settings=settings,
+    )
+    assert sid is not None
+    assert _db_sandbox(session_factory, sid).name == "cfg · gpt-4o · t2"
+
+
+async def test_spawn_one_no_trial_index_keeps_old_name(
+    session_factory, settings, fake_runtime
+) -> None:
+    """PR27: untrialed cells (trials=1 / pre-PR27 rows) keep the old name —
+    no `` · t1`` bolted on."""
+    run = make_run(session_factory, status="provisioning", config=run_config())
+    sid = await spawn_one(
+        session_factory=session_factory,
+        runtime=fake_runtime,
+        run_id=run.id,
+        harness_config={"adapter": "miniloop", "name": "baseline"},
+        settings=settings,
+    )
+    assert sid is not None
+    assert _db_sandbox(session_factory, sid).name == "baseline"
+
+
+def test_sandbox_name_truncates_label_preserving_trial_suffix() -> None:
+    """PR27: names past String(255) truncate the label, never the
+    `` · <model> · t<N>`` tail."""
+    long_label = "x" * 300
+    hc = {
+        "adapter": "miniloop",
+        "name": long_label,
+        "model": "m1",
+        "trial_index": 8,
+    }
+    name = provision._sandbox_name(hc, uuid.uuid4())
+    assert len(name) <= 255
+    assert name.endswith(" · m1 · t8")
+
+
+# ---------------------------------------------------------------------------
+# PR27 — model_options reach the adapter env
+# ---------------------------------------------------------------------------
+
+
+async def test_spawn_one_model_options_reach_miniloop_env(
+    session_factory, settings, fake_runtime
+) -> None:
+    """PR27: persisted ``model_options`` on a cell map to miniloop's
+    MINILOOP_* env knobs — temperature + max_tokens land as env vars."""
+    run = make_run(session_factory, status="provisioning", config=run_config())
+    sid = await spawn_one(
+        session_factory=session_factory,
+        runtime=fake_runtime,
+        run_id=run.id,
+        harness_config={
+            "adapter": "miniloop",
+            "model_options": {
+                "temperature": 0.7,
+                "seed": 42,
+                "max_tokens": 2048,
+                "reasoning": "high",
+            },
+        },
+        settings=settings,
+    )
+    assert sid is not None
+    env = fake_runtime.spawned[0].env
+    assert env["MINILOOP_TEMPERATURE"] == "0.7"
+    assert env["MINILOOP_SEED"] == "42"
+    assert env["MAX_TOKENS"] == "2048"
+    assert env["MINILOOP_REASONING_EFFORT"] == "high"
+    # the cell's options persisted on the row for downstream introspection
+    assert _db_sandbox(session_factory, sid).harness_config["model_options"] == {
+        "temperature": 0.7,
+        "seed": 42,
+        "max_tokens": 2048,
+        "reasoning": "high",
+    }
+
+
+async def test_spawn_one_no_model_options_no_new_env(
+    session_factory, settings, fake_runtime
+) -> None:
+    """PR27: a config without model_options gets no PR27 env knobs —
+    adapter defaults apply (pre-PR27 env shape)."""
+    run = make_run(session_factory, status="provisioning", config=run_config())
+    sid = await spawn_one(
+        session_factory=session_factory,
+        runtime=fake_runtime,
+        run_id=run.id,
+        harness_config={"adapter": "miniloop"},
+        settings=settings,
+    )
+    assert sid is not None
+    env = fake_runtime.spawned[0].env
+    for key in ("MINILOOP_TEMPERATURE", "MINILOOP_SEED",
+                "MINILOOP_REASONING_EFFORT"):
+        assert key not in env
+
+
+# ---------------------------------------------------------------------------
 # PR28 — budgets_for per-cell caps + mint_sandbox_cred claim
 # ---------------------------------------------------------------------------
 

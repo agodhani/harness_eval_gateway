@@ -1,7 +1,7 @@
 """model_prices table — user-editable glob price table
 
 Revision ID: c4e8d1a7f3b5
-Revises: a2b3c4d5e6f7
+Revises: d7e9f1a3b5c7
 Create Date: 2026-04-30
 
 PR28 — persistent price table layered over ``api.pricing.PRICE_TABLE``:
@@ -13,9 +13,9 @@ the input rate exactly as before. ``source`` distinguishes ``user`` rows
 (PUT /api/prices, never overwritten by sync) from ``openrouter`` rows
 (catalog sync, refreshed on each run).
 
-Merge note: parallel PRs add migrations off the same ``a2b3c4d5e6f7``
-head — whichever lands second must re-point ``down_revision`` at the
-other's head to keep a single migration head.
+Merge note: PR27's ``d7e9f1a3b5c7_runs_trials`` landed first off the
+same ``a2b3c4d5e6f7`` parent — this revision re-points
+``down_revision`` at it to keep a single migration head.
 """
 
 import sqlalchemy as sa
@@ -23,7 +23,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "c4e8d1a7f3b5"
-down_revision = "a2b3c4d5e6f7"
+down_revision = "d7e9f1a3b5c7"
 branch_labels = None
 depends_on = None
 
