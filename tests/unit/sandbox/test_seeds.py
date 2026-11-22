@@ -183,8 +183,8 @@ def test_extract_archive_size_and_file_caps(tmp_path: Path) -> None:
 
 
 def test_check_archive_enforces_the_same_member_caps(tmp_path: Path) -> None:
-    """Upload-check must catch what extraction would reject — a staged
-    upload can never turn unusable at provisioning."""
+    """Upload-check must catch the member-metadata failures extraction
+    would reject — caps included, not just unsafe names."""
     p = tmp_path / "big.zip"
     p.write_bytes(_zip_bytes({"a.bin": b"x" * 1024, "b.bin": b"y" * 1024}))
     assert seeds.check_archive(p) == "zip"  # under the defaults
@@ -382,6 +382,23 @@ def test_zip_member_cap_counts_records_not_the_declared_total(
     p.write_bytes(bytes(raw))
     assert zipfile.is_zipfile(p)  # premise: magic check only reads the EOCD
     assert seeds._zip_member_count(p, limit=64) == 4  # 4 real records
+    with pytest.raises(seeds.SeedError, match="file cap"):
+        seeds.check_archive(p, max_files=3)
+    with pytest.raises(seeds.SeedError, match="file cap"):
+        seeds.extract_archive(p, tmp_path / "out", max_files=3)
+
+
+def test_zip_file_cap_falls_back_to_the_parser_count(tmp_path: Path) -> None:
+    """A trailing byte past the EOCD makes the pre-parse CD scan fail its
+    comment-to-EOF verification (it returns None) while ``zipfile`` — which
+    takes the last EOCD occurrence unconditionally — still parses the
+    archive. The cap must then bind on the parser's own entry count, at
+    check AND extract alike."""
+    p = tmp_path / "trailing.zip"
+    p.write_bytes(_zip_bytes({f"f{i}.py": "x" for i in range(4)}) + b"\x00")
+    assert zipfile.is_zipfile(p)  # premise: zipfile ignores the trailing byte
+    assert seeds._zip_member_count(p, limit=64) is None  # premise: prescan off
+    assert seeds.check_archive(p, max_files=4) == "zip"
     with pytest.raises(seeds.SeedError, match="file cap"):
         seeds.check_archive(p, max_files=3)
     with pytest.raises(seeds.SeedError, match="file cap"):

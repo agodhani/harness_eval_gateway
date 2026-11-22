@@ -122,7 +122,8 @@ async def upload_archive(
     # Member safety scan (no extraction) — traversal, absolute paths, links,
     # specials, encrypted/empty archives all reject here and nothing is kept.
     # The same seed size/file caps extraction enforces are checked against
-    # declared member sizes so a staged upload can't fail at provisioning.
+    # declared member metadata up front; a corrupt payload can still fail at
+    # extraction, but as a clean SeedError.
     try:
         kind = seeds.check_archive(
             staged,

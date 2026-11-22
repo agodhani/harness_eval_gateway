@@ -1250,8 +1250,9 @@ rigged before it starts.
   absolute paths, `..` segments, drive roots, backslash separators, NULs,
   symlinks/hardlinks/devices/fifos, and encrypted members all rejected at
   BOTH upload time (`check_archive`, no extraction — declared member
-  sizes are also checked against `SEED_MAX_BYTES` / `SEED_MAX_FILES` so a
-  staged upload can't fail at provisioning) and extraction
+  sizes are also checked against `SEED_MAX_BYTES` / `SEED_MAX_FILES`, so
+  member-metadata failures reject at upload; a corrupt payload can still
+  fail at extract, as a clean SeedError) and extraction
   (`extract_archive` writes bytes manually, never `extractall`, under the
   same caps). A single common top-level dir is
   flattened (`proj/x` → `x`) so the workspace mirrors the repo root like

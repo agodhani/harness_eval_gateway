@@ -364,6 +364,15 @@ def _iter_zip_members(archive: Path, *, max_files: int) -> Iterator[_Member]:
         )
     with zipfile.ZipFile(archive) as zf:
         infos = zf.infolist()
+        # The pre-scan is an early-exit bound on parse memory, not the cap
+        # itself: it scans a DIFFERENT directory when its EOCD verification
+        # diverges from zipfile's (zipfile takes the last EOCD occurrence;
+        # we also require its comment to reach EOF) or when it can't locate
+        # the CD at all. The parser's own entry count is authoritative.
+        if len(infos) > max_files:
+            raise SeedError(
+                f"archive exceeds the seed file cap ({max_files} entries)"
+            )
         rels = [_member_relpath(i.filename) for i in infos]
         _check_member_conflicts(
             [
@@ -497,8 +506,9 @@ def check_archive(
     """Upload-time safety pass — walks member names/types/declared sizes
     without writing a byte. Returns the detected ``"zip"``/``"tar"`` kind;
     SeedError on unreadable archives, unsafe members, an archive with no
-    files, or a member size/count over the same caps extraction enforces —
-    a staged upload can never turn unusable at provisioning."""
+    files, or a member size/count over the same caps extraction enforces.
+    Only member metadata is verified here — a corrupt payload can still
+    fail at extraction, under the same SeedError contract."""
     files = 0
     total = 0
     for member in _iter_members(archive, max_files=max_files):

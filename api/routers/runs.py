@@ -451,9 +451,15 @@ def _remove_staged_upload(
         for cfg in configs
     ):
         return
-    _remove_data_dir(
-        seeds.uploads_root(get_settings()), upload_id, label="upload"
-    )
+    try:
+        uploads = seeds.uploads_root(get_settings())
+    except seeds.SeedError:
+        log.warning(
+            "uploads root unusable; upload %s left on disk", upload_id,
+            exc_info=True,
+        )
+        return
+    _remove_data_dir(uploads, upload_id, label="upload")
 
 
 @router.delete("/{run_id}")
