@@ -1022,6 +1022,27 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     AnalyticsSection gains a sandbox/model segmented view with per-model
     aggregation and per-model cost; the analysis page prices each sandbox at
     its own model's rate in "auto" mode.
+  - **PR31 — config × model heatmap + winner card:** the results page's
+    score card gains a `matrix | grid` segmented toggle. **Grid** folds the
+    per-sandbox columns back into the comparison matrix — rows = submitted
+    harness configs (identity = `harness_config` minus the injected
+    `model`/trial keys; the sandbox `name` is unique per sandbox and can't
+    group), cols = `RunResults.models` plus observed extras — each cell
+    showing the mean judge `overall` across its members (trials included —
+    same-(config, model) repeats roll up `±sd · ×n` with a scored-count
+    note under partial coverage), the PR21 weighted total underneath, on
+    the fixed 0–10 red→amber→green heat scale (readable at 32 cells).
+    The **winner card** above the grid ranks cells by mean WEIGHTED total
+    (never the judge's self-reported `overall`; a cell with only an
+    `overall` can't win), and shows the pick's weighted total, judge
+    overall, +Δ vs the runner-up cell (named), mean estimated cost per
+    sandbox + wall clock (from the F9 analytics payload — "unpriced"/"—"
+    honestly, never a $0 stand-in), and mean test pass-rate
+    (`generated_tests.pass_rate` → `exec` tests fallback). The winning
+    cell gets an outline + ★ in the grid. The matrix view's `total` row
+    already computed the PR21 weighted-normalised aggregate
+    (`web/lib/scoreMath.ts::weightedDimTotal`); the grid reuses the same
+    `dimensionKeys`/`specMap` rather than a second weighting.
 - **Where:** `orchestrator/matrix.py` (new), `orchestrator/lifecycle.py`,
   `orchestrator/provision.py`, `api/schemas.py` (`RunCreate.models`,
   `HarnessConfigIn.model`, `MAX_MATRIX_CELLS`, `models` on run/results/
@@ -1030,10 +1051,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (participant-row → `model_name`/`models` payload mapping),
   `web/app/submit/page.tsx`,
   `web/app/runs/page.tsx`, `web/app/runs/[id]/RunDetailClient.tsx`,
-  `web/app/runs/[id]/results/{ResultsClient,AnalyticsSection}.tsx`,
+  `web/app/runs/[id]/results/{ResultsClient,AnalyticsSection,GridView}.tsx`,
   `web/app/runs/[id]/analysis/AnalysisClient.tsx`,
   `web/app/runs/[id]/timeline/TimelineClient.tsx`,
   `web/lib/timelineAnalytics.ts` (per-sandbox price basis in strips),
+  `web/lib/gridMatrix.ts` (PR31 grid transform) + `gridMatrix.test.ts`,
   `web/components/RunConsoleLive.tsx`, `web/app/globals.css`
 - **Verify:**
   - Unit: `tests/unit/orchestrator/test_matrix.py` (defaults, overrides,
@@ -1045,7 +1067,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     `web/lib/modelRows.test.ts` (participant-row payload mapping)
   - Manual: submit with 2 configs × 2 models → 4 sandboxes named/labeled
     per cell; results matrix + analytics "model" view group by model; cost
-    auto-mode prices each cell at its own model.
+    auto-mode prices each cell at its own model. PR31: results page →
+    "grid" toggle → config × model heat table renders (8×4 = 32 cells),
+    winner card shows the top weighted cell + runner-up Δ + cost/time/
+    pass-rate; `cd web && npm test` covers the transform (cell assembly,
+    sparse cells, mean±sd rollups, heat stops, winner pick, pass-rate).
 - **Depends on:** F15 (PR1 — named configs + live model picker this stacks
   on); best after multi-provider support so >1 model is usable.
 

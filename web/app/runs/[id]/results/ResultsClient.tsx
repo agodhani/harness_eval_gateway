@@ -54,6 +54,7 @@ import {
 } from "@/components/ui";
 import AnalyticsSection from "./AnalyticsSection";
 import FileBrowser from "./FileBrowser";
+import GridView from "./GridView";
 import OutputView from "./OutputView";
 import PreviewControls from "./PreviewControls";
 import RescoreControls from "./RescoreControls";
@@ -181,6 +182,10 @@ export default function ResultsClient({ runId }: { runId: string }) {
   // `eval_scored` checkpoint events — source of the per-sandbox judge-mode
   // badge when the results payload doesn't carry `eval_mode` yet.
   const [scoredEvents, setScoredEvents] = useState<EventOut[]>([]);
+  // PR31 — `matrix` (per-sandbox columns) vs `grid` (config × model
+  // heatmap + winner card). Default stays the matrix every earlier
+  // release shipped.
+  const [view, setView] = useState<"matrix" | "grid">("matrix");
   // PR21 — rubric dims (weight + score scale) for the pinned version when it
   // isn't the latest rubric on the run record; keyed to runId+version like
   // `versionSel` so cross-run navigation can't reuse stale dims.
@@ -611,7 +616,44 @@ export default function ResultsClient({ runId }: { runId: string }) {
           </Card>
         ) : (
           <>
-            <Card title="Score matrix" className="card--flush">
+            <Card
+              title="Score matrix"
+              className="card--flush"
+              actions={
+                <div className="seg" role="tablist" aria-label="Results view">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={view === "matrix"}
+                    className={`seg__btn${view === "matrix" ? " seg__btn--active" : ""}`}
+                    onClick={() => setView("matrix")}
+                  >
+                    matrix
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={view === "grid"}
+                    className={`seg__btn${view === "grid" ? " seg__btn--active" : ""}`}
+                    onClick={() => setView("grid")}
+                  >
+                    grid
+                  </button>
+                </div>
+              }
+            >
+              {view === "grid" ? (
+                // PR31 — config × model heatmap + winner card. Same data,
+                // folded per config row × model column; weighted totals
+                // reuse the matrix's specMap/dimensionKeys.
+                <GridView
+                  runId={runId}
+                  sandboxes={sandboxes}
+                  models={participantModels}
+                  dimensionKeys={dimensionKeys}
+                  specMap={specMap}
+                />
+              ) : (
               <div className="matrix-wrap">
                 <table className="matrix">
                   <thead>
@@ -744,6 +786,7 @@ export default function ResultsClient({ runId }: { runId: string }) {
                   </tbody>
                 </table>
               </div>
+              )}
             </Card>
 
             {modelGroups.length > 1 ? (

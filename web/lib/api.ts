@@ -1328,6 +1328,33 @@ export interface SandboxResult {
   /** True when the sandbox's snapshot workspace was empty (the agent wrote
    *  nothing) — a 0-score outcome reads differently with it flagged. */
   empty_workspace?: boolean | null;
+  /** PR31: flat `exec`-signal summary (PR7 measured build/tests in the
+   *  locked heg-exec container) — feeds the results grid's pass-rate. */
+  exec?: {
+    status?: string;
+    tests_detected?: boolean;
+    tests_ok?: boolean | null;
+    tests_collected?: number;
+    tests_passed?: number;
+    tests_failed?: number;
+    coverage_percent?: number | null;
+    detail?: string | null;
+  } | null;
+  /** PR31: flat `generated_tests`-signal summary (PR8 evaluator-authored
+   *  suite run against the submission) — the preferred pass-rate signal. */
+  generated_tests?: {
+    status?: string;
+    model?: string | null;
+    tests_collected?: number;
+    tests_passed?: number;
+    pass_rate?: number | null;
+    coverage_percent?: number | null;
+    detail?: string | null;
+  } | null;
+  /** PR27 (when landed): repeat index of a matrix cell. The results grid
+   *  groups same-(config, model) members as trials regardless — this is
+   *  display-only. */
+  trial_index?: number | null;
 }
 
 export interface PreviewOut {
