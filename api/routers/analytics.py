@@ -8,10 +8,11 @@
   ``gateway/metering.py::emit_llm_response``).
 - ``ttft_ms`` (avg/p95/max of the payload's first-byte timing) and
   ``avg_tokens_per_sec`` (mean per-call output throughput) — PR30 speed
-  axis; events predating the fields contribute no sample, and cache
-  replays are excluded from both stats entirely (a replay's timings
-  measure the store's serve time, not the model — the gateway nulls
-  ``tokens_per_sec`` on replays for the same reason).
+  axis; events predating the fields contribute no sample. Cache replays
+  are excluded from every timing stat (``latency_ms``, ``ttft_ms``,
+  ``tokens_per_sec``) — a replay's timings measure the store's serve
+  time, not the model (the gateway nulls ``tokens_per_sec`` on replays
+  for the same reason).
 - ``tool_calls.by_tool`` merges every per-tool signal without double
   counting: ``tool_call`` events (miniloop, translated streams) plus
   hook-sourced ``tool_result`` outcomes (claude_code PostToolUse, pi's
@@ -155,10 +156,10 @@ class _Agg:
                 self.tokens.output += t.output
                 self.tokens.cache_read += t.cache_read
                 self.tokens.total += t.total
-                lat = _int(payload.get("latency_ms"))
-                if lat > 0:
-                    self.latencies.append(lat)
                 cached = bool(payload.get("cached"))
+                lat = _int(payload.get("latency_ms"))
+                if lat > 0 and not cached:
+                    self.latencies.append(lat)
                 ttft = _int(payload.get("ttft_ms"))
                 if ttft > 0 and not cached:
                     self.ttfts.append(ttft)

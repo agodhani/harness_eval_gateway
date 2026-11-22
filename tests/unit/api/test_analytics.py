@@ -257,7 +257,8 @@ def test_cached_replay_stays_off_the_speed_axis(
 ) -> None:
     """A cache replay's ttft_ms is the store's lookup time (~ms), not
     model speed — like the nulled tokens_per_sec it must not sample the
-    comparison stats. Oracle: only the live call's 120ms counts (the
+    comparison stats, and its latency_ms is the same serve-time on the
+    same chart. Oracle: only the live call's 120ms counts (the
     pre-fix read would average in the 2ms replay → ~61ms), and a
     cache-only lane reports null stats rather than an ~3ms "instant"
     first-byte time."""
@@ -316,13 +317,24 @@ def test_cached_replay_stays_off_the_speed_axis(
     live_row = rows[str(live_id)]
     # replays still count as traffic — just not as measured speed
     assert live_row["llm_turns"] == 2
+    assert live_row["latency_ms"] == {
+        "avg": 500.0,
+        "p95": 500.0,
+        "max": 500.0,
+    }
     assert live_row["ttft_ms"] == {"avg": 120.0, "p95": 120.0, "max": 120.0}
     assert live_row["avg_tokens_per_sec"] == pytest.approx(10.0)
     replay_row = rows[str(replay_id)]
+    assert replay_row["latency_ms"] == {"avg": None, "p95": None, "max": None}
     assert replay_row["ttft_ms"] == {"avg": None, "p95": None, "max": None}
     assert replay_row["avg_tokens_per_sec"] is None
     # sibling site: the pooled model rollup excludes the replay too
     (model_row,) = body["models"]
+    assert model_row["latency_ms"] == {
+        "avg": 500.0,
+        "p95": 500.0,
+        "max": 500.0,
+    }
     assert model_row["ttft_ms"] == {"avg": 120.0, "p95": 120.0, "max": 120.0}
     assert model_row["avg_tokens_per_sec"] == pytest.approx(10.0)
 

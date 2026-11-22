@@ -119,7 +119,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Per-cell budgets (PR28):** the monitor enforces the run spec's
   optional `sandbox_token_budget` (sandbox's own metered total) and
   `max_cost_usd` (its estimated spend at the layered price table —
-  priced models only) per poll alongside the run ceiling; each trips
+  priced models only) per poll alongside the run ceiling — a prompt
+  cell finishes before the poll could run, so `prompt_cell` applies the
+  same cost estimate inline post-call; each trips
   `budget_exceeded` with a terminate-checkpoint `limit` of
   `sandbox_tokens`/`cost` (`run_tokens` for the shared ceiling).
 - **Pacing (PR15):** one active run at a time — approvals while a run
@@ -1425,7 +1427,11 @@ configurable per cell (e.g. temperature sweeps).
   monitor prices the sandbox's own participant traffic each poll at its
   own model through the layered price book (prompt/completion/cache-read
   split) and terminates `budget_exceeded` with `payload.limit="cost"`.
-  Priced models only — an unpriced cell resolves `None` and can't trip
+  A prompt cell finishes before the monitor's poll could run, so
+  `prompt_cell._cost_cap_detail` runs the same metered estimate inline
+  post-call — a clean completion that breached the cap flips to
+  `budget_exceeded` (error/timeout verdicts stand). Priced models only
+  — an unpriced cell resolves `None` and can't trip
   the cap (PR21 honesty: never a guessed rate). Terminate checkpoints
   now carry `limit` + the numbers that fired (`used_tokens`/`budget`,
   `estimated_cost_usd`/`budget_usd`) for all three limits.
@@ -1461,6 +1467,7 @@ configurable per cell (e.g. temperature sweeps).
   `gateway/main.py::_budget_gate`, `gateway/mint_cred.py`,
   `orchestrator/provision.py` (`budgets_for`, `mint_sandbox_cred`),
   `orchestrator/monitor.py` (per-cell poll checks + terminate detail),
+  `orchestrator/prompt_cell.py::_cost_cap_detail` (inline cost cap),
   `api/routers/analytics.py` (book-resolved keys), `web/lib/api.ts`
   (prices fns, `globMatch`/`matchPriceKey`, cache-aware `estimateCostUsd`),
   `web/components/AddRate.tsx`, `web/app/submit/page.tsx`,

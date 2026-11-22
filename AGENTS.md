@@ -264,7 +264,10 @@ deadline cancels an in-flight call and skips the remaining retry
 container cells interleave in one run; evaluation receives
 `prompt_output_path` so `output.txt` stages as the submission.
 `system_prompt_extra` becomes a `system` message. Preview/thumbnail
-endpoints 404 early for prompt cells.
+endpoints 404 early for prompt cells. Budgets still apply: the cred
+carries `sandbox_max_tokens`, and `_cost_cap_detail` enforces
+`max_cost_usd` inline post-call (the monitor's poll never sees a
+no-sandbox cell).
 
 **Default skill packs** (named presets, vendored under `skillpacks/`):
 `superpowers`, `mattpocock-skills`, `spec-kit`.
@@ -719,9 +722,10 @@ or tests change.
   rate are skipped rather than priced-free. Per-cell budgets:
   `sandbox_token_budget` mints a `sandbox_max_tokens` cred claim
   (gateway gate + monitor backstop → `limit="sandbox_tokens"`);
-  `max_cost_usd` is monitor-polled against the cell's layered-price
-  estimate → `limit="cost"`, and it can't trip an unpriced model
-  (no honest rate to bill against). Cache-read tokens bill at
+  `max_cost_usd` is monitor-polled for containers and checked inline
+  post-call for prompt cells (`prompt_cell._cost_cap_detail`) against
+  the cell's layered-price estimate → `limit="cost"`, and it can't
+  trip an unpriced model (no honest rate to bill against). Cache-read tokens bill at
   `cache_read_per_mtok_usd` when declared, else the input rate.
   Price pickers (results + analysis) grow rates inline via "+ add rate".
 - **Config × model heatmap + winner card (PR31)** — the results page's
