@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from pathlib import Path
 
 import httpx
+import pytest
 from sqlalchemy import select
 
 from db.models import Artifact, Event, Sandbox
@@ -459,6 +461,156 @@ async def test_prompt_cell_429_provider_is_error_not_budget(
         client=_client(handler),
     )
     assert _sandbox(session_factory, sid).terminal_reason == "error"
+
+
+def _seed_llm_response(
+    session_factory, settings, request: httpx.Request, usage: dict
+) -> None:
+    """Insert the ``llm_response`` event the real gateway commits before it
+    returns this response — its ingest POST is awaited, so the row exists
+    by the time the cell reads the body. Same cred → same run+sandbox."""
+    cred = request.headers["authorization"].removeprefix("Bearer ")
+    claims = verify_cred(cred, secret=settings.GATEWAY_CRED_SECRET)
+    with session_factory() as s:
+        s.add(
+            Event(
+                run_id=uuid.UUID(claims.run_id),
+                sandbox_id=uuid.UUID(claims.sandbox_id),
+                source="gateway",
+                type="llm_response",
+                payload={"usage": usage},
+            )
+        )
+        s.commit()
+
+
+async def test_prompt_cell_cost_cap_terminates_budget_exceeded(
+    session_factory, settings, artifact_root
+) -> None:
+    """PR28 parity: ``max_cost_usd`` has no monitor poll for a no-sandbox
+    cell, so the post-call check is its enforcement site. gpt-4o at
+    $2.5/$10 per Mtok → 1000 in + 1000 out = $0.0125 trips a $0.01 cap."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _seed_llm_response(
+            session_factory,
+            settings,
+            request,
+            {
+                "prompt_tokens": 1000,
+                "completion_tokens": 1000,
+                "total_tokens": 2000,
+            },
+        )
+        return _chat_response("pricey reply")
+
+    run = make_run(
+        session_factory,
+        model_name="gpt-4o",
+        config=run_config(budgets={"max_cost_usd": 0.01}),
+    )
+    sid = await run_prompt_cell(
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        run_id=run.id,
+        harness_config=_prompt_config(),
+        settings=settings,
+        client=_client(handler),
+    )
+
+    sb = _sandbox(session_factory, sid)
+    assert sb.status == "failed"
+    assert sb.terminal_reason == "budget_exceeded"
+    term = next(
+        e.payload
+        for e in _events(session_factory, sid)
+        if e.type == "checkpoint" and e.payload.get("stage") == "terminate"
+    )
+    assert term["reason"] == "budget_exceeded"
+    assert term["limit"] == "cost"
+    assert term["estimated_cost_usd"] == pytest.approx(0.0125)
+    assert term["budget_usd"] == 0.01
+    meta = json.loads((Path(sb.artifact_path) / "meta.json").read_text())
+    assert meta["terminal_reason"] == "budget_exceeded"
+    # the call's output still lands — a terminated container's snapshot
+    # keeps its workspace too
+    assert (Path(sb.artifact_path) / "output.txt").read_text() == "pricey reply"
+
+
+async def test_prompt_cell_cost_cap_unpriced_model_cannot_trip(
+    session_factory, settings, artifact_root
+) -> None:
+    """Same PR21 honesty boundary as containers: an unlisted model has no
+    honest rate — the cap can't trip it, the clean completion stands."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _seed_llm_response(
+            session_factory,
+            settings,
+            request,
+            {
+                "prompt_tokens": 10**9,
+                "completion_tokens": 0,
+                "total_tokens": 10**9,
+            },
+        )
+        return _chat_response("free reply")
+
+    run = make_run(
+        session_factory,
+        model_name="test-model",  # not in PRICE_TABLE, no model_prices rows
+        config=run_config(budgets={"max_cost_usd": 0.000001}),
+    )
+    sid = await run_prompt_cell(
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        run_id=run.id,
+        harness_config=_prompt_config(),
+        settings=settings,
+        client=_client(handler),
+    )
+
+    sb = _sandbox(session_factory, sid)
+    assert sb.status == "done"
+    assert sb.terminal_reason == "harness_complete"
+    assert not any(
+        e.type == "checkpoint" and e.payload.get("stage") == "terminate"
+        for e in _events(session_factory, sid)
+    )
+
+
+async def test_prompt_cell_cost_cap_under_budget_completes(
+    session_factory, settings, artifact_root
+) -> None:
+    """Priced but under the cap — the verdict stays harness_complete."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _seed_llm_response(
+            session_factory,
+            settings,
+            request,
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 100,
+                "total_tokens": 200,
+            },
+        )
+        return _chat_response("cheap reply")
+
+    run = make_run(
+        session_factory,
+        model_name="gpt-4o",
+        config=run_config(budgets={"max_cost_usd": 1.00}),
+    )
+    sid = await run_prompt_cell(
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        run_id=run.id,
+        harness_config=_prompt_config(),
+        settings=settings,
+        client=_client(handler),
+    )
+    assert _sandbox(session_factory, sid).terminal_reason == "harness_complete"
 
 
 # ---------------------------------------------------------------------------

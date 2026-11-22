@@ -32,6 +32,10 @@ lifecycle routes to):
 5. ``terminal_state`` + ``sandbox_finalized`` events and the sandbox
    transition — ``harness_complete`` on a usable response, ``timeout`` /
    ``budget_exceeded`` / ``error`` on the matching failure modes.
+   ``budget_exceeded`` also fires post-call when the metered spend reaches
+   ``budgets.max_cost_usd`` — the monitor's poll enforces that cap for
+   containers, but a prompt cell finishes before the monitor exists, so
+   ``_cost_cap_detail`` runs the same estimate inline.
 """
 
 from __future__ import annotations
@@ -53,7 +57,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from db.models import Artifact, Run, Sandbox
 from sandbox.runtime import SandboxRuntime
 
-from . import provision, state_machine
+from . import monitor, provision, state_machine
 from .events import emit
 from .matrix import sandbox_model
 
@@ -569,6 +573,42 @@ def _finalize(
         session.commit()
 
 
+def _cost_cap_detail(
+    session_factory: sessionmaker[Session],
+    *,
+    run: Run,
+    sandbox_id: uuid.UUID,
+    call: _CallResult,
+    budgets: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Post-call ``max_cost_usd`` verdict for a completed cell.
+
+    Containers get the cap from ``watch_sandbox``'s poll; a prompt cell is
+    already finished before the monitor could run, so the same
+    metered-usage estimate (``monitor._sandbox_estimated_cost_usd`` — same
+    layered price table, same unpriced→None honesty) runs inline. Only a
+    clean completion is overridden — error/timeout verdicts and the
+    gateway's own token-gate 429 stand. Returns the terminate detail on a
+    breach, else None.
+    """
+    if call.terminal_reason != "harness_complete":
+        return None
+    max_cost = budgets.get("max_cost_usd")
+    if not max_cost:
+        return None
+    sb = monitor._load_sandbox(session_factory, sandbox_id)
+    if sb is None:
+        return None
+    est = monitor._sandbox_estimated_cost_usd(session_factory, run, sb)
+    if est is None or est < float(max_cost):
+        return None
+    return {
+        "limit": "cost",
+        "estimated_cost_usd": round(est, 6),
+        "budget_usd": float(max_cost),
+    }
+
+
 def _mark_cell_failed(
     session_factory: sessionmaker[Session],
     *,
@@ -683,6 +723,23 @@ async def run_prompt_cell(
         finally:
             if own_client:
                 await client.aclose()
+
+        cost_detail = _cost_cap_detail(
+            session_factory,
+            run=run,
+            sandbox_id=sid,
+            call=call,
+            budgets=budgets,
+        )
+        if cost_detail is not None:
+            call.terminal_reason = "budget_exceeded"
+            monitor._mark_terminating(
+                session_factory,
+                run_id=run_id,
+                sandbox_id=sid,
+                reason="budget_exceeded",
+                detail=cost_detail,
+            )
 
         artifact_dir = Path(runtime.artifact_root) / str(run_id) / str(sid)
         await asyncio.to_thread(
