@@ -30,6 +30,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F15 | Submit UX: live model picker + install, named harness configs | ✅ | `api/routers/models.py`, `gateway/main.py` (`/v1/models/pull`), `web/app/submit/page.tsx`, `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`, `orchestrator/provision.py` | `tests/unit/api/test_models.py`, `tests/unit/gateway/test_proxy.py` (pull), `tests/unit/db/test_migrations.py`, `tests/unit/orchestrator/test_provision.py` (name) |
 | F16 | Model-vs-model matrix (config × model) + per-model analytics | ✅ | `orchestrator/matrix.py`, `orchestrator/lifecycle.py`, `orchestrator/provision.py`, `api/schemas.py`, `api/routers/runs.py`, `results.py`, `analytics.py`, `web/app/submit/page.tsx`, `web/lib/api.ts`, `web/app/runs/[id]/` (detail, results, analysis) | `tests/unit/orchestrator/test_matrix.py`, `test_lifecycle.py`, `test_provision.py`, `tests/unit/api/test_runs.py`, `test_results.py`, `test_analytics.py` |
 | F17 | Artifact thumbnails (headless screenshots via the preview stack; desktop captures wait on real VNC framebuffer content, dead-app fast-fail with exit reason) | ✅ | `sandbox/thumbnails.py`, `sandbox/images/thumbnail-capture.{Dockerfile,sh}`, `sandbox/images/thumbnail-vnc.py`, `api/routers/preview.py` (`.../thumbnail`), `api/routers/results.py` (`SandboxResult.thumbnail`), `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_thumbnails.py`, `tests/unit/api/test_thumbnails.py`, `tests/integration/test_thumbnail.py` |
+| F18 | Prompt-only matrix cells (no-sandbox `prompt` adapter: one metered LLM call per cell, `output.txt` artifact, full results/eval pipeline) | ✅ | `orchestrator/prompt_cell.py`, `orchestrator/adapters.py` (pseudo-manifest), `orchestrator/lifecycle.py`, `evaluator/evaluate.py` (`prompt_output_path`), `web/app/runs/[id]/results/` (inline output view) | `tests/unit/orchestrator/test_prompt_cell.py`, `test_lifecycle.py` (prompt cases), `tests/unit/api/test_results.py` (prompt-cell cases) |
+| F19 | Artifact file browser + side-by-side diff (jailed listing/read endpoints; prompt cells browse the artifact root so `output.txt` stays reachable; server-side unified diffs) | ✅ | `api/routers/results.py` (`/api/sandboxes/{id}/files[/{path}]`), `web/app/runs/[id]/results/FileBrowser.tsx`, `web/lib/fileBrowser.ts`, `web/lib/api.ts` | `tests/unit/api/test_results.py` (PR34 section), `web/lib/fileBrowser.test.ts` |
 
 ## Feature details
 
@@ -1229,6 +1231,68 @@ workspace to produce.
   results page shows output inline with preview absent.
 - **Depends on:** F16 (config × model matrix expansion), F3 (gateway
   creds/metering), F7 (evaluator staging), F8/F12 (results + preview).
+
+### F19 — Artifact file browser + side-by-side diff ✅
+
+- **What:** the results matrix's artifacts cell gets a `📂 browse` chip
+  opening a two-pane modal — jailed file tree on the left, size-capped
+  text viewer on the right — plus a `diff vs` peer picker that diffs one
+  path across two sandboxes' artifacts server-side and renders the
+  unified diff in a colored `<pre>`. Users inspect and compare produced
+  workspaces without downloading tarballs; prompt cells' `output.txt`
+  surfaces through the same browser.
+- **Browse root:** `workspace/` wins when the snapshot exists; a
+  workspace-less artifact (prompt cells, pre-snapshot failures) browses
+  the artifact dir itself (`output.txt`, `transcript.log`, `meta.json`,
+  `analysis.json`, `generated_tests/`…). `FileListOut.root` reports
+  which root answered (`"workspace"` | `"artifact"`).
+- **Endpoints** (`api/routers/results.py`, all jailed under
+  `ARTIFACT_ROOT` exactly like the artifact-download endpoint):
+  - `GET /api/sandboxes/{id}/files` — depth-bounded (`8` levels),
+    entry-bounded (`5000`, `truncated` flag) walk; `node_modules`/`.git`/
+    `__pycache__`/`.venv`/`*.pyc` pruned like workspace ZIPs; symlinks
+    never followed or listed.
+  - `GET /api/sandboxes/{id}/files/{path}` — text read capped at 256 KiB
+    (`truncated` flag); NUL-carrying reads → `binary: true, text: null`
+    (UI offers `?download=1` FileResponse instead). Traversal, absolute
+    paths, symlink escapes → 404; `..` that stays inside the root
+    resolves normally.
+  - `GET .../files/{path}?diff=<other_sandbox_id>` — unified diff
+    (`difflib`, `a/`+`b/` labels) of the same path in both browse roots.
+    A path absent on one side diffs against empty (`a_missing`/
+    `b_missing`); absent on both → 404. Per-side input cap 1 MiB, output
+    cap 10k lines; binary sides → `binary: true`, empty `diff`.
+    `response_model=None` on the route (union of Response/FileContentOut/
+    FileDiffOut).
+- **UI** (`web/app/runs/[id]/results/FileBrowser.tsx` + `web/lib/
+  fileBrowser.ts`): browse mode renders the flat listing as a
+  collapsible tree (`buildFileTree` synthesizes parents a truncated
+  listing missed). Diff mode applies the PR10 split idiom
+  (`mergeFileLists` — ONE merged ordering of both sides' paths, each row
+  carrying its left/right cell, single-sided files facing an empty lane)
+  with a `only-left / only-right / shared` summary header; the viewer
+  renders `parseDiffLines`-classified rows (meta/hunk/add/del/context).
+  No diff library added — the server produces the format.
+- **Files:** `api/routers/results.py`, `tests/unit/api/test_results.py`,
+  `web/lib/api.ts`, `web/lib/fileBrowser.ts`,
+  `web/lib/fileBrowser.test.ts`,
+  `web/app/runs/[id]/results/FileBrowser.tsx`,
+  `web/app/runs/[id]/results/ResultsClient.tsx`, `web/app/globals.css`.
+- **Tests:** `tests/unit/api/test_results.py` PR34 section — fixture
+  workspace listing (paths, exclusions, `root:"workspace"`), text read +
+  256 KiB cap, `?download=1` attachment, `?diff=` valid unified format +
+  missing-side/binary/identical cases, `../` (incl. sibling-workspace
+  escape) + absolute-path + dir-as-file → 404, prompt-cell
+  `output.txt`/`meta.json` listing with `root:"artifact"`.
+  `web/lib/fileBrowser.test.ts` —
+  tree nesting/sorting, merged-lane ordering + single-sided rows,
+  summary counts, diff-line classification.
+- **Verify:** browse a 2048 artifact → `index.html` opens in the viewer;
+  diff two sandboxes' `index.html` → unified diff; percent-encoded
+  `..%2f` traversal and absolute paths → 404.
+- **Depends on:** F8 (results matrix + artifact jail), F12 (`sandbox/
+  preview.py` `resolve_artifact_dir`/`resolve_workspace_dir` helpers),
+  F18 (prompt-cell artifact root as a browse target).
 
 ## Implementation sequence
 

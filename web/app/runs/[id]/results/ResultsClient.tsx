@@ -11,6 +11,11 @@
  *
  * PR5 adds eval iteration: a rubric-version selector (?rubric_version=) plus
  * re-score / edit-rubric controls ({@link RescoreControls}).
+ *
+ * PR34 adds the artifact file browser: a `📂 browse` chip per artifact row
+ * opens {@link FileBrowser} — jailed file tree + size-capped viewer, with a
+ * "diff vs" peer picker rendering server-side unified diffs in the PR10
+ * merged-lane split idiom.
  */
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -48,6 +53,7 @@ import {
   WarnNote,
 } from "@/components/ui";
 import AnalyticsSection from "./AnalyticsSection";
+import FileBrowser from "./FileBrowser";
 import GridView from "./GridView";
 import OutputView from "./OutputView";
 import PreviewControls from "./PreviewControls";
@@ -164,6 +170,8 @@ export default function ResultsClient({ runId }: { runId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [unavailable, setUnavailable] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // PR34: sandbox_id whose artifact files the browser modal is showing.
+  const [browseFor, setBrowseFor] = useState<string | null>(null);
   // PR5: pinned rubric version for the score matrix — null = newest-wins.
   // Scoped to runId like the other loaded state (no remount between runs).
   const [versionSel, setVersionSel] = useState<{ id: string; v: number | null }>({
@@ -869,7 +877,7 @@ export default function ResultsClient({ runId }: { runId: string }) {
                             {sb.artifact_path ?? <span className="faint">—</span>}
                           </td>
                           <td>
-                            {artifactIds.length > 0 ? (
+                            {artifactIds.length > 0 || sb.artifact_path ? (
                               <div className="chip-row">
                                 {artifactIds.map((id) => (
                                   <a
@@ -888,12 +896,26 @@ export default function ResultsClient({ runId }: { runId: string }) {
                                     filename={outputArt.path?.split("/").pop() || "output.txt"}
                                   />
                                 ) : null}
+                                {artifactIds.length === 0 ? (
+                                  <span className="faint" style={{ fontSize: "0.8rem" }}>
+                                    id not exposed by API yet
+                                  </span>
+                                ) : null}
+                                {sb.artifact_path ? (
+                                  <button
+                                    type="button"
+                                    className="chip"
+                                    style={{ textDecoration: "none" }}
+                                    onClick={() => setBrowseFor(sb.sandbox_id)}
+                                    title="Browse the artifact's files (workspace/, or output.txt for prompt cells) and diff them against a sibling"
+                                  >
+                                    📂 browse
+                                  </button>
+                                ) : null}
                               </div>
                             ) : (
                               <span className="faint" style={{ fontSize: "0.8rem" }}>
-                                {sb.artifact_path
-                                  ? "id not exposed by API yet"
-                                  : "no artifact"}
+                                no artifact
                               </span>
                             )}
                           </td>
@@ -935,6 +957,27 @@ export default function ResultsClient({ runId }: { runId: string }) {
           </>
         )}
       </div>
+
+      {browseFor
+        ? (() => {
+            const sb = sandboxes.find((x) => x.sandbox_id === browseFor);
+            if (!sb) return null;
+            const rowLabel = (x: SandboxResult) =>
+              `${x.name ?? harnessConfigLabel(x.harness_config)} · ${shortId(x.sandbox_id)}`;
+            return (
+              <FileBrowser
+                sandboxId={browseFor}
+                label={rowLabel(sb)}
+                peers={sandboxes
+                  .filter(
+                    (x) => x.sandbox_id !== browseFor && !!x.artifact_path,
+                  )
+                  .map((x) => ({ id: x.sandbox_id, label: rowLabel(x) }))}
+                onClose={() => setBrowseFor(null)}
+              />
+            );
+          })()
+        : null}
     </main>
   );
 }
