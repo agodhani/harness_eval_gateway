@@ -292,6 +292,44 @@ def test_upload_corrupt_zip_is_422_and_leaves_nothing(api) -> None:
     assert staged == []  # nothing kept — no orphan for resolve_upload_archive
 
 
+def test_upload_non_utf8_zip_name_is_422_and_leaves_nothing(api) -> None:
+    """A central-directory name flagged UTF-8 that isn't valid UTF-8 raises
+    UnicodeDecodeError inside ``ZipFile()`` — the SeedError boundary turns
+    that into a 422, never a 500 + orphaned staged dir."""
+    raw = bytearray(_zip_bytes({"x.py": "1"}))
+    cd = raw.find(b"PK\x01\x02")
+    assert cd > 0
+    for start in (0, cd):
+        at = raw.find(b"x.py", start)
+        assert at > 0
+        raw[at] = 0xFF  # invalid UTF-8 byte, same length
+    raw[7] |= 0x08  # local-header flag bit 11: "name is UTF-8"
+    raw[cd + 9] |= 0x08  # central-directory flag bit 11
+    resp = api.client.post(
+        "/api/uploads",
+        files={"file": ("badname.zip", bytes(raw), "application/zip")},
+    )
+    assert resp.status_code == 422, resp.text
+    assert "unsafe archive" in resp.json()["detail"]
+    root = Path(api.settings.UPLOADS_DIR)
+    staged = list(root.iterdir()) if root.is_dir() else []
+    assert staged == []
+
+
+def test_upload_meta_write_failure_leaves_nothing(api, monkeypatch) -> None:
+    """``_write_meta`` sits outside the streaming/check guards — an OSError
+    there must still rmtree the staged dir, not orphan resolvable bytes."""
+    def boom(upload_dir: Path, meta: dict) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(uploads_router, "_write_meta", boom)
+    with pytest.raises(OSError, match="disk full"):
+        _post_zip(api.client, {"app.py": "x"})
+    root = Path(api.settings.UPLOADS_DIR)
+    staged = list(root.iterdir()) if root.is_dir() else []
+    assert staged == []
+
+
 def test_upload_over_cap_is_413(api) -> None:
     """The cap counts RAW upload bytes (pre-extraction) — incompressible
     random content keeps the multipart file itself over the 1 MiB test cap."""

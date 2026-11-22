@@ -345,6 +345,62 @@ def test_dir_members_count_toward_the_file_cap(tmp_path: Path) -> None:
         seeds.extract_archive(p, tmp_path / "out", max_files=6)
 
 
+def test_check_and_extract_translate_non_utf8_member_name(tmp_path: Path) -> None:
+    """A zip member flagged UTF-8 (bit 11) whose name bytes aren't valid
+    UTF-8 makes ``ZipFile()`` raise UnicodeDecodeError while parsing the
+    central directory — a ValueError the SeedError boundary must translate
+    at upload-check AND extraction alike."""
+    raw = bytearray(_zip_bytes({"x.py": "1"}))
+    cd = raw.find(b"PK\x01\x02")
+    assert cd > 0
+    for start in (0, cd):
+        at = raw.find(b"x.py", start)
+        assert at > 0
+        raw[at] = 0xFF  # invalid UTF-8 byte, same length
+    raw[7] |= 0x08  # local-header flag bit 11: "name is UTF-8"
+    raw[cd + 9] |= 0x08  # central-directory flag bit 11
+    p = tmp_path / "utf8.zip"
+    p.write_bytes(bytes(raw))
+    assert zipfile.is_zipfile(p)  # premise: the tail check never decodes names
+    with pytest.raises(seeds.SeedError):
+        seeds.check_archive(p)
+    with pytest.raises(seeds.SeedError):
+        seeds.extract_archive(p, tmp_path / "out")
+
+
+def test_zip_member_cap_counts_records_not_the_declared_total(
+    tmp_path: Path,
+) -> None:
+    """The file cap now binds parse memory, so the pre-parse check counts
+    actual central-directory records — an EOCD whose declared total lies
+    can't sneak a member flood past it."""
+    raw = bytearray(_zip_bytes({f"f{i}.py": "x" for i in range(4)}))
+    eocd = raw.rfind(b"PK\x05\x06")
+    assert eocd > 0
+    raw[eocd + 10 : eocd + 12] = (0).to_bytes(2, "little")  # declares 0
+    p = tmp_path / "forged.zip"
+    p.write_bytes(bytes(raw))
+    assert zipfile.is_zipfile(p)  # premise: magic check only reads the EOCD
+    assert seeds._zip_member_count(p, limit=64) == 4  # 4 real records
+    with pytest.raises(seeds.SeedError, match="file cap"):
+        seeds.check_archive(p, max_files=3)
+    with pytest.raises(seeds.SeedError, match="file cap"):
+        seeds.extract_archive(p, tmp_path / "out", max_files=3)
+
+
+def test_tar_member_cap_applies_while_streaming(tmp_path: Path) -> None:
+    """getmembers() materialized the whole member list before the cap could
+    apply — the streamed header pass must reject a many-member tar the same
+    way at check AND extract."""
+    p = tmp_path / "many.tar"
+    p.write_bytes(_tar_bytes({f"f{i}.py": "x" for i in range(4)}))
+    assert seeds.check_archive(p, max_files=4) == "tar"
+    with pytest.raises(seeds.SeedError, match="file cap"):
+        seeds.check_archive(p, max_files=3)
+    with pytest.raises(seeds.SeedError, match="file cap"):
+        seeds.extract_archive(p, tmp_path / "out", max_files=3)
+
+
 # ---------------------------------------------------------------------------
 # hash_tree + copy_seed
 # ---------------------------------------------------------------------------

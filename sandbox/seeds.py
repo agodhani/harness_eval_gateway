@@ -109,6 +109,9 @@ _ARCHIVE_ERRORS = (
     EOFError,
     OSError,
     RuntimeError,  # NotImplementedError, missing-codec and password errors
+    # UnicodeDecodeError — e.g. a zip member flagged UTF-8 whose name bytes
+    # aren't valid UTF-8, raised while ZipFile parses the central directory.
+    ValueError,
     zlib.error,
 ) + ((lzma.LZMAError,) if lzma is not None else ())
 
@@ -256,7 +259,109 @@ def _check_member_conflicts(named: list[tuple[PurePosixPath, bool]]) -> None:
         dirs.update(rel.parents)
 
 
-def _iter_zip_members(archive: Path) -> Iterator[_Member]:
+#: Zip container signatures used to bound member enumeration BEFORE
+#: ``zipfile`` materializes every ZipInfo — a capped upload can still carry
+#: millions of ~46-byte central-directory records (~2-3GB of parsed
+#: objects), so the file cap must trip while the CD is still just bytes.
+_CD_SIG = b"PK\x01\x02"
+_CD_FIXED_LEN = 46
+_EOCD_SIG = b"PK\x05\x06"
+_EOCD64_SIG = b"PK\x06\x06"
+_EOCD64_LOC_SIG = b"PK\x06\x07"
+_EOCD_TAIL = 22 + 0xFFFF  # shortest EOCD + the longest legal zip comment
+
+
+def _zip_cd_layout(path: Path) -> tuple[int, int, int] | None:
+    """``(start, size, declared_entries)`` of the central directory, located
+    from the EOCD tail (zip64-aware) — None when the records can't be
+    parsed, in which case ``ZipFile``'s own error path reports the archive.
+
+    ``start`` is derived from where the CD *ends* — immediately before the
+    EOCD, or before the zip64 EOCD — which sidesteps the concat/self-
+    extracting offset drift that makes the declared ``cd_offset``
+    unreliable.
+    """
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            f.seek(max(0, size - _EOCD_TAIL))
+            tail_start = f.tell()
+            tail = f.read()
+        idx = len(tail)
+        while True:  # a zip comment can hold the signature — verify the tail
+            idx = tail.rfind(_EOCD_SIG, 0, idx)
+            if idx < 0 or idx + 22 > len(tail):
+                return None
+            comment = int.from_bytes(tail[idx + 20 : idx + 22], "little")
+            if idx + 22 + comment == len(tail):
+                break
+        entries = int.from_bytes(tail[idx + 10 : idx + 12], "little")
+        cd_size = int.from_bytes(tail[idx + 12 : idx + 16], "little")
+        cd_off = int.from_bytes(tail[idx + 16 : idx + 20], "little")
+        cd_end = tail_start + idx
+        if entries == 0xFFFF or cd_size == 0xFFFFFFFF or cd_off == 0xFFFFFFFF:
+            # zip64 — the locator is the fixed 20 bytes before the EOCD.
+            if idx < 20 or tail[idx - 20 : idx - 16] != _EOCD64_LOC_SIG:
+                return None
+            z64 = int.from_bytes(tail[idx - 12 : idx - 4], "little")
+            with path.open("rb") as f:
+                f.seek(z64)
+                rec = f.read(56)
+            if len(rec) < 56 or rec[:4] != _EOCD64_SIG:
+                return None
+            entries = int.from_bytes(rec[32:40], "little")
+            cd_size = int.from_bytes(rec[40:48], "little")
+            cd_end = z64
+        start = cd_end - cd_size
+        if start < 0:
+            return None
+        return start, cd_size, entries
+    except OSError:
+        return None
+
+
+def _zip_member_count(path: Path, *, limit: int) -> int | None:
+    """Central-directory entry count, scanned in bounded memory — the loop
+    stops once the count passes ``limit``. Records are counted rather than
+    trusting the EOCD's declared total, which a crafted archive can lie
+    about; the declared total is still used as a fast path (it is exact for
+    every well-formed zip). None when the CD can't be located."""
+    layout = _zip_cd_layout(path)
+    if layout is None:
+        return None
+    start, cd_size, declared = layout
+    if declared > limit:
+        return declared
+    count = 0
+    consumed = 0
+    try:
+        with path.open("rb") as f:
+            f.seek(start)
+            while consumed < cd_size and count <= limit:
+                head = f.read(_CD_FIXED_LEN)
+                if len(head) < _CD_FIXED_LEN or head[:4] != _CD_SIG:
+                    break
+                consumed += _CD_FIXED_LEN + (
+                    int.from_bytes(head[28:30], "little")  # filename len
+                    + int.from_bytes(head[30:32], "little")  # extra len
+                    + int.from_bytes(head[32:34], "little")  # comment len
+                )
+                f.seek(start + consumed)
+                count += 1
+    except OSError:
+        return None
+    return count
+
+
+def _iter_zip_members(archive: Path, *, max_files: int) -> Iterator[_Member]:
+    # Every materialized entry counts toward the cap (an archive of empty
+    # dirs floods inodes like a file flood does) — enforced BEFORE ZipFile
+    # parses the central directory so parse memory itself stays bounded.
+    count = _zip_member_count(archive, limit=max_files)
+    if count is not None and count > max_files:
+        raise SeedError(
+            f"archive exceeds the seed file cap ({max_files} entries)"
+        )
     with zipfile.ZipFile(archive) as zf:
         infos = zf.infolist()
         rels = [_member_relpath(i.filename) for i in infos]
@@ -302,21 +407,30 @@ def _iter_zip_members(archive: Path) -> Iterator[_Member]:
             )
 
 
-def _iter_tar_members(archive: Path) -> Iterator[_Member]:
+def _iter_tar_members(archive: Path, *, max_files: int) -> Iterator[_Member]:
     with tarfile.open(archive, "r:*") as tf:
-        members = tf.getmembers()
-        rels = [_member_relpath(m.name) for m in members]
-        _check_member_conflicts(
-            [
-                (rel, m.isdir())
-                for m, rel in zip(members, rels, strict=True)
-                if rel is not None
-            ]
-        )
-        prefix = _common_root_part([r for r in rels if r is not None])
-        for m, rel in zip(members, rels, strict=True):
+        # Stream headers via next() — getmembers() materializes every
+        # TarInfo before the cap could apply (a compressed tar of empty
+        # headers expands ~50x into parsed objects). Buffering stays
+        # bounded because we raise the moment the cap is exceeded; every
+        # materialized entry counts, dirs included — an archive of empty
+        # dirs floods inodes like a file flood does.
+        members: list[tuple[tarfile.TarInfo, PurePosixPath]] = []
+        while True:
+            m = tf.next()
+            if m is None:
+                break
+            rel = _member_relpath(m.name)
             if rel is None:
                 continue
+            members.append((m, rel))
+            if len(members) > max_files:
+                raise SeedError(
+                    f"archive exceeds the seed file cap ({max_files} entries)"
+                )
+        _check_member_conflicts([(rel, m.isdir()) for m, rel in members])
+        prefix = _common_root_part([rel for _, rel in members])
+        for m, rel in members:
             if prefix is not None:
                 if len(rel.parts) <= 1:
                     continue  # the stripped root entry itself
@@ -357,10 +471,12 @@ def _archive_kind(path: Path) -> str:
     raise SeedError(f"{path.name!r} is not a readable zip or tar archive")
 
 
-def _iter_members(archive: Path) -> Iterator[_Member]:
+def _iter_members(archive: Path, *, max_files: int) -> Iterator[_Member]:
     kind = _archive_kind(archive)
     inner = (
-        _iter_zip_members(archive) if kind == "zip" else _iter_tar_members(archive)
+        _iter_zip_members(archive, max_files=max_files)
+        if kind == "zip"
+        else _iter_tar_members(archive, max_files=max_files)
     )
     try:
         yield from inner
@@ -383,17 +499,9 @@ def check_archive(
     SeedError on unreadable archives, unsafe members, an archive with no
     files, or a member size/count over the same caps extraction enforces —
     a staged upload can never turn unusable at provisioning."""
-    count = 0
     files = 0
     total = 0
-    for member in _iter_members(archive):
-        # Every materialized entry counts — an archive of empty dirs can
-        # flood inodes under the cap just like a file flood can.
-        count += 1
-        if count > max_files:
-            raise SeedError(
-                f"archive exceeds the seed file cap ({max_files} entries)"
-            )
+    for member in _iter_members(archive, max_files=max_files):
         if member.is_dir:
             continue
         total += member.size
@@ -430,17 +538,11 @@ def extract_archive(
     Only regular files and dirs survive; caps stop decompression bombs.
     """
     written = 0
-    entries = 0
     total = 0
     try:
         root = dest.resolve()
         dest.mkdir(parents=True, exist_ok=True)
-        for member in _iter_members(archive):
-            entries += 1
-            if entries > max_files:
-                raise SeedError(
-                    f"archive exceeds the seed file cap ({max_files} entries)"
-                )
+        for member in _iter_members(archive, max_files=max_files):
             out = _jailed_join(root, member.relpath)
             if member.is_dir:
                 out.mkdir(parents=True, exist_ok=True)

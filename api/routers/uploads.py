@@ -151,7 +151,11 @@ async def upload_archive(
         "kind": kind,
         "uploaded_at": datetime.now(UTC).isoformat(),
     }
-    _write_meta(upload_dir, meta)
+    try:
+        _write_meta(upload_dir, meta)
+    except BaseException:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        raise
     log.info("staged upload %s (%s, %d bytes)", upload_id, filename, size)
     return UploadOut(
         id=upload_id,
