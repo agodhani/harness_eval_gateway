@@ -790,9 +790,10 @@ or tests change.
   the established `latency_ms`, kept for readers), and derived
   `tokens_per_sec` = completion tokens ÷ call wall seconds. Cache
   replays emit the timing but a null rate — they measure the store, not
-  the model. Analytics rolls them up as `ttft_ms` stats (avg/p95/max,
-  pooled) + `avg_tokens_per_sec` per cell and per model; events
-  predating the fields contribute no sample. The analysis page's
+  the model — and are excluded from every analytics timing stat
+  (latency included). Analytics rolls them up as `ttft_ms` stats
+  (avg/p95/max, pooled) + `avg_tokens_per_sec` per cell and per model;
+  events predating the fields contribute no sample. The analysis page's
   latency chart renders ttft avg/p95 bars next to avg/p95/max (hidden
   when a backend emits no ttft) plus an output-speed card (mean avg
   tok/s per cell), the timeline metrics strip gains a `spd` chip, and

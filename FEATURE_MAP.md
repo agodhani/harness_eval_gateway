@@ -219,7 +219,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     file persistence, namespace invalidation, miss→hit replay for buffered +
     SSE + /v1/messages + /v1/responses, cached-event flagging + usage
     metering, budget gate before lookup, non-2xx and unmetered bypass,
-    lookup/store failure degradation)
+    lookup/store failure degradation),
+    `test_speed_metrics.py` (PR30 ttft_ms/total_ms/tokens_per_sec on
+    buffered + streamed llm_response payloads, first-byte shim, replay →
+    null rate)
   - Manual: mint cred (`uv run python -m gateway.mint_cred`) →
     `curl localhost:8081/v1/chat/completions` → completion + event rows
   - M2 e2e proven: sandbox→gateway→Ollama→events (see run
@@ -476,7 +479,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (in/out/cache/total), latency (avg/p95/max), PR30 speed — `ttft_ms`
   (avg/p95/max first-byte stats) + `avg_tokens_per_sec` (mean per-call
   output rate; events without the gateway's speed fields contribute no
-  sample) — tool-call + skill-invocation
+  sample, and every timing stat skips `cached` replays — their timings
+  measure the store's serve time, not the model) — tool-call +
+  skill-invocation
   breakdowns, shell/file/test/error counts, wall clock, estimated cost at a
   selectable price model (`api/pricing.py` `PRICE_TABLE`; local models
   flagged `local` → $0). The tool-call mix merges `tool_call` events,
@@ -854,7 +859,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `_eval_boundaries`/`_is_eval_event` helpers, also used by the per-run
   endpoint), `api/schemas.py` (`RunTrendPoint`, `RunTrends`),
   `web/app/runs/[id]/analysis/` (`page.tsx`, `AnalysisClient.tsx`,
-  `charts.tsx`), `web/app/runs/[id]/results/ResultsClient.tsx` (`row-total`
+  `charts.tsx`), `web/lib/analysisRows.ts` + `analysisRows.test.ts`
+  (chart-row shapers — an absent metric stays absent, no phantom-zero
+  bar), `web/app/runs/[id]/results/ResultsClient.tsx` (`row-total`
   + `dimTotals`/`maxTotal` memos), `web/lib/scoreMath.ts` (weighted-total
   helper) + `web/lib/scoreMath.test.ts`, `web/lib/api.ts` (`getRunTrends`,
   `RunTrendPoint`, `RunTrends`), `web/lib/format.ts` (`formatNum`,
@@ -1461,7 +1468,9 @@ configurable per cell (e.g. temperature sweeps).
   full dump (nulls = unset) so pre-PR28 runs behave identically.
 - **Files:** `api/pricing.py` (`PriceBook`/`load_book`/`glob_matches`/
   cache-aware `estimate_cost_usd`), `api/routers/prices.py`,
-  `db/models.py::ModelPriceRow` + migration `c4e8d1a7f3b5`,
+  `db/models.py::ModelPriceRow` + migrations `c4e8d1a7f3b5`,
+  `d6e2b8f4a1c9` (case-insensitive `lower(model_glob)` unique index — the
+  DB enforces the identity the case-folding lookups assume),
   `gateway/creds.py` (`sandbox_max_tokens` claim), `gateway/metering.py`
   (`llm_usage_totals` prompt/completion/cache split + sandbox scoping),
   `gateway/main.py::_budget_gate`, `gateway/mint_cred.py`,
@@ -1477,15 +1486,16 @@ configurable per cell (e.g. temperature sweeps).
   precedence, layering, unpriced→None, cache-rate split),
   `tests/unit/api/test_prices.py` (GET/PUT/DELETE round-trip, e2e
   repricing, OpenRouter sync via mocked gateway client — mapping,
-  user-row protection, unpriced skip, update-vs-add),
+  user-row protection, unpriced skip, update-vs-add, lost-insert-race
+  convergence),
   `tests/unit/gateway/test_creds.py` + `test_metering.py` +
   `test_proxy.py` (claim roundtrip/validation, sandbox-scoped sums,
   per-cell 429 `limit=sandbox_tokens`, sibling isolation, service-cred
   exemption), `tests/unit/orchestrator/test_monitor.py` +
   `test_provision.py` (token cap → `limit=sandbox_tokens`, cost cap →
   `limit="cost"` priced model + model_prices row, unpriced can't trip),
-  `tests/unit/db/test_migrations.py` (head = `c4e8d1a7f3b5`, table
-  up/down + ORM roundtrip).
+  `tests/unit/db/test_migrations.py` (head = `d6e2b8f4a1c9`, table
+  up/down + ORM roundtrip + lower-glob uniqueness).
 - **Verify:** `uv run pytest tests/unit/api/test_pricing.py
   tests/unit/api/test_prices.py tests/unit/gateway
   tests/unit/orchestrator -q`; manual: PUT
