@@ -33,6 +33,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F18 | Prompt-only matrix cells (no-sandbox `prompt` adapter: one metered LLM call per cell, `output.txt` artifact, full results/eval pipeline) | ✅ | `orchestrator/prompt_cell.py`, `orchestrator/adapters.py` (pseudo-manifest), `orchestrator/lifecycle.py`, `evaluator/evaluate.py` (`prompt_output_path`), `web/app/runs/[id]/results/` (inline output view) | `tests/unit/orchestrator/test_prompt_cell.py`, `test_lifecycle.py` (prompt cases), `tests/unit/api/test_results.py` (prompt-cell cases) |
 | F19 | Artifact file browser + side-by-side diff (jailed listing/read endpoints; prompt cells browse the artifact root so `output.txt` stays reachable; server-side unified diffs) | ✅ | `api/routers/results.py` (`/api/sandboxes/{id}/files[/{path}]`), `web/app/runs/[id]/results/FileBrowser.tsx`, `web/lib/fileBrowser.ts`, `web/lib/api.ts` | `tests/unit/api/test_results.py` (PR34 section), `web/lib/fileBrowser.test.ts` |
 | F20 | Trials per cell + per-config model options (config × model × trials expansion, `mean ± sample sd (n=N)` grouped results + cell rollups, adapter-filtered `model_options`) | ✅ | `api/schemas.py`, `api/routers/{runs,results,analytics}.py`, `orchestrator/{matrix,lifecycle,provision,prompt_cell,adapters}.py`, `adapters/common/contract.py`, `db/migrations/versions/d7e9f1a3b5c7_runs_trials.py`, `web/lib/{api,trialGroups,resubmit}.ts`, `web/app/submit/page.tsx`, `web/app/runs/[id]/results/`, `web/app/runs/[id]/analysis/` | `tests/unit/orchestrator/test_matrix.py`, `test_provision.py`, `tests/unit/api/test_runs.py`, `test_analytics.py`, `tests/unit/db/test_migrations.py` |
+| F21 | Budgets & pricing accuracy (per-cell `sandbox_max_tokens`/`max_cost_usd` caps; `model_prices` glob rate table layered over the static `PRICE_TABLE` via `GET/PUT/DELETE /api/prices` + OpenRouter sync) | ✅ | `api/pricing.py` (`PriceBook`), `api/routers/prices.py`, `db/models.py::ModelPriceRow`, `gateway/creds.py`, `gateway/metering.py`, `orchestrator/monitor.py`, `web/components/AddRate.tsx`, `web/lib/api.ts` | `tests/unit/api/test_pricing.py`, `test_prices.py`, `tests/unit/gateway/` (creds/metering/proxy), `tests/unit/orchestrator/` (monitor/provision), `tests/unit/db/test_migrations.py` |
 
 ## Feature details
 
@@ -115,6 +116,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (`RUBRIC_GEN_TIMEOUT_SECONDS`, default 960) out-waits the gateway's
   worst-case upstream hold (~915s) so a congested draft can't abandon a
   call its retry would then overlap.
+- **Per-cell budgets (PR28):** the monitor enforces the run spec's
+  optional `sandbox_token_budget` (sandbox's own metered total) and
+  `max_cost_usd` (its estimated spend at the layered price table —
+  priced models only) per poll alongside the run ceiling; each trips
+  `budget_exceeded` with a terminate-checkpoint `limit` of
+  `sandbox_tokens`/`cost` (`run_tokens` for the shared ceiling).
 - **Pacing (PR15):** one active run at a time — approvals while a run
   executes (or is queued) park in `queued` and promote FIFO by approval
   (`pacing.place_run` / `claim_next_queued`; promotion is wired into
@@ -152,7 +159,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `/v1/responses` (Codex) pass-throughs, streaming preserved with a metering
   tee; `GET /v1/models` for CLI probes; per-run/sandbox HMAC credentials
   (`heg.<b64>.<sig>`); records tokens in/out, latency, failures; token
-  budgets (429 + `error` event); emits `llm_request`/`llm_response`/`error`
+  budgets (429 + `error` event) — the cred's `max_tokens` run ceiling plus,
+  since PR28, a `sandbox_max_tokens` per-cell claim metered against only
+  that sandbox's own usage; emits `llm_request`/`llm_response`/`error`
   events carrying the resolved upstream provider — every metered call is
   terminally accounted, so a client disconnect mid-stream or while the
   upstream request is in flight still lands `llm_response` (partial /
@@ -483,7 +492,13 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `estimated_cost_usd`/`evaluator_cost_usd` come back null rather than
   billed at the first table entry's rate; an explicit `?price_model=`
   still reprices uniformly (unknown key → 422). Every UI cost surface
-  renders "unpriced", never $0 or a stand-in model name.
+  renders "unpriced", never $0 or a stand-in model name. **PR28:** price
+  resolution now runs through the layered `PriceBook` — `model_prices`
+  glob rows (declared via `PUT /api/prices` or OpenRouter sync) match
+  first and shadow the static table; a glob is itself a valid
+  `?price_model=` pick, and cache-read tokens bill at a declared cache
+  rate instead of the input rate. The picker's "+ add rate" control PUTs
+  a row inline and folds it into the picker table on the spot (F21).
 - **Where:** `api/pricing.py`, `api/routers/analytics.py`, response schemas
   in `api/schemas.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx`,
   `web/lib/api.ts` (`getRunAnalytics`, `estimateCostUsd`),
@@ -1382,6 +1397,86 @@ configurable per cell (e.g. temperature sweeps).
   config with `temperature` submits 201 with a drop warning.
 - **Depends on:** F16 (config × model matrix), F8/F9 (results +
   analytics), F18 (prompt cells replicate through the same path).
+
+### F21 — Budgets & pricing accuracy (PR28) ✅
+
+**What:** budgets that can't be starved + prices that aren't guesses.
+
+- **Per-cell token cap** — `BudgetsIn.sandbox_token_budget` (optional)
+  mints into each participant cred as the `sandbox_max_tokens` claim;
+  the gateway `_budget_gate` meters it against ONLY that sandbox's own
+  `llm_response` total (a runaway cell starves itself, not siblings —
+  service/eval creds carry no claim and stay exempt), and the monitor's
+  poll is the backstop that terminates the cell `budget_exceeded` with
+  `payload.limit="sandbox_tokens"` once its own total crosses. The run
+  ceiling (`token_budget` → `limit="run_tokens"`) is unchanged.
+- **Per-cell cost cap** — `BudgetsIn.max_cost_usd` (optional): the
+  monitor prices the sandbox's own participant traffic each poll at its
+  own model through the layered price book (prompt/completion/cache-read
+  split) and terminates `budget_exceeded` with `payload.limit="cost"`.
+  Priced models only — an unpriced cell resolves `None` and can't trip
+  the cap (PR21 honesty: never a guessed rate). Terminate checkpoints
+  now carry `limit` + the numbers that fired (`used_tokens`/`budget`,
+  `estimated_cost_usd`/`budget_usd`) for all three limits.
+- **`model_prices` table + `GET/PUT/DELETE /api/prices`** —
+  user-editable rates keyed by case-insensitive fnmatch `model_glob`
+  (`gpt-4*`), first match in declaration order wins, layered OVER the
+  static `PRICE_TABLE`: a glob hit is the price key analytics resolves
+  (and a valid `?price_model=` pick); a glob equal to a static key
+  shadows it. `cache_read_per_mtok_usd` NULL bills cached input at the
+  input rate; `local` marks free inference — PUT 422s `local` beside any
+  nonzero rate (the pickers render "local — $0"), so free rows can't
+  silently bill. A bare (no `/`) glob never
+  matches `vendor/model` ids — write `openai/*` deliberately.
+- **`POST /api/prices/sync`** — pulls the OpenRouter `/models` catalog
+  THROUGH the gateway (`x-heg-provider: openrouter` service-cred
+  override; the api never talks to providers). `pricing.*` USD-per-token
+  strings are stored as per-Mtok rates (`input_cache_read` →
+  `cache_read_per_mtok_usd`); entries with no parseable prompt or
+  completion rate are skipped rather than priced-free; `source="user"`
+  rows are never clobbered. 400s when openrouter isn't a configured
+  provider.
+- **UI** — both cost pickers (results Analytics card + analysis page)
+  gain "+ add rate" (PUT /api/prices inline; the new glob folds into the
+  picker table immediately and is selected); submit Budgets gains the
+  two optional per-cell fields (empty = unset). `Budgets.sandbox_token_budget`
+  / `max_cost_usd` are nullable in `BudgetsIn`; the run config stores the
+  full dump (nulls = unset) so pre-PR28 runs behave identically.
+- **Files:** `api/pricing.py` (`PriceBook`/`load_book`/`glob_matches`/
+  cache-aware `estimate_cost_usd`), `api/routers/prices.py`,
+  `db/models.py::ModelPriceRow` + migration `c4e8d1a7f3b5`,
+  `gateway/creds.py` (`sandbox_max_tokens` claim), `gateway/metering.py`
+  (`llm_usage_totals` prompt/completion/cache split + sandbox scoping),
+  `gateway/main.py::_budget_gate`, `gateway/mint_cred.py`,
+  `orchestrator/provision.py` (`budgets_for`, `mint_sandbox_cred`),
+  `orchestrator/monitor.py` (per-cell poll checks + terminate detail),
+  `api/routers/analytics.py` (book-resolved keys), `web/lib/api.ts`
+  (prices fns, `globMatch`/`matchPriceKey`, cache-aware `estimateCostUsd`),
+  `web/components/AddRate.tsx`, `web/app/submit/page.tsx`,
+  `web/app/runs/[id]/results/AnalyticsSection.tsx`,
+  `web/app/runs/[id]/analysis/AnalysisClient.tsx`.
+- **Tests:** `tests/unit/api/test_pricing.py` (glob rules, first-match
+  precedence, layering, unpriced→None, cache-rate split),
+  `tests/unit/api/test_prices.py` (GET/PUT/DELETE round-trip, e2e
+  repricing, OpenRouter sync via mocked gateway client — mapping,
+  user-row protection, unpriced skip, update-vs-add),
+  `tests/unit/gateway/test_creds.py` + `test_metering.py` +
+  `test_proxy.py` (claim roundtrip/validation, sandbox-scoped sums,
+  per-cell 429 `limit=sandbox_tokens`, sibling isolation, service-cred
+  exemption), `tests/unit/orchestrator/test_monitor.py` +
+  `test_provision.py` (token cap → `limit=sandbox_tokens`, cost cap →
+  `limit="cost"` priced model + model_prices row, unpriced can't trip),
+  `tests/unit/db/test_migrations.py` (head = `c4e8d1a7f3b5`, table
+  up/down + ORM roundtrip).
+- **Verify:** `uv run pytest tests/unit/api/test_pricing.py
+  tests/unit/api/test_prices.py tests/unit/gateway
+  tests/unit/orchestrator -q`; manual: PUT
+  `{"model_glob":"gpt-4o","input_per_mtok_usd":2.5,"output_per_mtok_usd":10}`
+  → analytics cost appears; submit a run with `max_cost_usd: 0.05` →
+  sandbox terminates `budget_exceeded` (checkpoint `limit: "cost"`);
+  unlisted model still shows `unpriced`.
+- **Depends on:** PR21 (unpriced honesty this makes permanent), F3
+  (creds/metering), F9 (analytics cost surface).
 
 ## Implementation sequence
 

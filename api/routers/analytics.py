@@ -19,9 +19,10 @@
 - ``empty_workspace`` flags sandboxes whose monitor-side finalize found a
   workspace with no real files (``sandbox_finalized`` payload /
   ``stage="empty_workspace"`` warning — see orchestrator/monitor.py).
-- ``estimated_cost_usd`` at the selected ``price_model`` (api/pricing.py
-  ``PRICE_TABLE``); auto mode (no param) costs each sandbox at its own
-  participant model's listed rate. Unlisted models are **unpriced** (PR21):
+- ``estimated_cost_usd`` at the selected ``price_model`` (api/pricing.py —
+  the ``model_prices`` glob table layered over the static ``PRICE_TABLE``,
+  PR28); auto mode (no param) costs each sandbox at its own participant
+  model's resolved rate. Unlisted models are **unpriced** (PR21):
   ``price_model``/``estimated_cost_usd`` come back null instead of being
   billed at another model's rate.
 
@@ -53,9 +54,9 @@ from sqlalchemy.orm import Session
 
 from api.deps import get_db
 from api.pricing import (
-    PRICE_TABLE,
     ModelPrice,
     estimate_cost_usd,
+    load_book,
     resolve_price_model,
 )
 from api.schemas import (
@@ -308,6 +309,7 @@ def _eval_activity(
                     eval_price,
                     input_tokens=eval_agg.tokens.input,
                     output_tokens=eval_agg.tokens.output,
+                    cache_read_tokens=eval_agg.tokens.cache_read,
                 ),
                 6,
             )
@@ -350,24 +352,27 @@ def get_run_analytics(
     # (what-if view); omitted → auto mode, each sandbox costed at its OWN
     # participant model's listed rate. PR21: unlisted models are unpriced —
     # price_model/estimated_cost_usd come back null rather than billed at a
-    # fallback rate. Response price_model is the explicit key or None —
-    # mirrors RunTrends.
+    # fallback rate. PR28: all resolution goes through the layered PriceBook —
+    # a matching model_prices glob wins over the static table (and is itself
+    # a valid explicit pick). Response price_model is the resolved explicit
+    # key or None — mirrors RunTrends.
+    book = load_book(session)
     explicit_key: str | None = None
     if price_model is not None:
-        explicit_key = resolve_price_model(price_model, run.model_name)
+        explicit_key = resolve_price_model(price_model, run.model_name, book)
         if explicit_key is None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     f"unknown price_model {price_model!r}; "
-                    f"known: {sorted(PRICE_TABLE)}"
+                    f"known: {sorted(book.table())}"
                 ),
             )
 
     def _price_key(model: str) -> str | None:
         if explicit_key is not None:
             return explicit_key
-        return model if model in PRICE_TABLE else None
+        return book.key_for(model)
 
     sandboxes = (
         session.execute(
@@ -428,8 +433,8 @@ def get_run_analytics(
     # ?price_model= what-if reprice which applies the picked rate.
     cfg = run.config or {}
     evaluator_model = cfg.get("evaluator_model") or run.model_name
-    eval_price = PRICE_TABLE.get(evaluator_model) or (
-        PRICE_TABLE[explicit_key] if explicit_key else None
+    eval_price = book.price_for(book.key_for(evaluator_model)) or (
+        book.price_for(explicit_key) if explicit_key else None
     )
 
     out: list[SandboxAnalytics] = []
@@ -437,7 +442,7 @@ def get_run_analytics(
         agg = participant[sb.id]
         model = sb_model[sb.id]
         price_key = _price_key(model)
-        price = PRICE_TABLE.get(price_key) if price_key else None
+        price = book.price_for(price_key)
         out.append(
             SandboxAnalytics(
                 sandbox_id=sb.id,
@@ -460,6 +465,7 @@ def get_run_analytics(
                             price,
                             input_tokens=agg.tokens.input,
                             output_tokens=agg.tokens.output,
+                            cache_read_tokens=agg.tokens.cache_read,
                         ),
                         6,
                     )
@@ -495,7 +501,7 @@ def get_run_analytics(
     for model in ordered_models:
         agg = participant_by_model.get(model, _Agg())
         price_key = _price_key(model)
-        price = PRICE_TABLE.get(price_key) if price_key else None
+        price = book.price_for(price_key)
         metrics = _agg_metrics(agg)
         metrics["wall_clock_seconds"] = model_wall_clock.get(model, 0.0)
         models_out.append(
@@ -510,6 +516,7 @@ def get_run_analytics(
                             price,
                             input_tokens=agg.tokens.input,
                             output_tokens=agg.tokens.output,
+                            cache_read_tokens=agg.tokens.cache_read,
                         ),
                         6,
                     )
@@ -562,7 +569,7 @@ def get_run_analytics(
         first = members[0]
         model = sb_model[first.id]
         price_key = _price_key(model)
-        price = PRICE_TABLE.get(price_key) if price_key else None
+        price = book.price_for(price_key)
         metrics = _agg_metrics(agg)
         metrics["wall_clock_seconds"] = round(
             sum(participant[sb.id].wall_clock_seconds() for sb in members), 3
@@ -581,6 +588,7 @@ def get_run_analytics(
                             price,
                             input_tokens=agg.tokens.input,
                             output_tokens=agg.tokens.output,
+                            cache_read_tokens=agg.tokens.cache_read,
                         ),
                         6,
                     )
@@ -602,7 +610,8 @@ def get_run_analytics(
         run_id=run.id,
         model_name=run.model_name,
         price_model=explicit_key,
-        price_table=PRICE_TABLE,
+        price_table=book.table(),
+        price_globs=book.globs(),
         sandboxes=out,
         models=models_out,
         cells=cells_out,
@@ -625,14 +634,20 @@ def get_run_trends(
     model makes the whole point unpriced (PR21: a partial total would read
     as complete).
     """
-    if price_model is not None and price_model not in PRICE_TABLE:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(
-                f"unknown price_model {price_model!r}; "
-                f"known: {sorted(PRICE_TABLE)}"
-            ),
-        )
+    # PR28: explicit picks resolve through the layered book — a model_prices
+    # glob is a valid ?price_model= and shadows the static key it covers.
+    book = load_book(session)
+    explicit_key: str | None = None
+    if price_model is not None:
+        explicit_key = resolve_price_model(price_model, book=book)
+        if explicit_key is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"unknown price_model {price_model!r}; "
+                    f"known: {sorted(book.table())}"
+                ),
+            )
 
     runs = (
         session.execute(
@@ -723,14 +738,14 @@ def get_run_trends(
         # Explicit param reprices every run uniformly; else the run's own
         # resolved price — None when the run's model isn't listed (unpriced).
         selected = (
-            price_model
-            if price_model is not None
-            else resolve_price_model(None, run.model_name)
+            explicit_key
+            if explicit_key is not None
+            else resolve_price_model(None, run.model_name, book)
         )
         # Judge traffic: the evaluator model's own rate when listed, else
         # the explicit pick (what-if reprice) — never another model's rate.
-        eval_price = PRICE_TABLE.get(evaluator_model) or (
-            PRICE_TABLE[price_model] if price_model is not None else None
+        eval_price = book.price_for(book.key_for(evaluator_model)) or (
+            book.price_for(explicit_key) if explicit_key is not None else None
         )
 
         agg = participant[run.id]
@@ -746,18 +761,20 @@ def get_run_trends(
         unpriced = False
         used_keys: set[str] = set()
         for model, mb in participant_by_model.get(run.id, {}).items():
-            key = price_model or (model if model in PRICE_TABLE else None)
-            if key is None:
+            key = explicit_key or book.key_for(model)
+            price = book.price_for(key)
+            if price is None or key is None:
                 unpriced = True
                 continue
             used_keys.add(key)
             cost += estimate_cost_usd(
-                PRICE_TABLE[key],
+                price,
                 input_tokens=mb.tokens.input,
                 output_tokens=mb.tokens.output,
+                cache_read_tokens=mb.tokens.cache_read,
             )
-        if price_model is not None:
-            point_price_model = price_model
+        if explicit_key is not None:
+            point_price_model = explicit_key
         elif unpriced or len(used_keys) > 1:
             point_price_model = None
         elif used_keys:
@@ -790,6 +807,9 @@ def get_run_trends(
                             eval_price,
                             input_tokens=eval_agg.tokens.input if eval_agg else 0,
                             output_tokens=eval_agg.tokens.output if eval_agg else 0,
+                            cache_read_tokens=(
+                                eval_agg.tokens.cache_read if eval_agg else 0
+                            ),
                         ),
                         6,
                     )
@@ -803,7 +823,7 @@ def get_run_trends(
         )
 
     return RunTrends(
-        price_model=price_model,
-        price_table=PRICE_TABLE,
+        price_model=explicit_key,
+        price_table=book.table(),
         points=points,
     )

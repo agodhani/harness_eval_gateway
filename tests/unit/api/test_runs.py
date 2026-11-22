@@ -246,6 +246,9 @@ def test_create_run_defaults(api) -> None:
         "max_iters": 50,
         "token_budget": 200_000,
         "wall_clock_seconds": 3600,
+        # PR28: optional per-sandbox caps default unset (no per-cell limit).
+        "sandbox_token_budget": None,
+        "max_cost_usd": None,
     }
     # evaluator defaults to participant model -> same_model_eval flag
     assert cfg["evaluator_model"] == "qwen3:8b"

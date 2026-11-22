@@ -141,12 +141,19 @@ def build_env(
 
 def budgets_for(run: Run) -> dict[str, Any]:
     budgets = (run.config or {}).get("budgets") or {}
+    # PR28 optional per-cell caps — absent (or stored null from an older
+    # spec) means no per-sandbox limit. Both flow to the monitor; the token
+    # cap additionally mints into each participant cred.
+    sandbox_tokens = budgets.get("sandbox_token_budget")
+    max_cost = budgets.get("max_cost_usd")
     return {
         "max_iters": int(budgets.get("max_iters", DEFAULT_MAX_ITERS)),
         "token_budget": int(budgets.get("token_budget", DEFAULT_TOKEN_BUDGET)),
         "wall_clock_seconds": int(
             budgets.get("wall_clock_seconds", DEFAULT_WALL_CLOCK_SECONDS)
         ),
+        "sandbox_token_budget": int(sandbox_tokens) if sandbox_tokens else None,
+        "max_cost_usd": float(max_cost) if max_cost else None,
     }
 
 
@@ -157,13 +164,24 @@ def mint_sandbox_cred(
     secret: str,
     budgets: dict[str, Any],
 ) -> str:
-    """Participant cred: sandbox-scoped, token-capped, TTL > wall clock."""
+    """Participant cred: sandbox-scoped, token-capped, TTL > wall clock.
+
+    Carries BOTH ceilings (PR28): ``max_tokens`` is the run-wide token
+    budget shared with siblings, ``sandbox_max_tokens`` caps this one
+    sandbox's own total — the gateway enforces both per request, so the
+    per-cell cap can't be starved by one hot cell eating the run budget.
+    """
     return mint_cred(
         run_id=run_id,
         sandbox_id=sandbox_id,
         secret=secret,
         ttl_seconds=int(budgets["wall_clock_seconds"]) + CRED_TTL_GRACE_SECONDS,
         max_tokens=int(budgets["token_budget"]),
+        sandbox_max_tokens=(
+            int(budgets["sandbox_token_budget"])
+            if budgets.get("sandbox_token_budget")
+            else None
+        ),
     )
 
 

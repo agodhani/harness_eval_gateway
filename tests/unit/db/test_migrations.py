@@ -20,8 +20,10 @@ import api.config
 REPO_ROOT = Path(__file__).resolve().parents[3]
 INITIAL_REV = "f0a1b2c3d4e5"
 SANDBOX_NAME_REV = "a2b3c4d5e6f7"
-# PR27: new single head — adds ``runs.trials`` (int, default 1).
+# PR27: adds ``runs.trials`` (int, default 1).
 RUNS_TRIALS_REV = "d7e9f1a3b5c7"
+# PR28 — current chain head (re-chained on top of RUNS_TRIALS_REV).
+MODEL_PRICES_REV = "c4e8d1a7f3b5"
 
 
 @pytest.fixture()
@@ -53,7 +55,7 @@ def _columns(url: str, table: str) -> set[str]:
 
 def test_migration_chain_single_headed() -> None:
     heads = ScriptDirectory.from_config(_cfg()).get_heads()
-    assert list(heads) == [RUNS_TRIALS_REV]
+    assert list(heads) == [MODEL_PRICES_REV]
 
 
 def test_sandbox_name_upgrade_downgrade(sqlite_url: str) -> None:
@@ -80,6 +82,79 @@ def test_sandbox_name_matches_model(sqlite_url: str) -> None:
         )
         assert col["nullable"] is True
         assert str(col["type"]) == "VARCHAR(255)"
+    finally:
+        engine.dispose()
+
+
+def test_model_prices_upgrade_downgrade(sqlite_url: str) -> None:
+    """PR28 — model_prices table lands at head and drops cleanly."""
+    command.upgrade(_cfg(), "head")
+    cols = _columns(sqlite_url, "model_prices")
+    assert {
+        "id",
+        "model_glob",
+        "input_per_mtok_usd",
+        "output_per_mtok_usd",
+        "cache_read_per_mtok_usd",
+        "local",
+        "source",
+        "created_at",
+        "updated_at",
+    } <= cols
+
+    # model_glob is the upsert key — must be unique
+    engine = create_engine(sqlite_url)
+    try:
+        uniques = {
+            tuple(u["column_names"])
+            for u in inspect(engine).get_unique_constraints("model_prices")
+        }
+        assert ("model_glob",) in uniques
+        # cache_read nullable — providers without a cache rate store NULL
+        col = next(
+            c
+            for c in inspect(engine).get_columns("model_prices")
+            if c["name"] == "cache_read_per_mtok_usd"
+        )
+        assert col["nullable"] is True
+    finally:
+        engine.dispose()
+
+    command.downgrade(_cfg(), SANDBOX_NAME_REV)
+    engine = create_engine(sqlite_url)
+    try:
+        assert "model_prices" not in inspect(engine).get_table_names()
+    finally:
+        engine.dispose()
+
+
+def test_model_prices_roundtrip_on_sqlite(sqlite_url: str) -> None:
+    """A migrated DB accepts + reads back a price row (ORM matches schema)."""
+    from db.models import ModelPriceRow
+    from db.session import make_engine, make_session_factory
+
+    command.upgrade(_cfg(), "head")
+    engine = make_engine(sqlite_url)
+    sf = make_session_factory(engine)
+    try:
+        with sf() as s:
+            s.add(
+                ModelPriceRow(
+                    model_glob="mig-test-*",
+                    input_per_mtok_usd=1.25,
+                    output_per_mtok_usd=2.5,
+                    cache_read_per_mtok_usd=None,
+                    local=False,
+                    source="user",
+                )
+            )
+            s.commit()
+        with sf() as s:
+            row = s.query(ModelPriceRow).filter_by(model_glob="mig-test-*").one()
+            assert row.input_per_mtok_usd == 1.25
+            assert row.local is False
+            assert row.created_at is not None
+            assert row.updated_at is not None
     finally:
         engine.dispose()
 
