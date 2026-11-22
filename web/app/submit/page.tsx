@@ -345,21 +345,22 @@ export default function SubmitPage() {
 
   // PR22 preset library — merged vendored + user presets. The
   // ?preset=<slug> param (detail-page "run this preset" links) is explicit
-  // user intent applied on mount regardless of the fetch outcome — a staged
-  // resubmit ref may already have set one and the URL param wins. A slug
-  // absent from the loaded library isn't detached — the picker surfaces the
-  // mismatch and validation makes the user re-pick or switch to custom (a
-  // missing slug would 422 server-side anyway).
+  // user intent applied on mount regardless of the fetch outcome — queued in
+  // a microtask so it lands after the resubmit effect's staged ref: the URL
+  // param wins. A slug absent from the loaded library isn't detached — the
+  // picker surfaces the mismatch and validation makes the user re-pick or
+  // switch to custom (a missing slug would 422 server-side anyway).
   useEffect(() => {
     let cancelled = false;
     const qp = new URLSearchParams(window.location.search)
       .get("preset")
       ?.trim()
       .toLowerCase();
-    if (qp) {
+    void Promise.resolve().then(() => {
+      if (cancelled || !qp) return;
       selectPreset(qp);
       setTaskMode("preset");
-    }
+    });
     listPresets()
       .then((list) => {
         if (cancelled) return;
