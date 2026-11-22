@@ -32,11 +32,11 @@ lifecycle routes to):
 5. ``terminal_state`` + ``sandbox_finalized`` events and the sandbox
    transition — ``harness_complete`` on a usable response, ``timeout`` /
    ``budget_exceeded`` / ``error`` on the matching failure modes.
-   ``budget_exceeded`` also fires post-call when the cell's metered usage
-   overshoots ``budgets.sandbox_token_budget`` or its spend reaches
-   ``budgets.max_cost_usd`` — the monitor's poll enforces those caps for
-   containers, but a prompt cell finishes before the monitor exists, so
-   ``_budget_cap_detail`` runs the same checks inline.
+   ``budget_exceeded`` also fires post-call when metered usage overshoots
+   ``budgets.token_budget``/``budgets.sandbox_token_budget`` or the cell's
+   spend reaches ``budgets.max_cost_usd`` — the monitor's poll enforces
+   those caps for containers, but a prompt cell finishes before the
+   monitor exists, so ``_budget_cap_detail`` runs the same checks inline.
 """
 
 from __future__ import annotations
@@ -584,14 +584,16 @@ def _budget_cap_detail(
 ) -> dict[str, Any] | None:
     """Post-call budget verdict for a completed cell (monitor parity).
 
-    Containers get ``sandbox_token_budget`` and ``max_cost_usd`` from
-    ``watch_sandbox``'s poll — the minted claim gates admission pre-call
-    but a reply can still overshoot, and the monitor's post-hoc check is
-    what stamps the verdict. A prompt cell is already finished before
-    the monitor could run, so the same metered-usage checks run inline,
-    in the monitor's order (sandbox tokens → cost): the token check sums
-    the cell's own ``llm_response`` usage (``monitor._sandbox_tokens_used``),
-    the cost check is the same layered-price estimate
+    Containers get ``token_budget``, ``sandbox_token_budget``, and
+    ``max_cost_usd`` from ``watch_sandbox``'s poll — the minted claims
+    gate admission pre-call but a reply can still overshoot, and the
+    monitor's post-hoc check is what stamps the verdict. A prompt cell
+    is already finished before the monitor could run, so the same
+    metered-usage checks run inline, in the monitor's order (run tokens
+    → sandbox tokens → cost): the run check sums the whole run's
+    ``llm_response`` usage (``monitor._run_tokens_used``), the sandbox
+    check the cell's own (``monitor._sandbox_tokens_used``), the cost
+    check is the same layered-price estimate
     (``monitor._sandbox_estimated_cost_usd`` — same unpriced→None honesty).
     Only a clean completion is overridden — error/timeout verdicts and the
     gateway's own token-gate 429 stand. Returns the terminate detail on a
@@ -599,6 +601,14 @@ def _budget_cap_detail(
     """
     if call.terminal_reason != "harness_complete":
         return None
+    if run_budget := budgets.get("token_budget"):
+        used = monitor._run_tokens_used(session_factory, run.id)
+        if used >= int(run_budget):
+            return {
+                "limit": "run_tokens",
+                "used_tokens": used,
+                "budget": int(run_budget),
+            }
     if sandbox_budget := budgets.get("sandbox_token_budget"):
         used = monitor._sandbox_tokens_used(
             session_factory, run.id, sandbox_id

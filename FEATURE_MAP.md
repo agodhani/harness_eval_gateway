@@ -121,7 +121,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `max_cost_usd` (its estimated spend at the layered price table —
   priced models only) per poll alongside the run ceiling — a prompt
   cell finishes before the poll could run, so `prompt_cell` applies the
-  same cost estimate inline post-call; each trips
+  same checks inline post-call; each trips
   `budget_exceeded` with a terminate-checkpoint `limit` of
   `sandbox_tokens`/`cost` (`run_tokens` for the shared ceiling).
 - **Pacing (PR15):** one active run at a time — approvals while a run
@@ -1430,8 +1430,8 @@ configurable per cell (e.g. temperature sweeps).
   poll is the backstop that terminates the cell `budget_exceeded` with
   `payload.limit="sandbox_tokens"` once its own total crosses —
   `prompt_cell._budget_cap_detail` gives a no-sandbox cell the same
-  post-call overshoot verdict inline. The run
-  ceiling (`token_budget` → `limit="run_tokens"`) is unchanged.
+  post-call overshoot verdict inline — the run ceiling
+  (`token_budget` → `limit="run_tokens"`) included.
 - **Per-cell cost cap** — `BudgetsIn.max_cost_usd` (optional): the
   monitor prices the sandbox's own participant traffic each poll at its
   own model through the layered price book (prompt/completion/cache-read
