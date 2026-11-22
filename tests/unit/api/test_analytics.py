@@ -353,9 +353,11 @@ def test_malformed_speed_fields_do_not_poison_stats(
     client: TestClient, session_factory: sessionmaker[Session]
 ) -> None:
     """Speed fields bypass ingest normalization, so the sampling guards
-    them: negative latency/ttft and negative or non-finite tok/s are
-    dropped rather than dragging avg/p95/max below zero. Oracle: only the
-    sane response's values appear in every stat."""
+    them: negative latency/ttft and a bool or negative tok/s are dropped
+    rather than dragging avg/p95/max below zero. Non-finite floats can't
+    appear here — Postgres JSONB rejects ``Infinity``/``NaN`` at insert,
+    so the persisted malformed axis is type confusion and negatives.
+    Oracle: only the sane response's values appear in every stat."""
     s = session_factory()
     try:
         run = Run(
@@ -392,7 +394,7 @@ def test_malformed_speed_fields_do_not_poison_stats(
             [
                 resp(T0, -500, -5, -3.0),
                 resp(T0 + timedelta(seconds=1), 400, 90, 25.0),
-                resp(T0 + timedelta(seconds=2), 600, 110, float("inf")),
+                resp(T0 + timedelta(seconds=2), 600, 110, True),
             ]
         )
         s.commit()
