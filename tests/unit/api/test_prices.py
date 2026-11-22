@@ -187,6 +187,58 @@ def test_put_upserts_case_insensitive(
     assert globs.count(glob) == 1
 
 
+def test_put_converges_when_insert_race_is_lost(
+    client: TestClient,
+    session_factory: sessionmaker[Session],
+    cleanup_globs,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two writers racing one glob: our select misses, then a concurrent
+    writer commits the row before our insert. The differently-cased insert
+    hits uq_model_prices_model_glob_lower — the loser must converge on the
+    winner's row (200, its id, our rates applied), not 500, and leave no
+    shadowed duplicate. The patched commit lands the winner between the
+    handler's select and commit, exercising the real constraint."""
+    from db.models import ModelPriceRow
+
+    cleanup_globs.append("pr28-race-*")
+    real_commit = Session.commit
+    seeded = False
+
+    def interposed_commit(self: Session) -> None:
+        nonlocal seeded
+        if not seeded:
+            seeded = True
+            with session_factory() as s:
+                s.add(
+                    ModelPriceRow(
+                        model_glob="PR28-RACE-*",
+                        source="openrouter",
+                        input_per_mtok_usd=1.0,
+                        output_per_mtok_usd=1.0,
+                    )
+                )
+                s.commit()
+        real_commit(self)
+
+    monkeypatch.setattr(Session, "commit", interposed_commit)
+
+    resp = _put(client, model_glob="pr28-race-*", input_per_mtok_usd=4.0)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["model_glob"] == "PR28-RACE-*"  # winner keeps its casing
+    assert body["input_per_mtok_usd"] == 4.0  # loser's rates landed on it
+    assert body["source"] == "user"  # PUT flips source like a plain upsert
+
+    rows = [
+        r
+        for r in client.get("/api/prices").json()["prices"]
+        if r["model_glob"].lower() == "pr28-race-*"
+    ]
+    assert len(rows) == 1
+    assert rows[0]["id"] == body["id"]
+
+
 def test_delete_price(
     client: TestClient, session_factory: sessionmaker[Session], cleanup_globs
 ) -> None:
