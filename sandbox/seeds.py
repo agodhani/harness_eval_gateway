@@ -277,10 +277,19 @@ def _zip_cd_layout(path: Path) -> tuple[int, int, int] | None:
     from the EOCD tail (zip64-aware) — None when the records can't be
     parsed, in which case ``ZipFile``'s own error path reports the archive.
 
-    ``start`` is derived from where the CD *ends* — immediately before the
-    EOCD, or before the zip64 EOCD — which sidesteps the concat/self-
-    extracting offset drift that makes the declared ``cd_offset``
-    unreliable.
+    The EOCD is located the way ``zipfile._EndRecData`` locates it — the
+    LAST ``PK\\x05\\x06`` occurrence in the tail window, no comment-
+    reaches-EOF check (a comment may itself carry the signature; the
+    parser takes the last occurrence regardless and fails on a garbled
+    record). Matching that rule is the point of the prescan: it must
+    bound the same directory the parser will materialize — a stricter
+    rule diverges, and a crafted archive whose real EOCD fails our check
+    but parses for ``zipfile`` slips an oversized CD past the cap.
+
+    ``start`` is derived from where the CD *ends* — immediately before
+    the EOCD, or before the zip64 EOCD — the same spot ``concat +
+    cd_offset`` normalizes to, so the scanned region is the one
+    ``ZipFile`` reads.
     """
     try:
         size = path.stat().st_size
@@ -288,14 +297,9 @@ def _zip_cd_layout(path: Path) -> tuple[int, int, int] | None:
             f.seek(max(0, size - _EOCD_TAIL))
             tail_start = f.tell()
             tail = f.read()
-        idx = len(tail)
-        while True:  # a zip comment can hold the signature — verify the tail
-            idx = tail.rfind(_EOCD_SIG, 0, idx)
-            if idx < 0 or idx + 22 > len(tail):
-                return None
-            comment = int.from_bytes(tail[idx + 20 : idx + 22], "little")
-            if idx + 22 + comment == len(tail):
-                break
+        idx = tail.rfind(_EOCD_SIG)
+        if idx < 0 or idx + 22 > len(tail):
+            return None
         entries = int.from_bytes(tail[idx + 10 : idx + 12], "little")
         cd_size = int.from_bytes(tail[idx + 12 : idx + 16], "little")
         cd_off = int.from_bytes(tail[idx + 16 : idx + 20], "little")
@@ -365,11 +369,9 @@ def _iter_zip_members(archive: Path, *, max_files: int) -> Iterator[_Member]:
         )
     with zipfile.ZipFile(archive) as zf:
         infos = zf.infolist()
-        # The pre-scan is an early-exit bound on parse memory, not the cap
-        # itself: it scans a DIFFERENT directory when its EOCD verification
-        # diverges from zipfile's (zipfile takes the last EOCD occurrence;
-        # we also require its comment to reach EOF) or when it can't locate
-        # the CD at all. The parser's own entry count is authoritative.
+        # The pre-scan bounds parse memory under the parser's own EOCD
+        # rule; the parser's entry count stays the authoritative cap in
+        # case the two still disagree (including a None scan).
         if len(infos) > max_files:
             raise SeedError(
                 f"archive exceeds the seed file cap ({max_files} entries)"

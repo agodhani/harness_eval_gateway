@@ -21,6 +21,7 @@ exactly like the artifact-download jail.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -114,7 +115,7 @@ async def upload_archive(
                         ),
                     )
                 sha.update(chunk)
-                dst.write(chunk)
+                await asyncio.to_thread(dst.write, chunk)
     except BaseException:
         shutil.rmtree(upload_dir, ignore_errors=True)
         raise
@@ -125,7 +126,11 @@ async def upload_archive(
     # declared member metadata up front; a corrupt payload can still fail at
     # extraction, but as a clean SeedError.
     try:
-        kind = seeds.check_archive(
+        # check_archive parses the whole staged file (CD scan, or a full
+        # gzip pass for tar) — run it off the event loop so a large or
+        # hostile archive can't stall the API.
+        kind = await asyncio.to_thread(
+            seeds.check_archive,
             staged,
             max_bytes=int(
                 getattr(settings, "SEED_MAX_BYTES", seeds.DEFAULT_SEED_MAX_BYTES)

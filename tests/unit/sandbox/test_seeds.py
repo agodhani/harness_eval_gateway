@@ -388,16 +388,37 @@ def test_zip_member_cap_counts_records_not_the_declared_total(
         seeds.extract_archive(p, tmp_path / "out", max_files=3)
 
 
-def test_zip_file_cap_falls_back_to_the_parser_count(tmp_path: Path) -> None:
-    """A trailing byte past the EOCD makes the pre-parse CD scan fail its
-    comment-to-EOF verification (it returns None) while ``zipfile`` — which
-    takes the last EOCD occurrence unconditionally — still parses the
-    archive. The cap must then bind on the parser's own entry count, at
-    check AND extract alike."""
+def test_zip_file_cap_prescan_follows_the_parsers_eocd(tmp_path: Path) -> None:
+    """``zipfile`` locates the EOCD as the LAST PK\\x05\\x06 occurrence —
+    no comment-reaches-EOF check — so a trailing byte past the EOCD still
+    parses. The prescan must bound that same directory (a stricter rule
+    that returns None here would leave parse memory unbounded for exactly
+    the archives zipfile will materialize); the parser's own entry count
+    remains the authoritative backstop at check AND extract alike."""
     p = tmp_path / "trailing.zip"
     p.write_bytes(_zip_bytes({f"f{i}.py": "x" for i in range(4)}) + b"\x00")
     assert zipfile.is_zipfile(p)  # premise: zipfile ignores the trailing byte
-    assert seeds._zip_member_count(p, limit=64) is None  # premise: prescan off
+    assert seeds._zip_member_count(p, limit=64) == 4  # prescan tracks zipfile
+    assert seeds.check_archive(p, max_files=4) == "zip"
+    with pytest.raises(seeds.SeedError, match="file cap"):
+        seeds.check_archive(p, max_files=3)
+    with pytest.raises(seeds.SeedError, match="file cap"):
+        seeds.extract_archive(p, tmp_path / "out", max_files=3)
+
+
+def test_zip_prescan_cannot_be_baited_by_an_earlier_eocd(tmp_path: Path) -> None:
+    """A planted earlier EOCD whose declared comment reaches EOF (bait for
+    a stricter comment-verified scan) must not win over the real EOCD —
+    zipfile takes the last occurrence, so the prescan bounds the real
+    central directory, at check AND extract alike."""
+    inner = _zip_bytes({f"f{i}.py": "x" for i in range(4)})
+    fake = bytearray(22)
+    fake[:4] = b"PK\x05\x06"  # declares 0 entries, 0-size CD
+    fake[20:22] = (22 + len(inner) + 1 - 22).to_bytes(2, "little")  # to EOF
+    p = tmp_path / "bait.zip"
+    p.write_bytes(bytes(fake) + inner + b"\x00")  # trailing byte
+    assert zipfile.is_zipfile(p)  # premise: zipfile uses the real EOCD
+    assert seeds._zip_member_count(p, limit=64) == 4  # the real CD, not bait
     assert seeds.check_archive(p, max_files=4) == "zip"
     with pytest.raises(seeds.SeedError, match="file cap"):
         seeds.check_archive(p, max_files=3)
