@@ -115,7 +115,8 @@ def slugify(text: str) -> str:
 
 
 def suggest_slug(taken: set[str], base: str) -> str:
-    """First free slug: ``base`` itself, else ``base-2``, ``base-3``…"""
+    """First free slug: ``slugify(base)`` itself, else ``base-2``, ``base-3``…"""
+    base = slugify(base)
     if base and base not in taken:
         return base
     m = _TRAILING_NUM_RE.match(base)
