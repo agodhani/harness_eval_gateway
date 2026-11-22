@@ -1428,14 +1428,16 @@ configurable per cell (e.g. temperature sweeps).
   `llm_response` total (a runaway cell starves itself, not siblings —
   service/eval creds carry no claim and stay exempt), and the monitor's
   poll is the backstop that terminates the cell `budget_exceeded` with
-  `payload.limit="sandbox_tokens"` once its own total crosses. The run
+  `payload.limit="sandbox_tokens"` once its own total crosses —
+  `prompt_cell._budget_cap_detail` gives a no-sandbox cell the same
+  post-call overshoot verdict inline. The run
   ceiling (`token_budget` → `limit="run_tokens"`) is unchanged.
 - **Per-cell cost cap** — `BudgetsIn.max_cost_usd` (optional): the
   monitor prices the sandbox's own participant traffic each poll at its
   own model through the layered price book (prompt/completion/cache-read
   split) and terminates `budget_exceeded` with `payload.limit="cost"`.
   A prompt cell finishes before the monitor's poll could run, so
-  `prompt_cell._cost_cap_detail` runs the same metered estimate inline
+  `prompt_cell._budget_cap_detail` runs the same metered estimate inline
   post-call — a clean completion that breached the cap flips to
   `budget_exceeded` (error/timeout verdicts stand). Priced models only
   — an unpriced cell resolves `None` and can't trip
@@ -1476,7 +1478,7 @@ configurable per cell (e.g. temperature sweeps).
   `gateway/main.py::_budget_gate`, `gateway/mint_cred.py`,
   `orchestrator/provision.py` (`budgets_for`, `mint_sandbox_cred`),
   `orchestrator/monitor.py` (per-cell poll checks + terminate detail),
-  `orchestrator/prompt_cell.py::_cost_cap_detail` (inline cost cap),
+  `orchestrator/prompt_cell.py::_budget_cap_detail` (inline per-cell caps),
   `api/routers/analytics.py` (book-resolved keys), `web/lib/api.ts`
   (prices fns, `globMatch`/`matchPriceKey`, cache-aware `estimateCostUsd`),
   `web/components/AddRate.tsx`, `web/app/submit/page.tsx`,

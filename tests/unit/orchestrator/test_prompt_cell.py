@@ -537,6 +537,68 @@ async def test_prompt_cell_cost_cap_terminates_budget_exceeded(
     assert (Path(sb.artifact_path) / "output.txt").read_text() == "pricey reply"
 
 
+async def test_prompt_cell_sandbox_token_cap_terminates_budget_exceeded(
+    session_factory, settings, artifact_root
+) -> None:
+    """PR28 parity: ``sandbox_token_budget`` mints the cred's
+    ``sandbox_max_tokens`` claim, which only gates admission — a reply
+    can overshoot it, and containers get the monitor's post-hoc
+    ``budget_exceeded``/``limit=sandbox_tokens`` verdict for that. A
+    prompt cell has no monitor, so the post-call check is its
+    enforcement site: 300 recorded tokens vs a 200 cap."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _seed_llm_response(
+            session_factory,
+            settings,
+            request,
+            {
+                "prompt_tokens": 200,
+                "completion_tokens": 100,
+                "total_tokens": 300,
+            },
+        )
+        return _chat_response("over-cap reply")
+
+    run = make_run(
+        session_factory,
+        config=run_config(
+            budgets={
+                "max_iters": 10,
+                "token_budget": 100_000,
+                "wall_clock_seconds": 3600,
+                "sandbox_token_budget": 200,
+            }
+        ),
+    )
+    sid = await run_prompt_cell(
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        run_id=run.id,
+        harness_config=_prompt_config(),
+        settings=settings,
+        client=_client(handler),
+    )
+
+    sb = _sandbox(session_factory, sid)
+    assert sb.status == "failed"
+    assert sb.terminal_reason == "budget_exceeded"
+    term = next(
+        e.payload
+        for e in _events(session_factory, sid)
+        if e.type == "checkpoint" and e.payload.get("stage") == "terminate"
+    )
+    assert term["reason"] == "budget_exceeded"
+    assert term["limit"] == "sandbox_tokens"
+    assert term["used_tokens"] == 300
+    assert term["budget"] == 200
+    meta = json.loads((Path(sb.artifact_path) / "meta.json").read_text())
+    assert meta["terminal_reason"] == "budget_exceeded"
+    # the call's output still lands — a terminated container's snapshot
+    # keeps its workspace too
+    assert (Path(sb.artifact_path) / "output.txt").read_text() == "over-cap reply"
+
+
 async def test_prompt_cell_cost_cap_unpriced_model_cannot_trip(
     session_factory, settings, artifact_root
 ) -> None:

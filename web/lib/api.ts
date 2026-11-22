@@ -895,6 +895,9 @@ export interface CellAnalytics {
   llm_turns: number;
   tokens: TokenUsage;
   latency_ms: LatencyStats;
+  /** PR30 speed metrics, pooled across the cell's trials. */
+  ttft_ms?: LatencyStats;
+  avg_tokens_per_sec?: number | null;
   tool_calls: ToolCallStats;
   skill_calls: SkillCallStats;
   shell_commands: number;

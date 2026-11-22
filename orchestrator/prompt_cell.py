@@ -32,10 +32,11 @@ lifecycle routes to):
 5. ``terminal_state`` + ``sandbox_finalized`` events and the sandbox
    transition — ``harness_complete`` on a usable response, ``timeout`` /
    ``budget_exceeded`` / ``error`` on the matching failure modes.
-   ``budget_exceeded`` also fires post-call when the metered spend reaches
-   ``budgets.max_cost_usd`` — the monitor's poll enforces that cap for
+   ``budget_exceeded`` also fires post-call when the cell's metered usage
+   overshoots ``budgets.sandbox_token_budget`` or its spend reaches
+   ``budgets.max_cost_usd`` — the monitor's poll enforces those caps for
    containers, but a prompt cell finishes before the monitor exists, so
-   ``_cost_cap_detail`` runs the same estimate inline.
+   ``_budget_cap_detail`` runs the same checks inline.
 """
 
 from __future__ import annotations
@@ -573,7 +574,7 @@ def _finalize(
         session.commit()
 
 
-def _cost_cap_detail(
+def _budget_cap_detail(
     session_factory: sessionmaker[Session],
     *,
     run: Run,
@@ -581,18 +582,33 @@ def _cost_cap_detail(
     call: _CallResult,
     budgets: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Post-call ``max_cost_usd`` verdict for a completed cell.
+    """Post-call budget verdict for a completed cell (monitor parity).
 
-    Containers get the cap from ``watch_sandbox``'s poll; a prompt cell is
-    already finished before the monitor could run, so the same
-    metered-usage estimate (``monitor._sandbox_estimated_cost_usd`` — same
-    layered price table, same unpriced→None honesty) runs inline. Only a
-    clean completion is overridden — error/timeout verdicts and the
+    Containers get ``sandbox_token_budget`` and ``max_cost_usd`` from
+    ``watch_sandbox``'s poll — the minted claim gates admission pre-call
+    but a reply can still overshoot, and the monitor's post-hoc check is
+    what stamps the verdict. A prompt cell is already finished before
+    the monitor could run, so the same metered-usage checks run inline,
+    in the monitor's order (sandbox tokens → cost): the token check sums
+    the cell's own ``llm_response`` usage (``monitor._sandbox_tokens_used``),
+    the cost check is the same layered-price estimate
+    (``monitor._sandbox_estimated_cost_usd`` — same unpriced→None honesty).
+    Only a clean completion is overridden — error/timeout verdicts and the
     gateway's own token-gate 429 stand. Returns the terminate detail on a
     breach, else None.
     """
     if call.terminal_reason != "harness_complete":
         return None
+    if sandbox_budget := budgets.get("sandbox_token_budget"):
+        used = monitor._sandbox_tokens_used(
+            session_factory, run.id, sandbox_id
+        )
+        if used >= int(sandbox_budget):
+            return {
+                "limit": "sandbox_tokens",
+                "used_tokens": used,
+                "budget": int(sandbox_budget),
+            }
     max_cost = budgets.get("max_cost_usd")
     if not max_cost:
         return None
@@ -724,21 +740,21 @@ async def run_prompt_cell(
             if own_client:
                 await client.aclose()
 
-        cost_detail = _cost_cap_detail(
+        cap_detail = _budget_cap_detail(
             session_factory,
             run=run,
             sandbox_id=sid,
             call=call,
             budgets=budgets,
         )
-        if cost_detail is not None:
+        if cap_detail is not None:
             call.terminal_reason = "budget_exceeded"
             monitor._mark_terminating(
                 session_factory,
                 run_id=run_id,
                 sandbox_id=sid,
                 reason="budget_exceeded",
-                detail=cost_detail,
+                detail=cap_detail,
             )
 
         artifact_dir = Path(runtime.artifact_root) / str(run_id) / str(sid)

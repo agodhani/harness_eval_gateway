@@ -265,9 +265,9 @@ container cells interleave in one run; evaluation receives
 `prompt_output_path` so `output.txt` stages as the submission.
 `system_prompt_extra` becomes a `system` message. Preview/thumbnail
 endpoints 404 early for prompt cells. Budgets still apply: the cred
-carries `sandbox_max_tokens`, and `_cost_cap_detail` enforces
-`max_cost_usd` inline post-call (the monitor's poll never sees a
-no-sandbox cell).
+carries `sandbox_max_tokens`, and `_budget_cap_detail` enforces the
+per-cell token overshoot and `max_cost_usd` inline post-call (the
+monitor's poll never sees a no-sandbox cell).
 
 **Default skill packs** (named presets, vendored under `skillpacks/`):
 `superpowers`, `mattpocock-skills`, `spec-kit`.
@@ -721,9 +721,11 @@ or tests change.
   the gateway's `x-heg-provider` override — entries with no parseable
   rate are skipped rather than priced-free. Per-cell budgets:
   `sandbox_token_budget` mints a `sandbox_max_tokens` cred claim
-  (gateway gate + monitor backstop → `limit="sandbox_tokens"`);
+  (gateway gate + monitor backstop → `limit="sandbox_tokens"`;
+  `prompt_cell._budget_cap_detail` gives the same overshoot verdict
+  inline post-call for no-sandbox cells);
   `max_cost_usd` is monitor-polled for containers and checked inline
-  post-call for prompt cells (`prompt_cell._cost_cap_detail`) against
+  post-call for prompt cells (`prompt_cell._budget_cap_detail`) against
   the cell's layered-price estimate → `limit="cost"`, and it can't
   trip an unpriced model (no honest rate to bill against). Cache-read tokens bill at
   `cache_read_per_mtok_usd` when declared, else the input rate.

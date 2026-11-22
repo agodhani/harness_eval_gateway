@@ -251,6 +251,16 @@ def test_speed_metrics_per_sandbox_and_model_rollup(
     assert model_row["ttft_ms"] == {"avg": 200.0, "p95": 300.0, "max": 300.0}
     assert model_row["avg_tokens_per_sec"] == pytest.approx(60.0)
 
+    # Cell rollup (PR27) pools the same samples per config × model group —
+    # sb1's cell shows the speed axis, sb2's uninstrumented cell stays
+    # null rather than reporting phantom zeros.
+    sup = _cell(body, "miniloop · superpowers")
+    assert sup["ttft_ms"] == {"avg": 200.0, "p95": 300.0, "max": 300.0}
+    assert sup["avg_tokens_per_sec"] == pytest.approx(60.0)
+    bare = _cell(body, "miniloop")
+    assert bare["ttft_ms"] == {"avg": None, "p95": None, "max": None}
+    assert bare["avg_tokens_per_sec"] is None
+
 
 def test_cached_replay_stays_off_the_speed_axis(
     client: TestClient, session_factory: sessionmaker[Session]

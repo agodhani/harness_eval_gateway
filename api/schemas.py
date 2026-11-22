@@ -625,6 +625,10 @@ class CellAnalytics(BaseModel):
     llm_turns: int = 0
     tokens: TokenUsage = Field(default_factory=TokenUsage)
     latency_ms: LatencyStats = Field(default_factory=LatencyStats)
+    # PR30 speed metrics — pooled across the cell's trials (see
+    # SandboxAnalytics.ttft_ms / avg_tokens_per_sec).
+    ttft_ms: LatencyStats = Field(default_factory=LatencyStats)
+    avg_tokens_per_sec: float | None = None
     tool_calls: ToolCallStats = Field(default_factory=ToolCallStats)
     skill_calls: SkillCallStats = Field(default_factory=SkillCallStats)
     shell_commands: int = 0
