@@ -211,6 +211,12 @@ class BudgetsIn(BaseModel):
       through the layered price table (api/pricing.py::PriceBook). It only
       bites on priced models — an unpriced cell has no honest rate to bill
       against, so the cap simply can't trip it (PR21 honesty preserved).
+
+    Poll-side checks only see container cells — a no-sandbox ``prompt``
+    cell finishes before the monitor exists, so
+    ``orchestrator/prompt_cell.py::_budget_cap_detail`` runs the same
+    overshoot verdicts (run ceiling, per-cell tokens, cost) inline
+    post-call.
     """
 
     max_iters: int = Field(default=50, ge=1, le=1000)
