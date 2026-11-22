@@ -162,7 +162,7 @@ async def upload_archive(
     except BaseException:
         shutil.rmtree(upload_dir, ignore_errors=True)
         raise
-    log.info("staged upload %s (%s, %d bytes)", upload_id, filename, size)
+    log.info("staged upload %s (%r, %d bytes)", upload_id, filename, size)
     return UploadOut(
         id=upload_id,
         filename=filename,

@@ -841,7 +841,7 @@ def _drop_escapee_links(root: Path) -> list[str]:
                 p.unlink()
                 dropped.append(p.relative_to(root).as_posix())
             except OSError:
-                log.warning("could not drop escapee symlink %s", p)
+                log.warning("could not drop escapee symlink %r", p)
             if name in dirnames:
                 dirnames.remove(name)
     return dropped
@@ -1001,7 +1001,7 @@ def prepare_run_seed(
             if stale.is_dir():
                 shutil.rmtree(stale, ignore_errors=True)
     log.info(
-        "prepared run seed for %s from %s (sha=%s)",
+        "prepared run seed for %s from %r (sha=%s)",
         run_id,
         source.get("url") or source.get("upload_id"),
         sha[:12],
