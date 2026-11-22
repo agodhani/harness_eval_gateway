@@ -23,6 +23,7 @@ from pydantic import (
 )
 
 from api.pricing import ModelPrice
+from sandbox import seeds
 
 # Re-exported so the control-plane score payloads live in one module — the
 # results API embeds AnalysisReport on SandboxResult (see bottom section).
@@ -236,6 +237,11 @@ class TaskInputsIn(BaseModel):
             raise ValueError(
                 "repo_url must be a plain https://<host>/<path> URL — "
                 "public git only (no userinfo, query, or fragment)"
+            )
+        if not seeds.is_public_git_host(parts.hostname or ""):
+            raise ValueError(
+                "repo_url must name a public host — loopback, "
+                "private-range, and link-local git endpoints are not allowed"
             )
         return v
 

@@ -258,8 +258,9 @@ def test_upload_rejects_absolute_and_special_members(api) -> None:
 
 def test_upload_rejects_members_over_seed_caps(api) -> None:
     """A ≤UPLOAD_MAX_BYTES archive whose DECLARED member sizes exceed the
-    seed caps 422s at upload — the same caps extraction enforces, so a
-    staged upload can never fail at provisioning."""
+    seed caps 422s at upload — the same caps extraction enforces. Only
+    member metadata is verified here: a corrupt payload can still fail at
+    extraction, but as a clean SeedError."""
     big = _zip_bytes({"blob.bin": b"x" * 4096})
     assert len(big) < api.settings.UPLOAD_MAX_BYTES  # passes the raw cap
     resp = api.client.post(
@@ -412,6 +413,20 @@ def test_create_run_dangling_archive_id_422(api) -> None:
         {"repo_url": "https://github.com/a/b#frag"},  # fragment
         {"repo_url": "https://github.com/a/b", "ref": "--tags"},  # option-shaped ref
         {"repo_url": "https://github.com/a/b", "ref": "has space"},
+        {"repo_url": "https://127.0.0.1/a/b"},  # loopback literal
+        {"repo_url": "https://10.0.0.9/a/b"},  # private range
+        {"repo_url": "https://192.168.1.1/a/b"},  # private range
+        {"repo_url": "https://172.16.0.1/a/b"},  # private range
+        {"repo_url": "https://169.254.169.254/latest"},  # link-local metadata
+        {"repo_url": "https://[::1]/a/b"},  # v6 loopback
+        {"repo_url": "https://[fe80::1]/a/b"},  # v6 link-local
+        {"repo_url": "https://[::ffff:7f00:1]/a/b"},  # v4-mapped loopback
+        {"repo_url": "https://localhost/a/b"},  # this machine
+        {"repo_url": "https://gitlab.internal/a/b"},  # LAN suffix
+        {"repo_url": "https://node.local/a/b"},  # mDNS suffix
+        {"repo_url": "https://host.docker.internal/a/b"},  # docker host
+        {"repo_url": "https://2130706433/a/b"},  # decimal IPv4 → 127.0.0.1
+        {"repo_url": "https://git/a/b"},  # dotless LAN alias
         {"archive_id": "not-a-uuid"},
         {"archive_id": str(uuid.uuid4()), "ref": "v1"},  # ref w/o repo
     ],

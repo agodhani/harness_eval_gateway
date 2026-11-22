@@ -207,6 +207,46 @@ def build_spec(
     )
 
 
+async def prepare_seed(
+    *,
+    run: Run,
+    runtime: SandboxRuntime,
+    settings: Any,
+) -> seeds.PreparedSeed | None:
+    """Materialize the run's ``task_inputs`` — the public-repo clone at a
+    pinned ref, or the staged upload archive — under
+    ``<data>/seeds/<run_id>/``. Per-run idempotent
+    (``seeds.prepare_run_seed``), so sequential cells share one
+    materialization; ``spec.seed_host_path`` then has ``runtime.spawn``
+    copy the tree into each cell's workspace before its container starts.
+    None for an unseeded run; SeedError on failure."""
+    task_inputs = (run.config or {}).get("task_inputs") or None
+    if not task_inputs:
+        return None
+    return await asyncio.to_thread(
+        seeds.prepare_run_seed,
+        run.id,
+        task_inputs,
+        seed_root=Path(runtime.state_dir).parent / "seeds",
+        uploads=seeds.uploads_root(settings),
+        git_runner=seeds.git_runner(
+            float(
+                getattr(
+                    settings,
+                    "SEED_GIT_TIMEOUT_SECONDS",
+                    seeds.DEFAULT_GIT_TIMEOUT_SECONDS,
+                )
+            )
+        ),
+        max_bytes=int(
+            getattr(settings, "SEED_MAX_BYTES", seeds.DEFAULT_SEED_MAX_BYTES)
+        ),
+        max_files=int(
+            getattr(settings, "SEED_MAX_FILES", seeds.DEFAULT_SEED_MAX_FILES)
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # spawn_one — the per-config provisioning unit
 # ---------------------------------------------------------------------------
@@ -344,12 +384,18 @@ async def spawn_one(
     run_id: uuid.UUID,
     harness_config: dict[str, Any],
     settings: Any,
+    seed: seeds.PreparedSeed | None = None,
 ) -> uuid.UUID | None:
     """Provision + spawn ONE sandbox for ``harness_config``.
 
     Returns the sandbox UUID on success, ``None`` on failure (the Sandbox row
     is still created, marked ``failed``/``error`` — spawn failures are
     per-sandbox and never abort sibling configs).
+
+    ``seed`` (PR24) is the run's materialized task-input tree — the
+    lifecycle prepares it once before the cell loop via ``prepare_seed``
+    and passes it down; a caller that omits it gets the same idempotent
+    preparation here.
 
     DB helpers run on the event-loop thread; the file staging and the
     blocking ``docker run`` call are the only ``to_thread`` hops.
@@ -364,38 +410,8 @@ async def spawn_one(
     try:
         adapter = get_adapter(str(harness_config.get("adapter") or "miniloop"))
 
-        # PR24 — task-input seed: materialize the run's ``task_inputs``
-        # (public-repo clone at a pinned ref, or the staged upload archive)
-        # once under ``<data>/seeds/<run_id>/``; ``spec.seed_host_path`` then
-        # has runtime.spawn copy it into THIS cell's workspace before the
-        # container starts. Idempotent per run — sequential cells reuse the
-        # one materialization; a SeedError fails this cell like any other
-        # spawn failure.
-        task_inputs = (run.config or {}).get("task_inputs") or None
-        seed: seeds.PreparedSeed | None = None
-        if task_inputs:
-            seed = await asyncio.to_thread(
-                seeds.prepare_run_seed,
-                run.id,
-                task_inputs,
-                seed_root=Path(runtime.state_dir).parent / "seeds",
-                uploads=seeds.uploads_root(settings),
-                git_runner=seeds.git_runner(
-                    float(
-                        getattr(
-                            settings,
-                            "SEED_GIT_TIMEOUT_SECONDS",
-                            seeds.DEFAULT_GIT_TIMEOUT_SECONDS,
-                        )
-                    )
-                ),
-                max_bytes=int(
-                    getattr(settings, "SEED_MAX_BYTES", seeds.DEFAULT_SEED_MAX_BYTES)
-                ),
-                max_files=int(
-                    getattr(settings, "SEED_MAX_FILES", seeds.DEFAULT_SEED_MAX_FILES)
-                ),
-            )
+        if seed is None:
+            seed = await prepare_seed(run=run, runtime=runtime, settings=settings)
 
         # Stage ONLY the selected packs (real copies under the state dir —
         # bind-mountable and per-sandbox isolated). The staged dir IS the

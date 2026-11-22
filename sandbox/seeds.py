@@ -34,6 +34,7 @@ callers wrap in ``asyncio.to_thread`` like the rest of provisioning.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -432,6 +433,13 @@ def _iter_tar_members(archive: Path, *, max_files: int) -> Iterator[_Member]:
             rel = _member_relpath(m.name)
             if rel is None:
                 continue
+            if m.size < 0:
+                # GNU base-256 negative sizes (0xFF marker byte) are legal
+                # to tarfile but would drive the aggregate byte cap below
+                # zero — the cap could never trip while real bytes land.
+                raise SeedError(
+                    f"archive member {m.name!r} declares a negative size — rejected"
+                )
             members.append((m, rel))
             if len(members) > max_files:
                 raise SeedError(
@@ -650,6 +658,46 @@ def git_runner(timeout: float | None = None) -> Callable[[list[str]], str]:
 #: ``git_runner`` *parameter* shadows the module-level name in that body.
 _make_git_runner = git_runner
 
+#: Host suffixes that always mean this machine or LAN — a git fetch is a
+#: server-side request from the api host, so naming one is SSRF.
+_NONPUBLIC_HOST_SUFFIXES = (".localhost", ".local", ".internal")
+
+#: Numeric/hex host forms curl still parses as IPv4 literals even though
+#: ``ipaddress`` rejects them — ``2130706433`` (→ 127.0.0.1), ``0x7f000001``,
+#: ``0177.0.0.1``. A host built only of such labels is never a public DNS
+#: name.
+_NUMERIC_HOST_RE = re.compile(r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*")
+
+
+def is_public_git_host(host: str) -> bool:
+    """True when ``host`` can't name a loopback/LAN endpoint the api host
+    could reach — the seed clone runs server-side at provisioning, so an
+    internal target is SSRF. IP literals (IPv4/IPv6 incl. zone ids and
+    v4-mapped forms) are checked by property; names that can only resolve
+    to this machine or a LAN are rejected by shape and suffix."""
+    h = host.rstrip(".").lower()
+    if not h:
+        return False
+    try:
+        ip = ipaddress.ip_address(h.partition("%")[0])
+    except ValueError:
+        ip = None
+    if ip is not None:
+        ip = getattr(ip, "ipv4_mapped", None) or ip
+        return not (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+    # A dotless name can only be a LAN alias (localhost, a compose service
+    # name, a search-domain hit) — never a public git host.
+    if "." not in h or h.endswith(_NONPUBLIC_HOST_SUFFIXES):
+        return False
+    return _NUMERIC_HOST_RE.fullmatch(h) is None
+
 
 def _clone_repo(
     url: str,
@@ -685,6 +733,11 @@ def _clone_repo(
         raise SeedError(
             f"repo_url is malformed or embeds credentials — got {url!r} "
             "(public git only; no userinfo, query, or fragment)"
+        )
+    if not is_public_git_host(parts.hostname or ""):
+        raise SeedError(
+            f"repo_url host {parts.hostname!r} is not a public address — "
+            "loopback/private/link-local git endpoints are not allowed"
         )
     if ref is not None and (ref.startswith("-") or _REF_RE.fullmatch(ref) is None):
         raise SeedError(

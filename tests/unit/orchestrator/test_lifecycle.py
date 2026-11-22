@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import tarfile
 from pathlib import Path
 
 import httpx
@@ -10,6 +12,7 @@ from sqlalchemy import select
 
 from db.models import Event, Rubric, Sandbox, Score
 from orchestrator.lifecycle import run_lifecycle
+from sandbox import seeds
 
 from .conftest import FakeRuntime, make_run, run_config
 
@@ -771,3 +774,149 @@ async def test_lifecycle_all_prompt_cells_fail_marks_run_failed(
         assert sb.status == "failed"
         assert sb.terminal_reason == "error"
     assert calls == []  # nothing to evaluate
+
+
+# ---------------------------------------------------------------------------
+# PR24 — run-level seed materialization
+# ---------------------------------------------------------------------------
+
+SEED_UPLOAD_ID = "12345678-1234-5678-9abc-def012345678"
+
+
+def _stage_seed_upload(settings, upload_id: str = SEED_UPLOAD_ID) -> None:
+    """Stage a real archive under the uploads root the run resolves — the
+    same layout POST /api/uploads produces."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, data in (("proj/app.py", b"print(1)"), ("proj/README.md", b"r")):
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    d = seeds.uploads_root(settings) / upload_id
+    d.mkdir(parents=True)
+    (d / f"{seeds.UPLOAD_ARCHIVE_NAME}.tar").write_bytes(buf.getvalue())
+    (d / seeds.UPLOAD_META_NAME).write_text(
+        json.dumps({"filename": "seed.tar", "size": 1, "sha256": "abc"})
+    )
+
+
+async def test_lifecycle_seed_failure_fails_run_fast(
+    session_factory, settings, artifact_root
+) -> None:
+    """A permanently failing seed (dangling archive_id) fails the RUN once,
+    before any cell — the per-cell path would retry the same materialization
+    in every sequential spawn while the run holds the pacing slot."""
+    cfg = run_config(
+        harness_configs=[
+            {"adapter": "miniloop", "name": "a"},
+            {"adapter": "miniloop", "name": "b"},
+        ]
+    )
+    cfg["task_inputs"] = {"archive_id": "00000000-0000-0000-0000-000000000000"}
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+
+    fake = FakeRuntime(artifact_root=artifact_root, default_logs=RESULT_DONE)
+    calls: list = []
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+
+    assert fake.spawned == []
+    with session_factory() as s:
+        assert (
+            s.execute(select(Sandbox).where(Sandbox.run_id == run.id))
+            .scalars()
+            .all()
+            == []
+        )
+        r = s.get(type(run), run.id)
+        assert r.status == "failed"
+        assert r.finished_at is not None
+        errs = [
+            e
+            for e in s.execute(select(Event).where(Event.run_id == run.id)).scalars()
+            if e.type == "error"
+        ]
+        assert any(e.payload.get("stage") == "seed" for e in errs)
+    assert calls == []
+
+
+async def test_lifecycle_seed_materialized_once_for_all_cells(
+    session_factory, settings, artifact_root, monkeypatch
+) -> None:
+    """The run's seed is prepared once at run level — both cells copy the
+    same materialized tree (identical seed_sha on their rows)."""
+    _stage_seed_upload(settings)
+    cfg = run_config(
+        harness_configs=[
+            {"adapter": "miniloop", "name": "a"},
+            {"adapter": "miniloop", "name": "b"},
+        ]
+    )
+    cfg["task_inputs"] = {"archive_id": SEED_UPLOAD_ID}
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+
+    real = seeds.prepare_run_seed
+    preps = 0
+
+    def counting(run_id, task_inputs, **kw):
+        nonlocal preps
+        preps += 1
+        return real(run_id, task_inputs, **kw)
+
+    monkeypatch.setattr(seeds, "prepare_run_seed", counting)
+
+    fake = FakeRuntime(artifact_root=artifact_root, default_logs=RESULT_DONE)
+    calls: list = []
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+
+    assert preps == 1  # one materialization, N cells
+    with session_factory() as s:
+        sbs = list(
+            s.execute(select(Sandbox).where(Sandbox.run_id == run.id)).scalars()
+        )
+        assert len(sbs) == 2
+        assert all(sb.status == "done" for sb in sbs)
+        shas = {sb.harness_config.get("seed_sha") for sb in sbs}
+        assert len(shas) == 1 and None not in shas
+    for spec in fake.spawned:
+        assert (spec.workspace_host_path / "app.py").read_text() == "print(1)"
+
+
+async def test_lifecycle_prompt_only_run_skips_seed(
+    session_factory, settings, artifact_root, monkeypatch
+) -> None:
+    """Prompt cells have no workspace — task_inputs on a prompt-only run is
+    inert: the seed is never fetched, so even a dangling one can't fail it."""
+    requests = _patch_gateway(monkeypatch, lambda r: _chat_ok())
+
+    cfg = run_config(harness_configs=[{"adapter": "prompt"}])
+    cfg["task_inputs"] = {"archive_id": "00000000-0000-0000-0000-000000000000"}
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+
+    fake = FakeRuntime(artifact_root=artifact_root)
+    calls: list = []
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+
+    assert len(requests) == 1
+    with session_factory() as s:
+        assert s.get(type(run), run.id).status == "done"

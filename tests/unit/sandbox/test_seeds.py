@@ -418,6 +418,67 @@ def test_tar_member_cap_applies_while_streaming(tmp_path: Path) -> None:
         seeds.extract_archive(p, tmp_path / "out", max_files=3)
 
 
+def test_check_and_extract_reject_negative_tar_member_size(
+    tmp_path: Path,
+) -> None:
+    """A GNU base-256 member size with the 0xFF marker byte parses as a
+    NEGATIVE size — the aggregate byte cap's running total would dip below
+    zero and could never trip while real payload bytes land. The member
+    must be rejected at check AND extract."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+        data = b"12345"
+        ti = tarfile.TarInfo("a.py")
+        ti.size = len(data)
+        tf.addfile(ti, io.BytesIO(data))
+    raw = bytearray(buf.getvalue())
+    raw[124:136] = b"\xff" * 12  # base-256 negative marker → size -1
+    raw[148:156] = b" " * 8
+    raw[148:156] = f"{sum(raw[:512]):06o}\x00 ".encode("ascii")  # re-checksum
+    p = tmp_path / "neg.tar"
+    p.write_bytes(bytes(raw))
+    with pytest.raises(seeds.SeedError):
+        seeds.check_archive(p)
+    with pytest.raises(seeds.SeedError):
+        seeds.extract_archive(p, tmp_path / "out")
+
+
+def test_iter_tar_members_rejects_negative_size(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Version-independent check of the guard itself: a member stream
+    yielding a negative size is rejected — never counted into the byte
+    cap's running total."""
+    fake_member = type(
+        "M",
+        (),
+        {
+            "name": "a.py",
+            "size": -5,
+            "type": tarfile.REGTYPE,
+            "isdir": lambda self: False,
+            "isreg": lambda self: True,
+        },
+    )()
+
+    class FakeTar:
+        def __init__(self) -> None:
+            self._queue = [fake_member]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def next(self):
+            return self._queue.pop(0) if self._queue else None
+
+    monkeypatch.setattr(seeds.tarfile, "open", lambda *a, **k: FakeTar())
+    with pytest.raises(seeds.SeedError, match="negative"):
+        list(seeds._iter_tar_members(tmp_path / "x.tar", max_files=10))
+
+
 # ---------------------------------------------------------------------------
 # hash_tree + copy_seed
 # ---------------------------------------------------------------------------
@@ -692,6 +753,53 @@ def test_prepare_run_seed_rejects_malformed_or_secret_bearing_url(
                 git_runner=fake_git,
             )
     assert calls == []
+
+
+def test_prepare_run_seed_rejects_internal_repo_hosts(tmp_path: Path) -> None:
+    """A repo_url naming this machine or a LAN endpoint is SSRF — the clone
+    runs server-side on the api host at provisioning, so loopback, private,
+    link-local, and LAN-shaped hosts are rejected before any git call."""
+    calls: list[list[str]] = []
+
+    def fake_git(argv: list[str]) -> str:
+        calls.append(list(argv))
+        return ""
+
+    for bad in (
+        "https://127.0.0.1/acme/proj",
+        "https://10.0.0.9/acme/proj",
+        "https://172.20.0.2/acme/proj",
+        "https://192.168.0.1/acme/proj",
+        "https://169.254.169.254/latest",
+        "https://[::1]/acme/proj",
+        "https://[fe80::1]/acme/proj",
+        "https://[::ffff:7f00:1]/acme/proj",
+        "https://localhost/acme/proj",
+        "https://repo.local/acme/proj",
+        "https://gitlab.internal/acme/proj",
+        "https://host.docker.internal/acme/proj",
+        "https://2130706433/acme/proj",  # decimal IPv4 → 127.0.0.1
+        "https://gitea/acme/proj",  # dotless LAN alias
+    ):
+        with pytest.raises(seeds.SeedError, match="public"):
+            seeds.prepare_run_seed(
+                "run-x",
+                {"repo_url": bad},
+                seed_root=tmp_path / "seeds",
+                uploads=tmp_path / "uploads",
+                git_runner=fake_git,
+            )
+    assert calls == []
+
+    # a public IP literal still reaches git (host properties, not shape)
+    seeds.prepare_run_seed(
+        "run-ok",
+        {"repo_url": "https://140.82.121.3/acme/proj"},
+        seed_root=tmp_path / "seeds",
+        uploads=tmp_path / "uploads",
+        git_runner=fake_git,
+    )
+    assert calls
 
 
 def test_prepare_run_seed_git_clone_pinned_ref(tmp_path: Path) -> None:

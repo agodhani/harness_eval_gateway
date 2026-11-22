@@ -1212,8 +1212,9 @@ workspace to produce.
 thing bugfix / refactor / analysis evals need. Exactly one source:
 
 - `repo_url` + optional `ref` — a PUBLIC git repo (`https://` only —
-  ssh/git/file schemes, embedded credentials, and option-shaped refs
-  rejected at the schema), materialized by `git init` +
+  ssh/git/file schemes, embedded credentials, option-shaped refs, and
+  loopback/private/link-local/LAN hosts rejected at the schema AND the
+  clone boundary — `seeds.is_public_git_host`), materialized by `git init` +
   `fetch --depth 1 origin <ref|HEAD>` + `checkout FETCH_HEAD` under one
   wall-clock deadline spanning the sequence (`SEED_GIT_TIMEOUT_SECONDS`,
   default 300s; one code path covers branches, tags, and raw shas; git
@@ -1231,9 +1232,12 @@ rigged before it starts.
 - Flow: `POST /api/runs` validates the shape (`TaskInputsIn` —
   exactly-one-source, https-only, uuid archive id) AND that an
   `archive_id` resolves to a staged upload (422 on a dangling id), then
-  persists `task_inputs` verbatim into `run.config`. Provisioning
-  (`spawn_one`) calls `seeds.prepare_run_seed` once per run — the
-  materialized tree lands at `<data>/seeds/<run_id>/content/` (+ meta,
+  persists `task_inputs` verbatim into `run.config`. The lifecycle
+  materializes it ONCE per run before the cell loop
+  (`provision.prepare_seed` → `seeds.prepare_run_seed` — a failing seed
+  fails the run fast rather than retrying in every sequential cell while
+  the run holds the pacing slot; prompt-only runs skip it entirely) —
+  the materialized tree lands at `<data>/seeds/<run_id>/content/` (+ meta,
   via tmp-dir + atomic rename so concurrent cells never see a partial
   tree; second call per run reuses it) — sets `spec.seed_host_path`, and
   `runtime.spawn` `copy_seed`s it into THAT cell's `workspace_host_path`
