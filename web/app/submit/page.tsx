@@ -867,9 +867,9 @@ export default function SubmitPage() {
               ) : presets === null ? (
                 presetsFailed ? (
                   <WarnNote>
-                    Preset library unavailable — a preset slug can still be
-                    submitted (the server resolves it), or switch to a custom
-                    prompt.
+                    Preset library unavailable — a preset staged via a ?preset=
+                    link or resubmit still submits (the server resolves the
+                    slug); otherwise switch to a custom prompt.
                   </WarnNote>
                 ) : (
                   <Loading label="Loading presets…" />

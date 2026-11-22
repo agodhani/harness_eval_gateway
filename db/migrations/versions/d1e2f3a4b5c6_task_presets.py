@@ -39,14 +39,14 @@ def upgrade() -> None:
         sa.Column("description", sa.Text(), nullable=False, server_default=""),
         sa.Column("task_prompt", sa.Text(), nullable=False),
         sa.Column("category", sa.String(length=64), nullable=False, server_default=""),
-        sa.Column("tags", JSONB, nullable=True),
+        sa.Column("tags", JSONB, nullable=False),
         # Rows are always "user" — "vendored" is reserved for file presets.
         sa.Column("source", sa.String(length=16), nullable=False, server_default="user"),
         sa.Column("revision", sa.Integer(), nullable=False, server_default="1"),
         sa.Column("suggested_adapter", sa.String(length=64), nullable=True),
         sa.Column("suggested_models", JSONB, nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.UniqueConstraint("slug", name="uq_task_presets_slug"),
     )
 
