@@ -8,7 +8,9 @@ them. Everything below maps to existing code.
 > sketch and `same_model_eval` formula are superseded by the model matrix —
 > `RunCreate.models`, per-config `model` pins, and the expanded same-model
 > check live in `api/schemas.py` / `orchestrator/matrix.py` (see
-> `FEATURE_MAP.md` F16).
+> `FEATURE_MAP.md` F16). PR22 adds optional `RunCreate.preset_ref` and the
+> `/api/presets*` surface + `GET /api/runs?preset=` filter — see
+> `FEATURE_MAP.md` F18.
 
 ## 0. Facts that constrain the design (verified in Phase-1 code)
 

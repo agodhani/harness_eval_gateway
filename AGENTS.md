@@ -354,6 +354,7 @@ or tests change.
 | F15 | Submit UX: live model picker + install, named harness configs |
 | F16 | Model-vs-model matrix: multi-model runs + per-model analytics |
 | F17 | Artifact thumbnails (headless screenshots via the preview stack) |
+| F18 | Task preset library (vendored + user presets, preset_ref provenance) |
 
 ## Post-MVP roadmap
 

@@ -42,6 +42,7 @@ sandbox/       image defs, workspace prep, done mechanism    (F4)
 evaluator/     rubric scoring agent                          (F7)
 scoring/       objective signal collectors (static + exec/coverage) (F7)
 skillpacks/    vendored default packs                        (F5)
+task_presets/  vendored task presets                         (F18)
 web/           Next.js app                                   (F1/F6/F8)
 data/artifacts/  run outputs (gitignored)
 tests/         pytest
