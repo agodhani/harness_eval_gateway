@@ -698,6 +698,22 @@ or tests change.
   ("Load more"), landing copy describes the config × model matrix, and the
   results `total` row is the weighted scale-normalised aggregate
   (`web/lib/scoreMath.ts`), not a raw Σ.
+- **Artifact file browsing is rooted per-sandbox, jailed like the download
+  (PR34/F19)** — `GET /api/sandboxes/{id}/files[/{path}]` reuses
+  `sandbox/preview.py`'s `resolve_workspace_dir`/`resolve_artifact_dir`
+  rather than `Artifact` rows: `workspace/` wins when the snapshot exists,
+  else the artifact dir itself browses (prompt cells surface `output.txt`/
+  `meta.json`/`transcript.log`; `FileListOut.root` reports which root
+  answered). Listings are depth(8)/entry(5000)-bounded with the workspace
+  ZIP's exclusions (`.git`/`node_modules`/`__pycache__`/`.venv`/`*.pyc`)
+  and never follow symlinks; text reads cap at 256 KiB and NUL-carrying
+  content returns `binary: true` + the `?download=1` FileResponse. `?diff=
+  <other>` is `difflib` server-side (a/ + b/ labels, 1 MiB per side, 10k
+  lines out, missing-side → diff vs empty) — the UI renders the unified
+  format in a `<pre>` classified by `web/lib/fileBrowser.ts`, whose
+  `mergeFileLists` reuses the PR10 merged-ordering split idiom for the
+  two-lane file list (no diff dependency added). Traversal/absolute-path/
+  sibling-workspace escapes 404 identically to the artifact download.
 - **PR27 — trials + per-config model options**: `RunCreate.trials` (1–8,
   default 1) replicates every effective config × model cell N times;
   expansion stays model-major then cell-major so a cell's `t1..tN` replicas
