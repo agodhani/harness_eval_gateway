@@ -1902,6 +1902,75 @@ rigged before it starts.
 - **Depends on:** F6 (event stream + timeline), PR10 split view +
   PR9 metrics strips (the comparison surfaces it augments)
 
+### F27 — Cross-run compare + leaderboards (PR32) ✅
+
+- **What:** rankings across every scored sandbox (the cross-run "who's
+  best" view PR31's per-run matrix can't answer) plus a two-run
+  side-by-side compare — the roadmap PR32 scope.
+- **`GET /api/analytics/leaderboard`** (`api/routers/analytics.py`) —
+  read-only aggregation over the newest-wins `overall` Score per
+  sandbox, joined to runs for provenance. Two boards: **by model**
+  (participant model → mean overall ± sample sd over n scored cells +
+  distinct run count + total cell count so coverage stays honest) and
+  **by config family** (`family:<adapter>|<sorted packs>` key — model
+  pins, names, trial markers stripped so a family aggregates across
+  submissions; `name`/`label` surface only when every member agrees).
+  Filters: `?preset=` (runs.preset_ref), `?since=`/`?until=` (inclusive
+  bounds on runs.created_at — naive date/datetime parses as UTC,
+  aware values respected), `?min_trials=` (runs.trials ≥ N — the
+  submitted repeat axis, not raw score count). Unscored cells are
+  excluded from means, never zeroed; empty scope returns honest
+  `[]` boards with the filter echo.
+- **Schemas** (`api/schemas.py`): `LeaderboardEntry`, `Leaderboard`
+  (both boards + filter echo + `runs_count`/`sandboxes_count`/`n_scored`
+  scope totals).
+- **`/leaderboard`** (`web/app/leaderboard/`) — filter bar (preset
+  dropdown from GET /api/presets + freeform slugs, since/until date
+  inputs, min-trials), scope KPI strip, both ranking tables; applied
+  filters sync to the URL (`?preset=&since=&until=&min_trials=`) so a
+  filtered view is shareable. `until` date-only values are widened to
+  end-of-day UTC client-side.
+- **`/compare?runs=idA,idB`** (`web/app/compare/`) — fetches each run's
+  detail + results + analytics client-side (no new endpoint) and
+  renders: spec-diff table (task/preset/suite, models, per-config
+  alignment by submission slot, budgets, task inputs, rubric version —
+  differing rows highlighted), the two config × model score grids
+  (same `buildScoreGrid` fold + heat colouring as the results page),
+  an analytics-delta table (participant totals + eval traffic separate;
+  Δ B−A tone-aware — green = better for B; cost shows `unpriced` when
+  any contributing model has no rate, never a partial total), and the
+  terminal-reason mix (counts + share, pending lanes visible). Fewer/
+  more than two ids → a run picker (datalist of recent runs).
+- **Transforms** (`web/lib/compareRuns.ts`, node-tested): `parseRunIds`,
+  `specDiffRows`/`configSummary`/`participantModels`, `analyticsTotals`
+  (per-model rollups → run totals; unpriced-with-traffic poisons the
+  cost total, zero-traffic doesn't), `terminalMix`, `overallStats`,
+  `delta` (null-propagating).
+- **Shared boards** (`web/components/LeaderboardBoards.tsx`): rank,
+  label (+shared family name), adapter badge, mean ± sd, n/sandboxes,
+  runs — used by `/leaderboard` AND `/presets/[slug]`, which now embeds
+  the preset-filtered global board (with a synthesised fallback from
+  the preset-local aggregates when the endpoint isn't there).
+- **Where:** `api/routers/analytics.py`, `api/schemas.py`,
+  `tests/unit/api/test_leaderboard.py`, `web/lib/api.ts`,
+  `web/lib/compareRuns.ts` + `.test.ts`, `web/components/
+  LeaderboardBoards.tsx`, `web/app/leaderboard/`, `web/app/compare/`,
+  `web/app/presets/[slug]/PresetDetailClient.tsx`,
+  `web/components/SiteHeader.tsx` (nav gains Compare + Leaderboard).
+- **Verify:**
+  - Unit: `tests/unit/api/test_leaderboard.py` (8 tests — model/config
+    ranking + sample sd, n vs sandboxes coverage, preset/date/min-trials
+    filters, newest-wins, empty scope) against per-test file-backed
+    SQLite (the shared :memory: engine leaks rows across tests).
+  - Web: `lib/compareRuns.test.ts` (9 tests); eslint + `next build`
+    clean (`/compare`, `/leaderboard` prerender).
+  - Manual: score ≥2 runs → `/leaderboard` ranks models + config
+    families; `/compare?runs=<idA>,<idB>` shows the diff + grids +
+    deltas; `/presets/<slug>` embeds the filtered board.
+- **Depends on:** F8/F9 (results + analytics shapes it reuses), F20
+  (trials axis for min_trials), F24 (preset_ref filter), F22 (mean±sd
+  + pricing-honesty conventions), F25 (suite provenance on the diff).
+
 ## Implementation sequence
 
 **Phase 0 — foundation (sequential):** F0 scaffold + base schema.

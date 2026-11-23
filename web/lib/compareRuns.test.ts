@@ -113,7 +113,9 @@ describe("specDiffRows", () => {
     const r = mkRun({
       config: {
         models: ["qwen3:8b", "gpt-4o"],
-        harness_configs: [{ adapter: "miniloop", model: "special-7b" }],
+        harness_configs: [
+          { adapter: "miniloop", skill_packs: [], model: "special-7b" },
+        ],
       },
     });
     assert.deepEqual(participantModels(r), ["qwen3:8b", "gpt-4o", "special-7b"]);

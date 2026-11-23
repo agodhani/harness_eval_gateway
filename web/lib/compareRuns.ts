@@ -73,8 +73,10 @@ export function configSummary(hc: Record<string, unknown> | undefined): string {
  * the diff table. Long-form (every config on its own line) rides the
  * title tooltips. */
 function configRows(a: RunOut, b: RunOut): SpecDiffRow[] {
-  const cfgsA = (a.config?.harness_configs ?? []) as Record<string, unknown>[];
-  const cfgsB = (b.config?.harness_configs ?? []) as Record<string, unknown>[];
+  // HarnessConfig has no index signature → widen through unknown for the
+  // Record<string, unknown>-typed helpers (configSummary/stableSerialize).
+  const cfgsA = (a.config?.harness_configs ?? []) as unknown as Record<string, unknown>[];
+  const cfgsB = (b.config?.harness_configs ?? []) as unknown as Record<string, unknown>[];
   const rows: SpecDiffRow[] = [];
   rows.push(
     row(
