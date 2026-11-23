@@ -1,0 +1,49 @@
+{
+  "name": "support-tone-compliance",
+  "description": "Rubric for customer-support reply tasks — does the reply resolve the issue accurately, in the right tone, while following policy (no forbidden promises, disclosures, or tone breaks)?",
+  "content": {
+    "summary": "Score the support reply on resolution accuracy, tone/register, policy compliance, and completeness of the answer — a compliant reply that doesn't help still fails, and a helpful reply that breaks policy fails harder.",
+    "dimensions": [
+      {
+        "name": "resolution_accuracy",
+        "title": "Resolution accuracy",
+        "description": "Does the reply correctly address the customer's actual issue with accurate product/policy facts? Wrong answers and confident guesses score near zero.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      },
+      {
+        "name": "tone",
+        "title": "Tone",
+        "description": "Is the register professional, empathetic, and appropriate to the customer's mood and the brand voice? Hostile, dismissive, or robotically generic replies score lower.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      },
+      {
+        "name": "policy_compliance",
+        "title": "Policy compliance",
+        "description": "Does the reply obey the stated support policies — no forbidden refunds/promises, required disclaimers present, correct escalation, no data leaks?",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      },
+      {
+        "name": "completeness",
+        "title": "Completeness",
+        "description": "Does the reply cover every question or action item the customer raised, including next steps? Partial answers score proportionally.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      }
+    ],
+    "criteria": [
+      {
+        "id": "example",
+        "text": "Example criterion — the generator replaces these with task-specific checkable items (policy rules, required disclosures, must-answer questions).",
+        "dimension": "policy_compliance",
+        "weight": 1.0
+      }
+    ]
+  }
+}

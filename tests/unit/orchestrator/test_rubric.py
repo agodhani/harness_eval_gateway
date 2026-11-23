@@ -98,7 +98,7 @@ def test_parse_no_json_raises() -> None:
 
 def test_parse_invalid_schema_raises_validation_error() -> None:
     payload = _valid_rubric_payload()
-    payload["dimensions"] = payload["dimensions"][:3]  # missing one canonical
+    payload["dimensions"] = []  # below the 1-dimension minimum (PR23)
     with pytest.raises(ValidationError):
         parse_rubric_json(json.dumps(payload))
 
@@ -114,6 +114,8 @@ def test_dimension_name_normalization() -> None:
 
 
 def test_dimension_aliases() -> None:
+    """The alias map is a soft normalizer — known re-phrasings fold onto the
+    canonical spellings (still true now that arbitrary names are allowed)."""
     payload = _valid_rubric_payload()
     aliases = ["functional", "acceptance", "implementation_quality", "complexity"]
     for dim, name in zip(payload["dimensions"], aliases):
@@ -122,21 +124,75 @@ def test_dimension_aliases() -> None:
     assert {d.name for d in content.dimensions} == set(CANONICAL_DIMENSIONS)
 
 
-def test_extra_dimension_rejected() -> None:
+def test_extra_dimension_accepted() -> None:
+    """PR23: arbitrary dimensions are allowed — a fifth, non-canonical dim
+    survives normalization instead of failing validation."""
     payload = _valid_rubric_payload()
     payload["dimensions"].append(
         {"name": "documentation", "description": "extra", "weight": 1.0}
     )
-    with pytest.raises(ValidationError, match="unexpected dimensions"):
+    content = parse_rubric_json(json.dumps(payload))
+    assert "documentation" in {d.name for d in content.dimensions}
+
+
+def test_arbitrary_dimensions_parse() -> None:
+    """PR23 verify path — a rubric with NO canonical dimension (accuracy/
+    tone/compliance) parses, normalizes names, and keeps its scales."""
+    content = parse_rubric_json(
+        json.dumps(
+            {
+                "summary": "support rubric",
+                "dimensions": [
+                    {
+                        "name": "Accuracy!!",
+                        "title": "Accuracy",
+                        "min_score": 0.0,
+                        "max_score": 5.0,
+                    },
+                    {"name": "tone", "max_score": 10.0},
+                    {"name": "policy compliance"},
+                ],
+            }
+        )
+    )
+    assert [d.name for d in content.dimensions] == [
+        "accuracy",
+        "tone",
+        "policy_compliance",
+    ]
+    assert content.dimensions[0].max_score == 5.0  # per-dim scale kept
+    assert content.dimensions[1].min_score == 0.0
+
+
+def test_dimension_count_bounds() -> None:
+    """1–12 dimensions (PR23): 1 parses, 13 fails."""
+    one = _valid_rubric_payload()
+    one["dimensions"] = one["dimensions"][:1]
+    assert len(parse_rubric_json(json.dumps(one)).dimensions) == 1
+
+    payload = _valid_rubric_payload()
+    payload["dimensions"] = [
+        {"name": f"dim_{i:02d}"} for i in range(13)
+    ]
+    with pytest.raises(ValidationError):
         parse_rubric_json(json.dumps(payload))
 
 
 def test_duplicate_dimension_rejected() -> None:
     payload = _valid_rubric_payload()
-    # Two dims normalize to the same canonical name -> dup + missing canonical.
+    # Two dims normalize to the same name -> the one structural rejection.
     payload["dimensions"][1]["name"] = "functional_requirements"
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="duplicate dimensions"):
         parse_rubric_json(json.dumps(payload))
+
+
+def test_criterion_dimension_normalized() -> None:
+    """Criteria bind to dimensions by name — the reference soft-normalizes
+    the same way dimension names do (``Accuracy`` → ``accuracy``)."""
+    payload = _valid_rubric_payload()
+    payload["criteria"] = [{"id": "c1", "text": "x", "dimension": "Functional"}]
+    content = parse_rubric_json(json.dumps(payload))
+    assert content.criteria[0].dimension == "functional_requirements"
 
 
 # ---------------------------------------------------------------------------
@@ -192,10 +248,13 @@ def test_parse_non_numeric_strings_still_rejected() -> None:
         parse_rubric_json(json.dumps(payload))
 
 
-def test_parse_missing_dimensions_still_rejected() -> None:
-    """Structural problems are never normalized away — no invented dims."""
+def test_parse_empty_dimensions_still_rejected() -> None:
+    """Structural problems are never normalized away — an empty dimensions
+    list can't invent one (and a partial list is now VALID, PR23)."""
     payload = _valid_rubric_payload()
     payload["dimensions"] = payload["dimensions"][:2]
+    assert len(parse_rubric_json(json.dumps(payload)).dimensions) == 2
+    payload["dimensions"] = []
     with pytest.raises(ValidationError):
         parse_rubric_json(json.dumps(payload))
 
@@ -309,7 +368,7 @@ async def test_draft_rubric_retry_feeds_validation_error(session_factory) -> Non
         calls.append(json.loads(request.content))
         if len(calls) == 1:
             bad = _valid_rubric_payload()
-            bad["dimensions"] = bad["dimensions"][:2]  # missing canonicals
+            bad["dimensions"] = []  # below the 1-dim minimum (PR23)
             return _chat_response(json.dumps(bad))
         return _chat_response(json.dumps(_valid_rubric_payload()))
 
@@ -318,7 +377,7 @@ async def test_draft_rubric_retry_feeds_validation_error(session_factory) -> Non
     assert len(calls) == 2
     retry_user = calls[1]["messages"][-1]["content"]
     assert "failed validation" in retry_user
-    assert "missing dimensions" in retry_user
+    assert "dimensions" in retry_user
 
 
 async def test_draft_rubric_retries_transient_http_error(session_factory, monkeypatch) -> None:
@@ -674,3 +733,134 @@ def test_draft_rubric_timeout_outwaits_gateway_worst_case() -> None:
         backoff_base * (2**i) for i in range(attempts - 1)
     )
     assert rubric_mod.DEFAULT_GEN_TIMEOUT_SECONDS > worst_case
+
+
+# ---------------------------------------------------------------------------
+# PR23 — template basis + domain hint plumbing
+# ---------------------------------------------------------------------------
+
+
+async def test_draft_rubric_passes_domain_hint(session_factory) -> None:
+    """``config.rubric_hint`` lands in the user message as the task domain
+    hint — non-coding tasks get fitting dimensions instead of code ones."""
+    run = make_run(
+        session_factory,
+        status="submitted",
+        task_prompt="Summarize the attached earnings report",
+        config={"rubric_hint": "financial summarisation"},
+    )
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return _chat_response(json.dumps(_valid_rubric_payload()))
+
+    client = _mock_client(handler)
+    await rubric_mod.draft_rubric(
+        run.id, session_factory=session_factory, settings=SETTINGS, client=client
+    )
+    user_msg = seen["body"]["messages"][1]["content"]
+    assert "financial summarisation" in user_msg
+    # hinted prompt: dims are chosen for the domain, not locked to canonical
+    system_msg = seen["body"]["messages"][0]["content"]
+    assert "EXACTLY these four" not in system_msg
+    assert "domain" in system_msg
+
+
+async def test_draft_rubric_template_basis(session_factory) -> None:
+    """``config.rubric_template`` resolves a vendored template whose content
+    becomes the generation basis embedded in the user message."""
+    run = make_run(
+        session_factory,
+        status="submitted",
+        config={"rubric_template": "extraction-accuracy"},
+    )
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return _chat_response(json.dumps(_valid_rubric_payload()))
+
+    client = _mock_client(handler)
+    await rubric_mod.draft_rubric(
+        run.id, session_factory=session_factory, settings=SETTINGS, client=client
+    )
+    messages = seen["body"]["messages"]
+    user_msg = messages[1]["content"]
+    assert "extraction_accuracy" in user_msg  # template dims are the basis
+    assert "field_coverage" in user_msg
+    assert "field_coverage" not in user_msg.split("Task prompt")[0]
+    system_msg = messages[0]["content"]
+    assert "rubric template" in system_msg.lower()
+
+
+async def test_draft_rubric_inline_basis(session_factory) -> None:
+    """``config.rubric_basis`` (a preset's inline suggested_rubric fragment)
+    wins over a template name and feeds the prompt directly."""
+    basis = {
+        "dimensions": [
+            {"name": "accuracy", "min_score": 0.0, "max_score": 10.0},
+            {"name": "tone", "min_score": 0.0, "max_score": 10.0},
+        ]
+    }
+    run = make_run(
+        session_factory,
+        status="submitted",
+        config={
+            "rubric_basis": basis,
+            "rubric_template": "code-default",  # ignored — inline wins
+        },
+    )
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return _chat_response(json.dumps(_valid_rubric_payload()))
+
+    client = _mock_client(handler)
+    await rubric_mod.draft_rubric(
+        run.id, session_factory=session_factory, settings=SETTINGS, client=client
+    )
+    user_msg = seen["body"]["messages"][1]["content"]
+    assert '"accuracy"' in user_msg or "accuracy" in user_msg
+    assert '"tone"' in user_msg or "tone" in user_msg
+    assert "cyclomatic_complexity" not in user_msg  # template name lost
+
+
+async def test_draft_rubric_unknown_template_degrades(session_factory) -> None:
+    """A stale template name (deleted between submit and draft) must not
+    fail the run — drafting degrades to freeform."""
+    run = make_run(
+        session_factory,
+        status="submitted",
+        config={"rubric_template": "no-such-template"},
+    )
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        return _chat_response(json.dumps(_valid_rubric_payload()))
+
+    client = _mock_client(handler)
+    await rubric_mod.draft_rubric(
+        run.id, session_factory=session_factory, settings=SETTINGS, client=client
+    )
+    assert len(calls) == 1
+    with session_factory() as s:
+        assert s.get(Run, run.id).status == "rubric_review"
+
+
+def test_system_prompt_variants() -> None:
+    """No basis/hint → the historical exactly-four contract; hint →
+    domain-driven dims; basis → template-refine wording."""
+    default = rubric_mod._system_prompt(rubric_basis=None, domain_hint=None)
+    assert "EXACTLY these four" in default
+    hinted = rubric_mod._system_prompt(
+        rubric_basis=None, domain_hint="customer support"
+    )
+    assert "EXACTLY these four" not in hinted
+    assert "domain" in hinted
+    templated = rubric_mod._system_prompt(
+        rubric_basis={"dimensions": []}, domain_hint=None
+    )
+    assert "rubric template" in templated.lower()

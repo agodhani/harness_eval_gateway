@@ -87,6 +87,11 @@ class Settings(BaseSettings):
     BENCHMARK_SUITES_DIR: Path = (
         Path(__file__).resolve().parents[1] / "benchmark_suites"
     )
+    # PR23 vendored rubric templates (<root>/<name>.json). Same repo-root
+    # anchoring; the DB rubric_templates table holds the user side.
+    RUBRIC_TEMPLATES_DIR: Path = (
+        Path(__file__).resolve().parents[1] / "rubric_templates"
+    )
     # Root for USER-IMPORTED skill packs (F11). None => derived from
     # ARTIFACT_ROOT as <data>/skillpacks (sibling of artifacts/ + sandboxes/,
     # so compose's ./data:/data mount + SandboxRuntime.to_host_path cover it).

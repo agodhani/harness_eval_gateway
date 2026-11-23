@@ -85,3 +85,73 @@ def test_prompt_prior_error_omitted_when_absent() -> None:
 def test_prompt_prior_error_capped() -> None:
     prompt = build_eval_prompt(RUBRIC, prior_error="x" * 1000)
     assert "x" * 400 not in prompt
+
+
+# ---------------------------------------------------------------------------
+# PR23 — dimension-aware judge brief
+# ---------------------------------------------------------------------------
+
+NON_CODE_RUBRIC = {
+    "summary": "Score the support reply.",
+    "dimensions": [
+        {
+            "name": "accuracy",
+            "title": "Accuracy",
+            "description": "Correct answer to the ticket.",
+            "min_score": 0,
+            "max_score": 10,
+        },
+        {
+            "name": "tone",
+            "title": "Tone",
+            "description": "Professional register.",
+            "min_score": 0,
+            "max_score": 10,
+        },
+        {
+            "name": "compliance",
+            "title": "Compliance",
+            "description": "Policy obeyed.",
+            "min_score": 0,
+            "max_score": 10,
+        },
+    ],
+}
+
+
+def test_prompt_non_code_rubric_gets_na_guidance() -> None:
+    """PR23: a rubric with no code dimensions reads as a general eval — the
+    measured-signals rule degrades to 'context only' and the brief tells the
+    judge how to mark non-applicable dimensions."""
+    prompt = build_eval_prompt(NON_CODE_RUBRIC)
+    assert "not applicable" in prompt
+    assert "coding-agent" not in prompt
+    # no code dims -> no cyclomatic-specific measured instruction
+    assert "score `cyclomatic_complexity` from its measured values" not in prompt
+    # the generic form instead
+    assert "context only" in prompt
+    # every dimension still listed for scoring
+    for name in ("accuracy", "tone", "compliance"):
+        assert name in prompt
+
+
+def test_prompt_cyclomatic_dim_keeps_measured_instruction() -> None:
+    """A rubric carrying cyclomatic_complexity keeps the measured-CC rule —
+    the not-applicable rule covers OTHER non-code dims in the same brief."""
+    rubric = dict(NON_CODE_RUBRIC)
+    rubric["dimensions"] = [
+        *NON_CODE_RUBRIC["dimensions"],
+        {"name": "cyclomatic_complexity", "min_score": 0, "max_score": 10},
+    ]
+    prompt = build_eval_prompt(rubric)
+    assert "score `cyclomatic_complexity` from its measured values" in prompt
+    assert "not applicable" in prompt
+
+
+def test_prompt_req_dims_named_in_exec_evidence() -> None:
+    """functional/acceptance dims are named in the exec + generated-suite
+    evidence lines; a rubric without them gets the generic phrasing."""
+    prompt = build_eval_prompt(RUBRIC)  # has functional_requirements
+    assert "`functional_requirements`" in prompt
+    generic = build_eval_prompt(NON_CODE_RUBRIC)
+    assert "whichever rubric dimensions they inform" in generic

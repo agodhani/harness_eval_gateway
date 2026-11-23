@@ -5,6 +5,7 @@ description: Produce correct SQL and a findings report against a database in the
 category: sql
 tags: [sql, sqlite, data, report]
 suggested_adapter: miniloop
+suggested_rubric: code-default
 ---
 
 The workspace contains a SQLite database (or `.sql` schema/seed files you can load into `sqlite3`).

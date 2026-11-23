@@ -241,10 +241,40 @@ class TaskPreset(Base):
     # keys so vendored and user presets read uniformly in PresetOut.
     suggested_adapter: Mapped[str | None] = mapped_column(String(64))
     suggested_models: Mapped[list[Any] | None] = mapped_column(JSONType)
+    # PR23 — optional rubric-generation basis: ``{"template": <name>}`` (a
+    # rubric_templates entry — vendored file or user row), ``{"hint": str}``
+    # (domain hint fed into the gen prompt), or an inline rubric fragment
+    # ``{"dimensions": [...]}`` used directly as the basis. Submit applies
+    # it only when no explicit ``rubric_template`` was submitted.
+    suggested_rubric: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class RubricTemplate(Base):
+    """PR23 — user-saved rubric template (the "user" side of the template
+    library, mirroring task_presets).
+
+    Vendored templates are ``rubric_templates/<name>.json`` files and never
+    appear here; rows are always ``source="user"`` and share the vendored
+    name namespace. ``content`` is a RubricContent-shaped dict — the
+    template acts as the rubric-generation basis when a submit selects it
+    (``runs.config.rubric_template``).
+    """
+
+    __tablename__ = "rubric_templates"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    # One name namespace with the vendored files — selection token for
+    # RunCreate.rubric_template and preset suggested_rubric {"template": ...}.
+    name: Mapped[str] = mapped_column(String(64), unique=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    content: Mapped[dict[str, Any]] = mapped_column(JSONType)
+    # "user" for every row — "vendored" is reserved for file templates.
+    source: Mapped[str] = mapped_column(String(16), default="user")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class SuiteRun(Base):

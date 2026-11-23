@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from api import modelcheck
 from api import presets as preset_store
+from api import rubric_templates as template_store
 from api.config import get_settings
 from api.deps import get_db
 from api.schemas import (
@@ -350,6 +351,7 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
     task_prompt = body.task_prompt
     preset_ref: str | None = None
     preset_revision: int | None = None
+    preset: preset_store.Preset | None = None
     if body.preset_ref:
         preset = preset_store.resolve(
             session, get_settings().TASK_PRESETS_DIR, body.preset_ref
@@ -365,6 +367,62 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
         task_prompt = preset.task_prompt
         preset_ref = preset.slug
         preset_revision = preset.revision
+
+    # PR23 — rubric-generation steering. An explicit ``rubric_template``
+    # wins outright and must resolve (a typo 422s, not a silent freeform
+    # fallback); a resolved preset's ``suggested_rubric`` fills in only when
+    # no template was submitted, and an unresolvable suggestion degrades
+    # quietly (a suggestion is a hint, not a contract). ``rubric_hint``
+    # falls back to the preset's category so preset tasks keep their domain
+    # in the gen prompt.
+    rubric_template = body.rubric_template
+    rubric_hint = body.rubric_hint
+    rubric_basis: dict[str, Any] | None = None
+    # getattr: test fixtures lean on the settings namespace — the repo-root
+    # default mirrors api.config's vendored dir.
+    templates_dir = getattr(get_settings(), "RUBRIC_TEMPLATES_DIR", None) or (
+        Path(__file__).resolve().parents[2] / "rubric_templates"
+    )
+    if rubric_template is not None:
+        if (
+            template_store.resolve(session, templates_dir, rubric_template)
+            is None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"unknown rubric_template {rubric_template!r} — "
+                    "GET /api/rubric-templates lists valid names"
+                ),
+            )
+    elif preset is not None:
+        suggested = preset.suggested_rubric or {}
+        suggested_template = str(suggested.get("template") or "").strip()
+        if suggested_template:
+            if (
+                template_store.resolve(session, templates_dir, suggested_template)
+                is not None
+            ):
+                rubric_template = suggested_template
+        elif isinstance(suggested.get("dimensions"), list):
+            # Inline rubric fragment — carried verbatim as the basis.
+            rubric_basis = {
+                k: suggested[k]
+                for k in ("summary", "title", "dimensions", "criteria")
+                if k in suggested
+            }
+        if rubric_hint is None:
+            suggested_hint = str(suggested.get("hint") or "").strip()
+            if suggested_hint:
+                rubric_hint = suggested_hint
+    if rubric_hint is None and preset is not None and preset.category:
+        rubric_hint = preset.category
+    if rubric_template is not None:
+        config["rubric_template"] = rubric_template
+    if rubric_basis is not None:
+        config["rubric_basis"] = rubric_basis
+    if rubric_hint is not None:
+        config["rubric_hint"] = rubric_hint
 
     run = Run(
         status="submitted",

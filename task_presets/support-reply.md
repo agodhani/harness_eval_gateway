@@ -5,6 +5,7 @@ description: Write empathetic, policy-accurate support replies to customer ticke
 category: support
 tags: [writing, support, communication]
 suggested_adapter: miniloop
+suggested_rubric: support-tone-compliance
 ---
 
 The workspace contains customer support tickets plus a policy/knowledge-base document (e.g. refund rules, SLAs, product facts).

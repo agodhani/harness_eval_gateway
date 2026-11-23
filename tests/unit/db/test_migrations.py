@@ -30,8 +30,10 @@ PRICE_GLOB_LOWER_REV = "d6e2b8f4a1c9"
 TASK_PRESETS_REV = "d1e2f3a4b5c6"
 # PR26 — benchmark suites + checker results.
 SUITES_REV = "e4f5a6b7c8d9"
-# PR35 — runs.share_token (export + share links); current chain head.
+# PR35 — runs.share_token (export + share links).
 SHARE_TOKEN_REV = "c5f9a2b8d4e7"
+# PR23 — rubric_templates + task_presets.suggested_rubric; current chain head.
+RUBRIC_TEMPLATES_REV = "f6a7b8c9d0e1"
 
 
 @pytest.fixture()
@@ -63,7 +65,7 @@ def _columns(url: str, table: str) -> set[str]:
 
 def test_migration_chain_single_headed() -> None:
     heads = ScriptDirectory.from_config(_cfg()).get_heads()
-    assert list(heads) == [SHARE_TOKEN_REV]
+    assert list(heads) == [RUBRIC_TEMPLATES_REV]
 
 
 def test_sandbox_name_upgrade_downgrade(sqlite_url: str) -> None:
@@ -110,6 +112,7 @@ def test_task_presets_upgrade_downgrade(sqlite_url: str) -> None:
         "revision",
         "suggested_adapter",
         "suggested_models",
+        "suggested_rubric",
         "created_at",
         "updated_at",
     } <= preset_cols
@@ -322,6 +325,89 @@ def test_runs_trials_matches_model(sqlite_url: str) -> None:
         )
         assert col["nullable"] is False
         assert "INT" in str(col["type"]).upper()
+    finally:
+        engine.dispose()
+
+
+def test_rubric_templates_upgrade_downgrade(sqlite_url: str) -> None:
+    """PR23: ``rubric_templates`` table + ``task_presets.suggested_rubric``
+    land at head and unwind cleanly."""
+    command.upgrade(_cfg(), "head")
+    engine = create_engine(sqlite_url)
+    try:
+        tables = set(inspect(engine).get_table_names())
+        assert "rubric_templates" in tables
+        tpl_cols = {c["name"] for c in inspect(engine).get_columns("rubric_templates")}
+        assert {"id", "name", "description", "content", "source", "created_at"} <= tpl_cols
+        assert "suggested_rubric" in {
+            c["name"] for c in inspect(engine).get_columns("task_presets")
+        }
+        # unique name — the shared vendored+user namespace
+        indexes = [
+            ix
+            for ix in inspect(engine).get_indexes("rubric_templates")
+            if ix.get("unique") and ix.get("column_names") == ["name"]
+        ]
+        uniques = [
+            uc
+            for uc in inspect(engine).get_unique_constraints("rubric_templates")
+            if "name" in uc.get("column_names", [])
+        ]
+        assert indexes or uniques
+    finally:
+        engine.dispose()
+
+    command.downgrade(_cfg(), SHARE_TOKEN_REV)
+    engine = create_engine(sqlite_url)
+    try:
+        assert "rubric_templates" not in inspect(engine).get_table_names()
+        assert "suggested_rubric" not in {
+            c["name"] for c in inspect(engine).get_columns("task_presets")
+        }
+    finally:
+        engine.dispose()
+
+    command.upgrade(_cfg(), "head")
+    assert "name" in _columns(sqlite_url, "rubric_templates")
+
+
+def test_rubric_templates_roundtrip(sqlite_url: str) -> None:
+    """A migrated DB accepts + reads back a template row and a preset
+    carrying ``suggested_rubric`` (JSONB on pg, JSON on sqlite)."""
+    from db.models import RubricTemplate, TaskPreset
+    from db.session import make_engine, make_session_factory
+
+    command.upgrade(_cfg(), "head")
+    engine = make_engine(sqlite_url)
+    sf = make_session_factory(engine)
+    try:
+        with sf() as s:
+            s.add(
+                RubricTemplate(
+                    name="mig-template",
+                    description="mig",
+                    content={
+                        "summary": "x",
+                        "dimensions": [{"name": "accuracy"}],
+                        "criteria": [],
+                    },
+                )
+            )
+            s.add(
+                TaskPreset(
+                    slug="mig-preset",
+                    title="Mig",
+                    task_prompt="do the thing",
+                    suggested_rubric={"template": "mig-template"},
+                )
+            )
+            s.commit()
+        with sf() as s:
+            tpl = s.query(RubricTemplate).filter_by(name="mig-template").one()
+            assert tpl.content["dimensions"][0]["name"] == "accuracy"
+            assert tpl.source == "user"
+            preset = s.query(TaskPreset).filter_by(slug="mig-preset").one()
+            assert preset.suggested_rubric == {"template": "mig-template"}
     finally:
         engine.dispose()
 

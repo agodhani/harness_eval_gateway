@@ -106,6 +106,7 @@ def _preset_out(
         revision=preset.revision,
         suggested_adapter=preset.suggested_adapter,
         suggested_models=preset.suggested_models,
+        suggested_rubric=preset.suggested_rubric,
         created_at=preset.created_at,
         updated_at=preset.updated_at,
         runs_count=runs_count,
@@ -400,6 +401,7 @@ async def create_preset(slug: str, body: PresetCreate, session: DbSession) -> Pr
             revision=1,
             suggested_adapter=body.suggested_adapter or None,
             suggested_models=body.suggested_models or None,
+            suggested_rubric=body.suggested_rubric or None,
         )
         session.add(row)
         try:
@@ -450,7 +452,7 @@ async def update_preset(slug: str, body: PresetUpdate, session: DbSession) -> Pr
             if value is not None:
                 setattr(row, field_name, value)
                 changed = True
-        for field_name in ("suggested_adapter", "suggested_models"):
+        for field_name in ("suggested_adapter", "suggested_models", "suggested_rubric"):
             if field_name in body.model_fields_set:
                 setattr(row, field_name, getattr(body, field_name) or None)
                 changed = True
