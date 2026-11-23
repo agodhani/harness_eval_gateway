@@ -654,7 +654,7 @@ def test_vendored_suggested_rubrics_resolve() -> None:
         __import__("db.session", fromlist=["make_engine"]).make_engine(
             "sqlite:///:memory:"
         )
-    )() as s:
+    )():
         for p in preset_store.list_vendored(VENDORED_DIR):
             if not p.suggested_rubric:
                 continue

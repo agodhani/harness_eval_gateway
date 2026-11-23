@@ -209,8 +209,10 @@ def _read_tail(path: Path, max_bytes: int) -> str | None:
 #: System prompt for the direct judge — output shape is the whole contract;
 #: context lives in the user message (same split as TESTGEN_SYSTEM_PROMPT).
 DIRECT_SYSTEM_PROMPT = (
-    "You are a strict, impartial evaluator for a coding-agent benchmark. "
-    "Score the candidate submission against the rubric. Respond with ONE "
+    "You are a strict, impartial evaluator for an agent benchmark. The "
+    "submission may be code, extracted data, written text, or any other "
+    "artifact the rubric describes. Score the candidate submission against "
+    "the rubric. Respond with ONE "
     "JSON object and NOTHING else — no prose, no explanation, no markdown "
     "fences, nothing before or after the object. Use double-quoted strings "
     "only.\n\n"
@@ -220,7 +222,10 @@ DIRECT_SYSTEM_PROMPT = (
     '"summary": "<2-4 sentence assessment>"}\n'
     "Score EVERY rubric dimension exactly once; `dimension` must be the "
     "rubric dimension's `name`. A rationale must cite concrete evidence — "
-    "file names, observed behavior, missing pieces."
+    "file names, observed behavior, missing pieces. If a dimension cannot "
+    "apply to this kind of submission (e.g. `cyclomatic_complexity` on a "
+    "non-code artifact), still emit its row: score the middle of its scale "
+    "and begin the rationale with \"not applicable\" followed by why."
 )
 
 #: Cap on the prior-error detail echoed into the retry/direct prompts.

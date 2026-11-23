@@ -38,6 +38,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F23 | Task inputs — seeded workspace (repo_url or uploaded archive, identical bytes per cell proven by `harness_config.seed_sha`) | ✅ | `sandbox/seeds.py`, `api/routers/uploads.py`, `api/schemas.py` (`TaskInputsIn`), `orchestrator/provision.py`, `sandbox/runtime.py`, `web/app/submit/page.tsx` (Inputs section) | `tests/unit/sandbox/test_seeds.py`, `tests/unit/api/test_uploads.py`, `tests/unit/orchestrator/test_provision_seed.py` |
 | F24 | Task preset library (vendored md + user presets, preset_ref on runs, /presets browse + detail) | ✅ | `task_presets/`, `api/presets.py`, `api/routers/presets.py`, `api/routers/runs.py` (preset_ref), `db/models.py` (`TaskPreset`, `Run.preset_*`), `web/app/presets/`, `web/components/SavePresetDialog.tsx`, `web/app/submit/page.tsx` | `tests/unit/api/test_presets.py`, `tests/unit/db/test_migrations.py`, `web/lib/resubmit.test.ts` |
 | F25 | Benchmark suites + deterministic checkers (vendored suite.yaml fan-out, objective pass/fail beside judge scores, batch aggregation) | ✅ | `benchmark_suites/`, `api/suites.py`, `api/routers/suites.py`, `scoring/checkers.py`, `db/models.py` (`SuiteRun`, `CheckerResult`, `Run.suite_*`), `orchestrator/lifecycle.py`, `web/app/suites/`, `web/app/suite-runs/` | `tests/unit/api/test_suites.py`, `tests/unit/scoring/test_checkers.py`, `tests/unit/orchestrator/test_lifecycle_suites.py`, `tests/unit/evaluator/test_suite_signal.py`, `tests/unit/db/test_migrations.py` |
+| F26 | Custom rubric dimensions + rubric templates (1–12 arbitrary dimensions, template basis + domain hint at submit, preset `suggested_rubric`, structured rubric editor) | ✅ | `orchestrator/rubric.py`, `rubric_templates/`, `api/rubric_templates.py`, `api/routers/rubric_templates.py`, `db/models.py` (`RubricTemplate`, `TaskPreset.suggested_rubric`), `evaluator/{prompts,judge_direct}.py`, `web/lib/{rubricEdit,api,resubmit}.ts`, `web/components/RubricEditor.tsx`, `web/app/submit/page.tsx`, `web/app/runs/[id]/` | `tests/unit/orchestrator/test_rubric.py`, `tests/unit/api/test_rubric_templates.py`, `test_runs.py`, `test_results.py`, `test_presets.py`, `tests/unit/evaluator/test_prompts.py`, `test_judge_direct.py`, `tests/unit/db/test_migrations.py`, `web/lib/rubricEdit.test.ts` |
 | F27 | Cross-run compare + leaderboards (global model + config-family rankings w/ filters, `/compare` two-run diff, preset-embedded board) | ✅ | `api/routers/analytics.py` (`GET /api/analytics/leaderboard`), `api/schemas.py` (`Leaderboard`/`LeaderboardEntry`), `web/app/leaderboard/`, `web/app/compare/`, `web/components/LeaderboardBoards.tsx`, `web/lib/compareRuns.ts`, `web/lib/api.ts`, `web/app/presets/[slug]/PresetDetailClient.tsx` | `tests/unit/api/test_leaderboard.py`, `web/lib/compareRuns.test.ts` |
 | F28 | Run export + share links (`?fmt=json|csv` bundle — spec, rubrics, matrix, analytics, events-lite; `runs.share_token` + read-only `/share/{token}` results+timeline view) | ✅ | `api/routers/results.py` (`/export`, `/share` mint/revoke + `GET /api/share/{token}`), `db/models.py` (`Run.share_token`), `db/migrations/versions/c5f9a2b8d4e7_runs_share_token.py`, `web/lib/api.ts`, `web/components/ExportButtons.tsx`, `web/app/share/[token]/` | `tests/unit/api/test_export.py`, `tests/unit/db/test_migrations.py`, `web/lib/api.test.ts` |
 | F29 | Dashboard home (`/dashboard`: summary aggregate — KPI strip, weekly spend + runs charts, terminal-mix donut, queue lane, top-5 boards, recent runs) | ✅ | `api/routers/analytics.py` (`GET /api/analytics/summary`), `api/schemas.py` (`DashboardSummary`/`DashboardTotals`/`DashboardWeekPoint`/`DashboardQueue*`/`DashboardTerminalSlice`/`DashboardRecentRun`), `web/app/dashboard/`, `web/lib/dashboard.ts`, `web/lib/api.ts`, `web/components/SiteHeader.tsx`, `web/components/landing/Hero.tsx` | `tests/unit/api/test_summary.py`, `web/lib/dashboard.test.ts` |
@@ -1864,6 +1865,111 @@ rigged before it starts.
   (evaluator + rescore newest-wins), PR8 (locked `heg-exec` runner +
   signal pipeline), F8 (results page), F18 (the `prompt` adapter pin —
   prompt-cell tasks resolve to real no-sandbox cells)
+
+### F26 — Custom rubric dimensions + rubric templates ✅
+
+- **What:** the rubric dimension set is no longer locked to the four
+  canonical coding axes. `RubricContent.dimensions` accepts **1–12
+  arbitrary dimensions** — names soft-normalize to snake_case and fold
+  through the canonical alias map (a *soft* normalizer, never a
+  validator); duplicates after normalization are the one structural
+  rejection. Each dimension keeps its own `title`/`description`/
+  `weight`/`min_score`/`max_score`, so non-10-point scales persist and
+  score correctly. `scores.dimension` stays keyed by dimension name —
+  an `accuracy`/`tone`/`compliance` rubric drafts, freezes, evaluates,
+  and renders with no canonical names anywhere.
+- **Generation steering:** the rubric gen prompt now takes a **domain
+  hint** (`RunCreate.rubric_hint` → falling back to the preset's
+  `category`) and a **template basis** (`RunCreate.rubric_template` →
+  falling back to the preset's `suggested_rubric` → falling back to
+  freeform task text). A template's dimensions/criteria seed the draft;
+  the generator refines them for the task rather than starting from
+  scratch. `draft_rubric()` reads `run.config` so suite/preset submits
+  resolve identically.
+- **Rubric templates** (`api/rubric_templates.py`,
+  `rubric_templates/*.json`): a merged store like presets — vendored
+  JSON seeds (`code-default`, `extraction-accuracy`,
+  `summarisation-fidelity`, `support-tone-compliance`) plus
+  `rubric_templates` DB rows for user-authored ones.
+  `GET /api/rubric-templates` lists `{name, description, content,
+  source}`; `GET /api/rubric-templates/{name}` gets one (vendored seeds
+  are validated through `RubricContent` at startup-access time).
+- **Preset `suggested_rubric`:** `task_presets.suggested_rubric`
+  (nullable JSONB) + vendored frontmatter — `{template: name}` |
+  `{hint: text}` | inline `{dimensions: [...]}`. User presets PATCH it;
+  vendored presets carry it (code presets → `code-default`, extraction
+  → `extraction-accuracy`, support-reply → `support-tone-compliance`).
+  Submit resolution order: explicit `rubric_template` → preset
+  `suggested_rubric` → freeform task text. `rubric_template`,
+  `rubric_basis`, `rubric_hint` persist on `run.config`.
+- **Evaluator:** `evaluator/prompts.py` is dimension-aware — the
+  measured-signals rule names only the dims the rubric actually
+  carries (`cyclomatic_complexity` gets the measured-CC instruction,
+  `functional_requirements`/`acceptance_criteria` get the
+  exec/generated-suite evidence pointer); a non-code rubric gets the
+  generic "measurements are context only" phrasing plus the explicit
+  **"not applicable"** rule (mid-scale score + "not applicable"
+  rationale prefix — never drop the row). `judge_direct.py`'s fallback
+  prompt is domain-neutral and carries the same rule. Collectors still
+  report whatever signals they can measure; the judge brief — not the
+  collector — decides applicability.
+- **DB:** migration `f6a7b8c9d0e1_rubric_templates.py` (revises
+  `c5f9a2b8d4e7`) — `rubric_templates` table (name PK, description,
+  JSONB content, source, timestamps) +
+  `task_presets.suggested_rubric`.
+- **API:** `RunCreate.rubric_template`/`rubric_hint` (nullable);
+  `RubricTemplateOut`; `Preset*` schemas carry `suggested_rubric`;
+  unknown template name → 422 at submit. `dimensionOrder` in
+  `web/lib/api.ts` stays canonical-first, then arbitrary names
+  alphabetically.
+- **Web:** `web/lib/rubricEdit.ts` — pure form-state helpers mirroring
+  the backend contract (`canonicalDimension`, `draftFromContent`,
+  `buildRubricContent` preserving unknown extras, `validateDraft`
+  enforcing 1–12/dedup/scale/ref rules) → `web/components/
+  RubricEditor.tsx`, a shared structured editor: summary, dimension
+  rows (name/title/description/weight/min–max scale, with the resolved
+  score key previewed), criteria rows (id/text/dimension-select/
+  weight), add/remove — **raw JSON behind a toggle** that serializes
+  the form and syncs back on valid parse. Both edit sites use it:
+  run-detail draft review (PUT) and results-page `RescoreControls`
+  (new version + optional re-score) — save is disabled while the
+  draft is invalid. Submit gains a **Rubric basis** select (auto →
+  preset suggestion → freeform; explicit template names) + a domain-
+  hint input; preset suggestions display inline. `resubmit.ts` carries
+  `rubric_template`/`rubric_hint` so resubmits regenerate the same
+  basis.
+- **Where:** `orchestrator/rubric.py`, `evaluator/prompts.py`,
+  `evaluator/judge_direct.py`, `rubric_templates/`,
+  `api/rubric_templates.py`, `api/routers/rubric_templates.py`,
+  `api/config.py` (`RUBRIC_TEMPLATES_DIR`), `api/presets.py`,
+  `api/routers/{presets,runs}.py`, `api/schemas.py`,
+  `db/models.py` + migration `f6a7b8c9d0e1`, `web/lib/{rubricEdit,
+  api,resubmit}.ts`, `web/components/RubricEditor.tsx`,
+  `web/app/submit/page.tsx`, `web/app/runs/[id]/RunDetailClient.tsx`,
+  `web/app/runs/[id]/results/RescoreControls.tsx`.
+- **Verify:**
+  - Unit: `tests/unit/orchestrator/test_rubric.py` (1–12 bounds,
+    normalization, alias folding, dedup, gen-prompt context variants,
+    retry semantics); `tests/unit/api/test_rubric_templates.py` (seed
+    validation, list/get, merged store); `test_runs.py`/`test_results.py`
+    (arbitrary dims accepted, dedup/over-12 → 422, template/hint persist,
+    preset suggestion resolution); `tests/unit/evaluator/test_prompts.py`
+    + `test_judge_direct.py` (dimension-aware guidance, not-applicable
+    rule, domain-neutral wording); `tests/unit/db/test_migrations.py`
+    (new head + `suggested_rubric`/`rubric_templates` round-trips).
+  - Web: `lib/rubricEdit.test.ts` (normalization, validation, content
+    build round-trip); `eslint` + `next build` clean.
+  - Manual: submit an extraction/support preset → the draft rubric
+    carries `accuracy`-style dims (no `cyclomatic_complexity`) →
+    approve → scores persist under those names → results render
+    alphabetically after the canonical block.
+- **Depends on:** F24 (preset `suggested_rubric` rides the preset
+  library + category hint), F2 (rubric gen pipeline), F7/F14
+  (evaluator + rescore), F25 (suite fan-out inherits the fields).
+  **Feeds:** the multi-domain business-eval direction — non-coding
+  task evaluation needs arbitrary rubrics; later judge-quality work
+  (calibration, pairwise comparison) builds on dynamic dimension
+  sets.
 
 ### F31 — Timeline compare-mode clock toggle ✅
 

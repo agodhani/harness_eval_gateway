@@ -324,7 +324,25 @@ Anthropic/OpenAI landed (env-switched, `PROVIDER_ROUTES` per-model).
 ## Rubric
 
 MVP dimensions: functional requirements, acceptance criteria, code
-implementation quality, cyclomatic complexity. Since PR6/PR7 the judge
+implementation quality, cyclomatic complexity. Since PR23 (F26) those four
+are only the **code-task default** — `RubricContent.dimensions` accepts
+1–12 arbitrary dimensions (names soft-normalize to snake_case + a small
+canonical-alias map; duplicates after normalization are the one structural
+rejection), so non-coding rubrics (extraction accuracy, tone, compliance,
+…) generate, freeze, score, and render with no code axes at all.
+Generation can be steered: `RunCreate.rubric_hint` (fallback: preset
+category) feeds a domain line into the gen prompt, and a **rubric
+template** (`RunCreate.rubric_template` — vendored JSON seeds under
+`rubric_templates/` + user `rubric_templates` rows, `GET
+/api/rubric-templates`) replaces the freeform task text as the generation
+basis; a preset's `suggested_rubric` (`task_presets.suggested_rubric`
+JSONB / vendored frontmatter) fills in when no explicit template is sent.
+Collectors still report every measurable signal; the judge brief names
+only the dimensions the rubric carries and marks non-applicable dims
+(e.g. `cyclomatic_complexity` on a non-code artifact) mid-scale with a
+"not applicable" rationale rather than dropping the row.
+
+Since PR6/PR7 the judge
 scores from **measured** signals where available — the `scoring` package's
 static-analysis collector (lizard, parse-only) computes real cyclomatic
 complexity/size/language mix, and the `exec` collector runs the
@@ -1058,6 +1076,27 @@ or tests change.
   the gateway request path and the monitor backstop. The default run
   budget moved 200k → 500k (`BudgetsIn`/`DEFAULT_RUN_TOKEN_BUDGET`
   aligned) — budgets stop runaways, not honest work.
+
+- **Rubric dimensions are open, not canonical-locked (PR23/F26)** — the
+  exact-four validator was the last thing keeping eval coding-only.
+  `RubricContent` now takes 1–12 arbitrary dims; the canonical names
+  remain as (a) the `code-default` template's set, (b) alias-fold
+  targets for common LLM re-phrasings, and (c) the results table's
+  sort anchor (canonical-first, then alpha). Dedup after normalization
+  is the ONLY structural rejection — a 3-dim rubric is valid, not an
+  error. Generation steering resolves strictly: explicit
+  `rubric_template` → preset `suggested_rubric` → freeform task text,
+  with `rubric_hint` → preset `category` → none for the domain line;
+  all three land on `run.config` so `draft_rubric` resolves them at
+  draft time. Rubric templates reuse the preset merged-store pattern
+  (vendored `rubric_templates/*.json` + DB rows). The judge brief —
+  not the collector set — decides signal applicability: collectors
+  always report what they can measure, and `evaluator/prompts.py`
+  phrases the measured-signals rule around the rubric's actual dims,
+  marking non-applicable dims mid-scale + "not applicable" instead of
+  fabricating or dropping rows. Frontend editing is the shared
+  `RubricEditor` (structured form, raw JSON behind a toggle); raw-JSON
+  textareas are gone from both edit sites.
 
 ## Working conventions
 
