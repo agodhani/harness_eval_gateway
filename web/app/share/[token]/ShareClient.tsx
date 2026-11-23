@@ -277,7 +277,8 @@ export default function ShareClient({ token }: { token: string }) {
               {bundle.events_truncated ? (
                 <p className="chart-legend">
                   The bundle itself was truncated — {bundle.events_total}{" "}
-                  events exist; the earliest {events.length} are shown.
+                  events exist; the earliest {events.length} are in the
+                  bundle.
                 </p>
               ) : null}
             </>

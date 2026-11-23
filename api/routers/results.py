@@ -1859,7 +1859,7 @@ _EXPORT_CSV_FIELDS = [
 ]
 
 
-_CSV_FORMULA_CHARS = ("=", "+", "-", "@")
+_CSV_FORMULA_CHARS = ("=", "+", "-", "@", "\t", "\r")
 
 
 def _csv_cell(value: Any) -> Any:
