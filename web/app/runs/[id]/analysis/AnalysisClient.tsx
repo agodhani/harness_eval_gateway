@@ -37,6 +37,7 @@ import {
 } from "@/lib/api";
 import { latencyChartRows, speedChartRows } from "@/lib/analysisRows";
 import { formatNum, formatUsd, shortId } from "@/lib/format";
+import { buildScoreGrid } from "@/lib/gridMatrix";
 import { dimensionSpecMap, weightedDimTotal } from "@/lib/scoreMath";
 import { fmtMeanSd } from "@/lib/trialGroups";
 import {
@@ -49,6 +50,7 @@ import {
   statusTone,
 } from "@/components/ui";
 import AddRate from "@/components/AddRate";
+import QualityScatter from "./QualityScatter";
 import {
   C,
   ColoredBars,
@@ -229,6 +231,35 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     const ids = totals.filter((s) => s.total === max).map((s) => s.id);
     return ids.length ? { ids, total: max } : null;
   }, [resSandboxes, scoreRows, data.run]);
+
+  /** PR33 — the scatter folds results sandboxes into the same config ×
+   * model cells as the results grid, then joins cost/clock/speed from
+   * the analytics payload. specMap/dimensionKeys mirror the results
+   * page's inputs so the weighted y is identical. */
+  const rubricDims = data.run?.rubric?.content?.dimensions;
+  const specMap = useMemo(() => dimensionSpecMap(rubricDims), [rubricDims]);
+  const scatterDimensionKeys = useMemo(() => {
+    const set = new Set<string>();
+    for (const sb of resSandboxes) {
+      for (const d of Object.keys(sb.dimensions ?? {})) set.add(d);
+    }
+    return dimensionOrder([...set]);
+  }, [resSandboxes]);
+  const resultModels = data.results?.models;
+  const scoreGrid = useMemo(
+    () =>
+      buildScoreGrid(
+        resSandboxes,
+        resultModels,
+        scatterDimensionKeys,
+        specMap,
+      ),
+    [resSandboxes, resultModels, scatterDimensionKeys, specMap],
+  );
+  const analyticsById = useMemo(
+    () => new Map(sbs.map((s) => [s.sandbox_id, s])),
+    [sbs],
+  );
 
   const tokenRows: Row[] = useMemo(
     () =>
@@ -508,6 +539,11 @@ export default function AnalysisClient({ runId }: { runId: string }) {
             </p>
           </Card>
         ) : null}
+
+        <QualityScatter
+          cells={scoreGrid.cells}
+          analyticsById={analyticsById}
+        />
 
         <Card title="Tool-call mix" className="card--flush">
           {notes.analytics && !data.analytics ? (
