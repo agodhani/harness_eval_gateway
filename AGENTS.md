@@ -438,6 +438,7 @@ or tests change.
 | F25 | Benchmark suites + deterministic checkers (suite.yaml fan-out, objective checkers beside judge scores) |
 | F31 | Timeline compare-mode clock (absolute|relative toggle, per-cell t+0 re-basing) |
 | F27 | Cross-run compare + leaderboards (global model/config-family rankings, run-vs-run diff) |
+| F28 | Run export + share links (`/export?fmt=json|csv` bundle; `/share/{token}` read-only view) |
 | F29 | Dashboard home (/dashboard summary aggregate — KPIs, weekly spend/runs, queue lane, top-5 boards) |
 
 ## Post-MVP roadmap
@@ -458,7 +459,9 @@ or tests change.
 - Higher-fidelity instrumentation via harness hooks/plugins
 - Gateway response caching / deterministic replay
 - Multi-host / K8s sandbox scaling
-- Auth, saved run templates, share links
+- Auth, saved run templates, share links — **share links landed as
+  PR35/F28** (`runs.share_token` + read-only `/share/{token}`); auth +
+  templates remain PR19 territory
 - ~~Dynamic model picker~~ + ~~named harness configs~~ — **landed as F15**
 - ~~Cross-run analytics & cost dashboards~~ — **landed (F13 trends +
   PR36/F29 `/dashboard`)**: weekly spend/runs, terminal mix, queue lane,
@@ -966,6 +969,27 @@ or tests change.
   `web/lib/compareRuns.ts` holds the pure transforms; the shared
   `LeaderboardBoards` renders on /leaderboard and embedded, preset-
   filtered, on /presets/[slug].
+- **Run export is a projection, not a transcript (PR35/F28)** —
+  `GET /api/runs/{id}/export?fmt=json` ships the `heg-run-export` v1
+  bundle: spec + every rubric version + the verbatim `RunResults`/
+  `RunAnalytics` payloads (the endpoint CALLS the same handlers the UI
+  uses — never re-derive) + events-lite rows: event payloads projected
+  to top-level scalars (strings capped) plus the `usage` dict; nested
+  content dropped on purpose. `fmt=csv` flattens to one row per
+  sandbox×dimension (judge `overall` = last dim row per sandbox;
+  unscored sandboxes still get one empty row; per-sandbox + analytics
+  columns repeat; UTF-8 BOM for Excel). The bundle models
+  (`RunExport`/`EventLiteOut`/`RunSpecOut`) live in
+  `api/routers/results.py` per the Phase-2 ownership split.
+- **Share links are the PR19 extension point (PR35/F28)** —
+  `runs.share_token` (nullable unique, migration `c5f9a2b8d4e7` chained
+  on `e4f5a6b7c8d9`) minted idempotently by `POST /api/runs/{id}/share`,
+  revoked by DELETE. `GET /api/share/{token}` serves a read-only bundle
+  (spec + matrix + bounded events-lite) to `/share/{token}` — the app
+  is unauthenticated, so the token is capability-URL prep for PR19
+  auth, NOT a security boundary today; when auth lands, the
+  control-plane routes lock down while `/share/*` stays open on the
+  token.
 - **Dashboard summary is one server-side aggregate (PR36/F29)** —
   `GET /api/analytics/summary` returns everything `/dashboard` needs
   that the leaderboard doesn't already serve (KPI totals, `?weeks=`
