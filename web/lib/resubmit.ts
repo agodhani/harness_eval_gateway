@@ -27,6 +27,8 @@ export interface ResubmitSpec {
   evaluator_model: string | null;
   harness_configs: HarnessConfig[];
   budgets: Budgets | null;
+  /** PR27: repeats per matrix cell (undefined = the form's default 1). */
+  trials?: number;
 }
 
 const STORAGE_KEY = "heg:resubmit-spec";
@@ -55,8 +57,14 @@ export function specFromRun(run: RunOut): ResubmitSpec {
       // Per-config model pins (PR14) ride along — the form has no pin UI
       // but re-submitting shouldn't silently drop them from the payload.
       model: c.model ?? null,
+      // PR27: keep the config's model knobs (unsupported keys were already
+      // stripped server-side at the original submit).
+      model_options: c.model_options ?? null,
     })),
     budgets: cfg.budgets ?? null,
+    // PR27: repeats ride along — the stored column first, then the config
+    // copy (specs written before the column existed), defaulting to 1.
+    trials: run.trials ?? (cfg.trials as number | undefined) ?? 1,
   };
 }
 

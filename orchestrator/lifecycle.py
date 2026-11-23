@@ -41,7 +41,7 @@ from gateway.metering import tokens_used
 from sandbox.runtime import SandboxRuntime
 from scoring import checkers
 
-from . import monitor, pacing, provision, state_machine
+from . import monitor, pacing, prompt_cell, provision, state_machine
 from .events import emit
 from .matrix import expanded_configs
 
@@ -84,10 +84,14 @@ def _sandbox_configs(run: Run) -> list[dict[str, Any]]:
     attribute it. Single-model runs return the raw harness_configs verbatim.
     """
     cfg = run.config or {}
+    # PR27: run.trials (column) wins; config["trials"] covers specs written
+    # before the column existed — either way an unset value means 1.
+    trials = getattr(run, "trials", None) or cfg.get("trials") or 1
     return expanded_configs(
         cfg.get("harness_configs") or [],
         cfg.get("models"),
         run.model_name,
+        trials=trials,
     )
 
 
@@ -581,6 +585,14 @@ async def _evaluate_all(
             "rubric": rubric.content,
             "artifact_dir": artifact_dir,
             "workspace_dir": artifact_dir / "workspace",
+            # PR25: output-only submissions — the evaluator stages
+            # output.txt as the judge's submission instead of a workspace
+            # (ignored for container cells).
+            "prompt_output_path": (
+                artifact_dir / prompt_cell.OUTPUT_FILENAME
+                if prompt_cell.is_prompt_config(sb.harness_config)
+                else None
+            ),
             "transcript_path": artifact_dir / "transcript.log",
             "terminal_reason": sb.terminal_reason,
             "model": evaluator_model,
@@ -749,18 +761,32 @@ async def _run_lifecycle(
         return
 
     # 1) Provision one sandbox per expanded matrix cell (sequential awaits).
+    # PR25: cells selecting the prompt pseudo-adapter skip docker entirely —
+    # prompt_cell runs the single gateway call + finalize inline and lands
+    # an already-terminal, artifact-bearing sandbox row by the time it
+    # returns.
     configs = _sandbox_configs(run)
     for hc in configs:
-        await provision.spawn_one(
-            session_factory=session_factory,
-            runtime=runtime,
-            run_id=run_id,
-            harness_config=hc,
-            settings=settings,
-        )
+        if prompt_cell.is_prompt_config(hc):
+            await prompt_cell.run_prompt_cell(
+                session_factory=session_factory,
+                runtime=runtime,
+                run_id=run_id,
+                harness_config=hc,
+                settings=settings,
+            )
+        else:
+            await provision.spawn_one(
+                session_factory=session_factory,
+                runtime=runtime,
+                run_id=run_id,
+                harness_config=hc,
+                settings=settings,
+            )
 
     running_ids = _running_sandbox_ids(session_factory, run_id)
-    if not running_ids:
+    artifact_sandboxes = _sandboxes_with_artifacts(session_factory, run_id)
+    if not running_ids and not artifact_sandboxes:
         _set_run_status(
             session_factory,
             run_id,
@@ -774,13 +800,19 @@ async def _run_lifecycle(
         )
         return
 
-    # 2) running → monitor all spawned sandboxes to terminal.
-    _set_run_status(
-        session_factory,
-        run_id,
-        "running",
-        event_payload={"stage": "sandboxes_running", "count": len(running_ids)},
+    # 2) running → monitor all spawned sandboxes to terminal (prompt cells
+    # are already terminal with artifacts — only containers enter the
+    # monitor).
+    prompt_done = sum(
+        1 for sb in artifact_sandboxes if prompt_cell.is_prompt_config(sb.harness_config)
     )
+    event_payload: dict[str, Any] = {
+        "stage": "sandboxes_running",
+        "count": len(running_ids),
+    }
+    if prompt_done:
+        event_payload["prompt_cells"] = prompt_done
+    _set_run_status(session_factory, run_id, "running", event_payload=event_payload)
     budgets = provision.budgets_for(run)
     await asyncio.gather(
         *(

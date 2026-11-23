@@ -44,6 +44,9 @@ adapters are added.
   with an identical clean initial repo/workspace as its siblings.
 - **Harness adapter** — per-harness plugin: knows how to install, configure,
   launch, observe, and terminate a given agent CLI inside a sandbox.
+- **Prompt cell** — a no-sandbox matrix cell (`adapter: "prompt"`): one
+  gateway-metered chat call from the orchestrator process, no container.
+  Same sandbox row / cred / artifact / evaluation / scoring pipeline.
 - **AI gateway** — lightweight custom proxy; the only egress route for model
   traffic. Metering, event capture, cost accounting, budget enforcement.
 - **Event** — structured, timestamped record (LLM request/response, tool call,
@@ -173,7 +176,12 @@ Terminal states per sandbox:
 `budget_exceeded` keys on the gateway's own budget-gate event
 (`stage="budget"` + `reason="budget_exceeded"`) — a bare 429 from the
 *upstream provider* is NOT budget exhaustion: ≥3 `stage="upstream"` error
-events terminate the sandbox `error` instead.
+events terminate the sandbox `error` instead. Three limits share the
+verdict (PR28) — the terminate checkpoint's `payload.limit` says which:
+`run_tokens` (shared ceiling, cred `max_tokens`), `sandbox_tokens`
+(per-cell ceiling, cred `sandbox_max_tokens` metered against the cell's
+own usage + monitor backstop), `cost` (`max_cost_usd` vs the cell's
+estimated spend at the layered price table — priced models only).
 
 Provisional defaults (confirm with user): 60 min wall clock, $2 spend cap,
 stuck-loop = 3 consecutive identical tool calls.
@@ -243,6 +251,25 @@ gateway's worst-case silent hold on one call — (1 +
 backoff (~915s under the shipped defaults) — an agent that gives up
 first abandons a call the gateway is still paying for upstream.
 
+**Pseudo-adapter (PR25):** `prompt` is selectable (manifest +
+`selectable_adapter_names()`) but has NO adapter module — it is absent
+from `adapter_names()` and `get_adapter("prompt")` raises a no-sandbox
+`KeyError`. Matrix cells with `adapter == "prompt"` skip `spawn_one`
+entirely and route to `orchestrator/prompt_cell.py::run_prompt_cell`,
+which runs the ordinary sandbox row through a single
+`{GATEWAY_URL}/v1/chat/completions` call on a sandbox-scoped cred (one
+retry on upstream 5xx/timeout; 4xx fails immediately), writes
+`output.txt` + `meta.json` + `transcript.log` into the standard
+artifact dir, emits `run_started` + `terminal_state` +
+`sandbox_finalized`, and finishes `done`/`harness_complete`. The run's
+`wall_clock_seconds` bounds the cell like a container cap — a monotonic
+deadline cancels an in-flight call and skips the remaining retry
+(terminal `timeout`, reason `wall_clock`). Prompt and
+container cells interleave in one run; evaluation receives
+`prompt_output_path` so `output.txt` stages as the submission.
+`system_prompt_extra` becomes a `system` message. Preview/thumbnail
+endpoints 404 early for prompt cells.
+
 **Default skill packs** (named presets, vendored under `skillpacks/`):
 `superpowers`, `mattpocock-skills`, `spec-kit`.
 
@@ -287,7 +314,7 @@ pins it); `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
 `TESTGEN_TIMEOUT_SECONDS` (960). `EXEC_TEST_TARGET` is the
 ExecRunner→runner env contract for the suite mount.
 
-PR26 (F19) adds a fourth measured signal, `suite`: runs fanned out from a
+PR26 (F23) adds a fourth measured signal, `suite`: runs fanned out from a
 vendored **benchmark suite** (`benchmark_suites/<slug>/suite.yaml` — tasks
 are preset refs or inline prompts, each optionally pinned to an adapter)
 get their declared **deterministic checkers** executed post-artifact and
@@ -380,8 +407,12 @@ or tests change.
 | F15 | Submit UX: live model picker + install, named harness configs |
 | F16 | Model-vs-model matrix: multi-model runs + per-model analytics |
 | F17 | Artifact thumbnails (headless screenshots via the preview stack) |
-| F18 | Task preset library (vendored + user presets, preset_ref provenance) |
-| F19 | Benchmark suites + deterministic checkers (suite.yaml fan-out, objective checkers beside judge scores) |
+| F18 | Prompt-only matrix cells (no-sandbox `prompt` adapter) |
+| F19 | Artifact file browser + side-by-side diff |
+| F20 | Trials per cell + per-config model options |
+| F21 | Budgets & pricing accuracy (`model_prices` glob rate table) |
+| F22 | Task preset library (vendored + user presets, preset_ref provenance) |
+| F23 | Benchmark suites + deterministic checkers (suite.yaml fan-out, objective checkers beside judge scores) |
 
 ## Post-MVP roadmap
 
@@ -395,7 +426,7 @@ or tests change.
 - ~~Automated test-suite generation as eval target~~ — **landed PR8**:
   `generated_tests` signal (LLM-written suite, exec via `test_target`,
   pass rate into the judge brief)
-- ~~Benchmark suites + deterministic checkers~~ — **landed PR26 (F19)**:
+- ~~Benchmark suites + deterministic checkers~~ — **landed PR26 (F23)**:
   vendored `suite.yaml` fan-out + objective `checker_results` beside
   judge scores (see Rubric §)
 - Higher-fidelity instrumentation via harness hooks/plugins
@@ -671,7 +702,7 @@ or tests change.
   grouped/stacked bars + a composed bar-line trend under React 19 / Next 16;
   themed via hexes mirroring globals.css tokens (no CSS-var reads). The
   cross-run trends endpoint (`GET /api/analytics/runs`) prices each point's
-  cells at their own model's rate (unlisted → the run's resolved rate)
+  cells at their own model's rate (unlisted → unpriced, null cost)
   unless `?price_model=` forces uniform
   repricing — same "estimate, not billing" framing as F9.
 - **Rubric versions are immutable** (F14): post-run edits INSERT a new
@@ -705,7 +736,90 @@ or tests change.
   (≤64, whitespace-normalized) lands on `sandboxes.name`; `spawn_one` fills
   blanks with `<adapter>-<shortid>` once the UUID exists. All UI surfaces
   read the column — no per-component re-derivation to drift.
-- **Task presets (PR22) mirror the skillpack resource model** — vendored
+- **Unlisted models are unpriced, not fallback-priced (PR21)** —
+  `resolve_price_model` returns `None` for models absent from
+  `PRICE_TABLE`; analytics emit `price_model`/`estimated_cost_usd`/
+  `evaluator_cost_usd` = null (never the first table entry's rate) and the
+  UI renders "unpriced". Explicit `?price_model=` still reprices uniformly;
+  unknown keys stay 422. Same audit batch: run-detail controls mirror
+  DELETE semantics (cancel only `submitted`/`rubric_review`/`queued`;
+  terminal runs hard-delete), the runs list paginates via `?offset`
+  ("Load more"), landing copy describes the config × model matrix, and the
+  results `total` row is the weighted scale-normalised aggregate
+  (`web/lib/scoreMath.ts`), not a raw Σ.
+- **Price truth lives in the DB, static table is the fallback (PR28)** —
+  `model_prices` rows keyed by case-insensitive fnmatch `model_glob`
+  (`created_at, id` declaration order, first match wins) layer OVER
+  `api.pricing.PRICE_TABLE` via `PriceBook`; a bare (no `/`) glob never
+  matches `vendor/model` ids. `PUT /api/prices` upserts user rows
+  (never clobbered by sync) — `local` marks free inference, so PUT 422s
+  it beside any nonzero rate rather than billing under a "local — $0"
+  label; `POST /api/prices/sync` maps OpenRouter
+  `/models` `pricing.*` USD-per-token strings to per-Mtok rates through
+  the gateway's `x-heg-provider` override — entries with no parseable
+  rate are skipped rather than priced-free. Per-cell budgets:
+  `sandbox_token_budget` mints a `sandbox_max_tokens` cred claim
+  (gateway gate + monitor backstop → `limit="sandbox_tokens"`);
+  `max_cost_usd` is monitor-polled against the cell's layered-price
+  estimate → `limit="cost"`, and it can't trip an unpriced model
+  (no honest rate to bill against). Cache-read tokens bill at
+  `cache_read_per_mtok_usd` when declared, else the input rate.
+  Price pickers (results + analysis) grow rates inline via "+ add rate".
+- **Config × model heatmap + winner card (PR31)** — the results page's
+  score card has a `matrix | grid` toggle; the grid
+  (`web/app/runs/[id]/results/GridView.tsx` + pure transform
+  `web/lib/gridMatrix.ts`, `node --test`-covered) folds sandboxes into
+  config rows × model cols. Row identity = `harness_config` minus
+  per-cell `model`/trial keys — the sandbox `name` is unique per sandbox
+  and must NOT be the group key. Cells show mean judge `overall` ±sd
+  (same-(config, model) repeats are the cell's trials — PR27 needs no
+  special-casing) on a fixed 0–10 red→amber→green scale; the `w` sub-line
+  is the PR21 weighted total (same `specMap`/`dimensionKeys` the totals
+  row uses — no second weighting). The winner card ranks cells by mean
+  weighted total only (a judge `overall` alone can't win), with runner-up
+  Δ, est. cost/wall clock (F9 analytics — "unpriced"/"—", never $0) and
+  mean pass-rate (`generated_tests.pass_rate` → `exec` tests).
+- **Artifact file browsing is rooted per-sandbox, jailed like the download
+  (PR34/F19)** — `GET /api/sandboxes/{id}/files[/{path}]` reuses
+  `sandbox/preview.py`'s `resolve_workspace_dir`/`resolve_artifact_dir`
+  rather than `Artifact` rows: `workspace/` wins when the snapshot exists,
+  else the artifact dir itself browses (prompt cells surface `output.txt`/
+  `meta.json`/`transcript.log`; `FileListOut.root` reports which root
+  answered). Listings are depth(8)/entry(5000)-bounded with the workspace
+  ZIP's exclusions (`.git`/`node_modules`/`__pycache__`/`.venv`/`*.pyc`)
+  and never follow symlinks; text reads cap at 256 KiB and NUL-carrying
+  content returns `binary: true` + the `?download=1` FileResponse. `?diff=
+  <other>` is `difflib` server-side (a/ + b/ labels, 1 MiB per side, 10k
+  lines out, missing-side → diff vs empty) — the UI renders the unified
+  format in a `<pre>` classified by `web/lib/fileBrowser.ts`, whose
+  `mergeFileLists` reuses the PR10 merged-ordering split idiom for the
+  two-lane file list (no diff dependency added). Traversal/absolute-path/
+  sibling-workspace escapes 404 identically to the artifact download.
+- **PR27 — trials + per-config model options**: `RunCreate.trials` (1–8,
+  default 1) replicates every effective config × model cell N times;
+  expansion stays model-major then cell-major so a cell's `t1..tN` replicas
+  stay adjacent, each stamped `harness_config.trial_index` (the key is
+  ABSENT at trials=1 — single-shot runs stay bit-identical to pre-PR27).
+  `trial_index` lives inside the existing `harness_config` JSONB — no new
+  sandbox column; `runs.trials` is a real int column (migration
+  `d7e9f1a3b5c7`, the column wins over `config["trials"]` on old specs).
+  Sandbox names append ` · tN` after the model suffix
+  (`cfg · model · t3`), truncating the label side to fit String(255).
+  `harness_configs[].model_options` (`temperature`/`seed`/`max_tokens`/
+  `reasoning`, `extra="forbid"`) is filtered at submit against the
+  adapter's `MANIFEST["model_options"]` — unsupported keys are dropped
+  from the persisted cell and reported as advisory `warnings` (never a
+  422); miniloop + `prompt` honor all four, codex takes `reasoning` only
+  (→ `model_reasoning_effort`), other CLIs none. Miniloop maps them to
+  `MINILOOP_TEMPERATURE`/`MINILOOP_SEED`/`MAX_TOKENS`/
+  `MINILOOP_REASONING_EFFORT` env knobs → request-body fields.
+  Results/analytics group trials by `cell_key` (harness_config minus
+  `trial_index`, serialized sorted): the results matrix shows one column
+  per cell (`mean ± sd (n=N)`, sample sd n−1) with expandable per-trial
+  rows; analytics adds a `cells` rollup (`overall_mean`/`overall_sd`/
+  `overall_n` counting only scored trials) plus per-sandbox `cell`/
+  `trial_index`, and a by-cell view in the results analytics table.
+- **Task presets (PR22/F22) mirror the skillpack resource model** — vendored
   presets are committed `task_presets/<slug>.md` files (same stdlib
   frontmatter parser as skillpacks — flow-style values like
   `tags: [a, b]`, no YAML block lists), user presets are Postgres rows;
@@ -721,7 +835,7 @@ or tests change.
   path. `/presets` + `/presets/[slug]` expose browse/detail with run
   history, per-model/per-config leaderboards, and a score trend — the
   grouping axis later suites/leaderboard pages hang off.
-- **Benchmark suites (PR26/F19) are vendored files, not preset fields** —
+- **Benchmark suites (PR26/F23) are vendored files, not preset fields** —
   the roadmap sketched `preset.suite.cases`; the shipped model is a
   `benchmark_suites/<slug>/suite.yaml` task list (preset_ref XOR inline
   prompt, optional `adapter` pin, `checks:` per task) because a suite
@@ -753,7 +867,10 @@ or tests change.
   `cd web && npm run dev` (use `-p 3002` if :3000 is taken);
   e2e `cd web && E2E_PORT=3100 npm run test:e2e`.
 - `GET /api/runs/{id}/analytics?price_model=` (F9) serves per-sandbox metrics
-  + estimated cost; price table lives in `api/pricing.py` (`PRICE_TABLE`).
+  + estimated cost; price resolution runs through the layered
+  `api/pricing.py::PriceBook` (`model_prices` glob rows over the static
+  `PRICE_TABLE`, F21 — managed via `GET/PUT/DELETE /api/prices`,
+  `POST /api/prices/sync` for OpenRouter).
   `tool_calls` merges every agent-activity signal without double counting —
   `tool_call` events, hook-sourced `tool_result` outcomes (per-name max),
   and `shell_command`/`file_op`/`test_execution` as proxies when a lane has

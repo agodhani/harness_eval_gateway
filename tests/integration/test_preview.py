@@ -362,7 +362,10 @@ def test_desktop_preview_crash_reports_exit(
     is removed (nothing left for the reaper)."""
     ws = tmp_path / "ws"
     ws.mkdir()
-    (ws / "main.py").write_text("import pygame\nthis is not python\n")
+    # NB: "this is = not python" is a REAL SyntaxError — the tempting
+    # "this is not python" is a valid `x is not y` expression that
+    # compiles and dies at runtime as a NameError instead.
+    (ws / "main.py").write_text("import pygame\nthis is = not python\n")
 
     before = _docker("ps", "-aq", "--filter", "name=heg-prev-").stdout.split()
     with pytest.raises(RuntimeError) as ei:

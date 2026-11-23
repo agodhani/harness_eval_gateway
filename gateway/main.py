@@ -152,6 +152,13 @@ def _tokens_used(run_uuid: uuid.UUID) -> int:
         return metering.tokens_used(session, run_uuid)
 
 
+def _sandbox_tokens_used(run_uuid: uuid.UUID, sandbox_uuid: uuid.UUID) -> int:
+    """One sandbox's token total (PR28 per-cell gate) — same fresh-session
+    rule as ``_tokens_used``."""
+    with get_session_factory()() as session:
+        return metering.tokens_used(session, run_uuid, sandbox_id=sandbox_uuid)
+
+
 # Body params only Ollama understands — harnesses tuned for Ollama (miniloop's
 # `think`/`num_ctx`) emit them; hosted providers may 400 on unknown fields.
 _OLLAMA_ONLY_KEYS = ("num_ctx", "keep_alive", "think", "options")
@@ -598,7 +605,18 @@ async def chat_completions(
 async def _budget_gate(
     claims: CredClaims, body: dict[str, Any], provider: ProviderName
 ) -> JSONResponse | None:
-    """Shared run-token-budget gate; returns a 429 response or None (pass)."""
+    """Shared token-budget gate; returns a 429 response or None (pass).
+
+    Two limits, both checked before any upstream traffic:
+
+    - RUN ceiling — the cred's ``max_tokens`` (or env default) against the
+      whole run's metered tokens; every cred shares it.
+    - PER-SANDBOX ceiling (PR28) — the cred's ``sandbox_max_tokens`` claim
+      against ONLY this sandbox's metered tokens, so a runaway cell starves
+      itself instead of eating the run's budget out from under its
+      siblings. Only participant creds carry the claim; service/eval creds
+      (``sandbox_id=None`` or no claim) skip the gate.
+    """
     settings = get_settings()
     run_uuid = metering.uuid_or_none(claims.run_id)
     if run_uuid is None:
@@ -606,19 +624,56 @@ async def _budget_gate(
     used = await asyncio.to_thread(_tokens_used, run_uuid)
     estimate = metering.max_tokens_estimate(body)
     limit = metering.token_budget(claims, settings)
-    if used + estimate <= limit:
+    if used + estimate > limit:
+        await metering.emit_error(
+            claims,
+            stage="budget",
+            reason="budget_exceeded",
+            message=(
+                f"run token budget exceeded: used={used} "
+                f"+ estimated={estimate} > limit={limit}"
+            ),
+            http_status=status.HTTP_429_TOO_MANY_REQUESTS,
+            used_tokens=used,
+            budget=limit,
+            limit="run_tokens",
+            provider=provider,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={
+                "error": {
+                    "message": (
+                        "run token budget exceeded "
+                        f"(used={used}, estimate={estimate}, limit={limit})"
+                    ),
+                    "type": "budget_exceeded",
+                    "used_tokens": used,
+                    "budget": limit,
+                    "limit": "run_tokens",
+                }
+            },
+        )
+
+    sandbox_limit = metering.sandbox_token_budget(claims)
+    sandbox_uuid = metering.uuid_or_none(claims.sandbox_id)
+    if sandbox_limit is None or sandbox_uuid is None:
+        return None
+    sb_used = await asyncio.to_thread(_sandbox_tokens_used, run_uuid, sandbox_uuid)
+    if sb_used + estimate <= sandbox_limit:
         return None
     await metering.emit_error(
         claims,
         stage="budget",
         reason="budget_exceeded",
         message=(
-            f"run token budget exceeded: used={used} "
-            f"+ estimated={estimate} > limit={limit}"
+            f"sandbox token budget exceeded: used={sb_used} "
+            f"+ estimated={estimate} > limit={sandbox_limit}"
         ),
         http_status=status.HTTP_429_TOO_MANY_REQUESTS,
-        used_tokens=used,
-        budget=limit,
+        used_tokens=sb_used,
+        budget=sandbox_limit,
+        limit="sandbox_tokens",
         provider=provider,
     )
     return JSONResponse(
@@ -626,12 +681,13 @@ async def _budget_gate(
         content={
             "error": {
                 "message": (
-                    "run token budget exceeded "
-                    f"(used={used}, estimate={estimate}, limit={limit})"
+                    "sandbox token budget exceeded "
+                    f"(used={sb_used}, estimate={estimate}, limit={sandbox_limit})"
                 ),
                 "type": "budget_exceeded",
-                "used_tokens": used,
-                "budget": limit,
+                "used_tokens": sb_used,
+                "budget": sandbox_limit,
+                "limit": "sandbox_tokens",
             }
         },
     )

@@ -889,3 +889,147 @@ def test_sandbox_gateway_url_normalization() -> None:
     assert sandbox_gateway_url("") == "http://gateway:8080"
     # a genuinely remote gateway passes through untouched
     assert sandbox_gateway_url("https://gw.example.com:443") == "https://gw.example.com:443"
+
+
+# ---------------------------------------------------------------------------
+# PR25 — output-only (prompt cell) submissions
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def seeded_prompt(session_factory: sessionmaker[Session], tmp_path: Path):
+    """A prompt-cell artifact dir: output.txt + transcript, NO workspace."""
+    artifact_dir = tmp_path / "prompt_artifact"
+    artifact_dir.mkdir(parents=True)
+    output = artifact_dir / "output.txt"
+    output.write_text("The extracted total is 42 EUR.\n")
+    transcript = artifact_dir / "transcript.log"
+    transcript.write_text("=== user ===\nextract the total\n=== assistant ===\n42 EUR\n")
+
+    s = session_factory()
+    try:
+        run = Run(task_prompt="extract the total", model_name="m", config={})
+        s.add(run)
+        s.flush()
+        sb = Sandbox(
+            run_id=run.id,
+            harness_config={"adapter": "prompt"},
+            status="done",
+            terminal_reason="harness_complete",
+            artifact_path=str(artifact_dir),
+        )
+        s.add(sb)
+        s.flush()
+        rubric = Rubric(run_id=run.id, version=1, status="approved", content=RUBRIC)
+        s.add(rubric)
+        s.commit()
+        ids = {"run_id": run.id, "sandbox_id": sb.id, "rubric_id": rubric.id}
+    finally:
+        s.close()
+    return {
+        **ids,
+        "artifact_dir": artifact_dir,
+        "output": output,
+        "transcript": transcript,
+        "eval_root": tmp_path / "eval",
+    }
+
+
+async def test_evaluate_prompt_output_submission(
+    seeded_prompt, session_factory
+) -> None:
+    """prompt_output_path: output.txt is staged as the submission — the
+    judge reads it like workspace content, no workspace dir required."""
+    fake = FakeRuntime()
+    rows = await evaluate_sandbox(
+        run_id=seeded_prompt["run_id"],
+        sandbox_id=seeded_prompt["sandbox_id"],
+        rubric_id=seeded_prompt["rubric_id"],
+        rubric=RUBRIC,
+        artifact_dir=seeded_prompt["artifact_dir"],
+        # no workspace_dir — a prompt cell has none; prompt_output_path
+        # stands in for it.
+        prompt_output_path=seeded_prompt["output"],
+        transcript_path=seeded_prompt["transcript"],
+        terminal_reason="harness_complete",
+        model="judge-model",
+        gateway_cred="heg.testcred",
+        session_factory=session_factory,
+        runtime=fake,
+        eval_root=seeded_prompt["eval_root"],
+        timeout_seconds=30,
+        poll_interval_seconds=0.01,
+        max_iters=5,
+    )
+    assert len(rows) == 3  # same score persistence path as workspaces
+
+    eval_ws = Path(fake.specs[0].workspace_host_path)
+    # the staged submission IS output.txt — readable by the judge
+    assert (eval_ws / "output.txt").read_text() == "The extracted total is 42 EUR.\n"
+    # transcript still lands as reference material
+    assert (eval_ws / "EVAL_TRANSCRIPT.log").is_file()
+    # EVAL_PROMPT frames output.txt as the submission, not a code repo
+    prompt = (eval_ws / "EVAL_PROMPT.md").read_text()
+    assert "output.txt" in prompt
+    assert "prompt-only" in prompt or "prompt" in prompt.lower()
+
+
+async def test_evaluate_prompt_output_missing_stages_empty(
+    seeded_prompt, session_factory
+) -> None:
+    """A missing output.txt stages an empty submission rather than
+    FileNotFoundError — same judgement posture as an empty workspace."""
+    fake = FakeRuntime()
+    rows = await evaluate_sandbox(
+        run_id=seeded_prompt["run_id"],
+        sandbox_id=seeded_prompt["sandbox_id"],
+        rubric_id=seeded_prompt["rubric_id"],
+        rubric=RUBRIC,
+        artifact_dir=seeded_prompt["artifact_dir"],
+        prompt_output_path=seeded_prompt["artifact_dir"] / "output.txt.missing",
+        transcript_path=seeded_prompt["transcript"],
+        terminal_reason="error",
+        model="judge-model",
+        gateway_cred="heg.testcred",
+        session_factory=session_factory,
+        runtime=fake,
+        eval_root=seeded_prompt["eval_root"],
+        timeout_seconds=30,
+        poll_interval_seconds=0.01,
+        max_iters=5,
+    )
+    assert len(rows) == 3
+    eval_ws = Path(fake.specs[0].workspace_host_path)
+    assert (eval_ws / "output.txt").read_text() == ""
+
+
+async def test_evaluate_prompt_output_analysis_persists(
+    seeded_prompt, session_factory
+) -> None:
+    """Collectors degrade gracefully on a .txt-only submission and the
+    analysis artifact still lands for the results API."""
+    fake = FakeRuntime()
+    await evaluate_sandbox(
+        run_id=seeded_prompt["run_id"],
+        sandbox_id=seeded_prompt["sandbox_id"],
+        rubric_id=seeded_prompt["rubric_id"],
+        rubric=RUBRIC,
+        artifact_dir=seeded_prompt["artifact_dir"],
+        prompt_output_path=seeded_prompt["output"],
+        transcript_path=seeded_prompt["transcript"],
+        terminal_reason="harness_complete",
+        model="judge-model",
+        gateway_cred="heg.testcred",
+        session_factory=session_factory,
+        runtime=fake,
+        eval_root=seeded_prompt["eval_root"],
+        timeout_seconds=30,
+        poll_interval_seconds=0.01,
+        max_iters=5,
+    )
+    analysis = seeded_prompt["artifact_dir"] / "analysis.json"
+    assert analysis.is_file()
+    report = json.loads(analysis.read_text())
+    static = next(s for s in report["signals"] if s["name"] == "static_analysis")
+    # output.txt isn't a source language — 0 files analyzed, not an error
+    assert static["metrics"]["files_analyzed"] == 0

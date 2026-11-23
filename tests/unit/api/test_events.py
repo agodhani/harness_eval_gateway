@@ -186,6 +186,114 @@ def test_ingest_invalid_source_or_type_422(client: TestClient, run_and_sandbox) 
     assert resp.status_code == 422
 
 
+def test_ingest_llm_response_usage_normalized_to_ints(
+    client: TestClient, run_and_sandbox, session_factory: sessionmaker[Session]
+) -> None:
+    """Usage token fields land as ints (or absent), never poison strings.
+
+    ``llm_usage_totals`` CASTs these fields to bigint — a stored 'abc'
+    raises on Postgres inside the per-request budget gate. Coercible
+    values become ints; non-numeric values are dropped; other usage keys
+    are untouched.
+    """
+    run_id, _ = run_and_sandbox
+    resp = client.post(
+        "/api/events/ingest",
+        json=_event(
+            run_id,
+            source="gateway",
+            type="llm_response",
+            payload={
+                "usage": {
+                    "prompt_tokens": "40",
+                    "completion_tokens": 12.9,
+                    "cache_read_input_tokens": "abc",
+                    "total_tokens": True,
+                    "unrelated": "kept",
+                }
+            },
+        ),
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+
+    (stored,) = client.get(f"/api/runs/{run_id}/events").json()
+    assert stored["payload"]["usage"] == {
+        "prompt_tokens": 40,
+        "completion_tokens": 12,
+        "unrelated": "kept",
+    }
+
+    from gateway.metering import llm_usage_totals
+
+    with session_factory() as session:
+        assert llm_usage_totals(session, run_id) == {
+            "prompt_tokens": 40,
+            "completion_tokens": 12,
+            "cache_read_tokens": 0,
+            "total_tokens": 0,
+        }
+
+
+def test_ingest_llm_response_usage_out_of_range_dropped(
+    client: TestClient, run_and_sandbox, session_factory: sessionmaker[Session]
+) -> None:
+    """Out-of-range counts read as absent: a negative would deflate the
+    metered totals (silent budget bypass) and a >BIGINT value still
+    raises inside the Postgres CAST on every budget-gate request."""
+    run_id, _ = run_and_sandbox
+    resp = client.post(
+        "/api/events/ingest",
+        json=_event(
+            run_id,
+            source="gateway",
+            type="llm_response",
+            payload={
+                "usage": {
+                    "prompt_tokens": -1000,
+                    "completion_tokens": 1e30,
+                    "cache_read_input_tokens": 0,
+                    "total_tokens": 2**63,
+                }
+            },
+        ),
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+
+    (stored,) = client.get(f"/api/runs/{run_id}/events").json()
+    assert stored["payload"]["usage"] == {"cache_read_input_tokens": 0}
+
+    from gateway.metering import llm_usage_totals
+
+    with session_factory() as session:
+        assert llm_usage_totals(session, run_id) == {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cache_read_tokens": 0,
+            "total_tokens": 0,
+        }
+
+
+def test_ingest_non_llm_response_usage_untouched(
+    client: TestClient, run_and_sandbox
+) -> None:
+    """Only llm_response usage is normalized — other types pass through."""
+    run_id, _ = run_and_sandbox
+    resp = client.post(
+        "/api/events/ingest",
+        json=_event(
+            run_id,
+            type="tool_call",
+            payload={"usage": {"total_tokens": "abc"}},
+        ),
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    (stored,) = client.get(f"/api/runs/{run_id}/events").json()
+    assert stored["payload"]["usage"] == {"total_tokens": "abc"}
+
+
 # ---------------------------------------------------------------------------
 # GET /api/runs/{run_id}/events — filters + pagination
 # ---------------------------------------------------------------------------

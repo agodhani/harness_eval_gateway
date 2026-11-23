@@ -150,6 +150,29 @@ describe("sandboxStrips", () => {
     assert.match(chip(b, "cost").title ?? "", /gpt-4o/);
   });
 
+  test("unlisted model → 'unpriced' chip, never a fallback rate (PR21)", () => {
+    const f = fixture();
+    f.price_model = null;
+    // server resolves an unlisted model to a null price_model
+    f.sandboxes[0].model = "mystery-model";
+    f.sandboxes[0].price_model = null;
+    const [a] = sandboxStrips(f);
+    assert.equal(chip(a, "cost").value, "unpriced");
+    assert.match(chip(a, "cost").title ?? "", /mystery-model.*price table/);
+  });
+
+  test("unpriced evaluator model → 'unpriced' judge cost (PR21)", () => {
+    const f = fixture();
+    f.sandboxes[0].evaluator = {
+      llm_turns: 2,
+      tokens: { input: 100, output: 20, total: 120 },
+      errors: 0,
+      estimated_cost_usd: null,
+    };
+    const [a] = sandboxStrips(f);
+    assert.equal(a.evalLine, "judge 2 turns · 120 tok · unpriced · 0 err");
+  });
+
   test("empty run → no strips", () => {
     assert.deepEqual(
       sandboxStrips({

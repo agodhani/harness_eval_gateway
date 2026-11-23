@@ -246,6 +246,9 @@ def test_create_run_defaults(api) -> None:
         "max_iters": 50,
         "token_budget": 200_000,
         "wall_clock_seconds": 3600,
+        # PR28: optional per-sandbox caps default unset (no per-cell limit).
+        "sandbox_token_budget": None,
+        "max_cost_usd": None,
     }
     # evaluator defaults to participant model -> same_model_eval flag
     assert cfg["evaluator_model"] == "qwen3:8b"
@@ -263,6 +266,24 @@ def test_create_run_multi_adapter(api) -> None:
     data = _post_run(api.client, body)
     adapters = [hc["adapter"] for hc in data["config"]["harness_configs"]]
     assert adapters == ["miniloop", "claude_code", "codex", "deepseek", "pi", "aider"]
+
+
+def test_create_run_prompt_adapter_validates(api) -> None:
+    """PR25: the no-sandbox ``prompt`` pseudo-adapter is a valid
+    ``harness_configs[].adapter`` — selectable without a registry module."""
+    data = _post_run(
+        api.client,
+        _valid_body(
+            harness_configs=[
+                {"adapter": "prompt", "system_prompt_extra": "be terse"},
+                {"adapter": "prompt"},
+                {"adapter": "miniloop"},
+            ]
+        ),
+    )
+    hcs = data["config"]["harness_configs"]
+    assert [hc["adapter"] for hc in hcs] == ["prompt", "prompt", "miniloop"]
+    assert hcs[0]["system_prompt_extra"] == "be terse"
 
 
 def test_create_run_harness_config_names(api) -> None:
@@ -948,3 +969,143 @@ def test_delete_cancelled_run_hard_deletes(api) -> None:
 
 def test_delete_unknown_run_404(api) -> None:
     assert api.client.delete(f"/api/runs/{uuid.uuid4()}").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# PR27 — trials + model_options
+# ---------------------------------------------------------------------------
+
+
+def test_create_run_trials_persisted(api) -> None:
+    """trials lands on the Run column AND the stored config, and is
+    returned on the submit response."""
+    data = _post_run(api.client, _valid_body(trials=3))
+    assert data["trials"] == 3
+    assert data["config"]["trials"] == 3
+    with api.session_factory() as s:
+        run = s.get(Run, uuid.UUID(data["id"]))
+        assert run.trials == 3
+
+
+def test_create_run_trials_defaults_to_one(api) -> None:
+    data = _post_run(api.client)
+    assert data["trials"] == 1
+    assert data["config"]["trials"] == 1
+
+
+def test_create_run_trials_bounds(api) -> None:
+    """trials is 1..8 — 0 and 9 are 422s, not clamps."""
+    for bad in (0, 9, -1):
+        resp = api.client.post("/api/runs", json=_valid_body(trials=bad))
+        assert resp.status_code == 422, (bad, resp.text)
+    for ok in (1, 8):
+        resp = api.client.post("/api/runs", json=_valid_body(trials=ok))
+        assert resp.status_code == 201, (ok, resp.text)
+
+
+def test_create_run_trials_multiplies_matrix_cap(api) -> None:
+    """The 32-sandbox cap applies post-trials: 3 configs × 1 model ×
+    11 trials would need 33 — but trials tops at 8, so use a multi-model
+    case instead: 2 configs × 2 models × 8 trials = 32 OK; × 3 models → 48."""
+    body = _valid_body(
+        models=["m2"],
+        trials=8,
+        harness_configs=[{"adapter": "miniloop"}, {"adapter": "miniloop"}],
+    )
+    resp = api.client.post("/api/runs", json=body)
+    assert resp.status_code == 201, resp.text  # 2×2×8 = 32 — at the cap
+
+    over = _valid_body(
+        models=["m2", "m3"],
+        trials=3,
+        harness_configs=[{"adapter": "miniloop"}] * 4,
+    )
+    resp = api.client.post("/api/runs", json=over)
+    assert resp.status_code == 422  # 4×3×3 = 36 > 32
+    assert "trials" in str(resp.json()["detail"])
+
+
+def test_create_run_model_options_supported_adapter_kept(api) -> None:
+    """miniloop + prompt honor all four knobs — persisted verbatim, no warning."""
+    body = _valid_body(
+        harness_configs=[
+            {
+                "adapter": "miniloop",
+                "model_options": {
+                    "temperature": 0.5,
+                    "seed": 7,
+                    "max_tokens": 1024,
+                    "reasoning": "medium",
+                },
+            }
+        ]
+    )
+    data = _post_run(api.client, body)
+    assert data["warnings"] == []
+    assert data["config"]["harness_configs"][0]["model_options"] == {
+        "temperature": 0.5,
+        "seed": 7,
+        "max_tokens": 1024,
+        "reasoning": "medium",
+    }
+
+
+def test_create_run_model_options_unsupported_dropped_with_warning(api) -> None:
+    """Codex honors only ``reasoning`` — ``temperature`` is dropped from the
+    persisted config and the submit response warns."""
+    body = _valid_body(
+        harness_configs=[
+            {
+                "adapter": "codex",
+                "model_options": {"temperature": 0.5, "reasoning": "high"},
+            }
+        ]
+    )
+    data = _post_run(api.client, body)
+    stored = data["config"]["harness_configs"][0]
+    assert stored["model_options"] == {"reasoning": "high"}
+    assert len(data["warnings"]) == 1
+    assert "temperature" in data["warnings"][0]
+    assert "codex" in data["warnings"][0]
+
+
+def test_create_run_model_options_all_unsupported_key_removed(api) -> None:
+    """An adapter with no model_options capability drops the whole mapping
+    (no empty dict persisted) — still advisory, not a 422."""
+    body = _valid_body(
+        harness_configs=[
+            {"adapter": "aider", "model_options": {"temperature": 0.9}}
+        ]
+    )
+    data = _post_run(api.client, body)
+    stored = data["config"]["harness_configs"][0]
+    assert "model_options" not in stored
+    assert len(data["warnings"]) == 1
+    assert "aider" in data["warnings"][0]
+
+
+def test_create_run_model_options_unknown_key_422(api) -> None:
+    """``extra="forbid"`` — a misspelled knob is a hard 422, not a silent no-op."""
+    body = _valid_body(
+        harness_configs=[
+            {"adapter": "miniloop", "model_options": {"temprature": 0.5}}
+        ]
+    )
+    resp = api.client.post("/api/runs", json=body)
+    assert resp.status_code == 422
+
+
+def test_create_run_model_options_value_bounds(api) -> None:
+    """Per-key bounds: temperature 0..2, seed ≥0, max_tokens ≥1."""
+    bads = [
+        {"temperature": 2.5},
+        {"temperature": -0.1},
+        {"seed": -1},
+        {"max_tokens": 0},
+    ]
+    for opts in bads:
+        body = _valid_body(
+            harness_configs=[{"adapter": "miniloop", "model_options": opts}]
+        )
+        resp = api.client.post("/api/runs", json=body)
+        assert resp.status_code == 422, (opts, resp.text)

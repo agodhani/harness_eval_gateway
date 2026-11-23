@@ -20,6 +20,7 @@ def test_list_harnesses() -> None:
         "codex",
         "deepseek",
         "pi",
+        "prompt",  # PR25: no-sandbox pseudo-adapter is selectable too
     } <= set(manifests)
     for name in ("aider", "claude_code", "codex", "deepseek", "pi"):
         m = manifests[name]
@@ -30,3 +31,15 @@ def test_list_harnesses() -> None:
     assert "anthropic-messages" in protocols
     assert "openai-responses" in protocols
     assert "openai-chat-completions" in protocols
+
+
+def test_harnesses_prompt_manifest_is_grouped_no_sandbox() -> None:
+    """PR25: the prompt manifest carries the no_sandbox flag the submit
+    form groups on — and declares no image/CLI (there is nothing to run)."""
+    client = TestClient(app)
+    m = next(x for x in client.get("/api/harnesses").json() if x["name"] == "prompt")
+    assert m["no_sandbox"] is True
+    assert m["display_name"]
+    assert m["llm_protocol"] == "openai-chat-completions"
+    assert "image" not in m
+    assert "cli" not in m
