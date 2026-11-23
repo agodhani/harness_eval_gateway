@@ -369,7 +369,9 @@ FEATURE_MAP F10, docs/p25-harness-adapters.md §PR17.
 ### PR19 — Auth + saved run templates + share links
 - **Scope:** auth (explicitly out of MVP scope — local single-user tool);
   saved run templates (small — could pull forward into PR1 if wanted);
-  share links (needs auth-adjacent infra).
+  share links — capability-URL share view landed as PR35/F28
+  (`runs.share_token` + `/share/{token}`); only the auth-gated variant
+  remains here.
 - **Touch:** api middleware, `web/` auth surfaces, db for templates.
 
 ### PR20 — Multi-host / K8s sandbox scaling

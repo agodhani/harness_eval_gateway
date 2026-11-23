@@ -9,7 +9,7 @@
  * share button mints `/share/{token}` on first click and copies the
  * absolute URL; once a link exists it shows open/copy/revoke chips.
  */
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { runExportUrl, shareRun, unshareRun } from "@/lib/api";
 
 export default function ExportButtons({
@@ -21,7 +21,14 @@ export default function ExportButtons({
   shareUrl?: string | null;
 }) {
   const [url, setUrl] = useState<string | null>(shareUrl ?? null);
-  useEffect(() => setUrl(shareUrl ?? null), [shareUrl]);
+  // Track the prop by adjusting state during render (mount sites render
+  // before run data resolves, so a minted link arrives as a late prop) —
+  // the set-state-in-effect form trips react-hooks lint.
+  const [prevShareUrl, setPrevShareUrl] = useState(shareUrl ?? null);
+  if (prevShareUrl !== (shareUrl ?? null)) {
+    setPrevShareUrl(shareUrl ?? null);
+    setUrl(shareUrl ?? null);
+  }
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
   const [err, setErr] = useState<string | null>(null);

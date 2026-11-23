@@ -428,7 +428,11 @@ heatmap, output browser.
 - **Verify:** browse a 2048 artifact, open `index.html`; diff two
   sandboxes' `index.html` shows unified diff; path traversal 404s.
 
-### PR35 — Export + share
+### PR35 — Export + share ✅ shipped
+- **Landed as F28:** export endpoint + flattened CSV + the stretch —
+  `runs.share_token` capability links and the read-only `/share/{token}`
+  view all shipped. Details: `FEATURE_MAP.md` F28. PR19 keeps auth +
+  templates.
 - **Scope:** `GET /api/runs/{id}/export?fmt=json|csv` — full run bundle:
   spec, rubric, score matrix (+versions), analytics, events-lite
   (summary rows, not full payloads); CSV = flattened per-cell rows.
