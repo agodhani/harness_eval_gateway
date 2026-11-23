@@ -438,6 +438,7 @@ or tests change.
 | F25 | Benchmark suites + deterministic checkers (suite.yaml fan-out, objective checkers beside judge scores) |
 | F31 | Timeline compare-mode clock (absolute|relative toggle, per-cell t+0 re-basing) |
 | F27 | Cross-run compare + leaderboards (global model/config-family rankings, run-vs-run diff) |
+| F29 | Dashboard home (/dashboard summary aggregate — KPIs, weekly spend/runs, queue lane, top-5 boards) |
 
 ## Post-MVP roadmap
 
@@ -459,7 +460,9 @@ or tests change.
 - Multi-host / K8s sandbox scaling
 - Auth, saved run templates, share links
 - ~~Dynamic model picker~~ + ~~named harness configs~~ — **landed as F15**
-- Cross-run analytics & cost dashboards
+- ~~Cross-run analytics & cost dashboards~~ — **landed (F13 trends +
+  PR36/F29 `/dashboard`)**: weekly spend/runs, terminal mix, queue lane,
+  top-5 boards, recent runs
 - Timeline-side analytics — **landed (PR9)**: per-sandbox metrics strip on
   `web/app/runs/[id]/timeline/` (turns/tokens/latency/speed/cost/errors
   chips + judge line; chips double as sandbox-filter selectors; 15s

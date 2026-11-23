@@ -381,7 +381,7 @@ heatmap, output browser.
 - **Verify:** grid renders 8×4; weighted total differs from raw Σ on a
   weighted rubric.
 
-### PR32 — Cross-run compare + leaderboards
+### PR32 — Cross-run compare + leaderboards ✅ shipped
 - **Scope:**
   - `/compare?runs=id1,id2` — two runs side by side: spec diff
     (models/configs/budgets/rubric version), score matrices,
@@ -442,7 +442,7 @@ heatmap, output browser.
 - **Verify:** JSON export re-imports/validates against schemas; CSV
   opens in sheets with one row per sandbox×dimension.
 
-### PR36 — Dashboard home
+### PR36 — Dashboard home ✅ shipped
 - **Scope:** `/dashboard` (nav + landing CTA): cards — total est. spend
   over time, runs per week, model leaderboard top-5 (PR32 aggregate),
   harness leaderboard top-5, terminal-reason mix donut, queue/active

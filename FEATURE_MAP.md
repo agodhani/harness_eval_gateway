@@ -2036,7 +2036,7 @@ rigged before it starts.
     terminal mix + queue positions, recent-runs mean score,
     unpriced → null + `?price_model=` rescue, window params) on
     per-test file-backed SQLite.
-  - Web: `lib/dashboard.test.ts` (12 tests); eslint + `next build`
+  - Web: `lib/dashboard.test.ts` (11 tests); eslint + `next build`
     clean (`/dashboard` prerenders static).
   - Manual: run a few evaluations → `/dashboard` fills in; submit a
     run and watch the queue card tick; an unpriced model's run shows
