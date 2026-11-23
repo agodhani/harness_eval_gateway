@@ -45,6 +45,13 @@ score, cost) for the most recent runs — powers the analysis page's trend
 chart. ``?price_model=`` reprices every point uniformly; omitted, each point
 is costed at its run's per-cell model rates — any unlisted cell model makes
 the point's cost unpriced (null), never a fallback rate (PR21).
+
+PR32 cross-run leaderboard: ``GET /api/analytics/leaderboard`` pools the
+newest-wins ``overall`` Score per sandbox across every run in scope into
+two rankings — by participant model and by harness-config family
+(``_family_key``: adapter + sorted skill-pack set) — with preset /
+date-range / min-trials run-axis filters. Powers ``/leaderboard`` and the
+preset-filtered embed on ``/presets/[slug]``.
 """
 
 from __future__ import annotations
