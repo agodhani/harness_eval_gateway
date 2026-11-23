@@ -259,9 +259,11 @@ def test_default_cost_is_zero_for_local_model(
         assert sb["estimated_cost_usd"] == 0.0
 
 
-def test_default_price_model_falls_back_to_first_entry(
+def test_unlisted_model_is_unpriced_not_fallback_priced(
     client: TestClient, session_factory: sessionmaker[Session]
 ) -> None:
+    """PR21: a model absent from PRICE_TABLE must not be billed at another
+    model's rate — price_model/estimated_cost_usd come back null."""
     s = session_factory()
     try:
         run = Run(task_prompt="x", model_name="mystery-model", config={}, status="running")
@@ -271,17 +273,42 @@ def test_default_price_model_falls_back_to_first_entry(
             run_id=run.id, harness_config={"adapter": "miniloop"}, status="running"
         )
         s.add(sb)
+        s.flush()
+        s.add(
+            _ev(
+                run.id,
+                sandbox_id=sb.id,
+                type_="llm_response",
+                ts=T0,
+                payload={
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50,
+                              "total_tokens": 150},
+                    "latency_ms": 10,
+                },
+            )
+        )
         s.commit()
         run_id = run.id
     finally:
         s.close()
     body = _get(client, run_id)
-    # PR14 auto mode: response price_model is None; the per-sandbox rate
-    # falls back to the first table entry for unlisted models.
+    # PR14 auto mode: response price_model is None; the sandbox reports
+    # unpriced rather than the first table entry's rate.
     assert body["price_model"] is None
     (row,) = body["sandboxes"]
-    assert row["price_model"] == next(iter(PRICE_TABLE))
     assert row["model"] == "mystery-model"
+    assert row["price_model"] is None
+    assert row["estimated_cost_usd"] is None
+    (model_row,) = body["models"]
+    assert model_row["price_model"] is None
+    assert model_row["estimated_cost_usd"] is None
+    # an explicit ?price_model= still reprices the unlisted model uniformly
+    body = _get(client, run_id, price_model="gpt-4o")
+    (row,) = body["sandboxes"]
+    assert row["price_model"] == "gpt-4o"
+    assert row["estimated_cost_usd"] == pytest.approx(
+        estimate_cost_usd(PRICE_TABLE["gpt-4o"], input_tokens=100, output_tokens=50)
+    )
 
 
 def test_unknown_price_model_422(client: TestClient, analytics_run) -> None:
@@ -453,11 +480,12 @@ def test_multimodel_uniform_repricing(client: TestClient, multimodel_run) -> Non
     assert qwen["estimated_cost_usd"] == pytest.approx(0.0105)
 
 
-def test_multimodel_unlisted_model_falls_back(
+def test_multimodel_unlisted_model_is_unpriced(
     client: TestClient, session_factory: sessionmaker[Session]
 ) -> None:
-    """A participant model absent from PRICE_TABLE costs at the run's
-    resolved fallback rate (first entry) in auto mode."""
+    """PR21: a participant model absent from PRICE_TABLE reports
+    price_model/estimated_cost_usd null in auto mode — the run's resolved
+    rate is NOT used as a stand-in."""
     s = session_factory()
     try:
         run = Run(
@@ -493,11 +521,12 @@ def test_multimodel_unlisted_model_falls_back(
     finally:
         s.close()
     body = _get(client, run_id)
-    fallback = next(iter(PRICE_TABLE))
     (row,) = [x for x in body["sandboxes"] if x["model"] == "mystery-b"]
-    assert row["price_model"] == fallback
+    assert row["price_model"] is None
+    assert row["estimated_cost_usd"] is None
     # rollup only contains models that have sandboxes
     assert [m["model"] for m in body["models"]] == ["mystery-b"]
+    assert body["models"][0]["estimated_cost_usd"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +794,92 @@ def test_trends_multimodel_prices_each_cell_at_its_own_rate(
     assert pt["estimated_cost_usd"] == pytest.approx(0.00009)
 
 
+def test_trends_unlisted_model_point_is_unpriced(
+    client: TestClient, session_factory: sessionmaker[Session]
+) -> None:
+    """PR21: a run whose cells ran unlisted models reports a null cost —
+    the unknown share can't be totalled at a guessed rate. Judge traffic on
+    an unlisted evaluator model is likewise null."""
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="unpriced",
+            model_name="mystery-model",
+            config={"evaluator_model": "mystery-judge"},
+            status="done",
+        )
+        s.add(run)
+        s.flush()
+        sb = Sandbox(
+            run_id=run.id,
+            harness_config={"adapter": "miniloop"},
+            status="done",
+        )
+        s.add(sb)
+        s.flush()
+        s.add(
+            _ev(
+                run.id,
+                sandbox_id=sb.id,
+                type_="llm_response",
+                ts=T0,
+                payload={
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50,
+                              "total_tokens": 150},
+                    "latency_ms": 10,
+                },
+            )
+        )
+        # judge-phase traffic (post eval_started) on the same sandbox
+        s.add(
+            _ev(
+                run.id,
+                sandbox_id=sb.id,
+                source="evaluator",
+                type_="checkpoint",
+                ts=T0 + timedelta(minutes=5),
+                payload={"phase": "eval_started"},
+            )
+        )
+        s.add(
+            _ev(
+                run.id,
+                sandbox_id=sb.id,
+                type_="llm_response",
+                ts=T0 + timedelta(minutes=6),
+                payload={
+                    "usage": {"prompt_tokens": 200, "completion_tokens": 20,
+                              "total_tokens": 220},
+                    "latency_ms": 10,
+                },
+            )
+        )
+        s.commit()
+        run_id = run.id
+    finally:
+        s.close()
+
+    body = client.get("/api/analytics/runs", params={"limit": 100}).json()
+    pt = _trend_point(body, run_id)
+    assert pt["price_model"] is None
+    assert pt["estimated_cost_usd"] is None
+    assert pt["evaluator_cost_usd"] is None
+
+    # explicit ?price_model= reprices participant AND judge traffic uniformly
+    body = client.get(
+        "/api/analytics/runs",
+        params={"limit": 100, "price_model": "gpt-4o"},
+    ).json()
+    pt = _trend_point(body, run_id)
+    assert pt["price_model"] == "gpt-4o"
+    assert pt["estimated_cost_usd"] == pytest.approx(
+        estimate_cost_usd(PRICE_TABLE["gpt-4o"], input_tokens=100, output_tokens=50)
+    )
+    assert pt["evaluator_cost_usd"] == pytest.approx(
+        estimate_cost_usd(PRICE_TABLE["gpt-4o"], input_tokens=200, output_tokens=20)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cross-source tool-call mix (CLI harness lanes) + empty_workspace flag
 # ---------------------------------------------------------------------------
@@ -916,3 +1031,108 @@ def test_empty_workspace_surfaced_on_row(
     assert _row(body, mixed_signal_run["sbs"]["empty"])["empty_workspace"] is True
     for key in ("hook", "mixed", "coarse"):
         assert _row(body, mixed_signal_run["sbs"][key])["empty_workspace"] is False
+
+
+# ---------------------------------------------------------------------------
+# PR27 — trials: per-cell rollups with mean ± sd variance
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def trialed_run(session_factory: sessionmaker[Session]):
+    """One config × model cell × 3 trials, hand-worked overall scores.
+
+    Scores 6, 8, 9 → mean 23/3 ≈ 7.667; sample sd (n−1) =
+    sqrt(14/3 / 2) = sqrt(7/3) ≈ 1.528; n = 3.
+    A second cell × 2 trials with one unscored trial exercises the
+    missing-score path: n counts only scored trials.
+    """
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="repeat me",
+            model_name="qwen3:8b",
+            trials=3,
+            config={
+                "evaluator_model": "qwen3:8b",
+                "trials": 3,
+            },
+            status="done",
+        )
+        s.add(run)
+        s.flush()
+        cell_a = {"adapter": "miniloop", "name": "cfg-a"}
+        cell_b = {"adapter": "codex", "name": "cfg-b"}
+        sbs: dict[str, list[Sandbox]] = {"a": [], "b": []}
+        for i in (1, 2, 3):
+            sbs["a"].append(
+                Sandbox(
+                    run_id=run.id,
+                    name=f"cfg-a · t{i}",
+                    harness_config={**cell_a, "trial_index": i},
+                    status="done",
+                    terminal_reason="agent_done",
+                )
+            )
+        for i in (1, 2):
+            sbs["b"].append(
+                Sandbox(
+                    run_id=run.id,
+                    name=f"cfg-b · t{i}",
+                    harness_config={**cell_b, "trial_index": i},
+                    status="done",
+                    terminal_reason="agent_done",
+                )
+            )
+        s.add_all([sb for group in sbs.values() for sb in group])
+        s.flush()
+        # cell A: all three scored — 6, 8, 9 (in insertion order)
+        for sb, sc in zip(sbs["a"], (6.0, 8.0, 9.0), strict=True):
+            s.add(Score(sandbox_id=sb.id, dimension="overall", score=sc))
+        # cell B: only trial 1 scored (trial 2 failed unscored)
+        s.add(Score(sandbox_id=sbs["b"][0].id, dimension="overall", score=5.0))
+        s.commit()
+        return {"run_id": run.id, "a": [sb.id for sb in sbs["a"]],
+                "b": [sb.id for sb in sbs["b"]]}
+    finally:
+        s.close()
+
+
+def _cell(body: dict, label: str) -> dict:
+    return next(c for c in body["cells"] if c["label"] == label)
+
+
+def test_trial_cell_rollup_hand_worked(client: TestClient, trialed_run) -> None:
+    """Hand-worked mean ± sd: scores 6/8/9 → mean 7.667, sample sd 1.528, n=3."""
+    body = _get(client, trialed_run["run_id"])
+    cell = _cell(body, "miniloop")  # label = adapter · packs shape
+    assert cell["sandbox_count"] == 3
+    assert cell["overall_mean"] == 7.667
+    assert cell["overall_sd"] == 1.528
+    assert cell["overall_n"] == 3
+
+
+def test_trial_cell_rollup_counts_scored_trials_only(
+    client: TestClient, trialed_run
+) -> None:
+    """A trial with no overall score is excluded from n — sd needs ≥2."""
+    body = _get(client, trialed_run["run_id"])
+    cell = _cell(body, "codex")
+    assert cell["sandbox_count"] == 2
+    assert cell["overall_mean"] == 5.0
+    assert cell["overall_sd"] is None  # <2 scored trials
+    assert cell["overall_n"] == 1
+
+
+def test_trial_sandbox_rows_carry_cell_and_index(
+    client: TestClient, trialed_run
+) -> None:
+    """Per-sandbox analytics rows self-describe their cell + trial_index so
+    the UI can group trials under one header."""
+    body = _get(client, trialed_run["run_id"])
+    rows = {str(r["sandbox_id"]): r for r in body["sandboxes"]}
+    a_rows = [rows[str(sid)] for sid in trialed_run["a"]]
+    assert sorted(r["trial_index"] for r in a_rows) == [1, 2, 3]
+    assert len({r["cell"] for r in a_rows}) == 1  # one shared cell key
+    b_rows = [rows[str(sid)] for sid in trialed_run["b"]]
+    assert a_rows[0]["cell"] != b_rows[0]["cell"]

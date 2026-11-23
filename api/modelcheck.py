@@ -41,15 +41,17 @@ log = logging.getLogger(__name__)
 _CATALOG_TTL_SECONDS = 60.0
 _CATALOG_TIMEOUT = httpx.Timeout(10.0)
 
-#: Registered adapters whose harness can run WITHOUT model tool/function
-#: calls — aider falls back to litellm text edit-formats on no-tools models.
-#: Every other adapter needs provider-reported ``"tools"`` support:
+#: Adapters whose harness can run WITHOUT model tool/function calls —
+#: aider falls back to litellm text edit-formats on no-tools models, and
+#: the ``prompt`` pseudo-adapter's single chat-completions call never
+#: carries a ``tools`` field. Every other adapter needs provider-reported
+#: ``"tools"`` support:
 #: miniloop sends ``tools=`` on every chat call, and the CLIs' protocols
 #: (anthropic-messages / responses / chat-completions) carry tools
 #: unconditionally — the observed qwen2.5vl run died exactly this way. New
 #: adapters default to tool-required; opt out only when the harness
 #: provably works without function calling.
-TOOL_OPTIONAL_ADAPTERS = frozenset({"aider"})
+TOOL_OPTIONAL_ADAPTERS = frozenset({"aider", "prompt"})
 
 #: model id → capability frozenset; ``None`` when the provider doesn't
 #: report per-model capabilities (tool check is then skipped for it).

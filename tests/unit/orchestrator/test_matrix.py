@@ -8,10 +8,12 @@ per-sandbox model lookup used by provision/results/analytics.
 from __future__ import annotations
 
 from orchestrator.matrix import (
+    cell_key,
     expanded_configs,
     participant_models,
     run_models,
     sandbox_model,
+    trial_index,
 )
 
 # ---------------------------------------------------------------------------
@@ -163,3 +165,85 @@ def test_sandbox_model_falls_back_to_run_default() -> None:
     assert sandbox_model({}, "qwen3:8b") == "qwen3:8b"
     assert sandbox_model(None, "qwen3:8b") == "qwen3:8b"
     assert sandbox_model({"model": "  "}, "qwen3:8b") == "qwen3:8b"
+
+
+# ---------------------------------------------------------------------------
+# PR27 — trials: every effective cell × N replicas, trial_index stamped
+# ---------------------------------------------------------------------------
+
+
+def test_expanded_configs_trials_multiplies_single_model() -> None:
+    """2 configs × 1 model × 3 trials = 6 sandboxes."""
+    hcs = [{"adapter": "miniloop"}, {"adapter": "codex"}]
+    out = expanded_configs(hcs, None, "m1", trials=3)
+    assert len(out) == 6
+    assert [hc["adapter"] for hc in out] == [
+        "miniloop", "miniloop", "miniloop", "codex", "codex", "codex",
+    ]
+
+
+def test_expanded_configs_trials_multiplies_multi_model() -> None:
+    """2 configs × 2 models × 2 trials = 8 sandboxes."""
+    hcs = [{"adapter": "miniloop"}, {"adapter": "codex"}]
+    out = expanded_configs(hcs, ["m2"], "m1", trials=2)
+    assert len(out) == 8
+    # model-major cells, then cell-major trials inside each cell
+    assert [hc["model"] for hc in out] == ["m1", "m1", "m1", "m1", "m2", "m2", "m2", "m2"]
+
+
+def test_expanded_configs_trial_index_one_based_cell_major() -> None:
+    """Each cell's replicas get 1-based trial_index, staying adjacent."""
+    hcs = [{"adapter": "a", "name": "x"}, {"adapter": "b", "name": "y"}]
+    out = expanded_configs(hcs, None, "m1", trials=3)
+    assert [(hc["name"], hc["trial_index"]) for hc in out] == [
+        ("x", 1), ("x", 2), ("x", 3), ("y", 1), ("y", 2), ("y", 3),
+    ]
+
+
+def test_expanded_configs_trials_one_emits_no_key() -> None:
+    """trials=1 keeps the pre-PR27 shape — no trial_index key at all."""
+    out = expanded_configs([{"adapter": "a"}], None, "m1", trials=1)
+    assert out == [{"adapter": "a"}]
+    assert "trial_index" not in out[0]
+
+
+def test_expanded_configs_trials_with_model_pin() -> None:
+    """A pinned config's single cell replicates like any other."""
+    hcs = [{"adapter": "a", "model": "m9"}, {"adapter": "b"}]
+    out = expanded_configs(hcs, ["m2"], "m1", trials=2)
+    assert out == [
+        {"adapter": "b", "model": "m1", "trial_index": 1},
+        {"adapter": "b", "model": "m1", "trial_index": 2},
+        {"adapter": "b", "model": "m2", "trial_index": 1},
+        {"adapter": "b", "model": "m2", "trial_index": 2},
+        {"adapter": "a", "model": "m9", "trial_index": 1},
+        {"adapter": "a", "model": "m9", "trial_index": 2},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# trial_index / cell_key
+# ---------------------------------------------------------------------------
+
+
+def test_trial_index_reads_stamped_value() -> None:
+    assert trial_index({"adapter": "a", "trial_index": 3}) == 3
+    assert trial_index({"adapter": "a"}) is None
+    assert trial_index(None) is None
+    # defensive: non-int / non-positive values read as untrialed
+    assert trial_index({"trial_index": "x"}) is None
+    assert trial_index({"trial_index": 0}) is None
+    assert trial_index({"trial_index": "2"}) == 2
+
+
+def test_cell_key_groups_trials_of_one_cell() -> None:
+    """Every trial of one config × model cell shares the identical key."""
+    base = {"adapter": "a", "model": "m1", "skill_packs": ["x"]}
+    t1 = cell_key({**base, "trial_index": 1})
+    t3 = cell_key({**base, "trial_index": 3})
+    assert t1 == t3
+    # untrialed shape groups with the same cell
+    assert cell_key(base) == t1
+    # different cells differ
+    assert cell_key({**base, "model": "m2"}) != t1
+    assert cell_key({**base, "adapter": "b"}) != t1

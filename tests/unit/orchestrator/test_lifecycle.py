@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import httpx
 from sqlalchemy import select
 
 from db.models import Event, Rubric, Sandbox, Score
@@ -578,3 +579,195 @@ async def test_lifecycle_no_approved_rubric_fails(
     with session_factory() as s:
         assert s.get(type(run), run.id).status == "failed"
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# PR25 — prompt-only cells (zero-container matrix cells)
+# ---------------------------------------------------------------------------
+
+
+def _chat_ok(text: str = "cell output") -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+        },
+    )
+
+
+def _patch_gateway(monkeypatch, handler) -> list[httpx.Request]:
+    """Swap prompt_cell's client factory for a MockTransport one — the cell
+    builds its own httpx.AsyncClient, so patching the class attribute the
+    module calls is the least invasive injection."""
+    requests: list[httpx.Request] = []
+
+    def recording(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return handler(request)
+
+    real = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(recording)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched)
+    return requests
+
+
+async def test_lifecycle_prompt_only_run(
+    session_factory, settings, artifact_root, monkeypatch
+) -> None:
+    """The card's verify: a `prompt` x N-models run completes with ZERO
+    docker containers, scores land, and the cell calls went through the
+    (fake) gateway."""
+    requests = _patch_gateway(monkeypatch, lambda r: _chat_ok())
+
+    cfg = run_config(
+        harness_configs=[{"adapter": "prompt", "skill_packs": []}]
+    )
+    cfg["models"] = ["m-a", "m-b", "m-c"]
+    run = make_run(
+        session_factory, status="provisioning", config=cfg, model_name="m-a"
+    )
+    _approved_rubric(session_factory, run.id)
+
+    fake = FakeRuntime(artifact_root=artifact_root)
+    calls: list = []
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+
+    # no docker: nothing spawned, nothing snapshotted by the monitor
+    assert fake.spawned == []
+    assert fake.snapshots == []
+    # one gateway call per cell
+    assert len(requests) == 3
+    models = sorted(json.loads(r.content)["model"] for r in requests)
+    assert models == ["m-a", "m-b", "m-c"]
+
+    with session_factory() as s:
+        sbs = list(
+            s.execute(select(Sandbox).where(Sandbox.run_id == run.id)).scalars()
+        )
+        assert len(sbs) == 3
+        assert all(sb.status == "done" for sb in sbs)
+        assert all(sb.terminal_reason == "harness_complete" for sb in sbs)
+        assert all(sb.docker_container_id is None for sb in sbs)
+        assert all(
+            (Path(sb.artifact_path) / "output.txt").read_text() == "cell output"
+            for sb in sbs
+        )
+        r = s.get(type(run), run.id)
+        assert r.status == "done"  # scores landed -> done
+        # orchestrator-side cell events landed on the sandbox rows
+        evs = s.execute(select(Event).where(Event.run_id == run.id)).scalars().all()
+        assert sum(1 for e in evs if e.type == "run_started") == 3
+        assert sum(1 for e in evs if e.type == "terminal_state") == 3
+        # evaluator saw all three cells
+        assert len(calls) == 3
+        prompt_paths = sorted(c["prompt_output_path"] for c in calls)
+        assert all(str(p).endswith("output.txt") for p in prompt_paths)
+
+
+async def test_lifecycle_mixed_prompt_and_container(
+    session_factory, settings, artifact_root, monkeypatch
+) -> None:
+    """A run mixing prompt and container cells routes each correctly —
+    prompt cells finalize inline (no monitor), containers spawn + monitor
+    as before — and both reach evaluation."""
+    _patch_gateway(monkeypatch, lambda r: _chat_ok("prompt says hi"))
+
+    cfg = run_config(
+        harness_configs=[
+            {"adapter": "prompt", "name": "prompted"},
+            {"adapter": "miniloop", "name": "contained"},
+        ]
+    )
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+
+    fake = FakeRuntime(artifact_root=artifact_root, default_logs=RESULT_DONE)
+    calls: list = []
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+
+    # exactly ONE spawn — the miniloop cell only
+    assert len(fake.spawned) == 1
+    with session_factory() as s:
+        sbs = {
+            (sb.harness_config or {}).get("adapter"): sb
+            for sb in s.execute(
+                select(Sandbox).where(Sandbox.run_id == run.id)
+            ).scalars()
+        }
+        prompt_sb = sbs["prompt"]
+        container_sb = sbs["miniloop"]
+        assert prompt_sb.status == "done"
+        assert prompt_sb.terminal_reason == "harness_complete"
+        assert prompt_sb.docker_container_id is None
+        assert container_sb.status == "done"
+        assert container_sb.docker_container_id is not None
+        assert s.get(type(run), run.id).status == "done"
+
+    # both evaluated; only the prompt cell carries prompt_output_path
+    by_adapter = {
+        (c["sandbox_id"] == prompt_sb.id): c for c in calls
+    }
+    assert by_adapter[True]["prompt_output_path"] == Path(
+        prompt_sb.artifact_path
+    ) / "output.txt"
+    assert by_adapter[False]["prompt_output_path"] is None
+    # the prompt cell still gets the container kwargs shape (evaluator ignores ws)
+    assert "workspace_dir" in by_adapter[True]
+
+
+async def test_lifecycle_all_prompt_cells_fail_marks_run_failed(
+    session_factory, settings, artifact_root, monkeypatch
+) -> None:
+    """Zero artifact-bearing cells -> run failed, same rule as containers.
+    A non-httpx client failure leaves no artifact at all (prompt_cell's
+    generic failure path)."""
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("mock transport exploded")
+
+    _patch_gateway(monkeypatch, boom)
+
+    cfg = run_config(harness_configs=[{"adapter": "prompt"}])
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+
+    fake = FakeRuntime(artifact_root=artifact_root)
+    calls: list = []
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+
+    with session_factory() as s:
+        assert s.get(type(run), run.id).status == "failed"
+        sb = s.execute(
+            select(Sandbox).where(Sandbox.run_id == run.id)
+        ).scalar_one()
+        assert sb.status == "failed"
+        assert sb.terminal_reason == "error"
+    assert calls == []  # nothing to evaluate

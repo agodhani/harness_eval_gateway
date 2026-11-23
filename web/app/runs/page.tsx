@@ -24,6 +24,10 @@ import { formatTs, shortId, truncate } from "@/lib/format";
 import { Badge, Card, EmptyState, ErrorNote, Loading, statusTone } from "@/components/ui";
 
 const POLL_MS = 10_000;
+/** Runs list page size — the API paginates via ?limit/?offset (le=200). */
+const PAGE_SIZE = 50;
+/** Hard cap on a single fetch — matches the endpoint's `limit` bound. */
+const MAX_FETCH = 200;
 
 function scoreTone(score: number): "good" | "mid" | "bad" {
   if (score >= 8) return "good";
@@ -58,12 +62,16 @@ export default function RunsPage() {
   const [query, setQuery] = useState("");
   // Preset library for the filter dropdown labels — silent on failure.
   const [presets, setPresets] = useState<TaskPreset[]>([]);
+  // Pagination: the API slices newest-first via ?offset — `hasMore` is the
+  // "last page was full" heuristic (a short page means the list ended).
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   // run_id → mean overall score (one trends call, not N results fetches);
   // null until the analytics endpoint responds / stays empty when it 404s.
   const [scores, setScores] = useState<Map<string, number | null>>(new Map());
 
-  // Fetch on mount + whenever the status filter changes. Runs inside an
-  // async IIFE so setState lands in async context (hooks lint rule).
+  // Fetch page 0 on mount + whenever the status filter changes. Runs inside
+  // an async IIFE so setState lands in async context (hooks lint rule).
   // Previous rows stay on screen while the new page loads (no flash).
   useEffect(() => {
     let cancelled = false;
@@ -73,10 +81,12 @@ export default function RunsPage() {
         const data = await listRuns({
           status: statusFilter || undefined,
           preset: presetFilter || undefined,
-          limit: 100,
+          limit: PAGE_SIZE,
+          offset: 0,
         });
         if (cancelled) return;
         setRuns(data);
+        setHasMore(data.length === PAGE_SIZE);
         setError(null);
       } catch (err) {
         if (cancelled) return;
@@ -111,6 +121,34 @@ export default function RunsPage() {
     };
   }, []);
 
+  /** Fetch the next page (?offset = loaded count) and append it. Dedup by
+   * id — a run submitted between clicks shifts the window by one row. */
+  async function loadMore() {
+    if (!runs || loadingMore || !hasMore) return;
+    setLoadingMore(true);
+    try {
+      const batch = await listRuns({
+        status: statusFilter || undefined,
+        preset: presetFilter || undefined,
+        limit: PAGE_SIZE,
+        offset: runs.length,
+      });
+      // Functional merge: a poll tick landing mid-fetch can't drop the
+      // appended page (the dedup still keys on whatever is current).
+      setRuns((prev) => {
+        const cur = prev ?? [];
+        const seen = new Set(cur.map((r) => r.id));
+        return [...cur, ...batch.filter((r) => !seen.has(r.id))];
+      });
+      setHasMore(batch.length === PAGE_SIZE);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.detail : "Failed to load more runs.");
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
   // Mean overall scores — a single trends call keyed by run_id. Failure is
   // silent: the column just shows "—" for every row.
   useEffect(() => {
@@ -133,16 +171,32 @@ export default function RunsPage() {
   }, []);
 
   // Poll while any visible run is non-terminal (silent — keeps last data).
+  // Refetches the loaded head window (bounded by the API's 200 limit) and
+  // merges: fresh rows replace the head, already-loaded older rows beyond
+  // the window stay appended, rows dropped from a non-full window (e.g.
+  // hard-deleted) disappear.
   useEffect(() => {
     const anyActive = (runs ?? []).some((r) => !TERMINAL_RUN_STATUSES.includes(r.status));
     if (!anyActive) return;
     const t = setInterval(() => {
+      const limit = Math.min(Math.max(runs?.length ?? 0, PAGE_SIZE), MAX_FETCH);
       listRuns({
         status: statusFilter || undefined,
         preset: presetFilter || undefined,
-        limit: 100,
+        limit,
       })
-        .then((data) => setRuns(data))
+        .then((fresh) => {
+          setHasMore(fresh.length >= limit);
+          setRuns((prev) => {
+            if (!prev) return fresh;
+            const freshIds = new Set(fresh.map((r) => r.id));
+            const tail =
+              fresh.length >= limit
+                ? prev.filter((r) => !freshIds.has(r.id))
+                : [];
+            return [...fresh, ...tail];
+          });
+        })
         .catch(() => {
           /* transient — next tick retries */
         });
@@ -299,8 +353,9 @@ export default function RunsPage() {
             )}
           </EmptyState>
         ) : (
-          <div className="table-wrap">
-            <table className="table">
+          <>
+            <div className="table-wrap">
+              <table className="table">
               <thead>
                 <tr>
                   <th>Run</th>
@@ -377,8 +432,34 @@ export default function RunsPage() {
                   );
                 })}
               </tbody>
-            </table>
-          </div>
+              </table>
+            </div>
+            <div
+              className="row"
+              style={{
+                padding: "0.7rem 0.9rem",
+                borderTop: "1px solid var(--border)",
+                justifyContent: "space-between",
+              }}
+            >
+              <span className="faint" style={{ fontSize: "0.78rem" }}>
+                {filtered.length === (runs?.length ?? 0)
+                  ? `${runs?.length ?? 0} run${runs?.length === 1 ? "" : "s"} loaded`
+                  : `${filtered.length} of ${runs?.length ?? 0} loaded runs match`}
+              </span>
+              {hasMore ? (
+                <button
+                  type="button"
+                  className="btn btn--sm"
+                  onClick={() => void loadMore()}
+                  disabled={loadingMore}
+                  title="Fetch the next page of runs from the API"
+                >
+                  {loadingMore ? "Loading…" : "Load more"}
+                </button>
+              ) : null}
+            </div>
+          </>
         )}
       </Card>
     </main>

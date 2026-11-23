@@ -118,6 +118,44 @@ class EventOut(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class ModelOptions(BaseModel):
+    """PR27 — optional per-config model-sampling knobs.
+
+    Honored where the adapter exposes the equivalent control (miniloop and
+    the ``prompt`` pseudo-adapter map all four into the chat-completions
+    request; adapters report their supported keys via
+    ``MANIFEST["model_options"]`` / ``GET /api/harnesses``). Keys the
+    selected adapter does NOT support are dropped at submit (the persisted
+    cell only carries honored keys) and called out in the submit response's
+    ``warnings`` — never silently applied.
+    Unknown keys are rejected here (``extra="forbid"``) so typos 422 rather
+    than silently no-op.
+
+    ``reasoning`` maps to the request-level ``reasoning_effort`` hint
+    (e.g. ``none``/``low``/``medium``/``high``) — a free-form bounded string
+    since provider vocabularies differ.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    seed: int | None = Field(default=None, ge=0)
+    max_tokens: int | None = Field(default=None, ge=1, le=131_072)
+    reasoning: str | None = Field(default=None, max_length=32)
+
+    @field_validator("reasoning", mode="before")
+    @classmethod
+    def _normalize_reasoning(cls, v: object) -> object:
+        if isinstance(v, str):
+            v = v.strip().lower()
+            return v or None
+        return v
+
+    def provided(self) -> dict[str, Any]:
+        """The keys the submitter actually set (non-None)."""
+        return self.model_dump(exclude_none=True)
+
+
 class HarnessConfigIn(BaseModel):
     """One sandbox configuration in a run's comparison matrix.
 
@@ -145,6 +183,9 @@ class HarnessConfigIn(BaseModel):
     system_prompt_extra: str | None = Field(default=None, max_length=8000)
     name: str | None = Field(default=None, max_length=64)
     model: str | None = Field(default=None, max_length=255)
+    # PR27: optional model-sampling knobs; keys the adapter doesn't support
+    # are dropped with a submit-time warning (see ModelOptions).
+    model_options: ModelOptions | None = None
 
     @field_validator("name", "model", mode="before")
     @classmethod
@@ -160,12 +201,24 @@ class BudgetsIn(BaseModel):
     """Termination-policy knobs for a run.
 
     ``token_budget`` is PER-RUN (the gateway meters tokens across all of a
-    run's sandboxes against one ceiling), not per-sandbox.
+    run's sandboxes against one ceiling), not per-sandbox. PR28 adds the
+    per-cell knobs — both optional, both enforced per sandbox:
+
+    - ``sandbox_token_budget`` caps each cell's OWN token total (minted as
+      the cred's ``sandbox_max_tokens`` claim for the gateway gate plus a
+      monitor poll check) — a runaway cell starves itself, not its siblings.
+    - ``max_cost_usd`` caps each cell's ESTIMATED spend, computed per poll
+      through the layered price table (api/pricing.py::PriceBook). It only
+      bites on priced models — an unpriced cell has no honest rate to bill
+      against, so the cap simply can't trip it (PR21 honesty preserved).
     """
 
     max_iters: int = Field(default=50, ge=1, le=1000)
     token_budget: int = Field(default=200_000, ge=1_000)
     wall_clock_seconds: int = Field(default=3600, ge=60, le=86_400)
+    # PR28: per-sandbox/per-cell caps; None = unset (no per-cell limit).
+    sandbox_token_budget: int | None = Field(default=None, ge=1_000)
+    max_cost_usd: float | None = Field(default=None, gt=0)
 
 
 #: PR14 — sanity cap on the expanded comparison matrix (configs × models);
@@ -207,12 +260,18 @@ class RunCreate(BaseModel):
         Field(default=None, max_length=255)
     )
     budgets: BudgetsIn = Field(default_factory=BudgetsIn)
+    # PR27 — repeats per matrix cell: every effective config × model cell
+    # spawns this many sandboxes (``trial_index`` 1..N stamped on each) so
+    # results report mean ± sd instead of single samples. 1 = pre-PR27.
+    trials: int = Field(default=1, ge=1, le=8)
 
     @model_validator(mode="after")
     def _normalize_models(self) -> RunCreate:
         """Dedupe/blank-drop ``models`` (model_name always wins), then cap
         the expanded matrix — 8 configs × 8 models would spawn 64 sandboxes.
-        A config pinned via ``model`` expands to one cell, not len(models)."""
+        A config pinned via ``model`` expands to one cell, not len(models).
+        PR27: ``trials`` multiplies every cell, so the cap applies to the
+        post-trial sandbox count."""
         if self.preset_ref is not None and not self.preset_ref:
             self.preset_ref = None
         if self.models is not None:
@@ -226,11 +285,12 @@ class RunCreate(BaseModel):
         model_count = 1 + len(self.models or [])
         pinned = sum(1 for hc in self.harness_configs if hc.model)
         cells = pinned + (len(self.harness_configs) - pinned) * model_count
-        if cells > MAX_MATRIX_CELLS:
+        sandboxes = cells * self.trials
+        if sandboxes > MAX_MATRIX_CELLS:
             raise ValueError(
-                f"run matrix would spawn {cells} sandboxes "
+                f"run matrix would spawn {sandboxes} sandboxes "
                 f"({len(self.harness_configs)} configs × "
-                f"{model_count} models); "
+                f"{model_count} models × {self.trials} trials); "
                 f"max is {MAX_MATRIX_CELLS}"
             )
         return self
@@ -275,6 +335,8 @@ class RunOut(BaseModel):
     status: str
     task_prompt: str
     model_name: str
+    # PR27: repeats per matrix cell submitted on this run (1 = single-shot).
+    trials: int = 1
     config: dict[str, Any]
     # True when the evaluator model equals ANY participant model — the UI
     # flags this so users notice non-independent judging.
@@ -481,7 +543,8 @@ class EvaluatorActivity(BaseModel):
     llm_turns: int = 0
     tokens: TokenUsage = Field(default_factory=TokenUsage)
     errors: int = 0
-    estimated_cost_usd: float = 0.0
+    # None when the evaluator model isn't in the price table (unpriced).
+    estimated_cost_usd: float | None = None
 
 
 class SandboxAnalytics(BaseModel):
@@ -490,15 +553,22 @@ class SandboxAnalytics(BaseModel):
     sandbox_id: uuid.UUID
     # Config label from the sandbox row (PR1 named harness configs).
     name: str | None = None
+    # PR27: which repeat of its config × model cell this sandbox is
+    # (``harness_config.trial_index``; 0/None semantics = untrialed run).
+    trial_index: int | None = None
+    # PR27: stable key identifying the config × model cell — equal across
+    # the cell's trials (harness_config minus ``trial_index``, serialized).
+    cell: str = ""
     # Human label mirroring the results-matrix header (adapter · packs;
     # includes the model on multi-model runs — PR14).
     label: str = ""
     harness_config: dict[str, Any] = Field(default_factory=dict)
     # PR14: the participant model this sandbox ran (config ``model`` cell,
     # else the run's ``model_name``) + the price-table key its
-    # ``estimated_cost_usd`` was computed at.
+    # ``estimated_cost_usd`` was computed at — None when the model isn't
+    # listed (unpriced, PR21 — never a guessed rate).
     model: str = ""
-    price_model: str = ""
+    price_model: str | None = None
     status: str
     terminal_reason: str | None = None
     # Monitor flagged a done-ish terminal state on an empty workspace
@@ -515,7 +585,7 @@ class SandboxAnalytics(BaseModel):
     test_executions: int = 0
     errors: int = 0
     wall_clock_seconds: float = 0.0
-    estimated_cost_usd: float = 0.0
+    estimated_cost_usd: float | None = None
     evaluator: EvaluatorActivity | None = None
 
 
@@ -531,7 +601,8 @@ class ModelAnalytics(BaseModel):
     model: str
     # Price-table key this model's ``estimated_cost_usd`` was computed at
     # (its own rate in auto mode, the uniform ``?price_model=`` otherwise).
-    price_model: str = ""
+    # None when the model isn't listed (unpriced, PR21).
+    price_model: str | None = None
     sandbox_count: int = 0
     llm_turns: int = 0
     tokens: TokenUsage = Field(default_factory=TokenUsage)
@@ -543,8 +614,39 @@ class ModelAnalytics(BaseModel):
     test_executions: int = 0
     errors: int = 0
     wall_clock_seconds: float = 0.0
-    estimated_cost_usd: float = 0.0
+    estimated_cost_usd: float | None = None
     evaluator: EvaluatorActivity | None = None
+
+
+class CellAnalytics(BaseModel):
+    """PR27 — per-cell rollup: one entry per distinct config × model
+    combination (the trial group). Same metric aggregation as
+    ``ModelAnalytics`` plus the trial-score variance columns the results
+    matrix reports (sample sd, n−1 denominator; ``overall_sd`` is null when
+    fewer than two trials produced an overall score).
+    """
+
+    # ``SandboxAnalytics.cell`` group key + the shared config label.
+    cell: str
+    label: str = ""
+    model: str = ""
+    sandbox_count: int = 0
+    llm_turns: int = 0
+    tokens: TokenUsage = Field(default_factory=TokenUsage)
+    latency_ms: LatencyStats = Field(default_factory=LatencyStats)
+    tool_calls: ToolCallStats = Field(default_factory=ToolCallStats)
+    skill_calls: SkillCallStats = Field(default_factory=SkillCallStats)
+    shell_commands: int = 0
+    file_ops: int = 0
+    test_executions: int = 0
+    errors: int = 0
+    wall_clock_seconds: float = 0.0
+    estimated_cost_usd: float | None = None
+    evaluator: EvaluatorActivity | None = None
+    # Score-variance columns across this cell's trials.
+    overall_mean: float | None = None
+    overall_sd: float | None = None
+    overall_n: int = 0
 
 
 class RunAnalytics(BaseModel):
@@ -554,14 +656,21 @@ class RunAnalytics(BaseModel):
     model_name: str
     # The explicit ``?price_model=`` repricing basis, or None for auto mode —
     # each sandbox (and model rollup) costed at its OWN model's listed rate,
-    # falling back to the run's resolved rate for unlisted models. Mirrors
+    # unpriced (null cost) for unlisted models. Mirrors
     # ``RunTrends.price_model``.
     price_model: str | None = None
     price_table: dict[str, ModelPrice] = Field(default_factory=dict)
+    # The ``model_prices`` row globs in declaration (first-match) order —
+    # client-side repricing replays ``key_for``'s rows-before-static
+    # layering against ``price_table`` with them.
+    price_globs: list[str] = Field(default_factory=list)
     sandboxes: list[SandboxAnalytics] = Field(default_factory=list)
     # PR14: participant-model rollups (one entry per model in the run's
     # matrix; a single entry for single-model runs).
     models: list[ModelAnalytics] = Field(default_factory=list)
+    # PR27: per-cell (config × model) rollups — one entry per trial group,
+    # carrying the score-variance columns (overall mean ± sd, n).
+    cells: list[CellAnalytics] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -608,12 +717,15 @@ class RunTrendPoint(BaseModel):
     evaluator_errors: int = 0
     # Which price_table entry ``estimated_cost_usd`` was computed at —
     # the explicit param, or the run's resolved rate in auto mode. None
-    # when auto mode priced cells at mixed per-model rates (no single key).
+    # when auto mode priced cells at mixed per-model rates (no single key)
+    # or when some cell is unpriced.
     price_model: str | None = None
-    estimated_cost_usd: float = 0.0
+    # Participant cost; None when any cell's model isn't listed — a partial
+    # total would read as complete, so the honest answer is "unpriced".
+    estimated_cost_usd: float | None = None
     # Judge tokens priced at the evaluator model's rate when it's listed,
-    # else the run's resolved rate (explicit param or resolved fallback).
-    evaluator_cost_usd: float = 0.0
+    # else the explicit ``?price_model=`` rate. None when unpriced.
+    evaluator_cost_usd: float | None = None
     # Mean of the run's ``overall`` score rows; None when unscored.
     mean_overall_score: float | None = None
 

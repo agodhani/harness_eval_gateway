@@ -12,10 +12,11 @@
 
 from __future__ import annotations
 
+import math
 import secrets
 import time
 from collections.abc import Iterator
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
@@ -100,8 +101,67 @@ def _validate_events(session: Session, events: list[IngestEvent]) -> None:
             )
 
 
+_USAGE_INT_FIELDS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "cache_read_input_tokens",
+    "total_tokens",
+)
+
+_USAGE_INT_MAX = 2**63 - 1
+
+
+def _usage_int(value: Any) -> int | None:
+    """Coerce a usage token count to int; None when it isn't a sane count.
+
+    Counts are non-negative and must fit the BIGINT the metering sums
+    CAST to — a negative would deflate metered totals (a silent budget
+    bypass) and an oversized one still raises inside the Postgres CAST,
+    so out-of-range values read as absent like non-numeric ones.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        number = value
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number):
+            return None
+        number = int(number)
+    if not 0 <= number <= _USAGE_INT_MAX:
+        return None
+    return number
+
+
+def _normalize_llm_usage(payload: dict[str, Any]) -> None:
+    """Coerce an ``llm_response`` payload's usage token fields to ints.
+
+    ``gateway.metering.llm_usage_totals`` sums these fields via
+    ``CAST(... AS bigint)`` — a stored non-integer raises on Postgres
+    inside the per-request budget gate. Coercible values become ints;
+    anything else is dropped so the field reads as absent instead of
+    poisoning the sum.
+    """
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return
+    for field in _USAGE_INT_FIELDS:
+        if field not in usage:
+            continue
+        coerced = _usage_int(usage[field])
+        if coerced is None:
+            del usage[field]
+        else:
+            usage[field] = coerced
+
+
 def _to_row(e: IngestEvent) -> Event:
     """Build an Event row; omit unset optionals so server defaults apply."""
+    if e.type == EventType.LLM_RESPONSE:
+        _normalize_llm_usage(e.payload)
     kwargs: dict = {
         "run_id": e.run_id,
         "sandbox_id": e.sandbox_id,

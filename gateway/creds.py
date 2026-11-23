@@ -5,7 +5,13 @@ Format::
     heg.<b64url-json-payload>.<b64url-hmac-sha256>
 
 ``payload`` = ``{"run_id": str, "sandbox_id": str|null, "iat": int,
-"exp": int, "max_tokens"?: int}`` — compact JSON, base64url (no padding).
+"exp": int, "max_tokens"?: int, "sandbox_max_tokens"?: int}`` — compact
+JSON, base64url (no padding).
+
+``max_tokens`` is the RUN-wide token ceiling (all the run's sandboxes share
+it); ``sandbox_max_tokens`` (PR28) is the per-sandbox cap minted from the
+run's ``sandbox_token_budget`` — the gateway gate meters it against only
+the cred's own sandbox's usage so a hot cell starves itself, not siblings.
 
 The signature is ``HMAC_SHA256(secret, "heg." + payload_b64)`` — JWT-style
 ``header.payload`` signing where the header is the constant ``heg``.
@@ -53,6 +59,9 @@ class CredClaims:
     iat: int
     exp: int
     max_tokens: int | None = None
+    # PR28 per-sandbox token cap (run's sandbox_token_budget) — only ever
+    # minted on sandbox-scoped participant creds.
+    sandbox_max_tokens: int | None = None
     dev: bool = False
 
 
@@ -80,6 +89,7 @@ def mint_cred(
     secret: str,
     ttl_seconds: int = 86_400,
     max_tokens: int | None = None,
+    sandbox_max_tokens: int | None = None,
     now: float | None = None,
 ) -> str:
     """Mint a signed credential. ``now`` is injectable for tests."""
@@ -92,6 +102,8 @@ def mint_cred(
     }
     if max_tokens is not None:
         payload["max_tokens"] = int(max_tokens)
+    if sandbox_max_tokens is not None:
+        payload["sandbox_max_tokens"] = int(sandbox_max_tokens)
     payload_b64 = _b64url_encode(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     )
@@ -136,6 +148,7 @@ def verify_cred(token: str, *, secret: str, now: float | None = None) -> CredCla
     iat = payload.get("iat")
     exp = payload.get("exp")
     max_tokens = payload.get("max_tokens")
+    sandbox_max_tokens = payload.get("sandbox_max_tokens")
     if not run_id or not isinstance(run_id, str):
         raise CredError("missing run_id claim")
     if sandbox_id is not None and not isinstance(sandbox_id, str):
@@ -144,6 +157,10 @@ def verify_cred(token: str, *, secret: str, now: float | None = None) -> CredCla
         raise CredError("iat/exp claims must be integers")
     if max_tokens is not None and (not isinstance(max_tokens, int) or max_tokens < 0):
         raise CredError("max_tokens claim must be a non-negative integer")
+    if sandbox_max_tokens is not None and (
+        not isinstance(sandbox_max_tokens, int) or sandbox_max_tokens < 0
+    ):
+        raise CredError("sandbox_max_tokens claim must be a non-negative integer")
 
     now_ts = time.time() if now is None else now
     if now_ts >= exp:
@@ -155,4 +172,5 @@ def verify_cred(token: str, *, secret: str, now: float | None = None) -> CredCla
         iat=iat,
         exp=exp,
         max_tokens=max_tokens,
+        sandbox_max_tokens=sandbox_max_tokens,
     )

@@ -30,7 +30,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F15 | Submit UX: live model picker + install, named harness configs | ✅ | `api/routers/models.py`, `gateway/main.py` (`/v1/models/pull`), `web/app/submit/page.tsx`, `db/migrations/versions/a2b3c4d5e6f7_sandbox_name.py`, `orchestrator/provision.py` | `tests/unit/api/test_models.py`, `tests/unit/gateway/test_proxy.py` (pull), `tests/unit/db/test_migrations.py`, `tests/unit/orchestrator/test_provision.py` (name) |
 | F16 | Model-vs-model matrix (config × model) + per-model analytics | ✅ | `orchestrator/matrix.py`, `orchestrator/lifecycle.py`, `orchestrator/provision.py`, `api/schemas.py`, `api/routers/runs.py`, `results.py`, `analytics.py`, `web/app/submit/page.tsx`, `web/lib/api.ts`, `web/app/runs/[id]/` (detail, results, analysis) | `tests/unit/orchestrator/test_matrix.py`, `test_lifecycle.py`, `test_provision.py`, `tests/unit/api/test_runs.py`, `test_results.py`, `test_analytics.py` |
 | F17 | Artifact thumbnails (headless screenshots via the preview stack; desktop captures wait on real VNC framebuffer content, dead-app fast-fail with exit reason) | ✅ | `sandbox/thumbnails.py`, `sandbox/images/thumbnail-capture.{Dockerfile,sh}`, `sandbox/images/thumbnail-vnc.py`, `api/routers/preview.py` (`.../thumbnail`), `api/routers/results.py` (`SandboxResult.thumbnail`), `web/app/runs/[id]/results/PreviewControls.tsx` | `tests/unit/sandbox/test_thumbnails.py`, `tests/unit/api/test_thumbnails.py`, `tests/integration/test_thumbnail.py` |
-| F18 | Task preset library (vendored md + user presets, preset_ref on runs, /presets browse + detail) | ✅ | `task_presets/`, `api/presets.py`, `api/routers/presets.py`, `api/routers/runs.py` (preset_ref), `db/models.py` (`TaskPreset`, `Run.preset_*`), `web/app/presets/`, `web/components/SavePresetDialog.tsx`, `web/app/submit/page.tsx` | `tests/unit/api/test_presets.py`, `tests/unit/db/test_migrations.py`, `web/lib/resubmit.test.ts` |
+| F18 | Prompt-only matrix cells (no-sandbox `prompt` adapter: one metered LLM call per cell, `output.txt` artifact, full results/eval pipeline) | ✅ | `orchestrator/prompt_cell.py`, `orchestrator/adapters.py` (pseudo-manifest), `orchestrator/lifecycle.py`, `evaluator/evaluate.py` (`prompt_output_path`), `web/app/runs/[id]/results/` (inline output view) | `tests/unit/orchestrator/test_prompt_cell.py`, `test_lifecycle.py` (prompt cases), `tests/unit/api/test_results.py` (prompt-cell cases) |
+| F19 | Artifact file browser + side-by-side diff (jailed listing/read endpoints; prompt cells browse the artifact root so `output.txt` stays reachable; server-side unified diffs) | ✅ | `api/routers/results.py` (`/api/sandboxes/{id}/files[/{path}]`), `web/app/runs/[id]/results/FileBrowser.tsx`, `web/lib/fileBrowser.ts`, `web/lib/api.ts` | `tests/unit/api/test_results.py` (PR34 section), `web/lib/fileBrowser.test.ts` |
+| F20 | Trials per cell + per-config model options (config × model × trials expansion, `mean ± sample sd (n=N)` grouped results + cell rollups, adapter-filtered `model_options`) | ✅ | `api/schemas.py`, `api/routers/{runs,results,analytics}.py`, `orchestrator/{matrix,lifecycle,provision,prompt_cell,adapters}.py`, `adapters/common/contract.py`, `db/migrations/versions/d7e9f1a3b5c7_runs_trials.py`, `web/lib/{api,trialGroups,resubmit}.ts`, `web/app/submit/page.tsx`, `web/app/runs/[id]/results/`, `web/app/runs/[id]/analysis/` | `tests/unit/orchestrator/test_matrix.py`, `test_provision.py`, `tests/unit/api/test_runs.py`, `test_analytics.py`, `tests/unit/db/test_migrations.py` |
+| F21 | Budgets & pricing accuracy (per-cell `sandbox_max_tokens`/`max_cost_usd` caps; `model_prices` glob rate table layered over the static `PRICE_TABLE` via `GET/PUT/DELETE /api/prices` + OpenRouter sync) | ✅ | `api/pricing.py` (`PriceBook`), `api/routers/prices.py`, `db/models.py::ModelPriceRow`, `gateway/creds.py`, `gateway/metering.py`, `orchestrator/monitor.py`, `web/components/AddRate.tsx`, `web/lib/api.ts` | `tests/unit/api/test_pricing.py`, `test_prices.py`, `tests/unit/gateway/` (creds/metering/proxy), `tests/unit/orchestrator/` (monitor/provision), `tests/unit/db/test_migrations.py` |
+| F22 | Task preset library (vendored md + user presets, preset_ref on runs, /presets browse + detail) | ✅ | `task_presets/`, `api/presets.py`, `api/routers/presets.py`, `api/routers/runs.py` (preset_ref), `db/models.py` (`TaskPreset`, `Run.preset_*`), `web/app/presets/`, `web/components/SavePresetDialog.tsx`, `web/app/submit/page.tsx` | `tests/unit/api/test_presets.py`, `tests/unit/db/test_migrations.py`, `web/lib/resubmit.test.ts` |
 
 ## Feature details
 
@@ -113,6 +117,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (`RUBRIC_GEN_TIMEOUT_SECONDS`, default 960) out-waits the gateway's
   worst-case upstream hold (~915s) so a congested draft can't abandon a
   call its retry would then overlap.
+- **Per-cell budgets (PR28):** the monitor enforces the run spec's
+  optional `sandbox_token_budget` (sandbox's own metered total) and
+  `max_cost_usd` (its estimated spend at the layered price table —
+  priced models only) per poll alongside the run ceiling; each trips
+  `budget_exceeded` with a terminate-checkpoint `limit` of
+  `sandbox_tokens`/`cost` (`run_tokens` for the shared ceiling).
 - **Pacing (PR15):** one active run at a time — approvals while a run
   executes (or is queued) park in `queued` and promote FIFO by approval
   (`pacing.place_run` / `claim_next_queued`; promotion is wired into
@@ -150,7 +160,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `/v1/responses` (Codex) pass-throughs, streaming preserved with a metering
   tee; `GET /v1/models` for CLI probes; per-run/sandbox HMAC credentials
   (`heg.<b64>.<sig>`); records tokens in/out, latency, failures; token
-  budgets (429 + `error` event); emits `llm_request`/`llm_response`/`error`
+  budgets (429 + `error` event) — the cred's `max_tokens` run ceiling plus,
+  since PR28, a `sandbox_max_tokens` per-cell claim metered against only
+  that sandbox's own usage; emits `llm_request`/`llm_response`/`error`
   events carrying the resolved upstream provider — every metered call is
   terminally accounted, so a client disconnect mid-stream or while the
   upstream request is in flight still lands `llm_response` (partial /
@@ -435,7 +447,12 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   re-probe). Directory
   artifact downloads ship as ZIPs that filter `.git`, `__pycache__`,
   `*.pyc`, `node_modules`, `.venv` at any depth (download-side only — the
-  raw workspace on disk is untouched).
+  raw workspace on disk is untouched). **PR21:** the runs list paginates
+  via `?offset`/`?limit` (50-row pages + "Load more", poll refetches the
+  loaded head window), and run-detail action controls mirror DELETE
+  semantics — "Cancel run" renders only for `submitted`/`rubric_review`/
+  `queued`, terminal runs get "Delete run" (hard delete), in-flight
+  statuses show neither.
 - **Where:** `web/app/runs/` (list, detail, `results/`), results components,
   `api/routers/results.py` (results + scores + artifact-download endpoints)
 - **Verify:**
@@ -471,7 +488,18 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   selectors: merged mode toggles the sandbox filter (same state as the
   toolbar dropdown, whose options gain adapter labels); split mode (PR10)
   assigns the sandbox to a comparison lane instead. The strip refreshes
-  every 15s while the run is non-terminal.
+  every 15s while the run is non-terminal. **PR21 cost honesty:** models
+  absent from `PRICE_TABLE` are *unpriced* — `price_model`/
+  `estimated_cost_usd`/`evaluator_cost_usd` come back null rather than
+  billed at the first table entry's rate; an explicit `?price_model=`
+  still reprices uniformly (unknown key → 422). Every UI cost surface
+  renders "unpriced", never $0 or a stand-in model name. **PR28:** price
+  resolution now runs through the layered `PriceBook` — `model_prices`
+  glob rows (declared via `PUT /api/prices` or OpenRouter sync) match
+  first and shadow the static table; a glob is itself a valid
+  `?price_model=` pick, and cache-read tokens bill at a declared cache
+  rate instead of the input rate. The picker's "+ add rate" control PUTs
+  a row inline and folds it into the picker table on the spot (F21).
 - **Where:** `api/pricing.py`, `api/routers/analytics.py`, response schemas
   in `api/schemas.py`, `web/app/runs/[id]/results/AnalyticsSection.tsx`,
   `web/lib/api.ts` (`getRunAnalytics`, `estimateCostUsd`),
@@ -782,8 +810,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   + F8 scores, using **recharts** (v3.10.x — React-19-compatible, lightweight
   enough for the plain-CSS theme; palette hexes mirror the globals.css
   tokens in `analysis/charts.tsx`). Cards: score-by-rubric-dimension
-  (grouped horizontal bars + "Σ leader" line), tool-call mix (stacked,
-  top-7 tools + `other`), tokens in/out (stacked), LLM latency
+  (grouped horizontal bars + "weighted total leader" line), tool-call mix
+  (stacked, top-7 tools + `other`), tokens in/out (stacked), LLM latency
   (avg/p95/max), estimated cost per sandbox (price-model dropdown →
   client-side recompute, same trick as AnalyticsSection — local models show
   a note instead of empty bars), participant-vs-evaluator spend split
@@ -791,14 +819,21 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   cross-run trends ComposedChart (stacked participant+evaluator token bars
   + mean-overall-score line on a right 0–10 axis; newest 20 runs, current
   run accent-highlighted, hover shows run meta). The results score matrix
-  also gains a **totals row** (Σ dimension scores, `total`) — distinct from
-  the judge-reported `overall` — with the max cell flagged `leader`.
+  also gains a **totals row** (`total`) — distinct from the judge-reported
+  `overall` — with the max cell flagged `leader`. PR21 makes the total
+  honest: `web/lib/scoreMath.ts` computes a weighted, scale-normalised
+  aggregate — Σ ((score − min)/(max − min)) × weight over Σ weight,
+  rescaled to 0–10 — honouring each rubric dimension's `weight` +
+  `min_score`/`max_score` instead of a raw Σ; the analysis page's leader
+  line uses the same helper.
 - **API:** `GET /api/analytics/runs?limit=&price_model=` →
   `RunTrends{price_model|null, price_table, points[]}` — per-run roll-up of
   the same participant/evaluator event split (eval boundary per sandbox),
   latest-`overall`-score-per-sandbox mean, participant + judge tokens,
   errors, cost. No `price_model` → each point's participant cells costed
-  at their own model's listed rate (unlisted → the run's resolved rate;
+  at their own model's listed rate (PR21: any unlisted cell model makes
+  the whole point unpriced — `estimated_cost_usd:null`, since a partial
+  total would read as complete;
   `RunTrends.price_model:null` "auto" — a point's own `price_model` is the
   single applied key, or null when cells priced at mixed rates); with it →
   uniform repricing.
@@ -808,7 +843,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   endpoint), `api/schemas.py` (`RunTrendPoint`, `RunTrends`),
   `web/app/runs/[id]/analysis/` (`page.tsx`, `AnalysisClient.tsx`,
   `charts.tsx`), `web/app/runs/[id]/results/ResultsClient.tsx` (`row-total`
-  + `dimTotals`/`maxTotal` memos), `web/lib/api.ts` (`getRunTrends`,
+  + `dimTotals`/`maxTotal` memos), `web/lib/scoreMath.ts` (weighted-total
+  helper) + `web/lib/scoreMath.test.ts`, `web/lib/api.ts` (`getRunTrends`,
   `RunTrendPoint`, `RunTrends`), `web/lib/format.ts` (`formatNum`,
   `formatUsd`), `web/app/globals.css` (`.analysis-grid`, `.chart-tip`,
   `.chart-legend`, `.row-total`/`.score-cell--leader`), nav links in
@@ -821,7 +857,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     (120 chars), `limit` bounds (1/0/101), 422 unknown price_model, null
     mean for unscored runs.
   - API: `curl localhost:8001/api/analytics/runs?limit=20`
-  - UI: results page → matrix `total` row sums match the dimension columns
+  - UI: results page → matrix `total` row shows the weighted 0–10 aggregate
     and flags the leader; run detail → "Analysis →" → all cards render on a
     scored run; cost dropdown reprices the cost + split charts client-side.
 - **Depends on:** F6 (events), F7 (scores), F8 (results page), F9
@@ -1003,6 +1039,27 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     AnalyticsSection gains a sandbox/model segmented view with per-model
     aggregation and per-model cost; the analysis page prices each sandbox at
     its own model's rate in "auto" mode.
+  - **PR31 — config × model heatmap + winner card:** the results page's
+    score card gains a `matrix | grid` segmented toggle. **Grid** folds the
+    per-sandbox columns back into the comparison matrix — rows = submitted
+    harness configs (identity = `harness_config` minus the injected
+    `model`/trial keys; the sandbox `name` is unique per sandbox and can't
+    group), cols = `RunResults.models` plus observed extras — each cell
+    showing the mean judge `overall` across its members (trials included —
+    same-(config, model) repeats roll up `±sd · ×n` with a scored-count
+    note under partial coverage), the PR21 weighted total underneath, on
+    the fixed 0–10 red→amber→green heat scale (readable at 32 cells).
+    The **winner card** above the grid ranks cells by mean WEIGHTED total
+    (never the judge's self-reported `overall`; a cell with only an
+    `overall` can't win), and shows the pick's weighted total, judge
+    overall, +Δ vs the runner-up cell (named), mean estimated cost per
+    sandbox + wall clock (from the F9 analytics payload — "unpriced"/"—"
+    honestly, never a $0 stand-in), and mean test pass-rate
+    (`generated_tests.pass_rate` → `exec` tests fallback). The winning
+    cell gets an outline + ★ in the grid. The matrix view's `total` row
+    already computed the PR21 weighted-normalised aggregate
+    (`web/lib/scoreMath.ts::weightedDimTotal`); the grid reuses the same
+    `dimensionKeys`/`specMap` rather than a second weighting.
 - **Where:** `orchestrator/matrix.py` (new), `orchestrator/lifecycle.py`,
   `orchestrator/provision.py`, `api/schemas.py` (`RunCreate.models`,
   `HarnessConfigIn.model`, `MAX_MATRIX_CELLS`, `models` on run/results/
@@ -1011,10 +1068,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (participant-row → `model_name`/`models` payload mapping),
   `web/app/submit/page.tsx`,
   `web/app/runs/page.tsx`, `web/app/runs/[id]/RunDetailClient.tsx`,
-  `web/app/runs/[id]/results/{ResultsClient,AnalyticsSection}.tsx`,
+  `web/app/runs/[id]/results/{ResultsClient,AnalyticsSection,GridView}.tsx`,
   `web/app/runs/[id]/analysis/AnalysisClient.tsx`,
   `web/app/runs/[id]/timeline/TimelineClient.tsx`,
   `web/lib/timelineAnalytics.ts` (per-sandbox price basis in strips),
+  `web/lib/gridMatrix.ts` (PR31 grid transform) + `gridMatrix.test.ts`,
   `web/components/RunConsoleLive.tsx`, `web/app/globals.css`
 - **Verify:**
   - Unit: `tests/unit/orchestrator/test_matrix.py` (defaults, overrides,
@@ -1026,7 +1084,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     `web/lib/modelRows.test.ts` (participant-row payload mapping)
   - Manual: submit with 2 configs × 2 models → 4 sandboxes named/labeled
     per cell; results matrix + analytics "model" view group by model; cost
-    auto-mode prices each cell at its own model.
+    auto-mode prices each cell at its own model. PR31: results page →
+    "grid" toggle → config × model heat table renders (8×4 = 32 cells),
+    winner card shows the top weighted cell + runner-up Δ + cost/time/
+    pass-rate; `cd web && npm test` covers the transform (cell assembly,
+    sparse cells, mean±sd rollups, heat stops, winner pick, pass-rate).
 - **Depends on:** F15 (PR1 — named configs + live model picker this stacks
   on); best after multi-provider support so >1 model is usable.
 
@@ -1115,7 +1177,309 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Depends on:** F12 (preview stack, purpose label plumbing, jailed
   workspace resolution), F8 (results page)
 
-### F18 — Task preset library ✅
+### F18 — Prompt-only matrix cells (no-sandbox adapter) ✅
+
+**What:** a pseudo-adapter `prompt` that makes a single LLM call per
+matrix cell with zero Docker containers — widening the matrix beyond
+coding agents to business-task evals (extraction, summarisation, Q&A,
+classification) while reusing the same creds, metering, artifacts,
+timeline, evaluation, and results pipeline.
+
+**Why:** the matrix already expands `configs × models`; prompt cells add
+a row type that answers "what does the model itself do with this prompt"
+— baseline-vs-harness comparisons and non-coding tasks that have no
+workspace to produce.
+
+- `prompt` appears in `/api/harnesses` + the submit picker under the
+  **No sandbox** group (manifest `no_sandbox: true`, no image/cli), but
+  is NOT in `adapter_names()` — `get_adapter("prompt")` raises a
+  no-sandbox `KeyError` and spawn-side lookups can't smuggle a
+  container-less cell into `spawn_one`.
+- Cell flow (`orchestrator/prompt_cell.py::run_prompt_cell`): create the
+  ordinary `Sandbox` row → mint the normal sandbox-scoped gateway cred
+  → `emit run_started` → POST `{GATEWAY_URL}/v1/chat/completions` with
+  `Bearer <cred>` — one retry on upstream 5xx/timeout only; 4xx fails
+  immediately. Gateway emits `llm_request`/`llm_response` + metering as
+  usual. Assistant text → `output.txt` (+ `meta.json` +
+  `transcript.log`) under the standard artifact dir; `sandbox_finalized`
+  + `terminal_state` events + `done`/`harness_complete` close the cell.
+- `harness_configs[].system_prompt_extra` lands as a `system` message
+  before the task prompt.
+- Mixed runs interleave: prompt cells resolve inline, container cells
+  spawn+monitor in the same loop; evaluation runs once all cells are
+  terminal, with `prompt_output_path` pointing the evaluator at
+  `output.txt`.
+- Evaluator: `evaluate_sandbox(prompt_output_path=...)` stages
+  `output.txt` as the submission (no workspace required); EVAL_PROMPT
+  frames it as a prompt output. Missing output stages empty — judged,
+  not infra-failed. Static/exec/generated-test collectors degrade to
+  `skipped` on `.txt`-only submissions.
+- Results/preview: the `output` artifact kind downloads via the existing
+  endpoint; results rows report `previewable: false` and the preview +
+  thumbnail endpoints 404 early for prompt cells (before any workspace
+  scan). The web results page shows output text inline + download,
+  suppressing preview affordances.
+- Files: `orchestrator/prompt_cell.py`, `orchestrator/adapters.py`
+  (pseudo-manifest + `no_sandbox_adapter_names()`),
+  `orchestrator/lifecycle.py` (prompt branch + all-cells-fail early
+  exit), `evaluator/evaluate.py` + `evaluator/prompts.py`
+  (`prompt_output_path`), `api/routers/runs.py` (validation),
+  `api/routers/preview.py` (guards), `web/lib/api.ts`,
+  `web/app/submit/page.tsx` (group), `web/app/runs/[id]/results/*`
+  (output view + preview suppression).
+- Tests:
+  - `tests/unit/orchestrator/test_prompt_cell.py` — request shape, cred
+    scope, single retry on 5xx/timeout, artifact/meta/events/finalize,
+    failure paths.
+  - `tests/unit/orchestrator/test_lifecycle.py::test_lifecycle_prompt_only_run`
+    + `test_lifecycle_mixed_prompt_and_container` — zero spawns, mixed
+    routing, all-fail → run failed.
+  - `tests/unit/adapters/test_adapter_contract.py` — selectable-but-not-
+    spawnable + manifest keys.
+  - `tests/unit/api/test_harnesses.py`, `test_runs.py`, `test_results.py`,
+    `test_preview.py` — manifest surface, submit validation, output
+    artifact/download + previewable:false, preview/thumbnail 404s.
+  - `tests/unit/evaluator/test_evaluate.py` — output.txt staging,
+    missing-output empty stage, analysis persistence.
+- Verify: `uv run pytest tests/unit/orchestrator/test_prompt_cell.py
+  tests/unit/orchestrator/test_lifecycle.py -k prompt -q`; manual:
+  submit a `prompt × 3 models` run → no containers started (docker ps),
+  three `output.txt` artifacts, scores land, cost/tokens metered;
+  results page shows output inline with preview absent.
+- **Depends on:** F16 (config × model matrix expansion), F3 (gateway
+  creds/metering), F7 (evaluator staging), F8/F12 (results + preview).
+
+### F19 — Artifact file browser + side-by-side diff ✅
+
+- **What:** the results matrix's artifacts cell gets a `📂 browse` chip
+  opening a two-pane modal — jailed file tree on the left, size-capped
+  text viewer on the right — plus a `diff vs` peer picker that diffs one
+  path across two sandboxes' artifacts server-side and renders the
+  unified diff in a colored `<pre>`. Users inspect and compare produced
+  workspaces without downloading tarballs; prompt cells' `output.txt`
+  surfaces through the same browser.
+- **Browse root:** `workspace/` wins when the snapshot exists; a
+  workspace-less artifact (prompt cells, pre-snapshot failures) browses
+  the artifact dir itself (`output.txt`, `transcript.log`, `meta.json`,
+  `analysis.json`, `generated_tests/`…). `FileListOut.root` reports
+  which root answered (`"workspace"` | `"artifact"`).
+- **Endpoints** (`api/routers/results.py`, all jailed under
+  `ARTIFACT_ROOT` exactly like the artifact-download endpoint):
+  - `GET /api/sandboxes/{id}/files` — depth-bounded (`8` levels),
+    entry-bounded (`5000`, `truncated` flag) walk; `node_modules`/`.git`/
+    `__pycache__`/`.venv`/`*.pyc` pruned like workspace ZIPs; symlinks
+    never followed or listed.
+  - `GET /api/sandboxes/{id}/files/{path}` — text read capped at 256 KiB
+    (`truncated` flag); NUL-carrying reads → `binary: true, text: null`
+    (UI offers `?download=1` FileResponse instead). Traversal, absolute
+    paths, symlink escapes → 404; `..` that stays inside the root
+    resolves normally.
+  - `GET .../files/{path}?diff=<other_sandbox_id>` — unified diff
+    (`difflib`, `a/`+`b/` labels) of the same path in both browse roots.
+    A path absent on one side diffs against empty (`a_missing`/
+    `b_missing`); absent on both → 404. Per-side input cap 1 MiB, output
+    cap 10k lines; binary sides → `binary: true`, empty `diff`.
+    `response_model=None` on the route (union of Response/FileContentOut/
+    FileDiffOut).
+- **UI** (`web/app/runs/[id]/results/FileBrowser.tsx` + `web/lib/
+  fileBrowser.ts`): browse mode renders the flat listing as a
+  collapsible tree (`buildFileTree` synthesizes parents a truncated
+  listing missed). Diff mode applies the PR10 split idiom
+  (`mergeFileLists` — ONE merged ordering of both sides' paths, each row
+  carrying its left/right cell, single-sided files facing an empty lane)
+  with a `only-left / only-right / shared` summary header; the viewer
+  renders `parseDiffLines`-classified rows (meta/hunk/add/del/context).
+  No diff library added — the server produces the format.
+- **Files:** `api/routers/results.py`, `tests/unit/api/test_results.py`,
+  `web/lib/api.ts`, `web/lib/fileBrowser.ts`,
+  `web/lib/fileBrowser.test.ts`,
+  `web/app/runs/[id]/results/FileBrowser.tsx`,
+  `web/app/runs/[id]/results/ResultsClient.tsx`, `web/app/globals.css`.
+- **Tests:** `tests/unit/api/test_results.py` PR34 section — fixture
+  workspace listing (paths, exclusions, `root:"workspace"`), text read +
+  256 KiB cap, `?download=1` attachment, `?diff=` valid unified format +
+  missing-side/binary/identical cases, `../` (incl. sibling-workspace
+  escape) + absolute-path + dir-as-file → 404, prompt-cell
+  `output.txt`/`meta.json` listing with `root:"artifact"`.
+  `web/lib/fileBrowser.test.ts` —
+  tree nesting/sorting, merged-lane ordering + single-sided rows,
+  summary counts, diff-line classification.
+- **Verify:** browse a 2048 artifact → `index.html` opens in the viewer;
+  diff two sandboxes' `index.html` → unified diff; percent-encoded
+  `..%2f` traversal and absolute paths → 404.
+- **Depends on:** F8 (results matrix + artifact jail), F12 (`sandbox/
+  preview.py` `resolve_artifact_dir`/`resolve_workspace_dir` helpers),
+  F18 (prompt-cell artifact root as a browse target).
+
+### F20 — Trials per cell + per-config model options (PR27) ✅
+
+**What:** every effective config × model matrix cell repeats `trials`
+times (1–8, default 1) so results report mean ± sample sd with `n`
+instead of a single sample; each harness config may carry
+`model_options` (`temperature`, `seed`, `max_tokens`, `reasoning`) that
+adapters honor where they expose the equivalent control.
+
+**Why:** a one-shot sample per cell can't rank harness/model combos
+defensibly — small models are stochastic. Repeated trials give the
+score distribution; model options make the comparison axis itself
+configurable per cell (e.g. temperature sweeps).
+
+- `RunCreate.trials` (int, 1–8, default 1) persists on `runs.trials`
+  (migration `d7e9f1a3b5c7`) and `config["trials"]`; the 32-sandbox
+  matrix cap applies to the post-trial count
+  (`configs × models × trials`).
+- Expansion (`orchestrator/matrix.py::expanded_configs`) runs
+  model-major first, then stamps a 1-based `trial_index` on each replica
+  cell-major — a cell's trials stay adjacent. `trials=1` emits no key
+  (pre-PR27 shape); `trial_index`/`cell_key` helpers read the stamp and
+  group identity (config minus `trial_index`, serialized sorted).
+  Lifecycle reads `run.trials` (column wins; `config["trials"]` covers
+  pre-column specs). Prompt pseudo-cells replicate identically.
+- Sandbox names append ` · tN` after the model suffix
+  (`cfg · model · t3`) — provision truncates the label side, never the
+  tail (`sandboxes.name` is String(255)).
+- `HarnessConfigIn.model_options` is a closed schema (`extra="forbid"`,
+  per-key bounds; `reasoning` normalizes to lowercase and maps to the
+  request-level `reasoning_effort`). Submit filters keys against
+  `orchestrator.adapters.supported_model_options` (each adapter's
+  `MANIFEST["model_options"]`, surfaced on `GET /api/harnesses`):
+  unsupported keys are dropped from the persisted cell + advisory
+  `warnings` on the response — never a 422. Support today: `miniloop` +
+  `prompt` all four; `codex` `reasoning` only (→
+  `model_reasoning_effort` config); `claude_code`/`pi`/`deepseek`/
+  `aider` none.
+- Miniloop maps options to env knobs `MINILOOP_TEMPERATURE`,
+  `MINILOOP_SEED`, `MAX_TOKENS`, `MINILOOP_REASONING_EFFORT`
+  (`AgentConfig.from_env` → request-body fields; the explicit
+  `max_tokens` kwarg outranks `model_options.max_tokens`). `prompt`
+  cells fold supported options into the chat-completions body. `cli_env`
+  takes `model_options` across the CLI contract.
+- Results API returns `trials` on the run + `trial_index` per sandbox;
+  the results matrix groups trials under one config × model header
+  showing `mean ± sd (n=N)` (sample sd, n−1 — null under 2 scored
+  trials; unscored trials drop out of `n`) with expandable per-trial
+  rows keeping rationales/artifacts. The by-model rollup reads
+  `mean overall (±sd, n=…)`.
+- Analytics adds per-sandbox `cell`/`trial_index` and a `cells` rollup
+  (`overall_mean`/`overall_sd`/`overall_n`, pooled metrics across the
+  cell's trials) plus a by-cell table view; the analysis page gains a
+  "Score variance by cell" table. Web helpers in
+  `web/lib/trialGroups.ts` (`cellKey`/`groupByCell`/`meanSd`/
+  `fmtMeanSd`/`stripTrialSuffix`).
+- Submit UI: a `trials` stepper (1–8) plus advanced per-config
+  model-options controls annotated with each adapter's supported set;
+  submit warnings surface dropped keys. Reasoning-effort options are
+  adapter-scoped — codex offers `minimal|low|medium|high|xhigh` (its
+  `model_reasoning_effort` vocabulary; `max`/`none` fail codex's config
+  parse), pass-through adapters keep the broader list. `resubmit` carries
+  both fields.
+- Files: `api/schemas.py` (`ModelOptions`, `RunCreate.trials`,
+  `CellAnalytics`), `api/routers/runs.py` (persist + filter + warnings),
+  `api/routers/analytics.py` + `results.py` (`trial_index`/`cell`/
+  `cells`), `orchestrator/{matrix,lifecycle,provision,prompt_cell,
+  adapters}.py`, `adapters/common/contract.py` (`cli_env` signature),
+  `adapters/{miniloop,codex,claude_code,pi,deepseek,aider}`,
+  `db/models.py` + `db/migrations/versions/d7e9f1a3b5c7_runs_trials.py`,
+  `web/lib/{api,trialGroups,resubmit}.ts`, `web/app/submit/page.tsx`,
+  `web/app/runs/[id]/results/{ResultsClient,AnalyticsSection}.tsx`,
+  `web/app/runs/[id]/analysis/AnalysisClient.tsx`, `web/app/globals.css`.
+- Tests: `test_matrix.py` (N-count, 1-based cell-major stamp,
+  `cell_key`/`trial_index`), `test_provision.py` (` · tN` naming +
+  truncation, model_options → miniloop env), `test_analytics.py`
+  (hand-worked mean ± sd = 7.667 ± 1.528 on scores 6/8/9, scored-only
+  `n`), `test_runs.py` (trials persist/bounds/cap, options kept-
+  supported/dropped-unsupported/422-unknown, whole-map removal),
+  `tests/unit/adapters/miniloop/test_adapter.py` (env knobs, kwarg
+  precedence), `tests/unit/db/test_migrations.py` (head +
+  up/down).
+- Verify: `uv run pytest tests/unit -q`; manual — submit a 2-config
+  run at trials=3 → six ` · tN` sandboxes; results matrix shows one
+  column per cell with `mean ± sd (n=3)` + expandable trials; a codex
+  config with `temperature` submits 201 with a drop warning.
+- **Depends on:** F16 (config × model matrix), F8/F9 (results +
+  analytics), F18 (prompt cells replicate through the same path).
+
+### F21 — Budgets & pricing accuracy (PR28) ✅
+
+**What:** budgets that can't be starved + prices that aren't guesses.
+
+- **Per-cell token cap** — `BudgetsIn.sandbox_token_budget` (optional)
+  mints into each participant cred as the `sandbox_max_tokens` claim;
+  the gateway `_budget_gate` meters it against ONLY that sandbox's own
+  `llm_response` total (a runaway cell starves itself, not siblings —
+  service/eval creds carry no claim and stay exempt), and the monitor's
+  poll is the backstop that terminates the cell `budget_exceeded` with
+  `payload.limit="sandbox_tokens"` once its own total crosses. The run
+  ceiling (`token_budget` → `limit="run_tokens"`) is unchanged.
+- **Per-cell cost cap** — `BudgetsIn.max_cost_usd` (optional): the
+  monitor prices the sandbox's own participant traffic each poll at its
+  own model through the layered price book (prompt/completion/cache-read
+  split) and terminates `budget_exceeded` with `payload.limit="cost"`.
+  Priced models only — an unpriced cell resolves `None` and can't trip
+  the cap (PR21 honesty: never a guessed rate). Terminate checkpoints
+  now carry `limit` + the numbers that fired (`used_tokens`/`budget`,
+  `estimated_cost_usd`/`budget_usd`) for all three limits.
+- **`model_prices` table + `GET/PUT/DELETE /api/prices`** —
+  user-editable rates keyed by case-insensitive fnmatch `model_glob`
+  (`gpt-4*`), first match in declaration order wins, layered OVER the
+  static `PRICE_TABLE`: a glob hit is the price key analytics resolves
+  (and a valid `?price_model=` pick); a glob equal to a static key
+  shadows it. `cache_read_per_mtok_usd` NULL bills cached input at the
+  input rate; `local` marks free inference — PUT 422s `local` beside any
+  nonzero rate (the pickers render "local — $0"), so free rows can't
+  silently bill. A bare (no `/`) glob never
+  matches `vendor/model` ids — write `openai/*` deliberately.
+- **`POST /api/prices/sync`** — pulls the OpenRouter `/models` catalog
+  THROUGH the gateway (`x-heg-provider: openrouter` service-cred
+  override; the api never talks to providers). `pricing.*` USD-per-token
+  strings are stored as per-Mtok rates (`input_cache_read` →
+  `cache_read_per_mtok_usd`); entries with no parseable prompt or
+  completion rate are skipped rather than priced-free; `source="user"`
+  rows are never clobbered. 400s when openrouter isn't a configured
+  provider.
+- **UI** — both cost pickers (results Analytics card + analysis page)
+  gain "+ add rate" (PUT /api/prices inline; the new glob folds into the
+  picker table immediately and is selected); submit Budgets gains the
+  two optional per-cell fields (empty = unset). `Budgets.sandbox_token_budget`
+  / `max_cost_usd` are nullable in `BudgetsIn`; the run config stores the
+  full dump (nulls = unset) so pre-PR28 runs behave identically.
+- **Files:** `api/pricing.py` (`PriceBook`/`load_book`/`glob_matches`/
+  cache-aware `estimate_cost_usd`), `api/routers/prices.py`,
+  `db/models.py::ModelPriceRow` + migration `c4e8d1a7f3b5`,
+  `gateway/creds.py` (`sandbox_max_tokens` claim), `gateway/metering.py`
+  (`llm_usage_totals` prompt/completion/cache split + sandbox scoping),
+  `gateway/main.py::_budget_gate`, `gateway/mint_cred.py`,
+  `orchestrator/provision.py` (`budgets_for`, `mint_sandbox_cred`),
+  `orchestrator/monitor.py` (per-cell poll checks + terminate detail),
+  `api/routers/analytics.py` (book-resolved keys), `web/lib/api.ts`
+  (prices fns, `globMatch`/`matchPriceKey`, cache-aware `estimateCostUsd`),
+  `web/components/AddRate.tsx`, `web/app/submit/page.tsx`,
+  `web/app/runs/[id]/results/AnalyticsSection.tsx`,
+  `web/app/runs/[id]/analysis/AnalysisClient.tsx`.
+- **Tests:** `tests/unit/api/test_pricing.py` (glob rules, first-match
+  precedence, layering, unpriced→None, cache-rate split),
+  `tests/unit/api/test_prices.py` (GET/PUT/DELETE round-trip, e2e
+  repricing, OpenRouter sync via mocked gateway client — mapping,
+  user-row protection, unpriced skip, update-vs-add),
+  `tests/unit/gateway/test_creds.py` + `test_metering.py` +
+  `test_proxy.py` (claim roundtrip/validation, sandbox-scoped sums,
+  per-cell 429 `limit=sandbox_tokens`, sibling isolation, service-cred
+  exemption), `tests/unit/orchestrator/test_monitor.py` +
+  `test_provision.py` (token cap → `limit=sandbox_tokens`, cost cap →
+  `limit="cost"` priced model + model_prices row, unpriced can't trip),
+  `tests/unit/db/test_migrations.py` (head = `c4e8d1a7f3b5`, table
+  up/down + ORM roundtrip).
+- **Verify:** `uv run pytest tests/unit/api/test_pricing.py
+  tests/unit/api/test_prices.py tests/unit/gateway
+  tests/unit/orchestrator -q`; manual: PUT
+  `{"model_glob":"gpt-4o","input_per_mtok_usd":2.5,"output_per_mtok_usd":10}`
+  → analytics cost appears; submit a run with `max_cost_usd: 0.05` →
+  sandbox terminates `budget_exceeded` (checkpoint `limit: "cost"`);
+  unlisted model still shows `unpriced`.
+- **Depends on:** PR21 (unpriced honesty this makes permanent), F3
+  (creds/metering), F9 (analytics cost surface).
+
+### F22 — Task preset library ✅
 
 - **What:** a shared library of reusable evaluation tasks. Submit can pick
   a preset instead of writing a freeform prompt — the preset's markdown

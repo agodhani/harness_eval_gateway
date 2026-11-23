@@ -46,20 +46,22 @@ export interface SandboxStrip {
  * Convert the analytics response into one strip per sandbox, in API order
  * (server sorts by started_at). Pricing basis mirrors the analysis page:
  * an explicit `price_model` reprices every sandbox uniformly, while null
- * (auto) prices each sandbox at its own resolved `sb.price_model`. Server
- * 422s unknown models, so the resolved key always indexes `price_table`.
+ * (auto) prices each sandbox at its own resolved `sb.price_model`. A
+ * sandbox whose model isn't in the table reports `price_model: null`
+ * (PR21) — the chip shows "unpriced", never a guessed rate.
  */
 export function sandboxStrips(analytics: RunAnalytics): SandboxStrip[] {
   return analytics.sandboxes.map((sb) => {
     const priceName = analytics.price_model ?? sb.price_model;
-    return toStrip(sb, analytics.price_table[priceName], priceName);
+    const price = priceName ? analytics.price_table[priceName] : undefined;
+    return toStrip(sb, price, priceName);
   });
 }
 
 function toStrip(
   sb: SandboxAnalytics,
-  price: ModelPrice,
-  priceName: string,
+  price: ModelPrice | undefined,
+  priceName: string | null,
 ): SandboxStrip {
   const chips: StatChip[] = [
     {
@@ -109,9 +111,16 @@ function latencyChip(sb: SandboxAnalytics): StatChip {
 
 function costChip(
   sb: SandboxAnalytics,
-  price: ModelPrice,
-  priceName: string,
+  price: ModelPrice | undefined,
+  priceName: string | null,
 ): StatChip {
+  if (!price) {
+    return {
+      label: "cost",
+      value: "unpriced",
+      title: `${sb.model} isn't in the price table — no honest rate`,
+    };
+  }
   if (price.local) {
     return { label: "cost", value: "$0", title: `${priceName} — local, $0` };
   }
@@ -125,6 +134,9 @@ function costChip(
 function evalLine(sb: SandboxAnalytics): string | null {
   const ev = sb.evaluator;
   if (!ev) return null;
-  // Same fields as the results-page evaluator row (incl. judge errors).
-  return `judge ${formatNum(ev.llm_turns)} turns · ${formatNum(ev.tokens.total)} tok · ${formatUsd(ev.estimated_cost_usd)} · ${formatNum(ev.errors)} err`;
+  // Same fields as the results-page evaluator row (incl. judge errors);
+  // null cost = unpriced judge model (PR21).
+  const cost =
+    ev.estimated_cost_usd == null ? "unpriced" : formatUsd(ev.estimated_cost_usd);
+  return `judge ${formatNum(ev.llm_turns)} turns · ${formatNum(ev.tokens.total)} tok · ${cost} · ${formatNum(ev.errors)} err`;
 }

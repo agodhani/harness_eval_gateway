@@ -1,7 +1,7 @@
 """task presets + run preset_ref
 
 Revision ID: d1e2f3a4b5c6
-Revises: a2b3c4d5e6f7
+Revises: c4e8d1a7f3b5
 Create Date: 2026-02-12
 
 PR22 — task preset library. ``task_presets`` stores USER-saved presets
@@ -11,9 +11,10 @@ PR22 — task preset library. ``task_presets`` stores USER-saved presets
 which revision of it) a submitted run's task_prompt came from — provenance
 for preset-scoped grouping, leaderboards, and score-over-time views.
 
-Merge note: parallel PRs may add migrations off the same parent
-(``a2b3c4d5e6f7``). Whichever lands second must re-point ``down_revision``
-at the other's head to keep a single migration head.
+Merge note: originally branched off ``a2b3c4d5e6f7``; PR27 (``d7e9f1a3b5c7``
+runs_trials) + PR28 (``c4e8d1a7f3b5`` model_prices) landed on main first, so
+``down_revision`` re-points at the newer head ``c4e8d1a7f3b5`` to keep a
+single migration head.
 """
 
 import sqlalchemy as sa
@@ -22,7 +23,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision = "d1e2f3a4b5c6"
-down_revision = "a2b3c4d5e6f7"
+down_revision = "c4e8d1a7f3b5"
 branch_labels = None
 depends_on = None
 

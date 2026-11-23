@@ -16,6 +16,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -50,6 +51,10 @@ class Run(Base):
     status: Mapped[str] = mapped_column(String(32), default="submitted", index=True)
     task_prompt: Mapped[str] = mapped_column(Text)
     model_name: Mapped[str] = mapped_column(String(255))
+    # PR27 — repeats per matrix cell (1–8): every effective config × model
+    # cell spawns ``trials`` sandboxes, each stamped
+    # ``harness_config.trial_index`` (1-based). Default 1 = pre-PR27 shape.
+    trials: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     # Harness configs, skill packs, evaluator model — shape refined in F1/F2.
     config: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -219,6 +224,38 @@ class TaskPreset(Base):
     suggested_adapter: Mapped[str | None] = mapped_column(String(64))
     suggested_models: Mapped[list[Any] | None] = mapped_column(JSONType)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ModelPriceRow(Base):
+    """PR28 — user-editable model price rate, layered over the static table.
+
+    ``model_glob`` is an fnmatch pattern (``gpt-4*``) matched
+    case-insensitively; rows are tried in declaration order (``created_at``,
+    ``id``) and the FIRST match wins, then the static ``PRICE_TABLE`` falls
+    back (api/pricing.py::PriceBook). ``cache_read_per_mtok_usd`` is nullable:
+    NULL bills cached input tokens at the input rate like before, a value
+    moves them to the provider's discounted cache-read rate. ``source`` is
+    ``user`` (PUT /api/prices) or ``openrouter`` (catalog sync) — sync never
+    clobbers a user row.
+    """
+
+    __tablename__ = "model_prices"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    model_glob: Mapped[str] = mapped_column(String(255), unique=True)
+    input_per_mtok_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    output_per_mtok_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    cache_read_per_mtok_usd: Mapped[float | None] = mapped_column(Float)
+    local: Mapped[bool] = mapped_column(Boolean, default=False)
+    # user | openrouter
+    source: Mapped[str] = mapped_column(String(32), default="user")
+    # Declaration order for PriceBook's first-match-wins scan.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

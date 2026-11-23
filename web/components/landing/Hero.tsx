@@ -26,9 +26,9 @@ export default function Hero() {
           <h1>
             <span className="lp-hero__brand">harness_eval_gateway</span>
             <br />
-            Benchmark the <span className="lp-t-signal lp-glow">harness</span>,
+            Benchmark the <span className="lp-t-signal lp-glow">harness</span>
             <br />
-            not the model.
+            and the model.
           </h1>
         </Reveal>
 
@@ -36,9 +36,10 @@ export default function Hero() {
           <Reveal delay={180}>
             <p className="lp-hero__lede">
               Coding agents differ in their scaffolding — tool loops, system
-              prompts, skill packs. This platform runs them head-to-head on the
-              same task with the same model, inside locked-down Docker
-              sandboxes, while a custom AI gateway meters every token.
+              prompts, skill packs — and in the models driving them. This
+              platform runs a config × model matrix head-to-head on the same
+              task inside locked-down Docker sandboxes, while a custom AI
+              gateway meters every token.
             </p>
             <div className="lp-hero__ctas">
               <Link href="/submit" className="btn btn--primary">

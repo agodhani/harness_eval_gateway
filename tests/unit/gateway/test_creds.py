@@ -95,3 +95,49 @@ def test_dev_cred_accepted_with_any_secret() -> None:
     assert claims.dev is True
     assert claims.run_id == str(DEV_RUN_ID)
     assert claims.sandbox_id == str(DEV_SANDBOX_ID)
+
+
+def test_sandbox_max_tokens_claim_roundtrip() -> None:
+    """PR28: the per-sandbox cap mints into the cred and verifies back."""
+    token = mint_cred(
+        run_id=RUN_ID,
+        sandbox_id=SANDBOX_ID,
+        secret=SECRET,
+        ttl_seconds=60,
+        max_tokens=200_000,
+        sandbox_max_tokens=50_000,
+    )
+    claims = verify_cred(token, secret=SECRET)
+    assert claims.max_tokens == 200_000
+    assert claims.sandbox_max_tokens == 50_000
+
+
+def test_sandbox_max_tokens_absent_is_none() -> None:
+    token = mint_cred(run_id=RUN_ID, sandbox_id=SANDBOX_ID, secret=SECRET)
+    assert verify_cred(token, secret=SECRET).sandbox_max_tokens is None
+
+
+def test_sandbox_max_tokens_invalid_rejected() -> None:
+    """A non-integer/negative claim fails verification like max_tokens."""
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+    def _forge(payload: dict) -> str:
+        payload_b64 = (
+            base64.urlsafe_b64encode(
+                json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+            )
+            .rstrip(b"=")
+            .decode()
+        )
+        sig = hmac.new(SECRET.encode(), f"heg.{payload_b64}".encode(), hashlib.sha256)
+        sig_b64 = base64.urlsafe_b64encode(sig.digest()).rstrip(b"=").decode()
+        return f"heg.{payload_b64}.{sig_b64}"
+
+    base = {"run_id": str(RUN_ID), "sandbox_id": None, "iat": 0, "exp": 9_999_999_999}
+    for bad in (-5, "lots", 12.5):
+        tok = _forge({**base, "sandbox_max_tokens": bad})
+        with pytest.raises(CredError):
+            verify_cred(tok, secret=SECRET)

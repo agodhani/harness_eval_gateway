@@ -46,6 +46,15 @@ export const TERMINAL_RUN_STATUSES: readonly string[] = [
   "cancelled",
 ];
 
+/** Statuses DELETE /api/runs/{id} cancels (nothing spawned yet). Runs in
+ * provisioning/running/evaluating 409 — in-flight sandbox teardown isn't
+ * supported; terminal runs hard-delete instead. */
+export const CANCELLABLE_RUN_STATUSES: readonly string[] = [
+  "submitted",
+  "rubric_review",
+  "queued",
+];
+
 export type SandboxStatus =
   | "provisioning"
   | "running"
@@ -133,7 +142,12 @@ export const ADAPTERS: readonly string[] = [
   "codex",
   "deepseek",
   "pi",
+  "prompt",
 ];
+
+/** PR25 pseudo-adapters that never spawn a container — offline fallback
+ * for {@link HarnessManifest.no_sandbox} when the API is unreachable. */
+export const NO_SANDBOX_ADAPTERS: readonly string[] = ["prompt"];
 
 /** Adapter manifest as served by GET /api/harnesses (Phase 2.5). */
 export interface HarnessManifest {
@@ -146,6 +160,11 @@ export interface HarnessManifest {
   install?: string;
   image?: string;
   requires?: string[];
+  /** PR25: pseudo-adapter — the cell runs one gateway call, no container. */
+  no_sandbox?: boolean;
+  /** PR27: ModelOptions keys this adapter honors (absent = unknown —
+   * don't gate the UI on it). */
+  model_options?: string[];
   [key: string]: unknown;
 }
 
@@ -207,6 +226,18 @@ export function runModels(
   return out;
 }
 
+/** PR27 — per-config model-sampling knobs. Keys the selected adapter
+ * doesn't support are dropped at submit (warning on the create response)
+ * — the UI greys out keys the adapter's manifest doesn't declare. */
+export interface ModelOptions {
+  temperature?: number | null;
+  seed?: number | null;
+  max_tokens?: number | null;
+  /** Maps to the request-level reasoning_effort hint (e.g. "none", "low",
+   * "medium", "high") — provider vocabularies differ, kept free-form. */
+  reasoning?: string | null;
+}
+
 export interface HarnessConfig {
   adapter: string;
   skill_packs: string[];
@@ -216,18 +247,41 @@ export interface HarnessConfig {
   /** PR14: pin this config to a single participant model, overriding the
    * run's model list for this config (one cell at the pinned model). */
   model?: string | null;
+  /** PR27: optional model knobs honored where the adapter supports them. */
+  model_options?: ModelOptions | null;
+}
+
+/** PR25: no-sandbox pseudo-adapters run a single model call and stage
+ * nothing — a skill_packs selection left over from a previous adapter
+ * pick must not ship on a prompt cell (the backend ignores it, but the
+ * payload shouldn't claim packs it never used). */
+export function sanitizeHarnessConfigs(
+  configs: HarnessConfig[],
+  isNoSandbox: (adapter: string) => boolean,
+): HarnessConfig[] {
+  return configs.map((c) =>
+    isNoSandbox(c.adapter) ? { ...c, skill_packs: [] } : c,
+  );
 }
 
 export interface Budgets {
   max_iters: number;
   token_budget: number;
   wall_clock_seconds: number;
+  /** PR28: optional per-sandbox token cap (null/undefined = no per-cell
+   * limit — a hot cell then only draws down the shared run ceiling). */
+  sandbox_token_budget?: number | null;
+  /** PR28: optional per-sandbox estimated-cost cap in USD. Only bites on
+   * priced models — unpriced cells have no honest rate to bill against. */
+  max_cost_usd?: number | null;
 }
 
 export const DEFAULT_BUDGETS: Budgets = {
   max_iters: 50,
   token_budget: 200_000,
   wall_clock_seconds: 3600,
+  sandbox_token_budget: null,
+  max_cost_usd: null,
 };
 
 export interface RunCreate {
@@ -245,6 +299,8 @@ export interface RunCreate {
   harness_configs: HarnessConfig[];
   evaluator_model?: string | null;
   budgets?: Budgets;
+  /** PR27: repeats per matrix cell (1–8, default 1). */
+  trials?: number;
 }
 
 export interface RunConfig {
@@ -254,6 +310,8 @@ export interface RunConfig {
   evaluator_model?: string | null;
   budgets?: Budgets;
   same_model_eval?: boolean;
+  /** PR27: repeats per matrix cell persisted at submit. */
+  trials?: number;
   [key: string]: unknown;
 }
 
@@ -311,7 +369,12 @@ export interface RunOut {
   status: RunStatus | string;
   task_prompt: string;
   model_name: string;
+  /** PR27: repeats per matrix cell (1 = single-shot). */
+  trials?: number;
   config: RunConfig;
+  /** Submit-time advisory warnings (e.g. dropped model_options keys,
+   * model not in provider catalog) — populated on POST /api/runs only. */
+  warnings?: string[];
   same_model_eval: boolean;
   created_at: string;
   updated_at: string | null;
@@ -407,6 +470,9 @@ export interface SandboxResult {
   /** PR14: participant model this sandbox ran (config ``model`` cell else
    * the run's model_name). */
   model?: string;
+  /** PR27: which repeat of its config × model cell this sandbox is
+   * (harness_config.trial_index; null on untrialed runs). */
+  trial_index?: number | null;
   status: string;
   terminal_reason: string | null;
   artifact_path: string | null;
@@ -459,6 +525,8 @@ export interface RunResults {
   models?: string[];
   evaluator_model: string | null;
   same_model_eval: boolean | null;
+  /** PR27: repeats-per-cell submitted on this run (1 = single-shot). */
+  trials?: number;
   /** PR5: the ?rubric_version= filter echoed back (null = newest-wins). */
   selected_rubric_version?: number | null;
   /** PR5: every rubric version + score counts for the selector. */
@@ -727,10 +795,13 @@ export function rescoreRun(runId: string, body: RescoreIn = {}): Promise<Rescore
 // analytics (F9)
 // ---------------------------------------------------------------------------
 
-/** USD-per-million-token rate for one model; `local` = free/local inference. */
+/** USD-per-million-token rate for one model; `local` = free/local inference.
+ * `cache_read_per_mtok_usd` (PR28): discounted rate for cache-read input
+ * tokens — absent/null bills them at the input rate. */
 export interface ModelPrice {
   input_per_mtok_usd: number;
   output_per_mtok_usd: number;
+  cache_read_per_mtok_usd?: number | null;
   local?: boolean;
 }
 
@@ -758,24 +829,32 @@ export interface SkillCallStats {
 }
 
 /** Judge traffic attributed to the sandbox's stream (eval creds reuse the
- * participant sandbox_id); partitioned out of participant metrics. */
+ * participant sandbox_id); partitioned out of participant metrics.
+ * `estimated_cost_usd` is null when the evaluator model is unpriced (PR21 —
+ * unlisted models get no guessed rate). */
 export interface EvaluatorActivity {
   llm_turns: number;
   tokens: { input: number; output: number; total: number };
   errors: number;
-  estimated_cost_usd: number;
+  estimated_cost_usd: number | null;
 }
 
 export interface SandboxAnalytics {
   sandbox_id: string;
   /** Config label from the sandbox row (PR1 named harness configs). */
   name?: string | null;
+  /** PR27: which repeat of its cell this sandbox is (null = untrialed). */
+  trial_index?: number | null;
+  /** PR27: stable config × model cell key — identical across a cell's
+   * trials (grouped on for the per-cell variance rollup). */
+  cell?: string;
   label: string;
   harness_config: Record<string, unknown>;
   /** PR14: participant model this sandbox ran + the price-table key its
-   * estimated_cost_usd was computed at. */
+   * estimated_cost_usd was computed at — null when the model isn't listed
+   * (unpriced, PR21). */
   model: string;
-  price_model: string;
+  price_model: string | null;
   status: string;
   terminal_reason: string | null;
   llm_turns: number;
@@ -788,14 +867,14 @@ export interface SandboxAnalytics {
   test_executions: number;
   errors: number;
   wall_clock_seconds: number;
-  estimated_cost_usd: number;
+  estimated_cost_usd: number | null;
   evaluator: EvaluatorActivity | null;
 }
 
 /** PR14 — per-model rollup across a run's sandboxes (compare-by-model). */
 export interface ModelAnalytics {
   model: string;
-  price_model: string;
+  price_model: string | null;
   sandbox_count: number;
   llm_turns: number;
   tokens: TokenUsage;
@@ -807,8 +886,34 @@ export interface ModelAnalytics {
   test_executions: number;
   errors: number;
   wall_clock_seconds: number;
-  estimated_cost_usd: number;
+  estimated_cost_usd: number | null;
   evaluator: EvaluatorActivity | null;
+}
+
+/** PR27 — per-cell (config × model) rollup: same metric aggregation as
+ * ModelAnalytics plus the trial-score variance columns the results matrix
+ * reports (sample sd, n−1 denominator; overall_sd null when fewer than two
+ * trials produced an overall score). */
+export interface CellAnalytics {
+  cell: string;
+  label: string;
+  model: string;
+  sandbox_count: number;
+  llm_turns: number;
+  tokens: TokenUsage;
+  latency_ms: LatencyStats;
+  tool_calls: ToolCallStats;
+  skill_calls: SkillCallStats;
+  shell_commands: number;
+  file_ops: number;
+  test_executions: number;
+  errors: number;
+  wall_clock_seconds: number;
+  estimated_cost_usd: number | null;
+  evaluator: EvaluatorActivity | null;
+  overall_mean: number | null;
+  overall_sd: number | null;
+  overall_n: number;
 }
 
 export interface RunAnalytics {
@@ -817,9 +922,14 @@ export interface RunAnalytics {
   /** Explicit ?price_model= basis, or null for auto per-model pricing. */
   price_model: string | null;
   price_table: Record<string, ModelPrice>;
+  /** model_prices row globs in declaration (first-match) order — lets
+   * matchPriceKey replay key_for's rows-before-static layering. */
+  price_globs?: string[];
   sandboxes: SandboxAnalytics[];
   /** PR14: participant-model rollups (one per model in the run's matrix). */
   models: ModelAnalytics[];
+  /** PR27: per-cell rollups — one entry per config × model trial group. */
+  cells?: CellAnalytics[];
 }
 
 export function getRunAnalytics(runId: string, priceModel?: string): Promise<RunAnalytics> {
@@ -828,13 +938,113 @@ export function getRunAnalytics(runId: string, priceModel?: string): Promise<Run
   );
 }
 
-/** Client-side cost estimate: tokens × rate. Mirrors api/pricing.py. */
+/** fnmatch-style glob test mirroring api/pricing.py::glob_matches —
+ * case-insensitive; a pattern with no "/" never matches a vendor/model id.
+ * The translator ports Python's fnmatch.translate: `*`/`?` wildcards,
+ * `[seq]` character classes with `[!seq]` negation (a leading "]" inside a
+ * class is a literal), and an unclosed "[" matching the literal text —
+ * where a naive escape-everything pass inverts [!seq] semantics and
+ * throws on a dangling bracket. */
+export function globMatch(pattern: string, model: string): boolean {
+  const pat = pattern.trim().toLowerCase();
+  const name = model.trim().toLowerCase();
+  if (!pat || !name) return false;
+  if (name.includes("/") && !pat.includes("/")) return false;
+  let re = "^";
+  let i = 0;
+  while (i < pat.length) {
+    const c = pat[i++];
+    if (c === "*") {
+      re += ".*";
+    } else if (c === "?") {
+      re += ".";
+    } else if (c === "[") {
+      // scan the class body: "!" negates, a leading "]" is a literal
+      let j = i;
+      if (j < pat.length && pat[j] === "!") j++;
+      if (j < pat.length && pat[j] === "]") j++;
+      while (j < pat.length && pat[j] !== "]") j++;
+      if (j >= pat.length) {
+        re += "\\["; // unclosed "[" — fnmatch treats it as the literal char
+      } else {
+        // escape \ and ] inside the class (JS needs \] for a literal "]"),
+        // then apply fnmatch's "!" → "^" negation; a leading ^/[ also
+        // needs escaping so it can't re-negate or nest a class
+        let stuff = pat.slice(i, j).replace(/[\\\]]/g, "\\$&");
+        if (stuff.startsWith("!")) {
+          stuff = "^" + stuff.slice(1);
+        } else if (stuff.startsWith("^") || stuff.startsWith("[")) {
+          stuff = "\\" + stuff;
+        }
+        re += `[${stuff}]`;
+        i = j + 1;
+      }
+    } else {
+      re += c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  re += "$";
+  try {
+    return new RegExp(re).test(name);
+  } catch {
+    return false;
+  }
+}
+
+/** Resolve a model to its effective price-table KEY — mirrors
+ * PriceBook.key_for: the FIRST row glob (declaration order —
+ * RunAnalytics.price_globs, plus rates added inline this session) that
+ * glob-matches the model wins, else the model itself when it's a key in
+ * the merged table (the static layer — a row glob equal to it already won
+ * above), else undefined (unlisted → unpriced, PR21). The row rate sits
+ * at table[key]; row ordering can't be recovered from the merged table
+ * alone (literal rows are indistinguishable from static keys), which is
+ * why price_globs rides the response. */
+export function matchPriceKey(
+  model: string | null | undefined,
+  table: Record<string, ModelPrice>,
+  rowGlobs: readonly string[],
+): string | undefined {
+  if (!model) return undefined;
+  for (const g of rowGlobs) {
+    if (Object.hasOwn(table, g) && globMatch(g, model)) return g;
+  }
+  return Object.hasOwn(table, model) ? model : undefined;
+}
+
+/** Resolve an explicit price pick to its effective price-table key —
+ * mirrors api/pricing.py::resolve_price_model: a pick naming a
+ * model_prices row glob (case-insensitively — the same row identity
+ * upsert/sync use) selects THAT row's rate so an earlier broader glob
+ * can't shadow it; any other pick resolves like a model through
+ * matchPriceKey's rows-first layering. Unresolvable → undefined (the
+ * server 422s it; the client renders "unpriced"). */
+export function resolvePricePick(
+  pick: string | null | undefined,
+  table: Record<string, ModelPrice>,
+  rowGlobs: readonly string[],
+): string | undefined {
+  if (!pick) return undefined;
+  const lower = pick.toLowerCase();
+  const row = rowGlobs.find((g) => g.toLowerCase() === lower);
+  return row ?? matchPriceKey(pick, table, rowGlobs);
+}
+
+/** Client-side cost estimate: tokens × rate. Mirrors api/pricing.py —
+ * cache-read tokens (inside `input`) bill at the cache rate when one is
+ * declared, else at the input rate. A non-positive cache_read counts
+ * zero cached tokens, matching estimate_cost_usd's guard. */
 export function estimateCostUsd(
   price: ModelPrice,
-  tokens: { input: number; output: number },
+  tokens: { input: number; output: number; cache_read?: number },
 ): number {
+  const cacheRate = price.cache_read_per_mtok_usd;
+  const cacheRead = tokens.cache_read ?? 0;
+  const cached =
+    cacheRate == null || cacheRead <= 0 ? 0 : Math.min(cacheRead, tokens.input);
   return (
-    (tokens.input * price.input_per_mtok_usd +
+    ((tokens.input - cached) * price.input_per_mtok_usd +
+      cached * (cacheRate ?? 0) +
       tokens.output * price.output_per_mtok_usd) /
     1_000_000
   );
@@ -864,11 +1074,14 @@ export interface RunTrendPoint {
   evaluator_errors: number;
   /** Price-table key `estimated_cost_usd` was computed at — the explicit
    * param or the run's resolved rate; null when auto mode mixed per-model
-   * rates (no single honest key). */
+   * rates (no single honest key) or the point is unpriced. */
   price_model: string | null;
-  estimated_cost_usd: number;
-  /** Judge tokens priced at the evaluator model's rate when listed. */
-  evaluator_cost_usd: number;
+  /** Participant cost; null when any cell's model is unpriced (PR21 — a
+   * partial total would read as the run's full cost). */
+  estimated_cost_usd: number | null;
+  /** Judge tokens priced at the evaluator model's rate when listed; null
+   * when the evaluator model is unpriced. */
+  evaluator_cost_usd: number | null;
   /** Mean of the run's `overall` score rows; null when unscored. */
   mean_overall_score: number | null;
 }
@@ -1308,6 +1521,33 @@ export interface SandboxResult {
   /** True when the sandbox's snapshot workspace was empty (the agent wrote
    *  nothing) — a 0-score outcome reads differently with it flagged. */
   empty_workspace?: boolean | null;
+  /** PR31: flat `exec`-signal summary (PR7 measured build/tests in the
+   *  locked heg-exec container) — feeds the results grid's pass-rate. */
+  exec?: {
+    status?: string;
+    tests_detected?: boolean;
+    tests_ok?: boolean | null;
+    tests_collected?: number;
+    tests_passed?: number;
+    tests_failed?: number;
+    coverage_percent?: number | null;
+    detail?: string | null;
+  } | null;
+  /** PR31: flat `generated_tests`-signal summary (PR8 evaluator-authored
+   *  suite run against the submission) — the preferred pass-rate signal. */
+  generated_tests?: {
+    status?: string;
+    model?: string | null;
+    tests_collected?: number;
+    tests_passed?: number;
+    pass_rate?: number | null;
+    coverage_percent?: number | null;
+    detail?: string | null;
+  } | null;
+  /** PR27 (when landed): repeat index of a matrix cell. The results grid
+   *  groups same-(config, model) members as trials regardless — this is
+   *  display-only. */
+  trial_index?: number | null;
 }
 
 export interface PreviewOut {
@@ -1494,4 +1734,167 @@ export function deletePreset(slug: string): Promise<void> {
   return request<void>(`/api/presets/${encodeURIComponent(slug)}`, {
     method: "DELETE",
   });
+}
+
+// ---------------------------------------------------------------------------
+// prices (PR28 — user-editable glob rate table layered over the static one)
+// ---------------------------------------------------------------------------
+
+/** One `model_prices` row — `model_glob` is an fnmatch pattern (`gpt-4*`);
+ * rows match in declaration order, first hit wins over the static table. */
+export interface PriceEntry {
+  id: string;
+  model_glob: string;
+  input_per_mtok_usd: number;
+  output_per_mtok_usd: number;
+  cache_read_per_mtok_usd: number | null;
+  local: boolean;
+  /** "user" (PUT /api/prices — never overwritten by sync) | "openrouter". */
+  source: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PricesOut {
+  prices: PriceEntry[];
+  /** Static fallback layer under the user table. */
+  static: Record<string, ModelPrice>;
+  /** POST /api/prices/sync is meaningful only when openrouter is configured. */
+  sync_available: boolean;
+}
+
+export interface PriceUpsert {
+  model_glob: string;
+  input_per_mtok_usd: number;
+  output_per_mtok_usd: number;
+  cache_read_per_mtok_usd?: number | null;
+  local?: boolean;
+}
+
+export interface PriceSyncOut {
+  synced: number;
+  added: number;
+  updated: number;
+  skipped_user: number;
+  skipped_unpriced: number;
+  remote_count: number;
+  prices: PriceEntry[];
+}
+
+export function getPrices(): Promise<PricesOut> {
+  return request<PricesOut>("/api/prices");
+}
+
+/** Upsert a user rate by `model_glob` — matching row keeps its
+ * declaration-order position, its rate updates. */
+export function upsertPrice(body: PriceUpsert): Promise<PriceEntry> {
+  return request<PriceEntry>("/api/prices", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+export function deletePrice(id: string): Promise<void> {
+  return request<void>(`/api/prices/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Pull OpenRouter /models pricing into model_prices (via the gateway's
+ * pass-through — the api never talks to providers directly). */
+export function syncPrices(): Promise<PriceSyncOut> {
+  return request<PriceSyncOut>("/api/prices/sync", { method: "POST" });
+}
+
+// ---------------------------------------------------------------------------
+// artifact file browser + side-by-side diff (PR34)
+// ---------------------------------------------------------------------------
+
+/** One browsable path inside a sandbox's artifact browse root —
+ * `path` is POSIX-style relative; `size` is null for dirs. */
+export interface FileEntry {
+  path: string;
+  kind: "file" | "dir" | string;
+  size: number | null;
+}
+
+/** GET /api/sandboxes/{id}/files — bounded listing.
+ * `root` = "workspace" (snapshot workspace) | "artifact" (artifact dir —
+ * prompt cells / workspace-less artifacts, where output.txt lives). */
+export interface FileListOut {
+  sandbox_id: string;
+  root: string;
+  entries: FileEntry[];
+  /** Listing hit the server's depth/entry caps. */
+  truncated: boolean;
+}
+
+/** GET /api/sandboxes/{id}/files/{path} — size-capped text read.
+ * `binary` = NUL-carrying content → `text` null (offer the download). */
+export interface FileContentOut {
+  sandbox_id: string;
+  path: string;
+  size: number;
+  truncated: boolean;
+  binary: boolean;
+  text: string | null;
+}
+
+/** GET .../files/{path}?diff=<other> — unified diff across browse roots.
+ * `sandbox_id` = a/left, `other_sandbox_id` = b/right. A path absent on
+ * one side diffs against empty; `binary` sides return an empty `diff`. */
+export interface FileDiffOut {
+  sandbox_id: string;
+  other_sandbox_id: string;
+  path: string;
+  a_missing: boolean;
+  b_missing: boolean;
+  binary: boolean;
+  identical: boolean;
+  truncated: boolean;
+  diff: string;
+}
+
+function sandboxFilesPath(sandboxId: string): string {
+  return `/api/sandboxes/${encodeURIComponent(sandboxId)}/files`;
+}
+
+/** Jailed, depth/entry-bounded listing of the sandbox's artifact browse
+ * root (workspace/ when present, else the artifact dir — prompt cells). */
+export function listSandboxFiles(sandboxId: string): Promise<FileListOut> {
+  return request<FileListOut>(sandboxFilesPath(sandboxId));
+}
+
+/** Segments of `path` are encoded individually so a legitimately nested
+ * artifact path keeps its slashes (and any `..`/absolute games 404
+ * server-side anyway — the browse root is jailed). */
+function fileUrlPath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
+/** Size-capped text read of one artifact file (JSON). */
+export function getSandboxFile(
+  sandboxId: string,
+  path: string,
+): Promise<FileContentOut> {
+  return request<FileContentOut>(
+    `${sandboxFilesPath(sandboxId)}/${fileUrlPath(path)}`,
+  );
+}
+
+/** Server-side unified diff of `path` across `sandboxId` (a) and
+ * `otherId` (b). 404s when the path exists on neither side. */
+export function getSandboxFileDiff(
+  sandboxId: string,
+  path: string,
+  otherId: string,
+): Promise<FileDiffOut> {
+  return request<FileDiffOut>(
+    `${sandboxFilesPath(sandboxId)}/${fileUrlPath(path)}${qs({ diff: otherId })}`,
+  );
+}
+
+/** Absolute URL for the `?download=1` attachment of a browsed file. */
+export function sandboxFileDownloadUrl(sandboxId: string, path: string): string {
+  return `${API_BASE}${sandboxFilesPath(sandboxId)}/${fileUrlPath(path)}?download=1`;
 }

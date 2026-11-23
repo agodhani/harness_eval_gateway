@@ -13,6 +13,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   ApiError,
   approveRun,
+  CANCELLABLE_RUN_STATUSES,
   deleteRun,
   getRun,
   getRunResults,
@@ -389,15 +390,19 @@ export default function RunDetailClient({ runId }: { runId: string }) {
     router.push("/submit");
   }
 
-  /** Cancel — DELETE /api/runs/{id} (parallel backend work). The endpoint
-   * may 409 for states it refuses (e.g. running/evaluating); surface the
-   * server's message verbatim. A deleted row 404s the next refresh → head
-   * back to the list. */
-  async function cancel() {
+  /** Cancel a pre-spawn run or delete a terminal one — DELETE /api/runs/{id}
+   * decides which ("cancelled" → status flip; "deleted" → hard removal).
+   * In-flight runs (provisioning/running/evaluating) are gated off the
+   * button entirely since the API 409s them. A deleted row 404s the next
+   * refresh → head back to the list. */
+  async function remove() {
     if (!run || cancelling) return;
+    const terminal = isTerminal(run.status);
     if (
       !window.confirm(
-        `Cancel run ${shortId(run.id)}? Sandboxes are stopped and the run is marked cancelled.`,
+        terminal
+          ? `Delete run ${shortId(run.id)}? The run and its events, scores, rubric, and stored artifacts are permanently removed.`
+          : `Cancel run ${shortId(run.id)}? It is marked cancelled — nothing has been spawned yet, so no sandboxes are stopped.`,
       )
     ) {
       return;
@@ -405,12 +410,16 @@ export default function RunDetailClient({ runId }: { runId: string }) {
     setCancelling(true);
     setError(null);
     try {
-      await deleteRun(run.id);
+      const out = await deleteRun(run.id);
+      if (out.status === "deleted") {
+        router.push("/runs");
+        return;
+      }
       const refreshed = await refresh(true);
       if (refreshed === null) router.push("/runs");
       else setNotice("Run cancelled.");
     } catch (err) {
-      setError(errMsg(err, "Cancel failed."));
+      setError(errMsg(err, terminal ? "Delete failed." : "Cancel failed."));
     } finally {
       setCancelling(false);
     }
@@ -508,7 +517,7 @@ export default function RunDetailClient({ runId }: { runId: string }) {
 
   const configs: HarnessConfig[] = run.config?.harness_configs ?? [];
   const budgets = run.config?.budgets;
-  const evaluatorModel = run.config?.evaluator_model ?? null;
+  const evaluatorModel = run.config?.evaluator_model ?? run.model_name;
   // PR14: effective participant-model set ([model_name] + config extras).
   const participantModels = runModels(
     run.model_name,
@@ -563,25 +572,39 @@ export default function RunDetailClient({ runId }: { runId: string }) {
             Analysis →
           </Link>
           {isTerminal(run.status) ? (
-            <button
-              type="button"
-              className="btn btn--sm"
-              onClick={resubmit}
-              title="Open the submit form prefilled with this run's spec"
-            >
-              ↻ Resubmit
-            </button>
-          ) : (
+            <>
+              <button
+                type="button"
+                className="btn btn--sm"
+                onClick={resubmit}
+                title="Open the submit form prefilled with this run's spec"
+              >
+                ↻ Resubmit
+              </button>
+              <button
+                type="button"
+                className="btn btn--sm btn--ghost"
+                onClick={() => void remove()}
+                disabled={cancelling}
+                title="Permanently delete this run and its artifacts"
+              >
+                {cancelling ? "Deleting…" : "Delete run"}
+              </button>
+            </>
+          ) : CANCELLABLE_RUN_STATUSES.includes(run.status) ? (
+            // Pre-spawn only — DELETE flips these to cancelled. In-flight
+            // runs (provisioning/running/evaluating) 409 server-side, so no
+            // control renders for them at all.
             <button
               type="button"
               className="btn btn--sm btn--ghost"
-              onClick={() => void cancel()}
+              onClick={() => void remove()}
               disabled={cancelling}
-              title="Cancel this run (stops its sandboxes)"
+              title="Cancel this run — it is marked cancelled (nothing spawned to stop)"
             >
               {cancelling ? "Cancelling…" : "Cancel run"}
             </button>
-          )}
+          ) : null}
           <Link href="/runs" className="btn btn--sm btn--ghost">
             ← All runs
           </Link>

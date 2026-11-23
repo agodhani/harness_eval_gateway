@@ -27,12 +27,15 @@ import {
   listHarnesses,
   listPresets,
   listSkillPacks,
+  NO_SANDBOX_ADAPTERS,
   PROVIDERS,
   pullModel,
+  sanitizeHarnessConfigs,
   SKILL_PACKS,
   type Budgets,
   type HarnessConfig,
   type HarnessManifest,
+  type ModelOptions,
   type SkillPack,
   type SkillpackImportResult,
   type TaskPreset,
@@ -66,6 +69,38 @@ const MAX_MATRIX_CELLS = 32;
 // RunCreate.models caps at 8 extras → at most 1 primary + 8 extra rows.
 const MAX_MODEL_ROWS = 9;
 
+/** PR27 per-config model-sampling knobs — form state stays stringly-typed
+ * (empty = unset) and serializes to numbers/null in the payload. */
+interface ModelOptsRow {
+  temperature: string;
+  seed: string;
+  max_tokens: string;
+  reasoning: string;
+}
+
+const BLANK_OPTS: ModelOptsRow = {
+  temperature: "",
+  seed: "",
+  max_tokens: "",
+  reasoning: "",
+};
+
+// Reasoning-effort vocabularies are adapter-scoped: codex writes the value
+// verbatim into model_reasoning_effort (minimal|low|medium|high|xhigh —
+// max/none fail config parse); pass-through adapters (miniloop, prompt)
+// forward it to the provider, which accepts the broader set.
+const DEFAULT_REASONING_EFFORTS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "max",
+];
+const REASONING_EFFORTS: Record<string, string[]> = {
+  codex: ["minimal", "low", "medium", "high", "xhigh"],
+};
+
 interface ConfigRow {
   key: number;
   name: string;
@@ -75,6 +110,8 @@ interface ConfigRow {
   /** PR14 per-config model pin — no picker UI, but preserved on resubmit so
    * re-submitting a run doesn't silently drop pins from the payload. */
   model?: string | null;
+  /** PR27: model_options inputs (advanced disclosure per config). */
+  opts: ModelOptsRow;
 }
 
 interface ModelRow {
@@ -101,6 +138,7 @@ function blankConfig(): ConfigRow {
     adapter: DEFAULT_ADAPTER,
     skill_packs: [],
     system_prompt_extra: "",
+    opts: { ...BLANK_OPTS },
   };
 }
 
@@ -151,6 +189,9 @@ export default function SubmitPage() {
   const catalogsInflight = useRef(new Set<string>());
   const [configs, setConfigs] = useState<ConfigRow[]>(() => [blankConfig()]);
   const [budgets, setBudgets] = useState<Budgets>({ ...DEFAULT_BUDGETS });
+  // PR27: repeats per matrix cell (1–8) — every config × model cell runs
+  // this many times and results report mean ± sd (n).
+  const [trials, setTrials] = useState(1);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
@@ -270,10 +311,28 @@ export default function SubmitPage() {
               skill_packs: [...c.skill_packs],
               system_prompt_extra: c.system_prompt_extra ?? "",
               model: c.model ?? null,
+              opts: {
+                temperature:
+                  c.model_options?.temperature != null
+                    ? String(c.model_options.temperature)
+                    : "",
+                seed:
+                  c.model_options?.seed != null
+                    ? String(c.model_options.seed)
+                    : "",
+                max_tokens:
+                  c.model_options?.max_tokens != null
+                    ? String(c.model_options.max_tokens)
+                    : "",
+                reasoning: c.model_options?.reasoning ?? "",
+              },
             }))
           : [blankConfig()],
       );
       if (spec.budgets) setBudgets({ ...spec.budgets });
+      if (spec.trials && spec.trials >= 1) {
+        setTrials(Math.min(8, Math.trunc(spec.trials)));
+      }
     });
     return () => {
       cancelled = true;
@@ -317,6 +376,23 @@ export default function SubmitPage() {
   );
   const adapterLabel = (name: string) =>
     harnesses.find((h) => h.name === name)?.display_name ?? name;
+  /** PR25 no-sandbox pseudo-adapters (prompt): manifest flag wins, static
+   * list is the offline fallback. Prompt cells run one gateway call — no
+   * container, no skill packs to stage. */
+  const isNoSandboxAdapter = (name: string) =>
+    harnesses.length > 0
+      ? harnesses.find((h) => h.name === name)?.no_sandbox === true
+      : NO_SANDBOX_ADAPTERS.includes(name);
+  const sandboxedAdapters = adapterNames.filter((a) => !isNoSandboxAdapter(a));
+  const noSandboxAdapters = adapterNames.filter(isNoSandboxAdapter);
+  /** PR27: the ModelOptions keys an adapter's manifest declares — null
+   * when the manifest predates the field (don't gate the UI on it). */
+  const supportedOpts = (adapter: string): string[] | null => {
+    const m = harnesses.find((h) => h.name === adapter);
+    return m && Array.isArray(m.model_options)
+      ? (m.model_options as string[])
+      : null;
+  };
 
   // Selectable packs — vendored fallback until GET /api/skillpacks lands
   // (imported packs only exist server-side). `importFor` = config key the
@@ -507,7 +583,7 @@ export default function SubmitPage() {
   const participants = useMemo(() => participantModels(modelRows), [modelRows]);
   const primaryModel = modelRows[0]?.model.trim() ?? "";
   const modelCount = participants.length;
-  const sandboxCount = configs.length * Math.max(modelCount, 1);
+  const sandboxCount = configs.length * Math.max(modelCount, 1) * trials;
 
   const effectiveEvaluator = evalRow.model.trim() || primaryModel;
   // PR14: flagged when the judge equals ANY participant model —
@@ -520,7 +596,7 @@ export default function SubmitPage() {
   // model must not blow the configs × models matrix cap.
   const canAddModel =
     modelRows.length < MAX_MODEL_ROWS &&
-    configs.length * (modelCount + 1) <= MAX_MATRIX_CELLS;
+    configs.length * (modelCount + 1) * trials <= MAX_MATRIX_CELLS;
   const canAddModelHint =
     modelRows.length >= MAX_MODEL_ROWS
       ? `max ${MAX_MODEL_ROWS} participant models`
@@ -549,6 +625,7 @@ export default function SubmitPage() {
       if (!adapterNames.includes(c.adapter)) {
         errs[`cfg_${i}_adapter`] = `Unknown adapter "${c.adapter}".`;
       }
+      if (isNoSandboxAdapter(c.adapter)) return; // no packs to stage
       for (const p of c.skill_packs) {
         if (!packNames.has(p)) errs[`cfg_${i}_packs`] = `Unknown skill pack "${p}".`;
       }
@@ -557,14 +634,42 @@ export default function SubmitPage() {
       errs.max_iters = "max_iters must be 1–1000.";
     if (budgets.token_budget < 1000)
       errs.token_budget = "token_budget must be ≥ 1000 (per-run).";
+    if (
+      budgets.sandbox_token_budget != null &&
+      !(Number.isFinite(budgets.sandbox_token_budget) &&
+        budgets.sandbox_token_budget >= 1000)
+    )
+      // Number.isFinite first — "1e999" parses to Infinity, passes range
+      // checks, then JSON.stringify silently emits null (cap dropped).
+      errs.sandbox_token_budget = "sandbox_token_budget must be ≥ 1000 when set.";
+    if (
+      budgets.max_cost_usd != null &&
+      !(Number.isFinite(budgets.max_cost_usd) && budgets.max_cost_usd > 0)
+    )
+      errs.max_cost_usd = "max_cost_usd must be > 0 when set.";
     if (budgets.wall_clock_seconds < 60 || budgets.wall_clock_seconds > 86400)
       errs.wall_clock_seconds = "wall_clock_seconds must be 60–86400.";
     if (sandboxCount > MAX_MATRIX_CELLS)
       errs.models =
         `Matrix too large: ${configs.length} configs × ${modelCount} models ` +
-        `= ${sandboxCount} sandboxes (max ${MAX_MATRIX_CELLS}).`;
+        `× ${trials} trials = ${sandboxCount} sandboxes (max ${MAX_MATRIX_CELLS}).`;
+    configs.forEach((c, i) => {
+      const t = parseFloat(c.opts.temperature);
+      if (c.opts.temperature.trim() && (!Number.isFinite(t) || t < 0 || t > 2))
+        errs[`cfg_${i}_opts`] = "temperature must be 0–2.";
+      const mt = Number(c.opts.max_tokens);
+      if (
+        c.opts.max_tokens.trim() &&
+        (!Number.isInteger(mt) || mt < 1 || mt > 131_072)
+      )
+        errs[`cfg_${i}_opts`] = "max_tokens must be an integer 1–131072.";
+      const sd = Number(c.opts.seed);
+      if (c.opts.seed.trim() && (!Number.isInteger(sd) || sd < 0))
+        errs[`cfg_${i}_opts`] = "seed must be an integer ≥ 0.";
+    });
     return errs;
-  }, [taskMode, taskPrompt, presetSlug, presetMissing, primaryModel, configs, budgets, adapterNames, packNames, sandboxCount, modelCount]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [taskMode, taskPrompt, presetSlug, presetMissing, primaryModel, configs, budgets, adapterNames, packNames, sandboxCount, modelCount, trials]);
 
   const isValid = Object.keys(validation).length === 0;
 
@@ -654,15 +759,30 @@ export default function SubmitPage() {
     setFieldErrors(validation);
     if (!isValid || submitting) return;
 
-    const harness_configs: HarnessConfig[] = configs.map((c) => ({
-      adapter: c.adapter,
-      skill_packs: c.skill_packs,
-      system_prompt_extra: c.system_prompt_extra.trim() || null,
-      name: c.name.trim() || null,
-      // Per-config model pin (PR14) — only ever set by a resubmit restore;
-      // the form itself has no pin UI.
-      model: c.model ?? null,
-    }));
+    const harness_configs: HarnessConfig[] = sanitizeHarnessConfigs(
+      configs.map((c) => {
+        // PR27: only provided knobs ship; the backend warns + drops keys
+        // the adapter doesn't declare in its manifest's model_options.
+        const opts: ModelOptions = {};
+        if (c.opts.temperature.trim())
+          opts.temperature = parseFloat(c.opts.temperature);
+        if (c.opts.seed.trim()) opts.seed = Number(c.opts.seed);
+        if (c.opts.max_tokens.trim())
+          opts.max_tokens = Number(c.opts.max_tokens);
+        if (c.opts.reasoning.trim()) opts.reasoning = c.opts.reasoning.trim();
+        return {
+          adapter: c.adapter,
+          skill_packs: c.skill_packs,
+          system_prompt_extra: c.system_prompt_extra.trim() || null,
+          name: c.name.trim() || null,
+          // Per-config model pin (PR14) — only ever set by a resubmit
+          // restore; the form itself has no pin UI.
+          model: c.model ?? null,
+          model_options: Object.keys(opts).length ? opts : null,
+        };
+      }),
+      isNoSandboxAdapter,
+    );
     // Row 1 → model_name; remaining deduped rows → models (null when
     // single-model). Providers stay client-side — RunCreate has no
     // per-model provider field; routing resolves gateway-side.
@@ -686,6 +806,7 @@ export default function SubmitPage() {
         harness_configs,
         evaluator_model: evalRow.model.trim() || null,
         budgets,
+        trials,
       });
       // Run-create warnings (new backend field — absent on older backends):
       // stash them so the run detail page can surface them once we land,
@@ -1053,10 +1174,12 @@ export default function SubmitPage() {
               {modelCount > 1 ? (
                 <>
                   <strong>
-                    {modelCount} models × {configs.length} configs = {sandboxCount}{" "}
+                    {modelCount} models × {configs.length} configs
+                    {trials > 1 ? ` × ${trials} trials` : ""} = {sandboxCount}{" "}
                     sandboxes
                   </strong>{" "}
-                  — every config runs once per model.{" "}
+                  — every config runs {trials > 1 ? `${trials}× ` : "once "}per
+                  model.{" "}
                 </>
               ) : (
                 "Add another model to compare harness AND model in one run — each config runs once per model. "
@@ -1065,6 +1188,62 @@ export default function SubmitPage() {
               the payload sends just the model name; actual routing resolves per
               model via the gateway&apos;s PROVIDER_ROUTES.
             </span>
+          </div>
+
+          <div className="field" style={{ marginTop: "0.9rem" }}>
+            <label className="field__label" htmlFor="trials">
+              Trials per cell <span className="faint">(repeats)</span>
+            </label>
+            <div className="row" style={{ flexWrap: "nowrap" }}>
+              <button
+                type="button"
+                className="btn btn--sm"
+                aria-label="Fewer trials"
+                disabled={submitting || trials <= 1}
+                onClick={() => setTrials((t) => Math.max(1, t - 1))}
+              >
+                −
+              </button>
+              <input
+                id="trials"
+                className="input"
+                type="number"
+                min={1}
+                max={8}
+                step={1}
+                style={{ width: "4.5rem", textAlign: "center" }}
+                value={trials}
+                onChange={(e) => {
+                  const n = Number(e.target.value);
+                  if (Number.isInteger(n)) setTrials(Math.min(8, Math.max(1, n)));
+                }}
+                disabled={submitting}
+              />
+              <button
+                type="button"
+                className="btn btn--sm"
+                aria-label="More trials"
+                disabled={submitting || trials >= 8}
+                onClick={() => setTrials((t) => Math.min(8, t + 1))}
+              >
+                +
+              </button>
+              <span className="field__hint" style={{ margin: 0 }}>
+                {trials > 1
+                  ? `each config × model cell repeats ${trials}× — results report mean ± sd (n=${trials})`
+                  : "1 = every matrix cell runs once (single sample)"}
+              </span>
+            </div>
+            {trials > 1 ? (
+              <span className="field__hint">
+                <strong>
+                  {configs.length} configs × {modelCount} models × {trials}{" "}
+                  trials = {sandboxCount} sandboxes
+                </strong>{" "}
+                — trials of one cell share a grouped header on the results
+                matrix.
+              </span>
+            ) : null}
           </div>
 
           <div className="field" style={{ marginTop: "0.9rem" }}>
@@ -1213,65 +1392,200 @@ export default function SubmitPage() {
                       onChange={(e) => updateConfig(cfg.key, { adapter: e.target.value })}
                       disabled={submitting}
                     >
-                      {adapterNames.map((a) => (
-                        <option key={a} value={a}>
-                          {adapterLabel(a)}
-                        </option>
-                      ))}
+                      <optgroup label="Agent harnesses">
+                        {sandboxedAdapters.map((a) => (
+                          <option key={a} value={a}>
+                            {adapterLabel(a)}
+                          </option>
+                        ))}
+                      </optgroup>
+                      {noSandboxAdapters.length > 0 ? (
+                        <optgroup label="No sandbox">
+                          {noSandboxAdapters.map((a) => (
+                            <option key={a} value={a}>
+                              {adapterLabel(a)}
+                            </option>
+                          ))}
+                        </optgroup>
+                      ) : null}
                     </select>
+                    {isNoSandboxAdapter(cfg.adapter) ? (
+                      <span className="field__hint">
+                        Prompt cell — one model call per cell, no container.
+                      </span>
+                    ) : null}
                   </div>
-                  <div className="field">
-                    <label className="field__label">
-                      Skill packs{" "}
-                      <button
-                        type="button"
-                        className="btn btn--sm btn--ghost"
-                        onClick={() => setImportFor(cfg.key)}
-                        disabled={submitting}
-                        title="Import skills from a GitHub repo link"
-                      >
-                        + import from GitHub
-                      </button>
-                    </label>
-                    <div className="check-list">
-                      {packs.map((p) => (
-                        <label key={p.name} className="check-item">
-                          <input
-                            type="checkbox"
-                            checked={cfg.skill_packs.includes(p.name)}
-                            onChange={() => togglePack(cfg, p.name)}
-                            disabled={submitting}
-                          />
-                          <code>{p.name}</code>
-                          {p.source === "imported" ? (
-                            <Badge tone="violet" title={p.origin_url ?? "user-imported"}>
-                              imported
-                            </Badge>
-                          ) : null}
-                          {p.skill_count > 0 ? (
-                            <span className="faint">({p.skill_count})</span>
-                          ) : null}
-                        </label>
-                      ))}
+                  {!isNoSandboxAdapter(cfg.adapter) ? (
+                    <div className="field">
+                      <label className="field__label">
+                        Skill packs{" "}
+                        <button
+                          type="button"
+                          className="btn btn--sm btn--ghost"
+                          onClick={() => setImportFor(cfg.key)}
+                          disabled={submitting}
+                          title="Import skills from a GitHub repo link"
+                        >
+                          + import from GitHub
+                        </button>
+                      </label>
+                      <div className="check-list">
+                        {packs.map((p) => (
+                          <label key={p.name} className="check-item">
+                            <input
+                              type="checkbox"
+                              checked={cfg.skill_packs.includes(p.name)}
+                              onChange={() => togglePack(cfg, p.name)}
+                              disabled={submitting}
+                            />
+                            <code>{p.name}</code>
+                            {p.source === "imported" ? (
+                              <Badge tone="violet" title={p.origin_url ?? "user-imported"}>
+                                imported
+                              </Badge>
+                            ) : null}
+                            {p.skill_count > 0 ? (
+                              <span className="faint">({p.skill_count})</span>
+                            ) : null}
+                          </label>
+                        ))}
+                      </div>
+                      <span className="field__hint">
+                        {cfg.skill_packs.length === 0
+                          ? "None — sandbox gets an empty packs dir."
+                          : `${cfg.skill_packs.length} pack${cfg.skill_packs.length > 1 ? "s" : ""} staged.`}
+                      </span>
                     </div>
-                    <span className="field__hint">
-                      {cfg.skill_packs.length === 0
-                        ? "None — sandbox gets an empty packs dir."
-                        : `${cfg.skill_packs.length} pack${cfg.skill_packs.length > 1 ? "s" : ""} staged.`}
-                    </span>
-                  </div>
+                  ) : null}
                 </div>
                 <div className="field">
                   <label className="field__label">System prompt extra</label>
                   <textarea
                     className="textarea"
                     rows={2}
-                    placeholder="Optional instructions appended to the harness system prompt (a comparison axis)."
+                    placeholder={
+                      isNoSandboxAdapter(cfg.adapter)
+                        ? "Sent as the system message of the cell's single model call (a comparison axis)."
+                        : "Optional instructions appended to the harness system prompt (a comparison axis)."
+                    }
                     value={cfg.system_prompt_extra}
                     onChange={(e) => updateConfig(cfg.key, { system_prompt_extra: e.target.value })}
                     disabled={submitting}
                   />
                 </div>
+                <details className="advanced">
+                  <summary>
+                    Model options{" "}
+                    <span className="faint">
+                      {(() => {
+                        const sup = supportedOpts(cfg.adapter);
+                        return sup === null
+                          ? "(adapter-declared support unknown)"
+                          : sup.length
+                            ? `(adapter maps: ${sup.join(", ")})`
+                            : "(adapter maps none — dropped with a warning)";
+                      })()}
+                    </span>
+                  </summary>
+                  <div className="advanced__body">
+                    <div className="input-row">
+                      {(
+                        [
+                          ["temperature", "Temperature", "0–2", "0.7"],
+                          ["seed", "Seed", "integer ≥ 0", "42"],
+                          ["max_tokens", "Max tokens", "≥ 1", "8192"],
+                        ] as const
+                      ).map(([keyName, label, hint, placeholder]) => {
+                        const sup = supportedOpts(cfg.adapter);
+                        const unsupported =
+                          sup !== null && !sup.includes(keyName);
+                        return (
+                          <div className="field" key={keyName}>
+                            <label className="field__label">{label}</label>
+                            <input
+                              className="input"
+                              type="number"
+                              placeholder={placeholder}
+                              min={keyName === "temperature" ? 0 : keyName === "seed" ? 0 : 1}
+                              max={keyName === "temperature" ? 2 : undefined}
+                              step={keyName === "temperature" ? 0.1 : 1}
+                              value={cfg.opts[keyName]}
+                              onChange={(e) =>
+                                updateConfig(cfg.key, {
+                                  opts: { ...cfg.opts, [keyName]: e.target.value },
+                                })
+                              }
+                              disabled={submitting || unsupported}
+                              title={
+                                unsupported
+                                  ? `${cfg.adapter} doesn't map ${keyName} — the submit warns and drops it`
+                                  : hint
+                              }
+                            />
+                            {unsupported ? (
+                              <span className="field__hint">
+                                unsupported by {cfg.adapter} — dropped
+                              </span>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                      {(() => {
+                        const sup = supportedOpts(cfg.adapter);
+                        const unsupported =
+                          sup !== null && !sup.includes("reasoning");
+                        const efforts =
+                          REASONING_EFFORTS[cfg.adapter] ??
+                          DEFAULT_REASONING_EFFORTS;
+                        const options =
+                          cfg.opts.reasoning &&
+                          !efforts.includes(cfg.opts.reasoning)
+                            ? [...efforts, cfg.opts.reasoning]
+                            : efforts;
+                        return (
+                          <div className="field">
+                            <label className="field__label">Reasoning</label>
+                            <select
+                              className="select"
+                              value={cfg.opts.reasoning}
+                              onChange={(e) =>
+                                updateConfig(cfg.key, {
+                                  opts: { ...cfg.opts, reasoning: e.target.value },
+                                })
+                              }
+                              disabled={submitting || unsupported}
+                              title={
+                                unsupported
+                                  ? `${cfg.adapter} doesn't map reasoning — the submit warns and drops it`
+                                  : "reasoning_effort hint passed to the model request"
+                              }
+                            >
+                              <option value="">adapter default</option>
+                              {options.map((r) => (
+                                <option key={r} value={r}>
+                                  {r}
+                                </option>
+                              ))}
+                            </select>
+                            {unsupported ? (
+                              <span className="field__hint">
+                                unsupported by {cfg.adapter} — dropped
+                              </span>
+                            ) : null}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                    {fieldErrors[`cfg_${i}_opts`] ? (
+                      <span className="field__error">{fieldErrors[`cfg_${i}_opts`]}</span>
+                    ) : null}
+                    <span className="field__hint">
+                      Honored where the adapter exposes the knob — miniloop and
+                      prompt cells map all four; codex maps reasoning. Anything
+                      else warns on submit instead of silently no-oping.
+                    </span>
+                  </div>
+                </details>
                 {fieldErrors[`cfg_${i}_adapter`] || fieldErrors[`cfg_${i}_packs`] ? (
                   <span className="field__error">
                     {fieldErrors[`cfg_${i}_adapter`] ?? fieldErrors[`cfg_${i}_packs`]}
@@ -1345,6 +1659,62 @@ export default function SubmitPage() {
                     disabled={submitting}
                   />
                   {fieldErrors.wall_clock_seconds ? <span className="field__error">{fieldErrors.wall_clock_seconds}</span> : null}
+                </div>
+              </div>
+              <div className="input-row" style={{ marginTop: "0.6rem" }}>
+                <div className="field">
+                  <label className="field__label" htmlFor="sandbox_token_budget">
+                    Token budget per sandbox <span className="faint">(optional)</span>
+                  </label>
+                  <input
+                    id="sandbox_token_budget"
+                    className="input"
+                    type="number"
+                    min={1000}
+                    step={1000}
+                    placeholder="unset — shares the run budget"
+                    value={budgets.sandbox_token_budget ?? ""}
+                    onChange={(e) =>
+                      setBudgets({
+                        ...budgets,
+                        sandbox_token_budget:
+                          e.target.value === "" ? null : Number(e.target.value),
+                      })
+                    }
+                    disabled={submitting}
+                  />
+                  <span className="dim-desc">
+                    PR28: caps each cell&apos;s own tokens — a runaway cell starves
+                    itself, not its siblings.
+                  </span>
+                  {fieldErrors.sandbox_token_budget ? <span className="field__error">{fieldErrors.sandbox_token_budget}</span> : null}
+                </div>
+                <div className="field">
+                  <label className="field__label" htmlFor="max_cost_usd">
+                    Max cost per sandbox (USD) <span className="faint">(optional)</span>
+                  </label>
+                  <input
+                    id="max_cost_usd"
+                    className="input"
+                    type="number"
+                    min={0}
+                    step="any"
+                    placeholder="unset — no spend cap"
+                    value={budgets.max_cost_usd ?? ""}
+                    onChange={(e) =>
+                      setBudgets({
+                        ...budgets,
+                        max_cost_usd:
+                          e.target.value === "" ? null : Number(e.target.value),
+                      })
+                    }
+                    disabled={submitting}
+                  />
+                  <span className="dim-desc">
+                    Priced models only — each cell&apos;s estimated spend at list
+                    prices; unpriced models can&apos;t trip it.
+                  </span>
+                  {fieldErrors.max_cost_usd ? <span className="field__error">{fieldErrors.max_cost_usd}</span> : null}
                 </div>
               </div>
             </div>
