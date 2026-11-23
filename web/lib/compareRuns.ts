@@ -195,7 +195,9 @@ export interface AnalyticsTotals {
   tokensOut: number;
   tokensTotal: number;
   errors: number;
-  wallClockSeconds: number;
+  /** Summed per-cell participant spans — busy-time, not run elapsed:
+   * cells running in parallel count in full. */
+  busySeconds: number;
   /** Summed estimated participant cost; null when any CONTRIBUTING model
    * is unpriced — a partial total would read as complete (PR21 rule).
    * A zero-traffic unlisted model contributes a legitimate $0 and does
@@ -227,7 +229,7 @@ export function analyticsTotals(a: RunAnalytics | null | undefined): AnalyticsTo
     tokensOut: 0,
     tokensTotal: 0,
     errors: 0,
-    wallClockSeconds: 0,
+    busySeconds: 0,
     costUsd: null,
     avgTokensPerSec: null,
     ttftAvgMs: null,
@@ -253,7 +255,7 @@ export function analyticsTotals(a: RunAnalytics | null | undefined): AnalyticsTo
     t.tokensOut += m.tokens.output;
     t.tokensTotal += m.tokens.total;
     t.errors += m.errors;
-    t.wallClockSeconds += m.wall_clock_seconds;
+    t.busySeconds += m.wall_clock_seconds;
     const hasTraffic = m.llm_turns > 0 || m.tokens.total > 0;
     if (m.estimated_cost_usd == null) {
       if (hasTraffic) costKnown = false;

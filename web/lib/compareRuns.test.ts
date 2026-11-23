@@ -206,7 +206,7 @@ describe("analyticsTotals", () => {
     assert.equal(t.tokensOut, 50);
     assert.equal(t.tokensTotal, 200);
     assert.equal(t.errors, 1);
-    assert.equal(t.wallClockSeconds, 180);
+    assert.equal(t.busySeconds, 180);
     assert.ok(Math.abs((t.costUsd ?? 0) - 0.75) < 1e-9);
     // tps pooled by turns: (40*4 + 20*2)/6 = 33.33…
     assert.ok(Math.abs((t.avgTokensPerSec ?? 0) - 200 / 6) < 1e-9);
