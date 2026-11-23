@@ -45,6 +45,10 @@ export default function Hero() {
               <Link href="/submit" className="btn btn--primary">
                 Submit a run
               </Link>
+              <Link href="/dashboard" className="lp-cta-ghost">
+                Open the dashboard
+                <ArrowRight className="icon-sm" />
+              </Link>
               <a href="#pipeline" className="lp-cta-ghost">
                 How a run works
                 <ArrowRight className="icon-sm" />

@@ -963,6 +963,23 @@ or tests change.
   `web/lib/compareRuns.ts` holds the pure transforms; the shared
   `LeaderboardBoards` renders on /leaderboard and embedded, preset-
   filtered, on /presets/[slug].
+- **Dashboard summary is one server-side aggregate (PR36/F29)** —
+  `GET /api/analytics/summary` returns everything `/dashboard` needs
+  that the leaderboard doesn't already serve (KPI totals, `?weeks=`
+  ISO-Monday buckets of runs/turns/spend ending at the current week,
+  terminal-reason counts + a separate pending count, the queue lane —
+  active runs + `queued` stamped with promotion-order position from
+  `started_at`, awaiting-review count, and `?recent=` newest runs with
+  newest-wins mean `overall`). One events scan prices each metered
+  call exactly like per-run analytics: sandbox events after the first
+  evaluator-source event bill at the run's `evaluator_model`;
+  run-level calls (`sandbox_id` null — rubric drafting) bill at the
+  payload `model`. Unpriced calls null their week's total + the grand
+  total (never zero-filled; `unpriced_llm_turns` names the gap),
+  `?price_model=` reprices all traffic like the trends endpoint.
+  `/dashboard` reuses the PR32 leaderboard for its top-5 boards and
+  polls only while the lane is busy. `web/lib/dashboard.ts` holds the
+  pure chart transforms (node-tested).
 
 ## Working conventions
 
