@@ -71,7 +71,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from api.config import get_settings
@@ -2015,20 +2015,41 @@ def create_share_link(run_id: UUID, session: DbSession) -> ShareLinkOut:
     """Mint (or return) the run's share token — idempotent.
 
     ``secrets.token_urlsafe(16)`` = 128 bits of entropy — the token is the
-    only credential the read-only share surface checks.
+    only credential the read-only share surface checks. The mint claims the
+    slot with a conditional UPDATE — stays idempotent under concurrent
+    POSTs on every dialect (``FOR UPDATE`` locks are a no-op on SQLite).
     """
-    run = session.get(Run, run_id, with_for_update=True)
+    run = session.get(Run, run_id)
     if run is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="run not found"
         )
-    if run.share_token is None:
-        run.share_token = secrets.token_urlsafe(16)
+    token = run.share_token
+    if token is None:
+        for _ in range(2):
+            candidate = secrets.token_urlsafe(16)
+            if session.execute(
+                update(Run)
+                .where(Run.id == run_id, Run.share_token.is_(None))
+                .values(share_token=candidate)
+            ).rowcount:
+                token = candidate
+                break
+            token = session.execute(
+                select(Run.share_token).where(Run.id == run_id)
+            ).scalar_one_or_none()
+            if token is not None:
+                break
+        if token is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="share link contention",
+            )
     session.commit()
     return ShareLinkOut(
         run_id=run.id,
-        token=run.share_token,
-        url=f"/share/{run.share_token}",
+        token=token,
+        url=f"/share/{token}",
     )
 
 
