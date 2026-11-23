@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from db.models import Run, Sandbox
 from gateway.creds import mint_cred
+from sandbox import seeds
 from sandbox.runtime import SandboxRuntime
 from sandbox.spec import SandboxSpec
 from skillpack_import.store import imported_root
@@ -193,9 +194,14 @@ def build_spec(
     runtime: SandboxRuntime,
     image: str,
     env: dict[str, str],
+    seed_host_path: Path | None = None,
 ) -> SandboxSpec:
     """Assemble the SandboxSpec for one config (paths are spawning-process
-    paths; the runtime translates them for ``docker run -v``)."""
+    paths; the runtime translates them for ``docker run -v``).
+
+    ``seed_host_path`` (PR24) is the run's materialized task-input tree —
+    ``runtime.spawn`` copies it into the workspace before ``docker run``.
+    """
     sid = str(sandbox_id)
     adapter = get_adapter(str(harness_config.get("adapter") or "miniloop"))
     task = {
@@ -217,7 +223,48 @@ def build_spec(
         env=env,
         workspace_host_path=runtime.state_dir / sid / "workspace",
         skillpacks_host_path=runtime.state_dir / sid / "skillpacks",
+        seed_host_path=seed_host_path,
         cmd=launch.get("cmd"),
+    )
+
+
+async def prepare_seed(
+    *,
+    run: Run,
+    runtime: SandboxRuntime,
+    settings: Any,
+) -> seeds.PreparedSeed | None:
+    """Materialize the run's ``task_inputs`` — the public-repo clone at a
+    pinned ref, or the staged upload archive — under
+    ``<data>/seeds/<run_id>/``. Per-run idempotent
+    (``seeds.prepare_run_seed``), so sequential cells share one
+    materialization; ``spec.seed_host_path`` then has ``runtime.spawn``
+    copy the tree into each cell's workspace before its container starts.
+    None for an unseeded run; SeedError on failure."""
+    task_inputs = (run.config or {}).get("task_inputs") or None
+    if not task_inputs:
+        return None
+    return await asyncio.to_thread(
+        seeds.prepare_run_seed,
+        run.id,
+        task_inputs,
+        seed_root=Path(runtime.state_dir).parent / "seeds",
+        uploads=seeds.uploads_root(settings),
+        git_runner=seeds.git_runner(
+            float(
+                getattr(
+                    settings,
+                    "SEED_GIT_TIMEOUT_SECONDS",
+                    seeds.DEFAULT_GIT_TIMEOUT_SECONDS,
+                )
+            )
+        ),
+        max_bytes=int(
+            getattr(settings, "SEED_MAX_BYTES", seeds.DEFAULT_SEED_MAX_BYTES)
+        ),
+        max_files=int(
+            getattr(settings, "SEED_MAX_FILES", seeds.DEFAULT_SEED_MAX_FILES)
+        ),
     )
 
 
@@ -314,8 +361,11 @@ def _mark_spawn_failed(
 def _mark_spawned(
     session_factory: sessionmaker[Session],
     *,
+    run_id: uuid.UUID,
     sandbox_id: uuid.UUID,
     container_id: str,
+    seed: seeds.PreparedSeed | None = None,
+    seed_sha: str | None = None,
 ) -> None:
     with session_factory() as session:
         sb = session.get(Sandbox, sandbox_id)
@@ -323,6 +373,31 @@ def _mark_spawned(
             return
         sb.docker_container_id = container_id
         sb.started_at = datetime.now(UTC)
+        if seed is not None:
+            # PR24 — the identical-seed proof: every cell's harness_config
+            # records the seed copy's content hash + its provenance, and a
+            # `seed` checkpoint lands on the timeline. seed_sha comes from
+            # the runtime's actual workspace copy (None only when a runtime
+            # faked spawn skipped the copy — then the provenance still
+            # records what was intended).
+            seed_keys: dict[str, Any] = {"seed": seed.source}
+            if seed_sha is not None:
+                seed_keys["seed_sha"] = seed_sha
+            sb.harness_config = {**(sb.harness_config or {}), **seed_keys}
+            payload: dict[str, Any] = {
+                "stage": "seed",
+                "seed_sha": seed_sha,
+                **seed.source,
+            }
+            if seed.warnings:
+                payload["warnings"] = list(seed.warnings)
+            emit(
+                session,
+                run_id=run_id,
+                sandbox_id=sandbox_id,
+                event_type="checkpoint",
+                payload=payload,
+            )
         try:
             state_machine.transition(session, sb, "running")
         except state_machine.InvalidTransition:
@@ -337,12 +412,18 @@ async def spawn_one(
     run_id: uuid.UUID,
     harness_config: dict[str, Any],
     settings: Any,
+    seed: seeds.PreparedSeed | None = None,
 ) -> uuid.UUID | None:
     """Provision + spawn ONE sandbox for ``harness_config``.
 
     Returns the sandbox UUID on success, ``None`` on failure (the Sandbox row
     is still created, marked ``failed``/``error`` — spawn failures are
     per-sandbox and never abort sibling configs).
+
+    ``seed`` (PR24) is the run's materialized task-input tree — the
+    lifecycle prepares it once before the cell loop via ``prepare_seed``
+    and passes it down; a caller that omits it gets the same idempotent
+    preparation here.
 
     DB helpers run on the event-loop thread; the file staging and the
     blocking ``docker run`` call are the only ``to_thread`` hops.
@@ -356,6 +437,9 @@ async def spawn_one(
     sid = _insert_sandbox_row(session_factory, run_id, harness_config)
     try:
         adapter = get_adapter(str(harness_config.get("adapter") or "miniloop"))
+
+        if seed is None:
+            seed = await prepare_seed(run=run, runtime=runtime, settings=settings)
 
         # Stage ONLY the selected packs (real copies under the state dir —
         # bind-mountable and per-sandbox isolated). The staged dir IS the
@@ -424,11 +508,17 @@ async def spawn_one(
             runtime=runtime,
             image=adapter_image(adapter, settings.SANDBOX_IMAGE),
             env=env,
+            seed_host_path=seed.path if seed is not None else None,
         )
 
         result = await asyncio.to_thread(runtime.spawn, spec)
         _mark_spawned(
-            session_factory, sandbox_id=sid, container_id=result.container_id
+            session_factory,
+            run_id=run_id,
+            sandbox_id=sid,
+            container_id=result.container_id,
+            seed=seed,
+            seed_sha=result.seed_sha,
         )
         log.info("spawn_one: sandbox %s -> %s", sid, result.container_name)
         return sid

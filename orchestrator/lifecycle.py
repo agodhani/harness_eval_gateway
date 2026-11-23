@@ -550,6 +550,33 @@ async def _run_lifecycle(
     # an already-terminal, artifact-bearing sandbox row by the time it
     # returns.
     configs = _sandbox_configs(run)
+
+    # PR24 — materialize the task-input seed ONCE for the run before any
+    # cell spawns (per-run idempotent — every cell copies the same tree).
+    # A failing seed (dead remote, unsafe archive) fails the run fast here
+    # instead of retrying from scratch in each sequential cell while the
+    # run holds the pacing slot. Prompt cells have no workspace — the seed
+    # is only fetched when at least one container cell exists.
+    seed = None
+    if any(not prompt_cell.is_prompt_config(hc) for hc in configs):
+        try:
+            seed = await provision.prepare_seed(
+                run=run, runtime=runtime, settings=settings
+            )
+        except Exception as exc:  # noqa: BLE001 — any prep failure fails the run
+            _set_run_status(
+                session_factory,
+                run_id,
+                "failed",
+                finished=True,
+                event_payload={
+                    "type": "error",
+                    "stage": "seed",
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            return
+
     for hc in configs:
         if prompt_cell.is_prompt_config(hc):
             await prompt_cell.run_prompt_cell(
@@ -566,6 +593,7 @@ async def _run_lifecycle(
                 run_id=run_id,
                 harness_config=hc,
                 settings=settings,
+                seed=seed,
             )
 
     running_ids = _running_sandbox_ids(session_factory, run_id)

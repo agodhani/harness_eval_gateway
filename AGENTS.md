@@ -142,7 +142,19 @@ adapters are added.
    parallel submits — a run parked on it stays `submitted` and emits a
    `rubric_queued` checkpoint while it waits.
 3. **Provision** — prepare identical initial repo; build/launch N sandboxes.
-   `spawn_one` additionally gates each `docker run` on host memory headroom
+   **Task inputs (PR24):** `run.config.task_inputs` (`repo_url`+`ref` public
+   https clone, or `archive_id` staged via `POST /api/uploads`) is
+   materialized once per run under `data/seeds/<run_id>/content/`
+   (`sandbox/seeds.py::prepare_run_seed`, tmp-dir + atomic rename,
+   idempotent) and `copy_seed`ed into every cell's workspace before
+   `docker run` — identical bytes per cell, proven by
+   `harness_config.seed_sha` (the workspace copy's `hash_tree`) plus a
+   `stage:"seed"` checkpoint per sandbox. Archive members are jail-checked
+   twice (upload `check_archive` + `extract_archive` — never `extractall`;
+   traversal/absolute/links/specials rejected, decompression capped) and an
+   escapee-symlink sweep runs post-materialization. Prompt cells (PR25)
+   have no workspace — seeds don't apply. `spawn_one` additionally gates
+   each `docker run` on host memory headroom
    (`SPAWN_MIN_FREE_MEM_MB`, probed via `/proc/meminfo` → `sysconf` →
    `docker info`+`stats`; unreadable probe = gate off). The wait is capped
    by `SPAWN_MEM_WAIT_SECONDS` — expiry fails that one sandbox and makes
@@ -348,7 +360,9 @@ skillpack_import/  # F11 GitHub import: codeload fetch, SKILL.md scan, pack stor
 web/           # Next.js app
 db/            # schema + Alembic migrations
 tests/         # unit / integration / e2e
-data/          # artifacts, imported skill packs (skillpacks/), sandbox state (gitignored)
+data/          # artifacts, imported skill packs (skillpacks/), sandbox state,
+               # task-input uploads (uploads/) + materialized seeds (seeds/)
+               # — all gitignored
 docs/
 docker-compose.yml
 ```
@@ -815,6 +829,26 @@ or tests change.
   "verdict" card under the chart is a pure template from
   `web/lib/scatterMatrix.ts` (`paretoFrontier`, `buildVerdict`,
   `verdictLines`), `node --test`-covered like `gridMatrix.ts`.
+- **Task inputs seed the workspace once per run (PR24)** — the seed is
+  materialized per RUN (`data/seeds/<run_id>/`, atomic rename), not per
+  sandbox: N cells cloning the same repo independently would waste the
+  wall clock and could race remote ref movement — one fetch pins
+  `resolved_sha`, then every workspace copies the same local bytes, and
+  the identical-bytes proof is the recorded `harness_config.seed_sha` (the
+  copy's own content hash, not the provenance hash). Archives upload via
+  `POST /api/uploads` BEFORE the run submits (upload ids are uuids;
+  `RunCreate.task_inputs.archive_id` 422s on a dangling id — a run can
+  never reference an archive staged after submit). Repo seeds are
+  `https://`-only public clones (`init`+`fetch --depth 1`+`checkout
+  FETCH_HEAD` — one code path for branch/tag/sha); `git` runs with
+  prompting disabled under `SEED_GIT_TIMEOUT_SECONDS`. Archive extraction
+  never calls `extractall` — members are name-checked and byte-capped,
+  and a post-materialization sweep drops symlinks resolving outside the
+  seed root. **Preset contract (feat/pr22-presets):** preset frontmatter
+  may carry `seed: {repo_url: <url>, ref: <sha>} | {upload: <upload_id>}`
+  — it maps onto `task_inputs` when `preset_ref` resolves (`upload`
+  translates to `archive_id`). Prompt cells have no workspace — a
+  `task_inputs` seed simply doesn't reach them.
 
 ## Working conventions
 

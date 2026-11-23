@@ -30,12 +30,15 @@ import {
   pullModel,
   sanitizeHarnessConfigs,
   SKILL_PACKS,
+  uploadArchive,
   type Budgets,
   type HarnessConfig,
   type HarnessManifest,
   type ModelOptions,
   type SkillPack,
   type SkillpackImportResult,
+  type TaskInputs,
+  type UploadOut,
 } from "@/lib/api";
 import { modelsPayload, participantModels } from "@/lib/modelRows";
 import {
@@ -177,6 +180,20 @@ export default function SubmitPage() {
   const [pulling, setPulling] = useState(false);
   const [pullMsg, setPullMsg] = useState<string | null>(null);
   const [pullFailed, setPullFailed] = useState(false);
+  // PR24 — task inputs (the seeded workspace). `none` = legacy empty
+  // workspace; `repo` clones a public https repo at `repoRef` (empty =
+  // remote HEAD); `archive` submits a staged upload id (files POST to
+  // /api/uploads the moment they're picked — uploadToken guards the race
+  // when a second pick lands before the first finishes).
+  const [inputsMode, setInputsMode] = useState<"none" | "repo" | "archive">(
+    "none",
+  );
+  const [repoUrl, setRepoUrl] = useState("");
+  const [repoRef, setRepoRef] = useState("");
+  const [stagedUpload, setStagedUpload] = useState<UploadOut | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const uploadToken = useRef(0);
 
   /** Model ids one row's picker suggests — live catalog for its provider,
    * MODEL_SUGGESTIONS when that catalog is missing/empty. */
@@ -293,6 +310,25 @@ export default function SubmitPage() {
           : [blankConfig()],
       );
       if (spec.budgets) setBudgets({ ...spec.budgets });
+      // PR24: restore the seed — repo seeds repopulate the inputs; an
+      // archive seed restores as an already-staged id (the server keeps the
+      // bytes under data/uploads, so the id still resolves).
+      const ti = spec.task_inputs;
+      if (ti?.repo_url) {
+        setInputsMode("repo");
+        setRepoUrl(ti.repo_url);
+        setRepoRef(ti.ref ?? "");
+      } else if (ti?.archive_id) {
+        setInputsMode("archive");
+        setStagedUpload({
+          id: ti.archive_id,
+          filename: "previously staged archive",
+          size: 0,
+          sha256: "",
+          kind: "archive",
+          uploaded_at: "",
+        });
+      }
       if (spec.trials && spec.trials >= 1) {
         setTrials(Math.min(8, Math.trunc(spec.trials)));
       }
@@ -490,6 +526,23 @@ export default function SubmitPage() {
       errs.models =
         `Matrix too large: ${configs.length} configs × ${modelCount} models ` +
         `× ${trials} trials = ${sandboxCount} sandboxes (max ${MAX_MATRIX_CELLS}).`;
+    // PR24 inputs: a picked mode must actually resolve to a seed — repo
+    // needs a public https URL (mirrors TaskInputsIn), archive needs the
+    // upload staged (file picked + POST /api/uploads succeeded).
+    if (inputsMode === "repo") {
+      const url = repoUrl.trim();
+      if (!url) {
+        errs.task_inputs =
+          "Enter a repo URL, or switch Inputs back to none.";
+      } else if (!url.startsWith("https://")) {
+        errs.task_inputs = "Repo URL must start with https:// (public git only).";
+      }
+    }
+    if (inputsMode === "archive" && !stagedUpload) {
+      errs.task_inputs = uploading
+        ? "Archive is still uploading…"
+        : "Pick an archive file, or switch Inputs back to none.";
+    }
     configs.forEach((c, i) => {
       const t = parseFloat(c.opts.temperature);
       if (c.opts.temperature.trim() && (!Number.isFinite(t) || t < 0 || t > 2))
@@ -506,7 +559,7 @@ export default function SubmitPage() {
     });
     return errs;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskPrompt, primaryModel, configs, budgets, adapterNames, packNames, sandboxCount, modelCount, trials]);
+  }, [taskPrompt, primaryModel, configs, budgets, adapterNames, packNames, sandboxCount, modelCount, trials, inputsMode, repoUrl, stagedUpload, uploading]);
 
   const isValid = Object.keys(validation).length === 0;
 
@@ -590,6 +643,52 @@ export default function SubmitPage() {
     setConfigs((cs) => (cs.length > 1 ? cs.filter((c) => c.key !== key) : cs));
   }
 
+  /** PR24: stage the picked archive the moment it's chosen — POST
+   * /api/uploads keeps only safe zip/tar member sets. */
+  async function onSeedFile(file: File | null) {
+    if (!file) return;
+    const token = ++uploadToken.current;
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const out = await uploadArchive(file);
+      if (uploadToken.current === token) setStagedUpload(out);
+    } catch (err) {
+      if (uploadToken.current === token) {
+        setStagedUpload(null);
+        setUploadError(
+          err instanceof ApiError
+            ? err.detail
+            : err instanceof Error
+              ? err.message
+              : "Upload failed.",
+        );
+      }
+    } finally {
+      if (uploadToken.current === token) setUploading(false);
+    }
+  }
+
+  function clearSeedUpload() {
+    uploadToken.current += 1; // cancel any in-flight upload
+    setStagedUpload(null);
+    setUploadError(null);
+    setUploading(false);
+  }
+
+  /** Effective task_inputs for createRun — undefined on `none`. */
+  function taskInputsPayload(): TaskInputs | undefined {
+    if (inputsMode === "repo") {
+      const url = repoUrl.trim();
+      const ref = repoRef.trim();
+      return url ? { repo_url: url, ...(ref ? { ref } : {}) } : undefined;
+    }
+    if (inputsMode === "archive" && stagedUpload) {
+      return { archive_id: stagedUpload.id };
+    }
+    return undefined;
+  }
+
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
     setError(null);
@@ -634,6 +733,7 @@ export default function SubmitPage() {
         harness_configs,
         evaluator_model: evalRow.model.trim() || null,
         budgets,
+        task_inputs: taskInputsPayload() ?? null,
         trials,
       });
       // Run-create warnings (new backend field — absent on older backends):
@@ -693,6 +793,113 @@ export default function SubmitPage() {
                 {taskPrompt.trim().length}/100,000 chars — the rubric is generated from this.
               </span>
             )}
+          </div>
+
+          {/* PR24 — task inputs: seed every sandbox's workspace from a
+              public repo or a staged archive before the agent starts. */}
+          <div className="field" style={{ marginTop: "0.9rem" }}>
+            <label className="field__label" htmlFor="inputs_mode">
+              Inputs <span className="faint">(optional — seeds the workspace)</span>
+            </label>
+            <select
+              id="inputs_mode"
+              className="select"
+              value={inputsMode}
+              onChange={(e) =>
+                setInputsMode(e.target.value as "none" | "repo" | "archive")
+              }
+              disabled={submitting}
+            >
+              <option value="none">none — empty workspace</option>
+              <option value="repo">git repo (public, https)</option>
+              <option value="archive">archive upload (.zip / .tar*)</option>
+            </select>
+
+            {inputsMode === "repo" ? (
+              <div className="stack" style={{ marginTop: "0.6rem", gap: "0.5rem" }}>
+                <input
+                  id="task_inputs_repo"
+                  className="input input--mono"
+                  placeholder="https://github.com/owner/repo"
+                  value={repoUrl}
+                  onChange={(e) => setRepoUrl(e.target.value)}
+                  disabled={submitting}
+                  maxLength={2000}
+                />
+                <input
+                  id="task_inputs_ref"
+                  className="input input--mono"
+                  placeholder="ref — branch, tag, or sha (empty = default branch)"
+                  value={repoRef}
+                  onChange={(e) => setRepoRef(e.target.value)}
+                  disabled={submitting}
+                  maxLength={255}
+                />
+                {fieldErrors.task_inputs ? (
+                  <span className="field__error">{fieldErrors.task_inputs}</span>
+                ) : (
+                  <span className="field__hint">
+                    Shallow-cloned at the ref — every sandbox starts from
+                    identical bytes (a seed hash is recorded per cell).
+                  </span>
+                )}
+              </div>
+            ) : null}
+
+            {inputsMode === "archive" ? (
+              <div style={{ marginTop: "0.6rem" }}>
+                {stagedUpload ? (
+                  <div className="row" style={{ flexWrap: "nowrap" }}>
+                    <Badge tone="teal" title={`sha256 ${stagedUpload.sha256}`}>
+                      {stagedUpload.filename}
+                      {stagedUpload.size > 0
+                        ? ` · ${(stagedUpload.size / 1024).toFixed(1)} KiB`
+                        : ""}
+                    </Badge>
+                    <button
+                      type="button"
+                      className="btn btn--sm btn--ghost"
+                      onClick={clearSeedUpload}
+                      disabled={submitting}
+                    >
+                      remove
+                    </button>
+                  </div>
+                ) : (
+                  <input
+                    id="task_inputs_file"
+                    className="input"
+                    type="file"
+                    accept=".zip,.tar,.tar.gz,.tgz,.tar.bz2,.tbz2,.tar.xz,.txz"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0] ?? null;
+                      e.target.value = ""; // same file re-picked must re-upload
+                      void onSeedFile(f);
+                    }}
+                    disabled={submitting || uploading}
+                  />
+                )}
+                {uploading ? (
+                  <span className="field__hint">
+                    <span className="spinner" aria-hidden /> staging archive…
+                  </span>
+                ) : uploadError ? (
+                  <span className="field__error">{uploadError}</span>
+                ) : fieldErrors.task_inputs ? (
+                  <span className="field__error">{fieldErrors.task_inputs}</span>
+                ) : !stagedUpload ? (
+                  <span className="field__hint">
+                    Zip or tar — staged via POST /api/uploads; unsafe members
+                    (traversal, links) are rejected server-side.
+                  </span>
+                ) : (
+                  <span className="field__hint">
+                    Extracted into every sandbox&apos;s workspace before the
+                    agent starts (a seed hash is recorded per cell).
+                  </span>
+                )}
+              </div>
+            ) : null}
           </div>
         </Card>
 

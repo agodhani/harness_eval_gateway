@@ -25,6 +25,7 @@ import {
   type RubricOut,
   type RunOut,
   type RunResults,
+  type SandboxOut,
 } from "@/lib/api";
 import { formatTs, shortId, truncate } from "@/lib/format";
 import {
@@ -62,6 +63,37 @@ function scoreTone(score: number): "good" | "mid" | "bad" {
   if (score >= 8) return "good";
   if (score >= 5) return "mid";
   return "bad";
+}
+
+/** PR24 — one-line seed description for the Task card: the task_inputs
+ * source (repo url + resolved ref, or staged archive name/id) plus the
+ * seed_sha every cell shares. */
+function seedLabel(
+  ti: { repo_url?: string | null; ref?: string | null; archive_id?: string | null } | null | undefined,
+  sandboxes: SandboxOut[],
+): string | null {
+  if (!ti) return null;
+  const hcSeed = sandboxes
+    .map((s) => (s.harness_config ?? {}) as Record<string, unknown>)
+    .map((hc) => hc.seed as Record<string, unknown> | undefined)
+    .find((seed) => seed && typeof seed === "object");
+  const sha = sandboxes
+    .map((s) => (s.harness_config ?? {}) as Record<string, unknown>)
+    .map((hc) => hc.seed_sha)
+    .find((v): v is string => typeof v === "string" && v.length > 0);
+  const shaBit = sha ? ` · seed_sha ${sha.slice(0, 10)}` : "";
+  if (ti.repo_url) {
+    const resolved =
+      (hcSeed?.resolved_sha as string | undefined) ?? ti.ref ?? "HEAD";
+    return `repo ${ti.repo_url} @ ${String(resolved).slice(0, 12)}${shaBit}`;
+  }
+  if (ti.archive_id) {
+    const fname =
+      (hcSeed?.filename as string | undefined) ??
+      `${ti.archive_id.slice(0, 8)}…`;
+    return `archive ${fname}${shaBit}`;
+  }
+  return sha ? `seeded${shaBit}` : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +665,17 @@ export default function RunDetailClient({ runId }: { runId: string }) {
             <dd className="mono">{formatTs(run.started_at)}</dd>
             <dt>Finished</dt>
             <dd className="mono">{formatTs(run.finished_at)}</dd>
+            {seedLabel(run.config?.task_inputs, run.sandboxes) ? (
+              <>
+                <dt>Seed</dt>
+                <dd
+                  className="mono"
+                  title="task inputs — every sandbox's workspace started from these identical bytes"
+                >
+                  {seedLabel(run.config?.task_inputs, run.sandboxes)}
+                </dd>
+              </>
+            ) : null}
           </dl>
         </Card>
 
@@ -703,6 +746,14 @@ export default function RunDetailClient({ runId }: { runId: string }) {
                               {typeof hc.model === "string" && hc.model ? (
                                 <Badge tone="teal" title="participant model">
                                   {hc.model}
+                                </Badge>
+                              ) : null}
+                              {typeof hc.seed_sha === "string" && hc.seed_sha ? (
+                                <Badge
+                                  tone="gray"
+                                  title={`task-input seed ${hc.seed_sha} — identical across every seeded cell`}
+                                >
+                                  seed {String(hc.seed_sha).slice(0, 8)}
                                 </Badge>
                               ) : null}
                               {packs.map((p) => (

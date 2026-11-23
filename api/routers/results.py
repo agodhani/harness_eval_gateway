@@ -289,6 +289,11 @@ class RunResults(BaseModel):
     models: list[str] = Field(default_factory=list)
     evaluator_model: str | None = None
     same_model_eval: bool | None = None
+    # PR24: the task-input seed spec echoed from run.config (a repo_url+ref
+    # or an upload archive_id), or None for unseeded runs. The per-cell
+    # proof rides each SandboxResult.harness_config — ``seed_sha`` is the
+    # identical hash across the matrix; ``seed`` its provenance.
+    task_inputs: dict[str, Any] | None = None
     # PR27: repeats-per-cell submitted on this run (1 = single-shot) — the
     # results matrix groups trial cells under one config × model header.
     trials: int = 1
@@ -741,6 +746,7 @@ def get_run_results(
         models=run_models(cfg, run.model_name),
         evaluator_model=cfg.get("evaluator_model"),
         same_model_eval=cfg.get("same_model_eval"),
+        task_inputs=cfg.get("task_inputs") or None,
         selected_rubric_version=rubric_version,
         rubric_versions=[
             RubricVersionOut(
