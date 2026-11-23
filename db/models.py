@@ -63,9 +63,19 @@ class Run(Base):
     # task_prompt stays the verbatim contract; these are grouping/provenance.
     preset_ref: Mapped[str | None] = mapped_column(String(64), index=True)
     preset_revision: Mapped[int | None] = mapped_column(Integer)
+    # PR26 suite provenance — set when the run was fanned out by
+    # POST /api/suites/{slug}/run: the suite slug, the 0-based index of this
+    # run's task inside suite.yaml, and the shared suite_runs batch row that
+    # groups the fan-out for aggregation.
+    suite_ref: Mapped[str | None] = mapped_column(String(64), index=True)
+    suite_index: Mapped[int | None] = mapped_column(Integer)
+    suite_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("suite_runs.id"), index=True
+    )
 
     sandboxes: Mapped[list[Sandbox]] = relationship(back_populates="run")
     rubrics: Mapped[list[Rubric]] = relationship(back_populates="run")
+    suite_run: Mapped[SuiteRun | None] = relationship(back_populates="runs")
 
 
 class Sandbox(Base):
@@ -94,6 +104,9 @@ class Sandbox(Base):
     events: Mapped[list[Event]] = relationship(back_populates="sandbox")
     scores: Mapped[list[Score]] = relationship(back_populates="sandbox")
     artifacts: Mapped[list[Artifact]] = relationship(back_populates="sandbox")
+    checker_results: Mapped[list[CheckerResult]] = relationship(
+        back_populates="sandbox"
+    )
 
 
 class Event(Base):
@@ -222,6 +235,72 @@ class TaskPreset(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class SuiteRun(Base):
+    """PR26 — one fan-out batch from ``POST /api/suites/{slug}/run``.
+
+    Each suite task becomes an independent Run (own rubric review,
+    sandboxes, eval pass); this row is the grouping handle — ``runs.
+    suite_run_id`` points back here so a suite view can aggregate the
+    task × cell matrix (checker pass rates + judge scores) per batch.
+    """
+
+    __tablename__ = "suite_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    # Suite slug + the suite.yaml ``version`` at submit time — provenance
+    # for which suite revision produced the fan-out.
+    suite_slug: Mapped[str] = mapped_column(String(64), index=True)
+    suite_version: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    runs: Mapped[list[Run]] = relationship(back_populates="suite_run")
+
+
+class CheckerResult(Base):
+    """PR26 — one deterministic checker outcome on a sandbox artifact.
+
+    Suite task checks (file_exists/grep/py_test/output_grep) are measured
+    post-artifact by the orchestrator before each eval pass; results live
+    in their own table — sibling of scores, NOT Score rows — so the
+    objective verdict complements the judge without joining rubric
+    provenance. Re-runs (rescore) append new rows; readers merge
+    newest-wins per (sandbox, check, spec).
+    """
+
+    __tablename__ = "checker_results"
+
+    # Autoincrement pk like events.id — the durable insertion order that
+    # newest-wins merging keys on (created_at is only second-precision on
+    # sqlite).
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("runs.id"), index=True)
+    sandbox_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("sandboxes.id"), index=True
+    )
+    # Checker type — file_exists | grep | py_test | output_grep.
+    check_type: Mapped[str] = mapped_column(String(32))
+    # The declared check spec echoed back ({path}, {path,pattern}, ...).
+    spec: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
+    # pass | fail | skipped (exec env absent — can't measure) | error
+    # (checker/spec failure — a red check is a measurement, not an error).
+    status: Mapped[str] = mapped_column(String(16))
+    # True only for status="pass"; False for fail/skipped/error — kept as a
+    # convenience column so pass-rate SQL stays trivial.
+    passed: Mapped[bool] = mapped_column(default=False)
+    detail: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    sandbox: Mapped[Sandbox] = relationship(back_populates="checker_results")
 
 
 class Artifact(Base):

@@ -34,7 +34,15 @@ from api.schemas import (
     RunSummary,
     SandboxOut,
 )
-from db.models import Artifact, Event, Rubric, Run, Sandbox, Score
+from db.models import (
+    Artifact,
+    CheckerResult,
+    Event,
+    Rubric,
+    Run,
+    Sandbox,
+    Score,
+)
 from orchestrator import adapters as orch_adapters
 from orchestrator import events as orch_events
 from orchestrator import pacing, provision, runner, state_machine
@@ -122,6 +130,9 @@ def _run_out(
         warnings=list(warnings or []),
         preset_ref=run.preset_ref,
         preset_revision=run.preset_revision,
+        suite_ref=run.suite_ref,
+        suite_index=run.suite_index,
+        suite_run_id=run.suite_run_id,
         sandboxes=[SandboxOut.model_validate(s) for s in _run_sandboxes(session, run.id)],
         rubric=RubricOut.model_validate(rubric) if rubric else None,
     )
@@ -173,15 +184,13 @@ def _validate_harness_configs(body: RunCreate) -> None:
 # ---------------------------------------------------------------------------
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
-async def create_run(body: RunCreate, session: DbSession) -> RunOut:
-    """Submit a run: persist the spec, kick off rubric drafting in background."""
-    _validate_harness_configs(body)
-    # Best-effort provider-catalog check — warnings on absent models, a hard
-    # 422 on provider-reported tool-capability mismatches. Catalog fetch
-    # failures skip validation entirely (offline tolerance).
-    warnings = await modelcheck.validate_run_models(body, settings=get_settings())
+def _persist_run(session: Session, body: RunCreate) -> Run:
+    """Build the run config, resolve the preset ref, insert the Run row.
 
+    Flush-only — the caller commits so multi-run batches (PR26 suite
+    fan-out) stay atomic. Returns the pending Run (``run.id`` is assigned
+    by the flush).
+    """
     evaluator_model = body.evaluator_model or body.model_name
     # PR14: persist the run's model list ([model_name] + deduped extras) so
     # lifecycle/results/analytics can expand the matrix without re-parsing
@@ -239,6 +248,20 @@ async def create_run(body: RunCreate, session: DbSession) -> RunOut:
         preset_revision=preset_revision,
     )
     session.add(run)
+    session.flush()
+    return run
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_run(body: RunCreate, session: DbSession) -> RunOut:
+    """Submit a run: persist the spec, kick off rubric drafting in background."""
+    _validate_harness_configs(body)
+    # Best-effort provider-catalog check — warnings on absent models, a hard
+    # 422 on provider-reported tool-capability mismatches. Catalog fetch
+    # failures skip validation entirely (offline tolerance).
+    warnings = await modelcheck.validate_run_models(body, settings=get_settings())
+
+    run = _persist_run(session, body)
     session.commit()
 
     runner.start_rubric_task(run.id)
@@ -250,15 +273,19 @@ async def list_runs(
     session: DbSession,
     run_status: Annotated[str | None, Query(alias="status")] = None,
     preset: Annotated[str | None, Query()] = None,
+    suite: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[RunSummary]:
-    """Runs newest-first; ``?status=``/``?preset=`` filter, paginated."""
+    """Runs newest-first; ``?status=``/``?preset=``/``?suite=`` filters,
+    paginated."""
     stmt = select(Run).order_by(Run.created_at.desc()).limit(limit).offset(offset)
     if run_status:
         stmt = stmt.where(Run.status == run_status)
     if preset:
         stmt = stmt.where(Run.preset_ref == preset.strip().lower())
+    if suite:
+        stmt = stmt.where(Run.suite_ref == suite.strip().lower())
     runs = session.execute(stmt).scalars().all()
 
     run_ids = [r.id for r in runs]
@@ -289,6 +316,9 @@ async def list_runs(
             finished_at=r.finished_at,
             sandbox_count=counts.get(r.id, 0),
             preset_ref=r.preset_ref,
+            suite_ref=r.suite_ref,
+            suite_index=r.suite_index,
+            suite_run_id=r.suite_run_id,
             queue_position=positions.get(r.id),
         )
         for r in runs
@@ -397,6 +427,9 @@ def _hard_delete_run(session: Session, run: Run) -> None:
     sandbox_ids = select(Sandbox.id).where(Sandbox.run_id == run.id)
     session.execute(delete(Score).where(Score.sandbox_id.in_(sandbox_ids)))
     session.execute(delete(Artifact).where(Artifact.sandbox_id.in_(sandbox_ids)))
+    session.execute(
+        delete(CheckerResult).where(CheckerResult.run_id == run.id)
+    )
     session.execute(delete(Event).where(Event.run_id == run.id))
     # Rubric.parent_id is a self-FK — a single DELETE of the run's rows
     # removes parent + child versions together.

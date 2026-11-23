@@ -34,10 +34,11 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from db.models import Event, Rubric, Run, Sandbox, Score
+from db.models import CheckerResult, Event, Rubric, Run, Sandbox, Score
 from gateway.creds import mint_cred
 from gateway.metering import tokens_used
 from sandbox.runtime import SandboxRuntime
+from scoring import checkers
 
 from . import monitor, pacing, provision, state_machine
 from .events import emit
@@ -301,6 +302,147 @@ def _import_evaluator() -> EvaluatorFn:
     return evaluate_sandbox
 
 
+# ---------------------------------------------------------------------------
+# deterministic suite checks (PR26)
+# ---------------------------------------------------------------------------
+
+
+def _suite_check_specs(
+    run: Run, settings: Any
+) -> tuple[list[dict[str, Any]], Path | None]:
+    """The deterministic checks declared by the run's suite task.
+
+    Returns ``([], None)`` for non-suite runs, an unresolvable/renamed
+    suite, a dropped task index, or a task with no ``check:`` block —
+    checkers are strictly opt-in per suite task. The suite is re-read on
+    every eval pass so a rescore measures the CURRENT suite.yaml spec.
+    """
+    if not getattr(run, "suite_ref", None) or run.suite_index is None:
+        return [], None
+    from api import suites as suite_store  # lazy — keep api deps out of module import
+
+    root = getattr(settings, "BENCHMARK_SUITES_DIR", None) or "benchmark_suites"
+    suite = suite_store.get_suite(root, run.suite_ref)
+    if suite is None:
+        log.warning(
+            "run %s: suite %r no longer resolvable — checks skipped",
+            run.id,
+            run.suite_ref,
+        )
+        return [], None
+    task = suite.task(run.suite_index)
+    if task is None:
+        log.warning(
+            "run %s: suite %r has no task %s — checks skipped",
+            run.id,
+            run.suite_ref,
+            run.suite_index,
+        )
+        return [], None
+    return task.checks(), suite.suite_dir
+
+
+async def _run_suite_checks(
+    *,
+    session_factory: sessionmaker[Session],
+    run_id: uuid.UUID,
+    sandbox_id: uuid.UUID,
+    artifact_dir: Path,
+    entries: list[dict[str, Any]],
+    suite_dir: Path | None,
+) -> None:
+    """Measure the suite task's deterministic checks on one artifact —
+    post-snapshot, pre-judge. Blocking docker-wait work runs in a worker
+    thread; rows + the checkpoint event are written on the loop thread
+    (the sqlite :memory: single-connection rule). A red check is a
+    measurement — it lands as a ``fail`` row, never an exception, and
+    never blocks the eval pass.
+    """
+    try:
+        outcomes = await asyncio.to_thread(
+            checkers.run_checks,
+            entries,
+            artifact_dir=artifact_dir,
+            suite_dir=suite_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 — run_checks traps per-entry;
+        # this is a catastrophic guard (e.g. thread-pool failure), so the
+        # checker subsystem can never take down the eval pass.
+        log.warning("suite checks crashed for sandbox %s: %s", sandbox_id, exc)
+        _emit_run_event(
+            session_factory,
+            run_id,
+            sandbox_id=sandbox_id,
+            event_type="error",
+            payload={
+                "stage": "suite_checks",
+                "message": f"{type(exc).__name__}: {exc}",
+            },
+        )
+        return
+
+    counts = {"pass": 0, "fail": 0, "skipped": 0, "error": 0}
+    for o in outcomes:
+        counts[o.status] = counts.get(o.status, 0) + 1
+    with session_factory() as session:
+        for o in outcomes:
+            session.add(
+                CheckerResult(
+                    run_id=run_id,
+                    sandbox_id=sandbox_id,
+                    check_type=o.check_type,
+                    spec=o.spec,
+                    status=o.status,
+                    passed=o.passed,
+                    detail=o.detail,
+                )
+            )
+        emit(
+            session,
+            run_id=run_id,
+            sandbox_id=sandbox_id,
+            event_type="checkpoint",
+            payload={
+                "stage": "suite_checks",
+                "passed": counts["pass"],
+                "failed": counts["fail"],
+                "skipped": counts["skipped"],
+                "errors": counts["error"],
+                "checks": [
+                    {
+                        "check": o.check_type,
+                        "status": o.status,
+                        "detail": o.detail,
+                    }
+                    for o in outcomes
+                ],
+            },
+        )
+        # py_test results additionally mirror the test_execution convention
+        # (eval_exec / generated_tests emit it) so the timeline shows the
+        # locked-container measurement the same way.
+        for o in outcomes:
+            if o.test_summary:
+                s = o.test_summary
+                emit(
+                    session,
+                    run_id=run_id,
+                    sandbox_id=sandbox_id,
+                    event_type="test_execution",
+                    payload={
+                        "phase": "suite_check",
+                        "ok": bool(s.get("ok")),
+                        "collected": s.get("collected", 0),
+                        "passed": s.get("passed", 0),
+                        "failed": s.get("failed", 0),
+                        "errors": s.get("errors", 0),
+                        "skipped": s.get("skipped", 0),
+                        "duration_seconds": s.get("duration_seconds"),
+                    },
+                )
+        session.commit()
+
+
 async def _evaluate_all(
     *,
     session_factory: sessionmaker[Session],
@@ -355,8 +497,22 @@ async def _evaluate_all(
     # inside the api container is /app (not daemon-visible).
     eval_root = Path(runtime.artifact_root).parent / "eval"
     retries = int(getattr(settings, "EVAL_SCORE_RETRIES", 1))
+    # PR26: deterministic checks the run's suite task declares — resolved
+    # once per eval pass (a rescore re-reads the current suite.yaml).
+    check_entries, check_suite_dir = _suite_check_specs(run, settings)
     for sb in sandboxes:
         artifact_dir = Path(sb.artifact_path)  # type: ignore[arg-type]
+        if check_entries:
+            # Post-artifact step — measured before the judge runs so the
+            # objective verdict is persisted even if eval later fails.
+            await _run_suite_checks(
+                session_factory=session_factory,
+                run_id=run.id,
+                sandbox_id=sb.id,
+                artifact_dir=artifact_dir,
+                entries=check_entries,
+                suite_dir=check_suite_dir,
+            )
         kwargs = {
             "run_id": run.id,
             "sandbox_id": sb.id,

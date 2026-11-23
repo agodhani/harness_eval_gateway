@@ -287,6 +287,12 @@ class RunOut(BaseModel):
     # from (null for freeform prompts) + the revision snapshot at submit.
     preset_ref: str | None = None
     preset_revision: int | None = None
+    # PR26 suite provenance — set on runs fanned out by
+    # POST /api/suites/{slug}/run: suite slug, the task's index inside
+    # suite.yaml, and the shared suite_runs batch id.
+    suite_ref: str | None = None
+    suite_index: int | None = None
+    suite_run_id: uuid.UUID | None = None
     # 1-based position among ``queued`` runs (approval/queue-entry order) —
     # set only while the run is parked; null in every other status.
     queue_position: int | None = None
@@ -315,6 +321,11 @@ class RunSummary(BaseModel):
     # PR22: preset slug the task came from (null for freeform prompts) —
     # drives the list view's preset column/filter.
     preset_ref: str | None = None
+    # PR26: suite slug the run was fanned out from (+ its task index and
+    # batch id) — drives the list view's suite filter/badge.
+    suite_ref: str | None = None
+    suite_index: int | None = None
+    suite_run_id: uuid.UUID | None = None
     # Same contract as RunOut.queue_position — null unless status=queued.
     queue_position: int | None = None
 
@@ -793,3 +804,201 @@ class PresetAnalytics(BaseModel):
     mean_overall_score: float | None = None
     n_scored: int = 0
     trend: list[PresetTrendPoint] = Field(default_factory=list)  # oldest first
+
+
+# ---------------------------------------------------------------------------
+# PR26 — benchmark suites + deterministic checkers (api/routers/suites.py)
+# ---------------------------------------------------------------------------
+
+
+class SuiteCheckOut(BaseModel):
+    """One declared deterministic check on a suite task — ``check`` is the
+    checker type (``file_exists`` | ``grep`` | ``py_test`` |
+    ``output_grep``), ``spec`` the checker's declared parameters."""
+
+    check: str
+    spec: dict[str, Any] = Field(default_factory=dict)
+
+
+class SuiteTaskOut(BaseModel):
+    """One entry of a suite.yaml task list — ``preset_ref`` XOR ``prompt``.
+
+    ``adapter`` optionally restricts the task to harness configs selecting
+    that adapter (e.g. ``miniloop`` container cells vs the PR25 ``prompt``
+    cell); null = the task runs on every submitted config.
+    """
+
+    index: int  # 0-based position inside the suite (== runs.suite_index)
+    id: str  # declared id, else the preset slug, else ``task-<index>``
+    preset_ref: str | None = None
+    prompt: str | None = None
+    adapter: str | None = None
+    checks: list[SuiteCheckOut] = Field(default_factory=list)
+
+
+class SuiteRunRef(BaseModel):
+    """A ``suite_runs`` batch row — one fan-out of a suite."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    suite_slug: str
+    suite_version: int | None = None
+    created_at: datetime
+    run_count: int = 0  # child runs in the batch (filled by the router)
+
+
+class SuiteOut(BaseModel):
+    """One vendored benchmark suite (``benchmark_suites/<slug>/``)."""
+
+    slug: str
+    version: int
+    title: str
+    description: str = ""
+    task_count: int
+    checks_count: int = 0  # declared checkers across all tasks
+    # Browse aggregate — fan-out batches launched against this suite.
+    suite_runs_count: int = 0
+
+
+class SuiteDetailOut(SuiteOut):
+    """GET /api/suites/{slug} — the suite plus its task entries and the
+    most recent fan-out batches."""
+
+    tasks: list[SuiteTaskOut] = Field(default_factory=list)
+    recent_runs: list[SuiteRunRef] = Field(default_factory=list)
+
+
+class SuiteRunIn(BaseModel):
+    """POST /api/suites/{slug}/run body — the shared run spec every suite
+    task fans out with (same fields as ``RunCreate`` minus the task text,
+    which each suite task supplies via preset_ref or an inline prompt)."""
+
+    model_name: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
+        min_length=1, max_length=255
+    )
+    models: (
+        list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]]
+        | None
+    ) = Field(default=None, max_length=8)
+    harness_configs: list[HarnessConfigIn] = Field(min_length=1, max_length=8)
+    evaluator_model: Annotated[str, StringConstraints(strip_whitespace=True)] | None = (
+        Field(default=None, max_length=255)
+    )
+    budgets: BudgetsIn = Field(default_factory=BudgetsIn)
+
+    @model_validator(mode="after")
+    def _normalize_models(self) -> SuiteRunIn:
+        """Same dedupe/blank-drop + matrix cap as ``RunCreate`` — each task
+        expands configs × models the same way a normal submit would."""
+        if self.models is not None:
+            seen = {self.model_name}
+            cleaned: list[str] = []
+            for m in self.models:
+                if m and m not in seen:
+                    seen.add(m)
+                    cleaned.append(m)
+            self.models = cleaned or None
+        model_count = 1 + len(self.models or [])
+        pinned = sum(1 for hc in self.harness_configs if hc.model)
+        cells = pinned + (len(self.harness_configs) - pinned) * model_count
+        if cells > MAX_MATRIX_CELLS:
+            raise ValueError(
+                f"run matrix would spawn {cells} sandboxes "
+                f"({len(self.harness_configs)} configs × "
+                f"{model_count} models); "
+                f"max is {MAX_MATRIX_CELLS}"
+            )
+        return self
+
+
+class SuiteRunChildOut(BaseModel):
+    """One run created by a suite fan-out."""
+
+    run_id: uuid.UUID
+    suite_index: int
+    task_id: str
+    preset_ref: str | None = None
+    status: str = "submitted"
+
+
+class SuiteRunOut(BaseModel):
+    """201 response to POST /api/suites/{slug}/run — the batch row plus the
+    fanned-out child runs (order = suite.yaml task order)."""
+
+    id: uuid.UUID
+    suite_slug: str
+    suite_version: int | None = None
+    runs: list[SuiteRunChildOut] = Field(default_factory=list)
+    # Submit-time advisory warnings from the model-catalog check (same
+    # contract as RunOut.warnings — computed once for the shared spec).
+    warnings: list[str] = Field(default_factory=list)
+
+
+class CheckerResultOut(BaseModel):
+    """One deterministic checker outcome — pass/fail/skipped/error +
+    detail. ``spec`` echoes the declared check so the UI can label it."""
+
+    check: str
+    spec: dict[str, Any] = Field(default_factory=dict)
+    status: str  # pass | fail | skipped | error
+    passed: bool = False
+    detail: str = ""
+    created_at: datetime | None = None
+
+
+class SuiteCellChecksOut(BaseModel):
+    """Checker roll-up for one suite cell — counts by status plus the
+    per-check detail rows (newest-wins, like the score merge)."""
+
+    total: int = 0
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    errors: int = 0
+    # passed / (passed + failed) — skipped/error checks aren't measured
+    # outcomes; null when nothing ran to a verdict.
+    pass_rate: float | None = None
+    checks: list[CheckerResultOut] = Field(default_factory=list)
+
+
+class SuiteCellOut(BaseModel):
+    """One task × cell result inside a suite run — a sandbox's judge score
+    beside its deterministic checker roll-up."""
+
+    sandbox_id: uuid.UUID
+    name: str | None = None
+    # Column label — config name or ``<adapter>[ · packs][ · model]`` — the
+    # suite view groups cells across tasks by this key.
+    label: str
+    model: str = ""
+    status: str
+    terminal_reason: str | None = None
+    # Newest-wins judge ``overall`` score (null while unscored).
+    judge_overall: float | None = None
+    checks: SuiteCellChecksOut = Field(default_factory=SuiteCellChecksOut)
+
+
+class SuiteRunTaskOut(BaseModel):
+    """One suite task's run inside a batch — task provenance + its cells."""
+
+    run_id: uuid.UUID
+    suite_index: int
+    task_id: str
+    preset_ref: str | None = None
+    status: str
+    created_at: datetime | None = None
+    finished_at: datetime | None = None
+    cells: list[SuiteCellOut] = Field(default_factory=list)
+
+
+class SuiteRunResults(BaseModel):
+    """GET /api/suite-runs/{id} — the task × cell aggregation for one
+    fan-out batch: per task, per sandbox cell, the judge ``overall`` score
+    and the deterministic checker pass rate."""
+
+    id: uuid.UUID
+    suite_slug: str
+    suite_version: int | None = None
+    created_at: datetime | None = None
+    runs: list[SuiteRunTaskOut] = Field(default_factory=list)

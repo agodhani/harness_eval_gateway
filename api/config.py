@@ -82,6 +82,11 @@ class Settings(BaseSettings):
     # body). Same repo-root anchoring: the api image bakes the repo, so
     # adding a committed preset needs no extra config.
     TASK_PRESETS_DIR: Path = Path(__file__).resolve().parents[1] / "task_presets"
+    # PR26 vendored benchmark suites (<root>/<slug>/suite.yaml + optional
+    # py_test dirs). Same repo-root anchoring as task_presets.
+    BENCHMARK_SUITES_DIR: Path = (
+        Path(__file__).resolve().parents[1] / "benchmark_suites"
+    )
     # Root for USER-IMPORTED skill packs (F11). None => derived from
     # ARTIFACT_ROOT as <data>/skillpacks (sibling of artifacts/ + sandboxes/,
     # so compose's ./data:/data mount + SandboxRuntime.to_host_path cover it).

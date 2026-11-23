@@ -27,6 +27,7 @@ from api.routers import (
     results,
     runs,
     skillpacks,
+    suites,
 )
 from orchestrator import runner
 
@@ -63,6 +64,7 @@ def create_app() -> FastAPI:
     app.include_router(preview.router)
     app.include_router(skillpacks.router)
     app.include_router(presets.router)
+    app.include_router(suites.router)
     return app
 
 
