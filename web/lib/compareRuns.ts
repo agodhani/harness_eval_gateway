@@ -57,8 +57,6 @@ export function configSummary(hc: Record<string, unknown> | undefined): string {
   bits.push(label);
   const extra = String(hc?.system_prompt_extra ?? "").trim();
   if (extra) bits.push(`'${extra.length <= 32 ? extra : `${extra.slice(0, 32)}…`}'`);
-  const pin = String(hc?.model ?? "").trim();
-  if (pin && !label.includes(pin)) bits.push(`pin:${pin}`);
   const opts = hc?.model_options;
   if (opts && typeof opts === "object") {
     const keys = Object.entries(opts as Record<string, unknown>)

@@ -107,6 +107,7 @@ from api.schemas import (
 from db.models import Event, Run, Sandbox, Score
 from evaluator.scores import OVERALL_DIMENSION
 from orchestrator.matrix import cell_key, run_models, sandbox_model, trial_index
+from orchestrator.pacing import ACTIVE_RUN_STATES
 
 router = APIRouter(tags=["analytics"])
 
@@ -1015,6 +1016,7 @@ def get_leaderboard(
             .order_by(
                 Score.created_at.asc(),
                 Score.seq.asc().nulls_first(),
+                Score.rubric_version.asc().nulls_first(),
                 Score.id.asc(),
             )
         ).all()
@@ -1074,8 +1076,6 @@ def get_leaderboard(
 # PR36 — dashboard summary (GET /api/analytics/summary)
 # ---------------------------------------------------------------------------
 
-#: Run statuses the queue card reports as in-flight (pacing's single slot).
-_ACTIVE_RUN_STATUSES = ("provisioning", "running", "evaluating")
 #: Submitted-but-not-executing — parked before the pacing queue.
 _AWAITING_RUN_STATUSES = ("submitted", "rubric_review")
 
@@ -1178,7 +1178,6 @@ def get_dashboard_summary(
     week_turns = [0] * weeks
     week_cost = [0.0] * weeks
     week_unpriced = [0] * weeks
-    week_has_unpriced = [False] * weeks
 
     for run in runs:
         if run.created_at is None:
@@ -1232,7 +1231,6 @@ def get_dashboard_summary(
             totals.unpriced_llm_turns += 1
             if idx is not None:
                 week_unpriced[idx] += 1
-                week_has_unpriced[idx] = True
         else:
             cost = estimate_cost_usd(
                 price,
@@ -1288,7 +1286,7 @@ def get_dashboard_summary(
             started_at=r.started_at,
         )
         for r in runs
-        if r.status in _ACTIVE_RUN_STATUSES
+        if r.status in ACTIVE_RUN_STATES
     ]
     queued_ids = (
         session.execute(
@@ -1384,7 +1382,7 @@ def get_dashboard_summary(
                 runs=week_runs[i],
                 llm_turns=week_turns[i],
                 estimated_cost_usd=(
-                    None if week_has_unpriced[i] else round(week_cost[i], 6)
+                    None if week_unpriced[i] > 0 else round(week_cost[i], 6)
                 ),
                 unpriced_llm_turns=week_unpriced[i],
             )

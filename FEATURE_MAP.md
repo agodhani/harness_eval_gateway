@@ -1950,9 +1950,10 @@ rigged before it starts.
   `delta` (null-propagating).
 - **Shared boards** (`web/components/LeaderboardBoards.tsx`): rank,
   label (+shared family name), adapter badge, mean ± sd, n/sandboxes,
-  runs — used by `/leaderboard` AND `/presets/[slug]`, which now embeds
-  the preset-filtered global board (with a synthesised fallback from
-  the preset-local aggregates when the endpoint isn't there).
+  runs — used by `/leaderboard` AND `/presets/[slug]`, which embeds
+  the preset-filtered global board (a failed fetch renders an inline
+  error; while loading, the preset-local aggregates' scored counts
+  hint what's coming).
 - **Where:** `api/routers/analytics.py`, `api/schemas.py`,
   `tests/unit/api/test_leaderboard.py`, `web/lib/api.ts`,
   `web/lib/compareRuns.ts` + `.test.ts`, `web/components/
@@ -1960,7 +1961,7 @@ rigged before it starts.
   `web/app/presets/[slug]/PresetDetailClient.tsx`,
   `web/components/SiteHeader.tsx` (nav gains Compare + Leaderboard).
 - **Verify:**
-  - Unit: `tests/unit/api/test_leaderboard.py` (8 tests — model/config
+  - Unit: `tests/unit/api/test_leaderboard.py` (10 tests — model/config
     ranking + sample sd, n vs sandboxes coverage, preset/date/min-trials
     filters, newest-wins, empty scope) against per-test file-backed
     SQLite (the shared :memory: engine leaks rows across tests).
