@@ -923,7 +923,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     denormalized `rubric_version` (stamped at write time, survives rubric
     lookups). `GET /api/runs/{id}/results?rubric_version=N` filters the
     matrix to one version's scores; the default view is per-sandbox
-    newest-wins (created_at, seq insertion-order tiebreak). `GET
+    newest-wins (asc created_at, seq, rubric_version, id → last row
+    wins). `GET
     /api/runs/{id}/rubrics`
     lists versions + score counts; `GET /api/rubrics/{id}` returns one
     version incl. content (prefills the editor).
@@ -1715,9 +1716,11 @@ rigged before it starts.
   `preset_ref`/`preset_revision`.
 - **Web:** `/presets` index (search + category chips, runs count +
   last-run mean columns, "run →" submit link); `/presets/[slug]` detail
-  (prompt, KPI strip, trend chart via the analysis recharts theme,
-  per-model + per-config leaderboards, run history, edit/delete for user
-  presets); submit page custom|preset toggle + scrollable picker
+  (prompt, KPI strip + loading hints from the local analytics
+  aggregates, trend chart via the analysis recharts theme, the
+  preset-filtered global leaderboard boards — F27 embed, run history,
+  edit/delete for user presets); submit page custom|preset toggle +
+  scrollable picker
   (`.preset-pick`), `?preset=` prefill, "edit as custom copy" detach,
   suggested adapter/model "apply to empty fields", "save as preset"
   dialog (`SavePresetDialog` — shared, also edit mode); run detail shows
