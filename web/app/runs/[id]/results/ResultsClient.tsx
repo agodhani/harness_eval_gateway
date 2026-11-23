@@ -866,8 +866,14 @@ export default function ResultsClient({ runId }: { runId: string }) {
               ↻ Resubmit
             </button>
           ) : null}
-          {/* PR35 — export downloads (json/csv) + share-link mint/revoke. */}
-          <ExportButtons runId={runId} shareUrl={run?.share_url ?? null} />
+          {/* PR35 — export downloads (json/csv) + share-link mint/revoke.
+           * `key` remounts per run — the minted-link state is run-scoped
+           * (this client survives /runs/A → /runs/B nav unmounted). */}
+          <ExportButtons
+            key={runId}
+            runId={runId}
+            shareUrl={run?.share_url ?? null}
+          />
         </div>
       </div>
 
