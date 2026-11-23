@@ -50,6 +50,8 @@ function matchesQuery(r: RunSummary, q: string): boolean {
     ...(r.adapters ?? []),
     // PR22 — preset provenance on the row.
     ...(r.preset_ref ? [r.preset_ref] : []),
+    // PR26 — suite provenance (slug the run was fanned out from).
+    ...(r.suite_ref ? [r.suite_ref] : []),
   ];
   return hay.some((h) => h.toLowerCase().includes(q));
 }
@@ -392,6 +394,20 @@ export default function RunsPage() {
                         ) : (
                           <span className="faint">—</span>
                         )}
+                        {r.suite_ref ? (
+                          <div className="faint" style={{ fontSize: "0.68rem" }}>
+                            <Link
+                              href={
+                                r.suite_run_id
+                                  ? `/suite-runs/${r.suite_run_id}`
+                                  : `/suites/${r.suite_ref}`
+                              }
+                              title={`suite task #${r.suite_index ?? "?"} — batch ${r.suite_run_id ?? ""}`}
+                            >
+                              suite:{r.suite_ref}
+                            </Link>
+                          </div>
+                        ) : null}
                       </td>
                       <td className="num">
                         {r.model_name}

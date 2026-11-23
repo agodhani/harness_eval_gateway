@@ -32,6 +32,7 @@ import {
   listEvents,
   runModels,
   TERMINAL_RUN_STATUSES,
+  type CheckerResult,
   type DimensionScore,
   type EventOut,
   type RubricDimension,
@@ -118,6 +119,93 @@ function scoreTone(score: number): "good" | "mid" | "bad" {
   if (score >= 8) return "good";
   if (score >= 5) return "mid";
   return "bad";
+}
+
+/** PR26 — deterministic suite checker status → badge tone + glyph. */
+function checkTone(
+  status: string,
+): { tone: "green" | "red" | "amber" | "gray"; glyph: string } {
+  switch (status) {
+    case "pass":
+      return { tone: "green", glyph: "✓" };
+    case "fail":
+      return { tone: "red", glyph: "✗" };
+    case "skipped":
+      return { tone: "gray", glyph: "⊘" };
+    default:
+      return { tone: "amber", glyph: "!" };
+  }
+}
+
+/** One checker_results row — ✓/✗/⊘/! glyph + check type + detail. */
+function CheckerBadge({ c }: { c: CheckerResult }) {
+  const { tone, glyph } = checkTone(c.status);
+  return (
+    <Badge
+      tone={tone}
+      title={`${c.check} ${JSON.stringify(c.spec)}${c.detail ? ` — ${c.detail}` : ""}`}
+    >
+      {glyph} {c.check}
+      {c.detail ? (
+        <span className="faint" style={{ marginLeft: "0.3rem" }}>
+          {c.detail.length > 60 ? `${c.detail.slice(0, 60)}…` : c.detail}
+        </span>
+      ) : null}
+    </Badge>
+  );
+}
+
+/** PR26 — per-sandbox deterministic checker card row (suite-fanned runs). */
+function CheckerRow({ sb }: { sb: SandboxResult }) {
+  const results = sb.checker_results ?? [];
+  const s = sb.suite ?? null;
+  if (results.length === 0 && !s) return null;
+  return (
+    <tr>
+      <td className="num" title={sb.sandbox_id}>
+        {shortId(sb.sandbox_id)}
+        {sb.name ? (
+          <div className="faint" style={{ fontSize: "0.7rem" }}>
+            {sb.name}
+          </div>
+        ) : null}
+      </td>
+      <td className="num">
+        {s ? (
+          <>
+            <Badge tone={s.passed === s.total && s.total > 0 ? "green" : s.failed > 0 ? "red" : "gray"}>
+              {s.passed}/{s.total}
+            </Badge>
+            <div className="faint" style={{ fontSize: "0.68rem" }}>
+              {s.pass_rate != null ? `${Math.round(s.pass_rate * 100)}% · ` : ""}
+              ⊘{s.skipped} !{s.errors}
+            </div>
+          </>
+        ) : (
+          <span className="faint">—</span>
+        )}
+      </td>
+      <td className="num">
+        {s?.suite_pass != null ? (
+          <span
+            className={`score-value score-value--${scoreTone(s.suite_pass)}`}
+            title="suite_pass score row — checker pass rate on the 0–10 scale"
+          >
+            {s.suite_pass}
+          </span>
+        ) : (
+          <span className="score-na">—</span>
+        )}
+      </td>
+      <td>
+        <div className="chip-row">
+          {results.map((c, i) => (
+            <CheckerBadge key={i} c={c} />
+          ))}
+        </div>
+      </td>
+    </tr>
+  );
 }
 
 /** Synthesize SandboxResult[] from per-sandbox ScoreOut rows. */
@@ -745,6 +833,11 @@ export default function ResultsClient({ runId }: { runId: string }) {
               {shortId(runId, 13)}…
             </span>
             {status ? <Badge tone={statusTone(status)}>{status}</Badge> : null}
+            {run?.suite_ref ? (
+              <Badge tone="violet" title={`Suite task #${run.suite_index ?? "?"} in ${run.suite_ref}`}>
+                suite {run.suite_ref}
+              </Badge>
+            ) : null}
           </div>
           <p className="subtitle">
             <Link href={`/runs/${runId}`}>← run detail</Link>
@@ -752,6 +845,12 @@ export default function ResultsClient({ runId }: { runId: string }) {
             <Link href={`/runs/${runId}/timeline`}>timeline</Link>
             {" · "}
             <Link href={`/runs/${runId}/analysis`}>analysis</Link>
+            {run?.suite_run_id ? (
+              <>
+                {" · "}
+                <Link href={`/suite-runs/${run.suite_run_id}`}>suite batch</Link>
+              </>
+            ) : null}
             {run?.task_prompt ? <> · {run.task_prompt.slice(0, 80)}{run.task_prompt.length > 80 ? "…" : ""}</> : null}
           </p>
         </div>
@@ -1049,6 +1148,36 @@ export default function ResultsClient({ runId }: { runId: string }) {
               </div>
               )}
             </Card>
+
+            {sandboxes.some(
+              (sb) => (sb.checker_results?.length ?? 0) > 0 || sb.suite,
+            ) ? (
+              <Card title="Deterministic checks" className="card--flush">
+                <div className="table-wrap">
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th>Sandbox</th>
+                        <th>Pass</th>
+                        <th>suite_pass</th>
+                        <th>Checks</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sandboxes.map((sb) => (
+                        <CheckerRow key={sb.sandbox_id} sb={sb} />
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="faint" style={{ fontSize: "0.72rem", margin: "0.5rem 0 0" }}>
+                  Objective outcomes from the suite&apos;s deterministic checkers
+                  — pass/fail/skipped/error measured post-artifact, kept beside
+                  (never folded into) judge scores except the explicit{" "}
+                  <code>suite_pass</code> row.
+                </p>
+              </Card>
+            ) : null}
 
             {modelGroups.length > 1 ? (
               <Card title="By model" className="card--flush">

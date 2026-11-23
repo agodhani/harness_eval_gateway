@@ -35,6 +35,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F20 | Trials per cell + per-config model options (config × model × trials expansion, `mean ± sample sd (n=N)` grouped results + cell rollups, adapter-filtered `model_options`) | ✅ | `api/schemas.py`, `api/routers/{runs,results,analytics}.py`, `orchestrator/{matrix,lifecycle,provision,prompt_cell,adapters}.py`, `adapters/common/contract.py`, `db/migrations/versions/d7e9f1a3b5c7_runs_trials.py`, `web/lib/{api,trialGroups,resubmit}.ts`, `web/app/submit/page.tsx`, `web/app/runs/[id]/results/`, `web/app/runs/[id]/analysis/` | `tests/unit/orchestrator/test_matrix.py`, `test_provision.py`, `tests/unit/api/test_runs.py`, `test_analytics.py`, `tests/unit/db/test_migrations.py` |
 | F21 | Budgets & pricing accuracy (per-cell `sandbox_max_tokens`/`max_cost_usd` caps; `model_prices` glob rate table layered over the static `PRICE_TABLE` via `GET/PUT/DELETE /api/prices` + OpenRouter sync) | ✅ | `api/pricing.py` (`PriceBook`), `api/routers/prices.py`, `db/models.py::ModelPriceRow`, `gateway/creds.py`, `gateway/metering.py`, `orchestrator/monitor.py`, `web/components/AddRate.tsx`, `web/lib/api.ts` | `tests/unit/api/test_pricing.py`, `test_prices.py`, `tests/unit/gateway/` (creds/metering/proxy), `tests/unit/orchestrator/` (monitor/provision), `tests/unit/db/test_migrations.py` |
 | F22 | Task preset library (vendored md + user presets, preset_ref on runs, /presets browse + detail) | ✅ | `task_presets/`, `api/presets.py`, `api/routers/presets.py`, `api/routers/runs.py` (preset_ref), `db/models.py` (`TaskPreset`, `Run.preset_*`), `web/app/presets/`, `web/components/SavePresetDialog.tsx`, `web/app/submit/page.tsx` | `tests/unit/api/test_presets.py`, `tests/unit/db/test_migrations.py`, `web/lib/resubmit.test.ts` |
+| F23 | Benchmark suites + deterministic checkers (vendored suite.yaml fan-out, objective pass/fail beside judge scores, batch aggregation) | ✅ | `benchmark_suites/`, `api/suites.py`, `api/routers/suites.py`, `scoring/checkers.py`, `db/models.py` (`SuiteRun`, `CheckerResult`, `Run.suite_*`), `orchestrator/lifecycle.py`, `web/app/suites/`, `web/app/suite-runs/` | `tests/unit/api/test_suites.py`, `tests/unit/scoring/test_checkers.py`, `tests/unit/orchestrator/test_lifecycle_suites.py`, `tests/unit/evaluator/test_suite_signal.py`, `tests/unit/db/test_migrations.py` |
 
 ## Feature details
 
@@ -1564,6 +1565,109 @@ configurable per cell (e.g. temperature sweeps).
     detail shows the run + leaderboards once scored.
 - **Depends on:** F1 (submit form + RunCreate), F8/F13 (runs list +
   analytics patterns), F11 (vendored-vs-db merge + name_conflict model)
+
+### F23 — Benchmark suites + deterministic checkers ✅
+
+- **What:** reusable vendored benchmark **suites** — YAML files under
+  `benchmark_suites/<slug>/suite.yaml` listing tasks (each a
+  `preset_ref` XOR an inline `prompt`, optional `adapter` pin, optional
+  `checks:` list) — plus a suite fan-out endpoint that submits one
+  normal run per task against the shared run spec, and **deterministic
+  checkers** that measure objective pass/fail on each sandbox's
+  artifact, kept strictly beside (never folded into) judge rubric
+  scores. Suite runs carry `runs.suite_ref`/`suite_index`/`suite_run_id`
+  provenance and group under one `suite_runs` batch row.
+- **Checkers** (`scoring/checkers.py`) — `file_exists`, `grep`,
+  `py_test`, `output_grep` (artifact/workspace oriented) plus the
+  case/output types `exact`, `contains`, `regex`, `json_schema`,
+  `numeric_tol`. All artifact paths are jailed + byte-capped;
+  `py_test` runs candidate tests inside the locked `heg-exec`
+  container only (`ExecRunner` — never on the host). Statuses:
+  `pass`/`fail` are measured outcomes; `skipped` = infrastructure
+  absent (no Docker/image); `error` = checker misconfig/crash.
+- **Lifecycle** (`orchestrator/lifecycle.py`): post-artifact, pre-judge
+  — `_suite_check_specs()` resolves the run's suite task from the
+  *current* `suite.yaml` (rescores re-read it), `_run_suite_checks()`
+  executes in `asyncio.to_thread` (Docker calls block), persists each
+  outcome as an append-only `checker_results` row, writes
+  `suite_checks.json` into the artifact, emits a `suite_checks`
+  checkpoint/`test_execution` event, folds a `suite` signal into
+  `analysis.json`/`ANALYSIS.md`, and writes a `suite_pass` Score row
+  (pass rate ×10). Checker failures never block judging; evaluator
+  errors still surface.
+- **DB:** migration `e4f5a6b7c8d9_benchmark_suites.py` (revises
+  `d1e2f3a4b5c6`) — `suite_runs` (batch: slug, version, created_at),
+  `runs.suite_ref`/`suite_index`/`suite_run_id`, `checker_results`
+  (autoincrement id → insertion-ordered newest-wins per
+  (sandbox, check_type, spec)).
+- **API** (`api/routers/suites.py`, store `api/suites.py`):
+  - `GET /api/suites` → vendored list (task/check counts, batches).
+  - `GET /api/suites/{slug}` → tasks + recent batches.
+  - `POST /api/suites/{slug}/run` → `SuiteRunIn` (RunCreate minus the
+    task text) → 201 `SuiteRunOut`: batch id + child runs, one per
+    suite task, each reusing the normal run-submit path (matrix
+    expansion, warnings). Adapter-pinned tasks with no matching config
+    → 422 before anything starts.
+  - `GET /api/suite-runs/{id}` → task × cell aggregation: per sandbox,
+    `judge_overall` beside the checker roll-up (counts, pass_rate,
+    per-check rows) + batch aggregate (pooled `check_pass_rate`,
+    `mean_judge_overall`).
+  - Results API: `SandboxResult.checker_results` (newest-wins per
+    check) + flat `suite` summary (counts, pass_rate, `suite_pass`);
+    `?suite=` filter on `GET /api/runs`; `RunOut`/`RunSummary` carry
+    the three suite fields.
+- **Suite validation** (`api/suites.py`): PyYAML parse, slug regex
+  before any filesystem touch, jail for suite-relative `py_test` paths
+  (no absolutes/`..`/NUL/drive letters), Pydantic-validated check
+  specs incl. the `json_schema` subset (object/required/properties/
+  enum/type scalars).
+- **Example suite:** `benchmark_suites/starter-regression/` — a
+  container task (preset_ref → wordle-html, `file_exists` + `grep` +
+  `py_test` checks) and a prompt-only task (`adapter: prompt`,
+  `output_grep`/`exact`/`contains`/`json_schema`/`numeric_tol` checks
+  against `output.txt`).
+- **Web:** `/suites` browse (task/check/batch counts) →
+  `/suites/[slug]` detail (task table w/ per-check chips, minimal
+  launcher posting `runSuite`, recent batches) → `/suite-runs/[id]`
+  matrix (batch KPI strip — pooled check pass rate + mean judge
+  overall; per task, per-cell status + check counts + expandable
+  ✓/✗/⊘/! badges, links into each run's results). Results page gains
+  a "Deterministic checks" card (per-sandbox pass counts, `suite_pass`
+  score value, per-check badges) + suite provenance badge/link; run
+  detail `Suite` kv row; `/runs` preset column shows `suite:<slug>`;
+  nav gains "Suites".
+- **Where:** `benchmark_suites/`, `api/suites.py`,
+  `api/routers/suites.py`, `api/routers/runs.py` (`?suite=`, suite
+  provenance on persist), `api/routers/results.py` (checker merge +
+  flat summary), `api/schemas.py` (Suite*/Checker*/SuiteRun* models),
+  `api/config.py` (`BENCHMARK_SUITES_DIR`), `scoring/checkers.py` +
+  `scoring/models.py` + `scoring/render.py` (suite signal),
+  `orchestrator/lifecycle.py`, `evaluator/evaluate.py`,
+  `db/models.py` + migration `e4f5a6b7c8d9`, `web/lib/api.ts`,
+  `web/app/suites/`, `web/app/suite-runs/`,
+  `web/app/runs/[id]/results/ResultsClient.tsx`,
+  `web/app/runs/page.tsx`, `web/components/SiteHeader.tsx`.
+- **Verify:**
+  - Unit: `tests/unit/api/test_suites.py` (suite list/detail, fan-out
+    happy path + adapter-pin 422 + matrix cap, batch aggregation
+    newest-wins, `?suite=` filter, slug/path jail);
+    `tests/unit/scoring/test_checkers.py` (every checker type, jail +
+    cap, skipped vs fail vs error); `tests/unit/orchestrator/
+    test_lifecycle_suites.py` (post-artifact ordering, rows +
+    artifact json + event + suite_pass + signal, evaluator-error
+    surfacing, rescore append-only); `tests/unit/evaluator/
+    test_suite_signal.py`; `tests/unit/db/test_migrations.py`
+    (new head + table round-trips).
+  - Web: `eslint` + `next build` clean (routes `/suites`,
+    `/suites/[slug]`, `/suite-runs/[id]` prerender).
+  - Manual: `/suites` → `starter-regression` → launch →
+    `/suite-runs/{id}` shows per-task cells with ✓/✗ beside judge
+    overalls; the card's acceptance — a prompt-cell run reports
+    per-case pass/fail + mean with no judge involvement.
+- **Depends on:** F22 (preset_ref tasks + provenance pattern), F7/F14
+  (evaluator + rescore newest-wins), PR8 (locked `heg-exec` runner +
+  signal pipeline), F8 (results page), F18 (the `prompt` adapter pin —
+  prompt-cell tasks resolve to real no-sandbox cells)
 
 ## Implementation sequence
 
