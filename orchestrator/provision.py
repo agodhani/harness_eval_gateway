@@ -34,7 +34,7 @@ from skillpack_import.store import imported_root
 from . import pacing, state_machine
 from .adapters import adapter_image, get_adapter
 from .events import emit
-from .matrix import sandbox_model
+from .matrix import sandbox_model, trial_index
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +122,7 @@ def build_env(
     model_name: str,
     max_iters: int,
     system_prompt_extra: str | None = None,
+    model_options: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Sandbox env for one harness config via the adapter contract."""
     env = adapter.env(
@@ -132,6 +133,7 @@ def build_env(
         events_ingest_url=GATEWAY_INGEST_URL,
         max_iters=max_iters,
         system_prompt_extra=system_prompt_extra,
+        model_options=model_options,
     )
     if timeout := os.environ.get("MINILOOP_LLM_TIMEOUT_SECONDS"):
         env["MINILOOP_LLM_TIMEOUT_SECONDS"] = timeout
@@ -140,12 +142,19 @@ def build_env(
 
 def budgets_for(run: Run) -> dict[str, Any]:
     budgets = (run.config or {}).get("budgets") or {}
+    # PR28 optional per-cell caps — absent (or stored null from an older
+    # spec) means no per-sandbox limit. Both flow to the monitor; the token
+    # cap additionally mints into each participant cred.
+    sandbox_tokens = budgets.get("sandbox_token_budget")
+    max_cost = budgets.get("max_cost_usd")
     return {
         "max_iters": int(budgets.get("max_iters", DEFAULT_MAX_ITERS)),
         "token_budget": int(budgets.get("token_budget", DEFAULT_TOKEN_BUDGET)),
         "wall_clock_seconds": int(
             budgets.get("wall_clock_seconds", DEFAULT_WALL_CLOCK_SECONDS)
         ),
+        "sandbox_token_budget": int(sandbox_tokens) if sandbox_tokens else None,
+        "max_cost_usd": float(max_cost) if max_cost else None,
     }
 
 
@@ -156,13 +165,24 @@ def mint_sandbox_cred(
     secret: str,
     budgets: dict[str, Any],
 ) -> str:
-    """Participant cred: sandbox-scoped, token-capped, TTL > wall clock."""
+    """Participant cred: sandbox-scoped, token-capped, TTL > wall clock.
+
+    Carries BOTH ceilings (PR28): ``max_tokens`` is the run-wide token
+    budget shared with siblings, ``sandbox_max_tokens`` caps this one
+    sandbox's own total — the gateway enforces both per request, so the
+    per-cell cap can't be starved by one hot cell eating the run budget.
+    """
     return mint_cred(
         run_id=run_id,
         sandbox_id=sandbox_id,
         secret=secret,
         ttl_seconds=int(budgets["wall_clock_seconds"]) + CRED_TTL_GRACE_SECONDS,
         max_tokens=int(budgets["token_budget"]),
+        sandbox_max_tokens=(
+            int(budgets["sandbox_token_budget"])
+            if budgets.get("sandbox_token_budget")
+            else None
+        ),
     )
 
 
@@ -193,6 +213,7 @@ def build_spec(
         "events_ingest_url": GATEWAY_INGEST_URL,
         "max_iters": env.get("MAX_ITERS"),
         "system_prompt_extra": harness_config.get("system_prompt_extra"),
+        "model_options": harness_config.get("model_options"),
     }
     launch = adapter.launch(task)
     return SandboxSpec(
@@ -265,18 +286,25 @@ def _sandbox_name(hc: dict[str, Any], sid: uuid.UUID) -> str:
     distinguishable in the timeline filter, results matrix, and analytics.
     PR14: on multi-model runs the cell's ``model`` is appended
     (``<label> · <model>``) so same-config siblings on different models stay
-    distinguishable everywhere the name is shown.
+    distinguishable everywhere the name is shown. PR27: trialed cells also
+    get a `` · tN`` suffix so the N replicas of one cell stay
+    distinguishable.
     """
     label = str(hc.get("name") or "").strip()
     if not label:
         adapter = str(hc.get("adapter") or hc.get("harness") or "miniloop")
         label = f"{adapter}-{str(sid)[:8]}"
-    model = str(hc.get("model") or "").strip()
-    if not model:
-        return label[:255]
-    # sandboxes.name is String(255): keep the model tail intact, truncate
-    # the label side if the pair overflows.
-    suffix = f" · {model}"
+    parts = [label]
+    # sandboxes.name is String(255): keep the model/trial tails intact,
+    # truncate the label side if the combination overflows.
+    if model := str(hc.get("model") or "").strip():
+        parts.append(model)
+    # PR27: trialed cells get an unambiguous `` · tN`` suffix so siblings
+    # sharing one config × model stay distinguishable everywhere the name
+    # is shown (timeline filter, results matrix, analytics, artifacts).
+    if idx := trial_index(hc):
+        parts.append(f"t{idx}")
+    suffix = "".join(f" · {p}" for p in parts[1:])
     if len(suffix) >= 255:
         return suffix[-255:]
     if len(label) + len(suffix) > 255:
@@ -466,6 +494,9 @@ async def spawn_one(
             model_name=model,
             max_iters=budgets["max_iters"],
             system_prompt_extra=harness_config.get("system_prompt_extra"),
+            # PR27: per-config model knobs — the adapter maps the keys it
+            # supports and ignores the rest (submit already warned).
+            model_options=harness_config.get("model_options"),
         )
         # Adapter-declared image wins (Phase 2.5: each CLI harness ships its
         # own image); miniloop and adapters without an ``image`` key keep the

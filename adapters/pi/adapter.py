@@ -34,6 +34,9 @@ MANIFEST = {
     "install": "npm i -g @mariozechner/pi-coding-agent",
     "image": IMAGE,
     "requires": ["gateway:/v1/chat/completions"],
+    # PR27: pi exposes no headless knob for any ModelOptions key — dropped
+    # with a submit-time warning.
+    "model_options": [],
     "hooks": (
         "generated extension (extensions/heg-events.ts) forwards "
         "tool_execution_end → tool_result via adapters.common.hooks"
@@ -59,6 +62,7 @@ def env(
     max_iters: int | None = None,
     skillpacks_root: str = "/opt/skillpacks",
     system_prompt_extra: str | None = None,
+    model_options: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     # The cred reaches pi through models.json's "$GATEWAY_CRED" interpolation.
     return contract.cli_env(
@@ -72,6 +76,7 @@ def env(
         max_iters=max_iters,
         skillpacks_root=skillpacks_root,
         system_prompt_extra=system_prompt_extra,
+        model_options=model_options,
         extra={"PI_CODING_AGENT_DIR": PI_AGENT_DIR},
     )
 

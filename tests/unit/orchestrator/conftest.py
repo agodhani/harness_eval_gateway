@@ -93,6 +93,7 @@ def make_run(
     status: str = "provisioning",
     task_prompt: str = "create hello.txt",
     model_name: str = "test-model",
+    trials: int = 1,
     config: dict[str, Any] | None = None,
 ) -> Run:
     with session_factory() as s:
@@ -100,6 +101,7 @@ def make_run(
             status=status,
             task_prompt=task_prompt,
             model_name=model_name,
+            trials=trials,
             config=config or {},
         )
         s.add(run)

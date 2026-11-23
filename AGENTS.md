@@ -181,7 +181,12 @@ Terminal states per sandbox:
 `budget_exceeded` keys on the gateway's own budget-gate event
 (`stage="budget"` + `reason="budget_exceeded"`) — a bare 429 from the
 *upstream provider* is NOT budget exhaustion: ≥3 `stage="upstream"` error
-events terminate the sandbox `error` instead.
+events terminate the sandbox `error` instead. Three limits share the
+verdict (PR28) — the terminate checkpoint's `payload.limit` says which:
+`run_tokens` (shared ceiling, cred `max_tokens`), `sandbox_tokens`
+(per-cell ceiling, cred `sandbox_max_tokens` metered against the cell's
+own usage + monitor backstop), `cost` (`max_cost_usd` vs the cell's
+estimated spend at the layered price table — priced models only).
 
 Provisional defaults (confirm with user): 60 min wall clock, $2 spend cap,
 stuck-loop = 3 consecutive identical tool calls.
@@ -712,6 +717,78 @@ or tests change.
   ("Load more"), landing copy describes the config × model matrix, and the
   results `total` row is the weighted scale-normalised aggregate
   (`web/lib/scoreMath.ts`), not a raw Σ.
+- **Price truth lives in the DB, static table is the fallback (PR28)** —
+  `model_prices` rows keyed by case-insensitive fnmatch `model_glob`
+  (`created_at, id` declaration order, first match wins) layer OVER
+  `api.pricing.PRICE_TABLE` via `PriceBook`; a bare (no `/`) glob never
+  matches `vendor/model` ids. `PUT /api/prices` upserts user rows
+  (never clobbered by sync) — `local` marks free inference, so PUT 422s
+  it beside any nonzero rate rather than billing under a "local — $0"
+  label; `POST /api/prices/sync` maps OpenRouter
+  `/models` `pricing.*` USD-per-token strings to per-Mtok rates through
+  the gateway's `x-heg-provider` override — entries with no parseable
+  rate are skipped rather than priced-free. Per-cell budgets:
+  `sandbox_token_budget` mints a `sandbox_max_tokens` cred claim
+  (gateway gate + monitor backstop → `limit="sandbox_tokens"`);
+  `max_cost_usd` is monitor-polled against the cell's layered-price
+  estimate → `limit="cost"`, and it can't trip an unpriced model
+  (no honest rate to bill against). Cache-read tokens bill at
+  `cache_read_per_mtok_usd` when declared, else the input rate.
+  Price pickers (results + analysis) grow rates inline via "+ add rate".
+- **Config × model heatmap + winner card (PR31)** — the results page's
+  score card has a `matrix | grid` toggle; the grid
+  (`web/app/runs/[id]/results/GridView.tsx` + pure transform
+  `web/lib/gridMatrix.ts`, `node --test`-covered) folds sandboxes into
+  config rows × model cols. Row identity = `harness_config` minus
+  per-cell `model`/trial keys — the sandbox `name` is unique per sandbox
+  and must NOT be the group key. Cells show mean judge `overall` ±sd
+  (same-(config, model) repeats are the cell's trials — PR27 needs no
+  special-casing) on a fixed 0–10 red→amber→green scale; the `w` sub-line
+  is the PR21 weighted total (same `specMap`/`dimensionKeys` the totals
+  row uses — no second weighting). The winner card ranks cells by mean
+  weighted total only (a judge `overall` alone can't win), with runner-up
+  Δ, est. cost/wall clock (F9 analytics — "unpriced"/"—", never $0) and
+  mean pass-rate (`generated_tests.pass_rate` → `exec` tests).
+- **Artifact file browsing is rooted per-sandbox, jailed like the download
+  (PR34/F19)** — `GET /api/sandboxes/{id}/files[/{path}]` reuses
+  `sandbox/preview.py`'s `resolve_workspace_dir`/`resolve_artifact_dir`
+  rather than `Artifact` rows: `workspace/` wins when the snapshot exists,
+  else the artifact dir itself browses (prompt cells surface `output.txt`/
+  `meta.json`/`transcript.log`; `FileListOut.root` reports which root
+  answered). Listings are depth(8)/entry(5000)-bounded with the workspace
+  ZIP's exclusions (`.git`/`node_modules`/`__pycache__`/`.venv`/`*.pyc`)
+  and never follow symlinks; text reads cap at 256 KiB and NUL-carrying
+  content returns `binary: true` + the `?download=1` FileResponse. `?diff=
+  <other>` is `difflib` server-side (a/ + b/ labels, 1 MiB per side, 10k
+  lines out, missing-side → diff vs empty) — the UI renders the unified
+  format in a `<pre>` classified by `web/lib/fileBrowser.ts`, whose
+  `mergeFileLists` reuses the PR10 merged-ordering split idiom for the
+  two-lane file list (no diff dependency added). Traversal/absolute-path/
+  sibling-workspace escapes 404 identically to the artifact download.
+- **PR27 — trials + per-config model options**: `RunCreate.trials` (1–8,
+  default 1) replicates every effective config × model cell N times;
+  expansion stays model-major then cell-major so a cell's `t1..tN` replicas
+  stay adjacent, each stamped `harness_config.trial_index` (the key is
+  ABSENT at trials=1 — single-shot runs stay bit-identical to pre-PR27).
+  `trial_index` lives inside the existing `harness_config` JSONB — no new
+  sandbox column; `runs.trials` is a real int column (migration
+  `d7e9f1a3b5c7`, the column wins over `config["trials"]` on old specs).
+  Sandbox names append ` · tN` after the model suffix
+  (`cfg · model · t3`), truncating the label side to fit String(255).
+  `harness_configs[].model_options` (`temperature`/`seed`/`max_tokens`/
+  `reasoning`, `extra="forbid"`) is filtered at submit against the
+  adapter's `MANIFEST["model_options"]` — unsupported keys are dropped
+  from the persisted cell and reported as advisory `warnings` (never a
+  422); miniloop + `prompt` honor all four, codex takes `reasoning` only
+  (→ `model_reasoning_effort`), other CLIs none. Miniloop maps them to
+  `MINILOOP_TEMPERATURE`/`MINILOOP_SEED`/`MAX_TOKENS`/
+  `MINILOOP_REASONING_EFFORT` env knobs → request-body fields.
+  Results/analytics group trials by `cell_key` (harness_config minus
+  `trial_index`, serialized sorted): the results matrix shows one column
+  per cell (`mean ± sd (n=N)`, sample sd n−1) with expandable per-trial
+  rows; analytics adds a `cells` rollup (`overall_mean`/`overall_sd`/
+  `overall_n` counting only scored trials) plus per-sandbox `cell`/
+  `trial_index`, and a by-cell view in the results analytics table.
 - **Task inputs seed the workspace once per run (PR24)** — the seed is
   materialized per RUN (`data/seeds/<run_id>/`, atomic rename), not per
   sandbox: N cells cloning the same repo independently would waste the
@@ -746,7 +823,10 @@ or tests change.
   `cd web && npm run dev` (use `-p 3002` if :3000 is taken);
   e2e `cd web && E2E_PORT=3100 npm run test:e2e`.
 - `GET /api/runs/{id}/analytics?price_model=` (F9) serves per-sandbox metrics
-  + estimated cost; price table lives in `api/pricing.py` (`PRICE_TABLE`).
+  + estimated cost; price resolution runs through the layered
+  `api/pricing.py::PriceBook` (`model_prices` glob rows over the static
+  `PRICE_TABLE`, F21 — managed via `GET/PUT/DELETE /api/prices`,
+  `POST /api/prices/sync` for OpenRouter).
   `tool_calls` merges every agent-activity signal without double counting —
   `tool_call` events, hook-sourced `tool_result` outcomes (per-name max),
   and `shell_command`/`file_op`/`test_execution` as proxies when a lane has

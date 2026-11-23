@@ -13,12 +13,19 @@ import {
   ApiError,
   estimateCostUsd,
   getRunAnalytics,
+  matchPriceKey,
+  resolvePricePick,
+  type CellAnalytics,
   type ModelAnalytics,
+  type ModelPrice,
+  type PriceEntry,
   type RunAnalytics,
   type SandboxAnalytics,
 } from "@/lib/api";
 import { formatDuration, formatNum, formatUsd, shortId } from "@/lib/format";
+import { fmtMeanSd } from "@/lib/trialGroups";
 import { Badge, Card, InfoNote, statusTone } from "@/components/ui";
+import AddRate from "@/components/AddRate";
 
 function errMsg(err: unknown): string {
   if (err instanceof ApiError) return err.detail;
@@ -26,14 +33,24 @@ function errMsg(err: unknown): string {
   return "analytics endpoint unavailable";
 }
 
-/** A table column — one sandbox, or one participant-model rollup (PR14). */
-type Column = SandboxAnalytics | ModelAnalytics;
+/** A table column — one sandbox, one participant-model rollup (PR14), or
+ * one config × model trial-group rollup (PR27). */
+type Column = SandboxAnalytics | ModelAnalytics | CellAnalytics;
+
+function isCellCol(c: Column): c is CellAnalytics {
+  return "sandbox_count" in c && "cell" in c;
+}
 
 function isModelCol(c: Column): c is ModelAnalytics {
-  return "sandbox_count" in c;
+  return "sandbox_count" in c && !isCellCol(c);
+}
+
+function isSandboxCol(c: Column): c is SandboxAnalytics {
+  return "sandbox_id" in c;
 }
 
 function colKey(c: Column): string {
+  if (isCellCol(c)) return `cell:${c.cell}`;
   return isModelCol(c) ? `model:${c.model}` : c.sandbox_id;
 }
 
@@ -64,9 +81,14 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
   // null = auto: each column costed at its own model's rate (server
   // resolved); a price-table key reprices every column uniformly (what-if).
   const [priceModel, setPriceModel] = useState<string | null>(null);
-  // PR14: "sandbox" = per-cell metrics; "model" = per-model rollup. Only
-  // offered when the run actually spans >1 participant model.
-  const [view, setView] = useState<"sandbox" | "model">("sandbox");
+  // PR28: rates added inline via "+ add rate" — the response's price_table
+  // was fetched before they existed, so they're merged in client-side and
+  // also persist server-side for the next fetch.
+  const [extraPrices, setExtraPrices] = useState<Record<string, ModelPrice>>({});
+  // PR14: "sandbox" = per-cell metrics; "model" = per-model rollup (only
+  // offered when the run spans >1 participant model). PR27: "cell" = the
+  // trial-group rollup (only when a run repeated cells — mean ± sd (n)).
+  const [view, setView] = useState<"sandbox" | "model" | "cell">("sandbox");
 
   useEffect(() => {
     let cancelled = false;
@@ -92,10 +114,42 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
 
   const current = loadedFor === runId ? analytics : null;
   const multiModel = (current?.models?.length ?? 0) > 1;
+  const hasTrialCells = (current?.cells ?? []).some(
+    (c) => c.sandbox_count > 1,
+  );
   const byModel = view === "model" && multiModel;
+  const byCell = view === "cell" && hasTrialCells;
+  const bySandbox = !byModel && !byCell;
   const columns: Column[] = byModel
     ? (current?.models ?? [])
-    : (current?.sandboxes ?? []);
+    : byCell
+      ? (current?.cells ?? [])
+      : (current?.sandboxes ?? []);
+  // PR28: the effective picker table — server price_table plus rates added
+  // inline this session (they persist as model_prices rows; on refetch the
+  // server's layered book returns them anyway).
+  const priceTable: Record<string, ModelPrice> = {
+    ...(current?.price_table ?? {}),
+    ...extraPrices,
+  };
+  // Row globs in declaration order — the fetched list plus rates added
+  // inline this session (a new row lands at the end of the book's scan).
+  const priceGlobs = [
+    ...(current?.price_globs ?? []),
+    ...Object.keys(extraPrices),
+  ];
+  // An explicit pick resolves like the server's resolve_price_model — a
+  // verbatim row glob (any case) selects that row; a model-like pick goes
+  // through the row-glob scan so an earlier glob can shadow a static key.
+  const resolvedPick = priceModel
+    ? resolvePricePick(priceModel, priceTable, priceGlobs)
+    : undefined;
+  // Prefill the add-rate glob from a column whose model resolved no rate
+  // — through the SAME matcher auto mode uses, so a just-saved glob is
+  // what lifts the column out of "unpriced".
+  const unpricedModel = columns.find(
+    (c) => matchPriceKey(c.model, priceTable, priceGlobs) === undefined,
+  )?.model;
 
   if (current === null) {
     if (loadedFor !== runId) return null; // still loading — page shows spinners
@@ -108,6 +162,26 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
   if (current.sandboxes.length === 0) return null;
 
   const rows: Row[] = [
+    ...(byCell
+      ? [
+          {
+            label: "score (overall)",
+            hint: "mean ±sd (n) across the cell's trials",
+            cell: (col: Column) =>
+              isCellCol(col) && col.overall_mean != null ? (
+                <span className="mono" style={{ fontSize: "0.8rem" }}>
+                  {fmtMeanSd({
+                    mean: col.overall_mean,
+                    sd: col.overall_sd,
+                    n: col.overall_n,
+                  })}
+                </span>
+              ) : (
+                <span className="score-na">—</span>
+              ),
+          },
+        ]
+      : []),
     {
       label: "wall clock",
       // By-model rollups sum member cells' event spans — parallel cells
@@ -175,15 +249,21 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
     {
       label: "estimated cost",
       hint: priceModel
-        ? `at ${priceModel}`
+        ? `at ${resolvedPick ?? priceModel}`
         : "auto — per-model rates · unlisted = unpriced",
       cell: (col) => {
         // Explicit pick reprices every column uniformly (what-if); auto
-        // uses each column's own resolved rate (PR14 per-model pricing).
-        // A null key is an unlisted model (PR21) — unpriced, never billed
-        // at a guessed rate.
-        const rateKey = priceModel ?? col.price_model;
-        const p = rateKey ? current.price_table[rateKey] : undefined;
+        // resolves each column's model through the layered book itself
+        // (row globs first — including rates added inline this session,
+        // which the fetch-time col.price_model can't see — then the
+        // static fallback). An unmatched key is an unlisted model (PR21)
+        // — unpriced, never billed at a guessed rate. PR27 cell columns
+        // price at their model's key through the same matcher (all trials
+        // of a cell share one model).
+        const rateKey = priceModel
+          ? resolvedPick
+          : matchPriceKey(col.model, priceTable, priceGlobs);
+        const p = rateKey ? priceTable[rateKey] : undefined;
         if (!p) {
           return (
             <span
@@ -219,8 +299,8 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
               <button
                 type="button"
                 role="tab"
-                aria-selected={!byModel}
-                className={`seg__btn${byModel ? "" : " seg__btn--active"}`}
+                aria-selected={bySandbox}
+                className={`seg__btn${bySandbox ? " seg__btn--active" : ""}`}
                 onClick={() => setView("sandbox")}
               >
                 per sandbox
@@ -236,6 +316,28 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
               </button>
             </div>
           ) : null}
+          {hasTrialCells ? (
+            <div className="seg" role="tablist" aria-label="Trial rollup">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={bySandbox}
+                className={`seg__btn${bySandbox ? " seg__btn--active" : ""}`}
+                onClick={() => setView("sandbox")}
+              >
+                per sandbox
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={byCell}
+                className={`seg__btn${byCell ? " seg__btn--active" : ""}`}
+                onClick={() => setView("cell")}
+              >
+                by cell
+              </button>
+            </div>
+          ) : null}
           <label className="row" style={{ gap: "0.4rem", fontSize: "0.8rem" }}>
             <span className="faint">Estimated cost at:</span>
             <select
@@ -248,7 +350,7 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
               <option value="">
                 auto — per-model rates
               </option>
-              {Object.entries(current.price_table).map(([name, p]) => (
+              {Object.entries(priceTable).map(([name, p]) => (
                 <option key={name} value={name}>
                   {p.local
                     ? `${name} (local — $0)`
@@ -257,6 +359,22 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
               ))}
             </select>
           </label>
+          <AddRate
+            suggestGlob={unpricedModel ?? ""}
+            onAdded={(entry: PriceEntry) => {
+              setExtraPrices((m) => ({
+                ...m,
+                [entry.model_glob]: {
+                  input_per_mtok_usd: entry.input_per_mtok_usd,
+                  output_per_mtok_usd: entry.output_per_mtok_usd,
+                  cache_read_per_mtok_usd: entry.cache_read_per_mtok_usd,
+                  local: entry.local,
+                },
+              }));
+              // select the new rate — the what-if reprice is why it exists
+              setPriceModel(entry.model_glob);
+            }}
+          />
         </div>
       }
     >
@@ -266,7 +384,17 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
             <tr>
               <th style={{ minWidth: "150px" }}>Metric</th>
               {columns.map((col) =>
-                isModelCol(col) ? (
+                isCellCol(col) ? (
+                  <th key={colKey(col)}>
+                    <div className="row" style={{ gap: "0.4rem" }}>
+                      <span className="mono">{col.model}</span>
+                      <Badge tone="outline">
+                        {col.sandbox_count} trial{col.sandbox_count === 1 ? "" : "s"}
+                      </Badge>
+                    </div>
+                    <div className="dim-desc">{col.label}</div>
+                  </th>
+                ) : isModelCol(col) ? (
                   <th key={colKey(col)}>
                     <div className="row" style={{ gap: "0.4rem" }}>
                       <span className="mono">{col.model}</span>
@@ -281,6 +409,11 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
                       <span className="mono" title={col.sandbox_id}>
                         {shortId(col.sandbox_id)}
                       </span>
+                      {col.trial_index ? (
+                        <Badge tone="outline" title="trial index within its cell">
+                          t{col.trial_index}
+                        </Badge>
+                      ) : null}
                       <Badge tone={statusTone(col.status)}>{col.status}</Badge>
                     </div>
                     {col.name ? (
@@ -307,6 +440,18 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
                   </td>
                 ))}
               </tr>
+            ) : byCell ? (
+              <tr>
+                <td>
+                  <div className="dim-name">trials</div>
+                  <div className="dim-desc">repeats of this cell</div>
+                </td>
+                {columns.map((col) => (
+                  <td key={colKey(col)} className="num">
+                    {isCellCol(col) ? col.sandbox_count : "—"}
+                  </td>
+                ))}
+              </tr>
             ) : (
               <tr>
                 <td>
@@ -314,7 +459,7 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
                 </td>
                 {columns.map((col) => (
                   <td key={colKey(col)} className="num">
-                    {!isModelCol(col) && col.terminal_reason ? (
+                    {isSandboxCol(col) && col.terminal_reason ? (
                       <Badge tone={statusTone(col.terminal_reason)}>
                         {col.terminal_reason}
                       </Badge>

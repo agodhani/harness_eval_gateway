@@ -11,6 +11,11 @@
  *
  * PR5 adds eval iteration: a rubric-version selector (?rubric_version=) plus
  * re-score / edit-rubric controls ({@link RescoreControls}).
+ *
+ * PR34 adds the artifact file browser: a `📂 browse` chip per artifact row
+ * opens {@link FileBrowser} — jailed file tree + size-capped viewer, with a
+ * "diff vs" peer picker rendering server-side unified diffs in the PR10
+ * merged-lane split idiom.
  */
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -38,6 +43,14 @@ import { formatTs, shortId } from "@/lib/format";
 import { dimensionSpecMap, weightedDimTotal } from "@/lib/scoreMath";
 import { specFromRun, stageResubmit } from "@/lib/resubmit";
 import {
+  fmtMeanSd,
+  groupByCell,
+  meanSd,
+  stripTrialSuffix,
+  trialIndex,
+  type TrialGroup,
+} from "@/lib/trialGroups";
+import {
   Badge,
   Card,
   EmptyState,
@@ -48,6 +61,8 @@ import {
   WarnNote,
 } from "@/components/ui";
 import AnalyticsSection from "./AnalyticsSection";
+import FileBrowser from "./FileBrowser";
+import GridView from "./GridView";
 import OutputView from "./OutputView";
 import PreviewControls from "./PreviewControls";
 import RescoreControls from "./RescoreControls";
@@ -122,6 +137,7 @@ async function fetchResultsViaScores(run: RunOut): Promise<RunResults> {
       else dimensions[sc.dimension] = entry;
     }
     sandboxes.push({
+      trial_index: (sb.harness_config?.trial_index as number | undefined) ?? null,
       sandbox_id: sb.id,
       harness_config: sb.harness_config ?? {},
       name: sb.name ?? null,
@@ -147,6 +163,7 @@ async function fetchResultsViaScores(run: RunOut): Promise<RunResults> {
     ),
     evaluator_model: run.config?.evaluator_model ?? null,
     same_model_eval: run.same_model_eval ?? null,
+    trials: run.trials ?? (run.config?.trials as number | undefined) ?? 1,
     sandboxes,
   };
 }
@@ -163,6 +180,8 @@ export default function ResultsClient({ runId }: { runId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [unavailable, setUnavailable] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // PR34: sandbox_id whose artifact files the browser modal is showing.
+  const [browseFor, setBrowseFor] = useState<string | null>(null);
   // PR5: pinned rubric version for the score matrix — null = newest-wins.
   // Scoped to runId like the other loaded state (no remount between runs).
   const [versionSel, setVersionSel] = useState<{ id: string; v: number | null }>({
@@ -173,6 +192,10 @@ export default function ResultsClient({ runId }: { runId: string }) {
   // `eval_scored` checkpoint events — source of the per-sandbox judge-mode
   // badge when the results payload doesn't carry `eval_mode` yet.
   const [scoredEvents, setScoredEvents] = useState<EventOut[]>([]);
+  // PR31 — `matrix` (per-sandbox columns) vs `grid` (config × model
+  // heatmap + winner card). Default stays the matrix every earlier
+  // release shipped.
+  const [view, setView] = useState<"matrix" | "grid">("matrix");
   // PR21 — rubric dims (weight + score scale) for the pinned version when it
   // isn't the latest rubric on the run record; keyed to runId+version like
   // `versionSel` so cross-run navigation can't reuse stale dims.
@@ -379,6 +402,19 @@ export default function ResultsClient({ runId }: { runId: string }) {
 
   const sandboxes = useMemo(() => currentResults?.sandboxes ?? [], [currentResults]);
 
+  // PR27: group each config × model cell's trials — identical configs
+  // (harness_config minus trial_index) share one matrix column showing
+  // mean ± sd (n); the per-trial detail expands inside each cell.
+  const trialGroups = useMemo(() => groupByCell(sandboxes), [sandboxes]);
+  const hasTrials = useMemo(
+    () =>
+      trialGroups.some((g) => g.items.length > 1) ||
+      (currentResults?.trials ?? 1) > 1 ||
+      sandboxes.some((sb) => trialIndex(sb) > 1),
+    [trialGroups, currentResults, sandboxes],
+  );
+  const [groupsOpen, setGroupsOpen] = useState<Set<string>>(new Set());
+
   const dimensionKeys = useMemo(() => {
     const set = new Set<string>();
     for (const sb of sandboxes) {
@@ -425,9 +461,7 @@ export default function ResultsClient({ runId }: { runId: string }) {
       else map.set(m, [sb]);
     }
     return [...map.entries()].map(([model, sbs]) => {
-      const overalls = sbs
-        .map((s) => s.overall?.score)
-        .filter((v): v is number => typeof v === "number");
+      const overalls = sbs.map((s) => s.overall?.score);
       const totals = sbs
         .map((s) => dimTotals.get(s.sandbox_id))
         .filter(
@@ -436,10 +470,9 @@ export default function ResultsClient({ runId }: { runId: string }) {
       return {
         model,
         count: sbs.length,
-        meanOverall:
-          overalls.length > 0
-            ? overalls.reduce((a, b) => a + b, 0) / overalls.length
-            : null,
+        // PR27: mean overall ±sd — a model's ranking now reports variance
+        // across its cells/trials, not a bare mean.
+        overall: meanSd(overalls),
         meanTotal:
           totals.length > 0
             ? totals.reduce((a, t) => a + t.total, 0) / totals.length
@@ -454,6 +487,15 @@ export default function ResultsClient({ runId }: { runId: string }) {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key);
       else next.add(key);
+      return next;
+    });
+  }
+
+  function toggleGroup(cellKey: string) {
+    setGroupsOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(cellKey)) next.delete(cellKey);
+      else next.add(cellKey);
       return next;
     });
   }
@@ -488,6 +530,171 @@ export default function ResultsClient({ runId }: { runId: string }) {
           </div>
         ) : null}
       </div>
+    );
+  }
+
+  /** PR27 — the trials of one cell, ordered by trial_index for display. */
+  function orderedTrials(g: TrialGroup<SandboxResult>): SandboxResult[] {
+    return [...g.items].sort((a, b) => trialIndex(a) - trialIndex(b));
+  }
+
+  /** PR27 — one trial group's aggregate score cell: mean ± sd (n) on the
+   * score-value styling; expanding the group's header reveals every
+   * trial's own score (+status +rationale) below it. */
+  function groupScoreCell(
+    g: TrialGroup<SandboxResult>,
+    dim: string,
+    pick: (sb: SandboxResult) => DimensionScore | null | undefined,
+  ): React.ReactNode {
+    const open = groupsOpen.has(g.key);
+    const ordered = orderedTrials(g);
+    const ms = meanSd(ordered.map((sb) => pick(sb)?.score));
+    return (
+      <div>
+        {ms.mean !== null ? (
+          <span className={`score-value score-value--${scoreTone(ms.mean)}`}>
+            {fmtMeanSd(ms)}
+          </span>
+        ) : (
+          <span className="score-na">—</span>
+        )}
+        {open ? (
+          <div className="trial-list">
+            {ordered.map((sb) => (
+              <div key={sb.sandbox_id} className="trial-list__row">
+                <span className="mono faint">t{trialIndex(sb)}</span>
+                {sb.status !== "done" ? (
+                  <Badge tone={statusTone(sb.status)}>{sb.status}</Badge>
+                ) : null}
+                {scoreCell(sb, dim, pick(sb))}
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  /** PR27 — the totals row's aggregate cell: mean ± sd of the per-trial
+   * weighted totals, leader highlight on the best group mean. */
+  function groupTotalCell(
+    g: TrialGroup<SandboxResult>,
+    maxGroupMean: number,
+  ): React.ReactNode {
+    const open = groupsOpen.has(g.key);
+    const ordered = orderedTrials(g);
+    const ms = meanSd(
+      ordered.map((sb) => {
+        const t = dimTotals.get(sb.sandbox_id);
+        return t && t.scored > 0 ? t.total : null;
+      }),
+    );
+    const isLeader = ms.mean !== null && ms.mean === maxGroupMean;
+    return (
+      <div>
+        {ms.mean !== null ? (
+          <>
+            <span className="score-value">{fmtMeanSd(ms)}</span>
+            <div className={`dim-desc${isLeader ? " dim-desc--leader" : ""}`}>
+              {ms.n}/{g.items.length} trials{isLeader ? " · leader" : ""}
+            </div>
+          </>
+        ) : (
+          <span className="score-na">—</span>
+        )}
+        {open ? (
+          <div className="trial-list">
+            {ordered.map((sb) => {
+              const t = dimTotals.get(sb.sandbox_id);
+              return (
+                <div key={sb.sandbox_id} className="trial-list__row">
+                  <span className="mono faint">t{trialIndex(sb)}</span>
+                  {t && t.scored > 0 ? (
+                    <span className="score-value">
+                      {Math.round(t.total * 10) / 10}
+                    </span>
+                  ) : (
+                    <span className="score-na">—</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  /** PR27 — the grouped matrix header for one config × model cell: the
+   * shared config label (trial suffix stripped), a per-trial status
+   * rollup, and the expander that reveals each trial's scores inline. */
+  function groupHeader(g: TrialGroup<SandboxResult>): React.ReactNode {
+    const first = g.items[0];
+    const n = g.items.length;
+    const open = groupsOpen.has(g.key);
+    const ordered = orderedTrials(g);
+    const statuses = new Map<string, number>();
+    for (const sb of g.items) {
+      statuses.set(sb.status, (statuses.get(sb.status) ?? 0) + 1);
+    }
+    const evalFails = g.items.filter((sb) => sb.eval_error).length;
+    const emptyWs = g.items.filter((sb) => sb.empty_workspace).length;
+    return (
+      <th key={g.key}>
+        <div className="row" style={{ gap: "0.4rem", flexWrap: "wrap" }}>
+          <button
+            type="button"
+            className="btn btn--sm"
+            onClick={() => toggleGroup(g.key)}
+            title={open ? "hide per-trial scores" : "show per-trial scores"}
+          >
+            {open ? "▾" : "▸"} {n} trial{n === 1 ? "" : "s"}
+          </button>
+          {[...statuses.entries()].map(([s, count]) => (
+            <Badge key={s} tone={statusTone(s)}>
+              {count > 1 ? `${count}× ` : ""}
+              {s}
+            </Badge>
+          ))}
+        </div>
+        {typeof first?.harness_config?.name === "string" &&
+        first.harness_config.name.trim() ? (
+          <div className="dim-name" title={first?.name ?? undefined}>
+            {stripTrialSuffix(first?.name)}
+          </div>
+        ) : null}
+        <div className="dim-desc">{harnessConfigLabel(first?.harness_config)}</div>
+        {evalFails > 0 ? (
+          <div className="dim-desc">
+            <Badge tone="red">{evalFails} eval failed</Badge>
+          </div>
+        ) : null}
+        {emptyWs > 0 ? (
+          <div className="dim-desc">
+            <Badge
+              tone="amber"
+              title="Some trials finished with an empty workspace"
+            >
+              {emptyWs} empty workspace
+            </Badge>
+          </div>
+        ) : null}
+        {open ? (
+          <div className="dim-desc" style={{ marginTop: "0.3rem" }}>
+            {ordered.map((sb) => (
+              <div key={sb.sandbox_id}>
+                <Link
+                  href={`/runs/${runId}/timeline?sandbox=${sb.sandbox_id}`}
+                  className="mono"
+                  title={sb.sandbox_id}
+                >
+                  t{trialIndex(sb)} · {shortId(sb.sandbox_id)}
+                </Link>
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </th>
     );
   }
 
@@ -603,8 +810,111 @@ export default function ResultsClient({ runId }: { runId: string }) {
           </Card>
         ) : (
           <>
-            <Card title="Score matrix" className="card--flush">
+            <Card
+              title="Score matrix"
+              className="card--flush"
+              actions={
+                <div className="seg" role="tablist" aria-label="Results view">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={view === "matrix"}
+                    className={`seg__btn${view === "matrix" ? " seg__btn--active" : ""}`}
+                    onClick={() => setView("matrix")}
+                  >
+                    matrix
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={view === "grid"}
+                    className={`seg__btn${view === "grid" ? " seg__btn--active" : ""}`}
+                    onClick={() => setView("grid")}
+                  >
+                    grid
+                  </button>
+                </div>
+              }
+            >
+              {view === "grid" ? (
+                // PR31 — config × model heatmap + winner card. Same data,
+                // folded per config row × model column; weighted totals
+                // reuse the matrix's specMap/dimensionKeys.
+                <GridView
+                  runId={runId}
+                  sandboxes={sandboxes}
+                  models={participantModels}
+                  dimensionKeys={dimensionKeys}
+                  specMap={specMap}
+                />
+              ) : (
               <div className="matrix-wrap">
+                {hasTrials ? (
+                  <table className="matrix">
+                    <thead>
+                      <tr>
+                        <th style={{ minWidth: "200px" }}>Dimension</th>
+                        {trialGroups.map((g) => groupHeader(g))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr className="row-overall">
+                        <td>
+                          <div className="dim-name">overall</div>
+                          <div className="dim-desc">
+                            judge-reported aggregate · mean ±sd (n)
+                          </div>
+                        </td>
+                        {trialGroups.map((g) => (
+                          <td key={g.key} className="score-cell">
+                            {groupScoreCell(g, "overall", (sb) => sb.overall)}
+                          </td>
+                        ))}
+                      </tr>
+                      {dimensionKeys.map((dim) => (
+                        <tr key={dim}>
+                          <td>
+                            <div className="dim-name">{dim}</div>
+                          </td>
+                          {trialGroups.map((g) => (
+                            <td key={g.key} className="score-cell">
+                              {groupScoreCell(g, dim, (sb) => sb.dimensions?.[dim])}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                      {dimensionKeys.length > 0 ? (
+                        <tr className="row-total">
+                          <td>
+                            <div className="dim-name">total</div>
+                            <div className="dim-desc">
+                              weighted · mean of trials ±sd · 0–10
+                            </div>
+                          </td>
+                          {trialGroups.map((g) => {
+                            const maxGroupMean = Math.max(
+                              0,
+                              ...trialGroups.map((g2) => {
+                                const ms = meanSd(
+                                  g2.items.map((sb) => {
+                                    const t = dimTotals.get(sb.sandbox_id);
+                                    return t && t.scored > 0 ? t.total : null;
+                                  }),
+                                );
+                                return ms.mean ?? 0;
+                              }),
+                            );
+                            return (
+                              <td key={g.key} className="score-cell">
+                                {groupTotalCell(g, maxGroupMean)}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ) : null}
+                    </tbody>
+                  </table>
+                ) : (
                 <table className="matrix">
                   <thead>
                     <tr>
@@ -735,7 +1045,9 @@ export default function ResultsClient({ runId }: { runId: string }) {
                     ) : null}
                   </tbody>
                 </table>
+                )}
               </div>
+              )}
             </Card>
 
             {modelGroups.length > 1 ? (
@@ -758,11 +1070,11 @@ export default function ResultsClient({ runId }: { runId: string }) {
                           </td>
                           <td className="num">{g.count}</td>
                           <td className="num">
-                            {g.meanOverall !== null ? (
+                            {g.overall.mean !== null ? (
                               <span
-                                className={`score-value score-value--${scoreTone(g.meanOverall)}`}
+                                className={`score-value score-value--${scoreTone(g.overall.mean)}`}
                               >
-                                {Math.round(g.meanOverall * 10) / 10}
+                                {fmtMeanSd(g.overall)}
                               </span>
                             ) : (
                               <span className="score-na">—</span>
@@ -826,7 +1138,7 @@ export default function ResultsClient({ runId }: { runId: string }) {
                             {sb.artifact_path ?? <span className="faint">—</span>}
                           </td>
                           <td>
-                            {artifactIds.length > 0 ? (
+                            {artifactIds.length > 0 || sb.artifact_path ? (
                               <div className="chip-row">
                                 {artifactIds.map((id) => (
                                   <a
@@ -845,12 +1157,26 @@ export default function ResultsClient({ runId }: { runId: string }) {
                                     filename={outputArt.path?.split("/").pop() || "output.txt"}
                                   />
                                 ) : null}
+                                {artifactIds.length === 0 ? (
+                                  <span className="faint" style={{ fontSize: "0.8rem" }}>
+                                    id not exposed by API yet
+                                  </span>
+                                ) : null}
+                                {sb.artifact_path ? (
+                                  <button
+                                    type="button"
+                                    className="chip"
+                                    style={{ textDecoration: "none" }}
+                                    onClick={() => setBrowseFor(sb.sandbox_id)}
+                                    title="Browse the artifact's files (workspace/, or output.txt for prompt cells) and diff them against a sibling"
+                                  >
+                                    📂 browse
+                                  </button>
+                                ) : null}
                               </div>
                             ) : (
                               <span className="faint" style={{ fontSize: "0.8rem" }}>
-                                {sb.artifact_path
-                                  ? "id not exposed by API yet"
-                                  : "no artifact"}
+                                no artifact
                               </span>
                             )}
                           </td>
@@ -892,6 +1218,27 @@ export default function ResultsClient({ runId }: { runId: string }) {
           </>
         )}
       </div>
+
+      {browseFor
+        ? (() => {
+            const sb = sandboxes.find((x) => x.sandbox_id === browseFor);
+            if (!sb) return null;
+            const rowLabel = (x: SandboxResult) =>
+              `${x.name ?? harnessConfigLabel(x.harness_config)} · ${shortId(x.sandbox_id)}`;
+            return (
+              <FileBrowser
+                sandboxId={browseFor}
+                label={rowLabel(sb)}
+                peers={sandboxes
+                  .filter(
+                    (x) => x.sandbox_id !== browseFor && !!x.artifact_path,
+                  )
+                  .map((x) => ({ id: x.sandbox_id, label: rowLabel(x) }))}
+                onClose={() => setBrowseFor(null)}
+              />
+            );
+          })()
+        : null}
     </main>
   );
 }

@@ -11,11 +11,12 @@ Handlers are ``async def`` because they call ``asyncio.create_task`` (via
 from __future__ import annotations
 
 import logging
+import math
 import shutil
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
@@ -110,6 +111,7 @@ def _run_out(
         status=run.status,
         task_prompt=run.task_prompt,
         model_name=run.model_name,
+        trials=run.trials or 1,
         config=run.config or {},
         same_model_eval=_same_model_eval(run),
         created_at=run.created_at,
@@ -197,10 +199,49 @@ async def create_run(body: RunCreate, session: DbSession) -> RunOut:
     """Submit a run: persist the spec, kick off rubric drafting in background."""
     _validate_harness_configs(body)
     _validate_task_inputs(body)
+    # gt=0 accepts inf — a non-finite cap would silently never trip (and a
+    # field-level rejection serializes the echoed body into the 422 → 500).
+    if body.budgets.max_cost_usd is not None and not math.isfinite(
+        body.budgets.max_cost_usd
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="budgets.max_cost_usd must be a finite number",
+        )
     # Best-effort provider-catalog check — warnings on absent models, a hard
     # 422 on provider-reported tool-capability mismatches. Catalog fetch
     # failures skip validation entirely (offline tolerance).
     warnings = await modelcheck.validate_run_models(body, settings=get_settings())
+    # PR27: model_options keys the config's adapter doesn't expose are
+    # stripped before persisting — the sandbox env/request only ever sees
+    # honored knobs — and the drop is called out as a warning (never a 422:
+    # the user asked for the option where supported, not for submission to
+    # fail on a harness that can't do seed/temperature).
+    configs_in: list[dict[str, Any]] = []
+    for i, hc in enumerate(body.harness_configs):
+        entry = {
+            k: v
+            for k, v in hc.model_dump().items()
+            if k != "model" or v is not None
+        }
+        provided = hc.model_options.provided() if hc.model_options else {}
+        if provided:
+            supported = orch_adapters.supported_model_options(hc.adapter)
+            kept = {k: v for k, v in provided.items() if k in supported}
+            dropped = sorted(set(provided) - set(kept))
+            if dropped:
+                warnings.append(
+                    f"harness_configs[{i}] (adapter {hc.adapter!r}): "
+                    f"model_options {dropped} not supported — dropped "
+                    f"(supported: {sorted(supported) or 'none'})"
+                )
+            if kept:
+                entry["model_options"] = kept
+            else:
+                entry.pop("model_options", None)
+        else:
+            entry.pop("model_options", None)
+        configs_in.append(entry)
 
     evaluator_model = body.evaluator_model or body.model_name
     # PR14: persist the run's model list ([model_name] + deduped extras) so
@@ -209,14 +250,7 @@ async def create_run(body: RunCreate, session: DbSession) -> RunOut:
     # dict (null pins omitted — unexpanded configs carry no ``model`` key).
     models = participant_models(body.model_name, body.models)
     config = {
-        "harness_configs": [
-            {
-                k: v
-                for k, v in hc.model_dump().items()
-                if k != "model" or v is not None
-            }
-            for hc in body.harness_configs
-        ],
+        "harness_configs": configs_in,
         "models": models,
         "evaluator_model": evaluator_model,
         "budgets": body.budgets.model_dump(),
@@ -229,6 +263,9 @@ async def create_run(body: RunCreate, session: DbSession) -> RunOut:
             if body.task_inputs is not None
             else {}
         ),
+        # PR27: repeats-per-cell — duplicated on the Run column so GETs can
+        # read it without parsing config; the matrix expansion reads config.
+        "trials": body.trials,
     }
     # Judge == any participant model flags non-independent scoring; pins
     # count as participants even when outside the run's model list.
@@ -239,6 +276,7 @@ async def create_run(body: RunCreate, session: DbSession) -> RunOut:
         status="submitted",
         task_prompt=body.task_prompt,
         model_name=body.model_name,
+        trials=body.trials,
         config=config,
     )
     session.add(run)

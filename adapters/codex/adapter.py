@@ -33,6 +33,9 @@ MANIFEST = {
     "install": "npm i -g @openai/codex",
     "image": IMAGE,
     "requires": ["gateway:/v1/responses"],
+    # PR27: ``reasoning`` maps to codex's ``model_reasoning_effort`` config
+    # (config.toml — written by the shim from CODEX_MODEL_REASONING_EFFORT).
+    "model_options": ["reasoning"],
     "hooks": (
         "notify → adapters.common.hooks "
         "(agent-turn-complete → checkpoint, last-assistant-message)"
@@ -58,8 +61,14 @@ def env(
     max_iters: int | None = None,
     skillpacks_root: str = "/opt/skillpacks",
     system_prompt_extra: str | None = None,
+    model_options: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Codex env: the per-sandbox cred is read via ``env_key`` in config.toml."""
+    extra = {"HEG_API_KEY": cred, "CODEX_HOME": CODEX_HOME}
+    if reasoning := (model_options or {}).get("reasoning"):
+        # PR27: codex's ``model_reasoning_effort`` config key — the shim's
+        # config.toml writer picks it up from this env var.
+        extra["CODEX_MODEL_REASONING_EFFORT"] = str(reasoning)
     return contract.cli_env(
         gateway_url=gateway_url,
         cred=cred,
@@ -71,7 +80,8 @@ def env(
         max_iters=max_iters,
         skillpacks_root=skillpacks_root,
         system_prompt_extra=system_prompt_extra,
-        extra={"HEG_API_KEY": cred, "CODEX_HOME": CODEX_HOME},
+        model_options=model_options,
+        extra=extra,
     )
 
 

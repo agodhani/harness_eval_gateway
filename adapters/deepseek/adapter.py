@@ -34,6 +34,9 @@ MANIFEST = {
     "install": "npm i -g @deepseek-ai/dsh",
     "image": IMAGE,
     "requires": ["gateway:/v1/messages"],
+    # PR27: dsh exposes no headless knob for any ModelOptions key — dropped
+    # with a submit-time warning.
+    "model_options": [],
 }
 
 
@@ -63,6 +66,7 @@ def env(
     max_iters: int | None = None,
     skillpacks_root: str = "/opt/skillpacks",
     system_prompt_extra: str | None = None,
+    model_options: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     return contract.cli_env(
         gateway_url=gateway_url,
@@ -75,6 +79,7 @@ def env(
         max_iters=max_iters,
         skillpacks_root=skillpacks_root,
         system_prompt_extra=system_prompt_extra,
+        model_options=model_options,
         extra=_extra(cred, gateway_url),
     )
 
