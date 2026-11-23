@@ -52,18 +52,27 @@ two rankings — by participant model and by harness-config family
 (``_family_key``: adapter + sorted skill-pack set) — with preset /
 date-range / min-trials run-axis filters. Powers ``/leaderboard`` and the
 preset-filtered embed on ``/presets/[slug]``.
+
+PR36 dashboard summary: ``GET /api/analytics/summary`` aggregates the
+non-leaderboard ``/dashboard`` cards in one call — an ISO-week series
+(runs created + metered turns + est. spend, priced per participant /
+judge / control-plane model rate — any unpriced call nulls that bucket's
+cost, never a partial sum), the all-time terminal-reason mix, live
+queue/active status, all-time totals, and the recent-runs table rows
+(with mean ``overall``). ``?price_model=`` reprices every call uniformly,
+same what-if convention as the trends endpoint.
 """
 
 from __future__ import annotations
 
 import math
 import statistics
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from api.deps import get_db
@@ -75,6 +84,13 @@ from api.pricing import (
 )
 from api.schemas import (
     CellAnalytics,
+    DashboardQueue,
+    DashboardQueueRun,
+    DashboardRecentRun,
+    DashboardSummary,
+    DashboardTerminalSlice,
+    DashboardTotals,
+    DashboardWeekPoint,
     EvaluatorActivity,
     LatencyStats,
     Leaderboard,
@@ -1051,4 +1067,333 @@ def get_leaderboard(
         n_scored=len(latest),
         by_model=_leaderboard_board(by_model, config=False),
         by_config=_leaderboard_board(by_family, config=True),
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR36 — dashboard summary (GET /api/analytics/summary)
+# ---------------------------------------------------------------------------
+
+#: Run statuses the queue card reports as in-flight (pacing's single slot).
+_ACTIVE_RUN_STATUSES = ("provisioning", "running", "evaluating")
+#: Submitted-but-not-executing — parked before the pacing queue.
+_AWAITING_RUN_STATUSES = ("submitted", "rubric_review")
+
+
+def _utc(ts: datetime | None) -> datetime | None:
+    """Aware-or-UTC — sqlite returns naive datetimes where Postgres yields
+    timestamptz; naive values read as UTC (the leaderboard bound rule)."""
+    if ts is not None and ts.tzinfo is None:
+        return ts.replace(tzinfo=UTC)
+    return ts
+
+
+def _week_start(ts: datetime) -> datetime:
+    """Monday 00:00 UTC of ``ts``'s ISO week."""
+    ts = _utc(ts) or ts
+    day = ts.date()
+    monday = day - timedelta(days=day.weekday())
+    return datetime(monday.year, monday.month, monday.day, tzinfo=UTC)
+
+
+def _iso_week_label(week_start: datetime) -> str:
+    iso = week_start.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+@router.get("/api/analytics/summary", response_model=DashboardSummary)
+def get_dashboard_summary(
+    session: DbSession,
+    price_model: Annotated[str | None, Query()] = None,
+    weeks: Annotated[int, Query(ge=1, le=52)] = 12,
+    recent: Annotated[int, Query(ge=1, le=20)] = 8,
+) -> DashboardSummary:
+    """One aggregate for the /dashboard cards the leaderboard doesn't serve.
+
+    ``weeks`` ISO buckets (oldest → current week) carry runs created, metered
+    llm turns, and est. spend priced per call — participant traffic at the
+    cell's own model rate, judge-phase traffic at the run's evaluator model,
+    and run-level control-plane calls (rubric drafting — ``sandbox_id`` null)
+    at the payload's recorded model. A call with no resolvable rate counts
+    toward ``unpriced_llm_turns`` and nulls its bucket's cost total — the
+    PR21 rule: a partial sum would read as the week's full spend.
+    ``?price_model=`` reprices every call at one key (unknown → 422).
+
+    ``terminal_mix`` is the all-time outcome histogram (pending lanes counted
+    separately); ``queue`` reports the pacing slot live; ``recent_runs``
+    mirrors the runs list (newest-first) with a mean-``overall`` column
+    (newest-wins per sandbox, averaged — same merge rule as trends).
+    """
+    book = load_book(session)
+    explicit_key: str | None = None
+    if price_model is not None:
+        explicit_key = resolve_price_model(price_model, book=book)
+        if explicit_key is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"unknown price_model {price_model!r}; "
+                    f"known: {sorted(book.table())}"
+                ),
+            )
+
+    runs = (
+        session.execute(select(Run).order_by(Run.created_at.desc(), Run.id))
+        .scalars()
+        .all()
+    )
+    run_by_id = {r.id: r for r in runs}
+    sandboxes = session.execute(select(Sandbox)).scalars().all()
+    sb_run: dict[UUID, UUID] = {sb.id: sb.run_id for sb in sandboxes}
+    sb_model: dict[UUID, str] = {
+        sb.id: sandbox_model(
+            sb.harness_config or {}, run_by_id[sb.run_id].model_name
+        )
+        for sb in sandboxes
+        if sb.run_id in run_by_id
+    }
+    # Judge boundary per sandbox — eval creds share the participant
+    # sandbox_id, so source="evaluator" (or ts at/after its first eval
+    # event) prices that call at the evaluator model, not the cell's.
+    eval_start = {
+        sid: ts
+        for sid, ts in session.execute(
+            select(Event.sandbox_id, func.min(Event.ts))
+            .where(
+                Event.sandbox_id.is_not(None),
+                Event.source == "evaluator",
+            )
+            .group_by(Event.sandbox_id)
+        ).all()
+        if sid is not None and ts is not None
+    }
+
+    # Week buckets: ``weeks`` consecutive ISO weeks ending at the current
+    # one (oldest first) — zero-filled weeks are honest (no runs/traffic).
+    now = datetime.now(UTC)
+    first_week = _week_start(now) - timedelta(weeks=weeks - 1)
+    buckets = [first_week + timedelta(weeks=i) for i in range(weeks)]
+    bucket_index = {ws: i for i, ws in enumerate(buckets)}
+    week_runs = [0] * weeks
+    week_turns = [0] * weeks
+    week_cost = [0.0] * weeks
+    week_unpriced = [0] * weeks
+    week_has_unpriced = [False] * weeks
+
+    for run in runs:
+        if run.created_at is None:
+            continue
+        idx = bucket_index.get(_week_start(run.created_at))
+        if idx is not None:
+            week_runs[idx] += 1
+
+    totals = DashboardTotals(runs=len(runs), sandboxes=len(sandboxes))
+    total_cost = 0.0
+    metered = (
+        session.execute(select(Event).where(Event.type == "llm_response"))
+        .scalars()
+        .all()
+    )
+    for ev in metered:
+        totals.llm_turns += 1
+        t = _event_tokens(ev.payload if isinstance(ev.payload, dict) else {})
+        totals.tokens.input += t.input
+        totals.tokens.output += t.output
+        totals.tokens.cache_read += t.cache_read
+        totals.tokens.total += t.total
+
+        run = run_by_id.get(ev.run_id)
+        price: ModelPrice | None = None
+        if explicit_key is not None:
+            price = book.price_for(explicit_key)
+        elif ev.sandbox_id is not None and ev.sandbox_id in sb_run:
+            if _is_eval_event(ev, eval_start.get(ev.sandbox_id)):
+                eval_model = (
+                    (run.config or {}).get("evaluator_model") or run.model_name
+                ) if run is not None else None
+                price = book.price_for(book.key_for(eval_model))
+            else:
+                price = book.price_for(book.key_for(sb_model.get(ev.sandbox_id)))
+        else:
+            # Run-level traffic (rubric drafting on a sandbox-free cred) —
+            # price at the model the payload recorded.
+            payload = ev.payload if isinstance(ev.payload, dict) else {}
+            model = payload.get("model")
+            price = book.price_for(
+                book.key_for(model if isinstance(model, str) else None)
+            )
+
+        idx = (
+            bucket_index.get(_week_start(ev.ts))
+            if ev.ts is not None
+            else None
+        )
+        if price is None:
+            totals.unpriced_llm_turns += 1
+            if idx is not None:
+                week_unpriced[idx] += 1
+                week_has_unpriced[idx] = True
+        else:
+            cost = estimate_cost_usd(
+                price,
+                input_tokens=t.input,
+                output_tokens=t.output,
+                cache_read_tokens=t.cache_read,
+            )
+            total_cost += cost
+            if idx is not None:
+                week_cost[idx] += cost
+        if idx is not None:
+            week_turns[idx] += 1
+
+    totals.estimated_cost_usd = (
+        None if totals.unpriced_llm_turns > 0 else round(total_cost, 6)
+    )
+    n_scored = session.execute(
+        select(func.count(func.distinct(Score.sandbox_id))).where(
+            Score.dimension == OVERALL_DIMENSION
+        )
+    ).scalar_one()
+    totals.scored_sandboxes = int(n_scored or 0)
+
+    # Terminal mix — all-time, pending lanes reported separately.
+    mix_counts: dict[str, int] = {}
+    terminal_pending = 0
+    for sb in sandboxes:
+        if sb.terminal_reason:
+            mix_counts[sb.terminal_reason] = (
+                mix_counts.get(sb.terminal_reason, 0) + 1
+            )
+        else:
+            terminal_pending += 1
+    terminal_mix = [
+        DashboardTerminalSlice(reason=reason, count=count)
+        for reason, count in sorted(
+            mix_counts.items(), key=lambda kv: (-kv[1], kv[0])
+        )
+    ]
+
+    # Queue card — the pacing lane live: in-flight runs (should be ≤1),
+    # parked runs in promotion order (same ordering claim_next_queued and
+    # _queue_positions use: started_at asc nulls-last, created_at asc), and
+    # the pre-queue crowd awaiting rubric review.
+    active = [
+        DashboardQueueRun(
+            run_id=r.id,
+            status=r.status,
+            task_prompt=r.task_prompt[:120],
+            model_name=r.model_name,
+            preset_ref=r.preset_ref,
+            created_at=r.created_at,
+            started_at=r.started_at,
+        )
+        for r in runs
+        if r.status in _ACTIVE_RUN_STATUSES
+    ]
+    queued_ids = (
+        session.execute(
+            select(Run.id)
+            .where(Run.status == "queued")
+            .order_by(Run.started_at.asc().nulls_last(), Run.created_at.asc())
+        )
+        .scalars()
+        .all()
+    )
+    queued: list[DashboardQueueRun] = []
+    for pos, qid in enumerate(queued_ids, start=1):
+        qr = run_by_id.get(qid)
+        if qr is None:
+            continue
+        queued.append(
+            DashboardQueueRun(
+                run_id=qr.id,
+                status=qr.status,
+                task_prompt=qr.task_prompt[:120],
+                model_name=qr.model_name,
+                preset_ref=qr.preset_ref,
+                queue_position=pos,
+                created_at=qr.created_at,
+                started_at=qr.started_at,
+            )
+        )
+    awaiting = sum(1 for r in runs if r.status in _AWAITING_RUN_STATUSES)
+
+    # Recent runs + mean newest-wins overall (same score merge as trends:
+    # asc (created_at, seq, rubric_version, id) → newest per sandbox wins,
+    # then averaged over the run's scored cells).
+    recent_runs = runs[:recent]
+    recent_ids = {r.id for r in recent_runs}
+    sb_count = {rid: 0 for rid in recent_ids}
+    recent_sb_ids = [
+        sb.id for sb in sandboxes if sb.run_id in recent_ids
+    ]
+    for sb in sandboxes:
+        if sb.run_id in recent_ids:
+            sb_count[sb.run_id] += 1
+    latest_overall: dict[UUID, float] = {}
+    if recent_sb_ids:
+        for sid, sc in session.execute(
+            select(Score.sandbox_id, Score.score)
+            .where(
+                Score.sandbox_id.in_(recent_sb_ids),
+                Score.dimension == OVERALL_DIMENSION,
+            )
+            .order_by(
+                Score.created_at.asc(),
+                Score.seq.asc().nulls_first(),
+                Score.rubric_version.asc().nulls_first(),
+                Score.id.asc(),
+            )
+        ).all():
+            latest_overall[sid] = sc
+    overall_by_run: dict[UUID, list[float]] = {}
+    for sb in sandboxes:
+        if sb.run_id in recent_ids and sb.id in latest_overall:
+            overall_by_run.setdefault(sb.run_id, []).append(
+                latest_overall[sb.id]
+            )
+    recent_out = [
+        DashboardRecentRun(
+            run_id=r.id,
+            status=r.status,
+            task_prompt=r.task_prompt[:120],
+            model_name=r.model_name,
+            preset_ref=r.preset_ref,
+            sandbox_count=sb_count.get(r.id, 0),
+            created_at=r.created_at,
+            finished_at=r.finished_at,
+            mean_overall_score=(
+                round(
+                    sum(overall_by_run[r.id]) / len(overall_by_run[r.id]), 2
+                )
+                if overall_by_run.get(r.id)
+                else None
+            ),
+        )
+        for r in recent_runs
+    ]
+
+    return DashboardSummary(
+        generated_at=now,
+        price_model=explicit_key,
+        totals=totals,
+        weeks=[
+            DashboardWeekPoint(
+                week=_iso_week_label(ws),
+                week_start=ws,
+                runs=week_runs[i],
+                llm_turns=week_turns[i],
+                estimated_cost_usd=(
+                    None if week_has_unpriced[i] else round(week_cost[i], 6)
+                ),
+                unpriced_llm_turns=week_unpriced[i],
+            )
+            for i, ws in enumerate(buckets)
+        ],
+        terminal_mix=terminal_mix,
+        terminal_pending=terminal_pending,
+        queue=DashboardQueue(
+            active=active, queued=queued, awaiting_review=awaiting
+        ),
+        recent_runs=recent_out,
     )
