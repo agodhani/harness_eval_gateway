@@ -14,6 +14,7 @@ import { checkHealth } from "@/lib/api";
 const LINKS = [
   { href: "/submit", label: "New run" },
   { href: "/presets", label: "Presets" },
+  { href: "/suites", label: "Suites" },
   { href: "/runs", label: "Runs" },
 ] as const;
 

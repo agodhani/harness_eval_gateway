@@ -640,6 +640,25 @@ export default function RunDetailClient({ runId }: { runId: string }) {
                 </dd>
               </>
             ) : null}
+            {run.suite_ref ? (
+              <>
+                <dt>Suite</dt>
+                <dd className="mono">
+                  <Link href={`/suites/${run.suite_ref}`}>{run.suite_ref}</Link>
+                  <span className="faint">
+                    {" "}· task #{run.suite_index ?? "?"}
+                  </span>
+                  {run.suite_run_id ? (
+                    <>
+                      {" "}·{" "}
+                      <Link href={`/suite-runs/${run.suite_run_id}`}>
+                        batch {run.suite_run_id.slice(0, 8)}
+                      </Link>
+                    </>
+                  ) : null}
+                </dd>
+              </>
+            ) : null}
             <dt>Created</dt>
             <dd className="mono">{formatTs(run.created_at)}</dd>
             <dt>Started</dt>

@@ -287,6 +287,29 @@ pins it); `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
 `TESTGEN_TIMEOUT_SECONDS` (960). `EXEC_TEST_TARGET` is the
 ExecRunner→runner env contract for the suite mount.
 
+PR26 (F19) adds a fourth measured signal, `suite`: runs fanned out from a
+vendored **benchmark suite** (`benchmark_suites/<slug>/suite.yaml` — tasks
+are preset refs or inline prompts, each optionally pinned to an adapter)
+get their declared **deterministic checkers** executed post-artifact and
+pre-judge by `scoring/checkers.py`. Output checkers (`exact`, `contains`,
+`regex`, `json_schema`, `numeric_tol`, `output_grep`) read bounded,
+jailed files under the artifact (prompt cells: `output.txt` at the
+artifact root); workspace checkers (`file_exists`, `grep`) resolve
+workspace-first; `py_test` runs the suite's vendored tests against the
+candidate workspace inside the locked `heg-exec` container via
+`ExecRunner` — candidate test code never executes on the host. Each
+outcome persists as an append-only `checker_results` row
+(pass/fail/skipped/error + detail — `skipped` = infra absent, `error` =
+checker misconfig/crash), plus `suite_checks.json` in the artifact, a
+`suite_checks` checkpoint/`test_execution` event, the `suite` signal in
+`analysis.json`/`ANALYSIS.md`, and a `suite_pass` Score row (pass rate
+×10 — the one deliberate fold into the score table). Results surfaces a
+flat `suite` summary + `checker_results` per sandbox (newest-wins per
+check spec); `GET /api/suite-runs/{id}` aggregates a batch task × cell
+with `judge_overall` beside checker roll-ups. Rescores re-read the
+current suite.yaml; checker outcomes stay complementary to — never
+merged into — judge rubric dimensions.
+
 Flow: auto-generated from task spec → HITL review/edit in UI → frozen →
 applied identically to all sandboxes. Generation is fault-tolerant —
 `RUBRIC_GEN_RETRIES` (default 2) covers transient upstream errors and
@@ -320,6 +343,9 @@ skillpacks/    # vendored default packs: superpowers, mattpocock-skills, spec-ki
 skillpack_import/  # F11 GitHub import: codeload fetch, SKILL.md scan, pack store
 task_presets/  # vendored task presets (<slug>.md — frontmatter + prompt body)
 api/presets.py # preset store: vendored discovery + merged vendored/user resolve
+benchmark_suites/ # vendored benchmark suites (<slug>/suite.yaml + tests/)
+api/suites.py  # suite store: yaml parse, slug-safe resolve, jailed check paths
+scoring/checkers.py # deterministic suite checkers (output + workspace + py_test)
 web/           # Next.js app
 db/            # schema + Alembic migrations
 tests/         # unit / integration / e2e
@@ -355,6 +381,7 @@ or tests change.
 | F16 | Model-vs-model matrix: multi-model runs + per-model analytics |
 | F17 | Artifact thumbnails (headless screenshots via the preview stack) |
 | F18 | Task preset library (vendored + user presets, preset_ref provenance) |
+| F19 | Benchmark suites + deterministic checkers (suite.yaml fan-out, objective checkers beside judge scores) |
 
 ## Post-MVP roadmap
 
@@ -368,6 +395,9 @@ or tests change.
 - ~~Automated test-suite generation as eval target~~ — **landed PR8**:
   `generated_tests` signal (LLM-written suite, exec via `test_target`,
   pass rate into the judge brief)
+- ~~Benchmark suites + deterministic checkers~~ — **landed PR26 (F19)**:
+  vendored `suite.yaml` fan-out + objective `checker_results` beside
+  judge scores (see Rubric §)
 - Higher-fidelity instrumentation via harness hooks/plugins
 - Gateway response caching / deterministic replay
 - Multi-host / K8s sandbox scaling
@@ -691,6 +721,24 @@ or tests change.
   path. `/presets` + `/presets/[slug]` expose browse/detail with run
   history, per-model/per-config leaderboards, and a score trend — the
   grouping axis later suites/leaderboard pages hang off.
+- **Benchmark suites (PR26/F19) are vendored files, not preset fields** —
+  the roadmap sketched `preset.suite.cases`; the shipped model is a
+  `benchmark_suites/<slug>/suite.yaml` task list (preset_ref XOR inline
+  prompt, optional `adapter` pin, `checks:` per task) because a suite
+  groups heterogeneous tasks, not parameterizations of one prompt.
+  `POST /api/suites/{slug}/run` fans out ONE normal run per task under a
+  shared `suite_runs` batch row (`runs.suite_ref`/`suite_index`/
+  `suite_run_id`) — the whole existing lifecycle (approval → provision →
+  monitor → snapshot → eval) stays authoritative; no second runner.
+  **Deterministic checkers are complementary evidence, never judge
+  input**: `scoring/checkers.py` measures pass/fail/skipped/error
+  post-artifact into append-only `checker_results` (autoincrement `id`
+  orders newest-wins merges; rescores append, never update). The only
+  deliberate fold into the score table is the explicit `suite_pass` row
+  (pass rate ×10) the card asked for. Candidate code still never
+  executes on the host — `py_test` runs inside locked `heg-exec`; a
+  missing Docker/image is `skipped`, not a failure. Paths are
+  suite-jailed and byte-capped; slugs validate before filesystem touch.
 
 ## Working conventions
 

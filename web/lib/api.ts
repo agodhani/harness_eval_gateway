@@ -321,6 +321,12 @@ export interface RunOut {
    * (null for freeform prompts). */
   preset_ref?: string | null;
   preset_revision?: number | null;
+  /** PR26: suite provenance on suite-fanned runs — the vendored suite
+   * slug, the task's 0-based index inside suite.yaml, and the shared
+   * suite_runs batch id (links to /suite-runs/{id}). */
+  suite_ref?: string | null;
+  suite_index?: number | null;
+  suite_run_id?: string | null;
   sandboxes: SandboxOut[];
   rubric: RubricOut | null;
 }
@@ -338,6 +344,10 @@ export interface RunSummary {
   /** PR22: preset slug the task came from (null for freeform prompts) —
    * drives the list's preset column/filter. */
   preset_ref?: string | null;
+  /** PR26: suite slug + task index + batch id (null on non-suite runs). */
+  suite_ref?: string | null;
+  suite_index?: number | null;
+  suite_run_id?: string | null;
 }
 
 export interface EventOut {
@@ -438,6 +448,12 @@ export interface SandboxResult {
    * never spawns captures. `url` is api-relative (prefix API_BASE).
    */
   thumbnail?: ThumbRef | null;
+  /** PR26: deterministic suite checker outcomes (newest-wins per check) —
+   * pass/fail/skipped/error beside judge scores; empty for non-suite runs. */
+  checker_results?: CheckerResult[];
+  /** PR26: flat roll-up of checker_results — counts + pass rate + the
+   * suite_pass score value (0–10). Null for non-suite runs. */
+  suite?: SuiteSummary | null;
 }
 
 /** PR5: one rubric version as listed in results — drives the version
@@ -603,13 +619,15 @@ export interface ListRunsOptions {
   status?: string;
   /** PR22: restrict to runs submitted from this preset slug. */
   preset?: string;
+  /** PR26: restrict to runs fanned out from this suite slug. */
+  suite?: string;
   limit?: number;
   offset?: number;
 }
 
 export function listRuns(opts: ListRunsOptions = {}): Promise<RunSummary[]> {
   return request<RunSummary[]>(
-    `/api/runs${qs({ status: opts.status, preset: opts.preset, limit: opts.limit ?? 100, offset: opts.offset ?? 0 })}`,
+    `/api/runs${qs({ status: opts.status, preset: opts.preset, suite: opts.suite, limit: opts.limit ?? 100, offset: opts.offset ?? 0 })}`,
   );
 }
 
@@ -1494,4 +1512,184 @@ export function deletePreset(slug: string): Promise<void> {
   return request<void>(`/api/presets/${encodeURIComponent(slug)}`, {
     method: "DELETE",
   });
+}
+
+
+// ---------------------------------------------------------------------------
+// PR26 — benchmark suites + deterministic checkers
+// ---------------------------------------------------------------------------
+
+/** One declared check on a suite task — `check` is the checker type
+ * (file_exists | grep | py_test | output_grep | exact | contains |
+ * json_schema | numeric_tol), `spec` its declared parameters. */
+export interface SuiteCheck {
+  check: string;
+  spec: Record<string, unknown>;
+}
+
+/** One suite.yaml task — preset_ref XOR prompt; `adapter` pins the task
+ * to harness configs selecting that adapter (null = all configs). */
+export interface SuiteTask {
+  index: number;
+  id: string;
+  preset_ref: string | null;
+  prompt: string | null;
+  adapter: string | null;
+  checks: SuiteCheck[];
+}
+
+/** A suite_runs batch — one fan-out of a suite. */
+export interface SuiteRunRef {
+  id: string;
+  suite_slug: string;
+  suite_version: number | null;
+  created_at: string;
+  run_count: number;
+}
+
+/** GET /api/suites row — vendored suite + browse aggregates. */
+export interface Suite {
+  slug: string;
+  version: number;
+  title: string;
+  description: string;
+  task_count: number;
+  checks_count: number;
+  suite_runs_count: number;
+}
+
+/** GET /api/suites/{slug} — suite + tasks + recent batches. */
+export interface SuiteDetail extends Suite {
+  tasks: SuiteTask[];
+  recent_runs: SuiteRunRef[];
+}
+
+/** POST /api/suites/{slug}/run body — the shared run spec every suite
+ * task fans out with (RunCreate minus the task text). */
+export interface SuiteRunIn {
+  model_name: string;
+  models?: string[] | null;
+  harness_configs: HarnessConfig[];
+  evaluator_model?: string | null;
+  budgets?: Budgets;
+}
+
+/** One run created by a suite fan-out. */
+export interface SuiteRunChild {
+  run_id: string;
+  suite_index: number;
+  task_id: string;
+  preset_ref: string | null;
+  status: string;
+}
+
+/** 201 response to POST /api/suites/{slug}/run. */
+export interface SuiteRunOut {
+  id: string;
+  suite_slug: string;
+  suite_version: number | null;
+  runs: SuiteRunChild[];
+  warnings: string[];
+}
+
+/** One deterministic checker outcome (checker_results row). */
+export interface CheckerResult {
+  check: string;
+  spec: Record<string, unknown>;
+  status: string; // pass | fail | skipped | error
+  passed: boolean;
+  detail: string;
+  created_at: string | null;
+}
+
+/** Flat suite roll-up on SandboxResult — the card's "per-case pass/fail +
+ * mean without judge involvement". pass_rate excludes skipped/error;
+ * suite_pass mirrors the suite_pass Score value (0–10). */
+export interface SuiteSummary {
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  errors: number;
+  pass_rate: number | null;
+  suite_pass: number | null;
+}
+
+/** Checker roll-up for one suite cell. */
+export interface SuiteCellChecks {
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  errors: number;
+  pass_rate: number | null;
+  checks: CheckerResult[];
+}
+
+/** One task × cell result — judge overall beside checker roll-up. */
+export interface SuiteCell {
+  sandbox_id: string;
+  name: string | null;
+  label: string;
+  model: string;
+  status: string;
+  terminal_reason: string | null;
+  judge_overall: number | null;
+  checks: SuiteCellChecks;
+}
+
+/** One suite task's run inside a batch. */
+export interface SuiteRunTask {
+  run_id: string;
+  suite_index: number;
+  task_id: string;
+  preset_ref: string | null;
+  status: string;
+  created_at: string | null;
+  finished_at: string | null;
+  cells: SuiteCell[];
+}
+
+/** Batch-level roll-up — pooled checker pass rate + mean judge overall. */
+export interface SuiteRunAggregate {
+  tasks: number;
+  cells: number;
+  checks_total: number;
+  checks_passed: number;
+  checks_failed: number;
+  checks_skipped: number;
+  checks_errors: number;
+  check_pass_rate: number | null;
+  cells_scored: number;
+  mean_judge_overall: number | null;
+}
+
+/** GET /api/suite-runs/{id} — task × cell aggregation + batch roll-up. */
+export interface SuiteRunResults {
+  id: string;
+  suite_slug: string;
+  suite_version: number | null;
+  created_at: string | null;
+  runs: SuiteRunTask[];
+  aggregate: SuiteRunAggregate;
+}
+
+export function listSuites(): Promise<Suite[]> {
+  return request<Suite[]>("/api/suites");
+}
+
+export function getSuite(slug: string): Promise<SuiteDetail> {
+  return request<SuiteDetail>(`/api/suites/${encodeURIComponent(slug)}`);
+}
+
+/** Launch the whole suite — one run per task (201). */
+export function runSuite(slug: string, body: SuiteRunIn): Promise<SuiteRunOut> {
+  return request<SuiteRunOut>(`/api/suites/${encodeURIComponent(slug)}/run`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function getSuiteRun(id: string): Promise<SuiteRunResults> {
+  return request<SuiteRunResults>(`/api/suite-runs/${encodeURIComponent(id)}`);
 }
