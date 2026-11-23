@@ -84,23 +84,34 @@ def analytics_run(session_factory: sessionmaker[Session]):
         s.add_all([sb1, sb2])
         s.flush()
 
-        def resp(sb, ts, prompt, completion, latency, model="qwen3:8b", source="gateway"):
+        def resp(
+            sb, ts, prompt, completion, latency, model="qwen3:8b",
+            source="gateway", ttft=None, tps=None,
+        ):
+            payload = {
+                "model": model,
+                "usage": {
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
+                    "total_tokens": prompt + completion,
+                },
+                "latency_ms": latency,
+                "total_ms": latency,
+                "http_status": 200,
+            }
+            # PR30 speed fields ride only when present — events predating
+            # them contribute no sample (sb2 stays uninstrumented on purpose).
+            if ttft is not None:
+                payload["ttft_ms"] = ttft
+            if tps is not None:
+                payload["tokens_per_sec"] = tps
             return _ev(
                 run.id,
                 sandbox_id=sb.id,
                 source=source,
                 type_="llm_response",
                 ts=ts,
-                payload={
-                    "model": model,
-                    "usage": {
-                        "prompt_tokens": prompt,
-                        "completion_tokens": completion,
-                        "total_tokens": prompt + completion,
-                    },
-                    "latency_ms": latency,
-                    "http_status": 200,
-                },
+                payload=payload,
             )
 
         s.add_all(
@@ -108,7 +119,8 @@ def analytics_run(session_factory: sessionmaker[Session]):
                 # ---- sb1 participant phase (t0 .. t0+9min) ----
                 _ev(run.id, sandbox_id=sb1.id, type_="run_started", ts=T0,
                     payload={"model": "qwen3:8b"}),
-                resp(sb1, T0 + timedelta(minutes=1), 100, 40, 500),
+                resp(sb1, T0 + timedelta(minutes=1), 100, 40, 500,
+                     ttft=100, tps=80.0),
                 _ev(run.id, sandbox_id=sb1.id, type_="tool_call",
                     ts=T0 + timedelta(minutes=2), payload={"name": "shell"}),
                 _ev(run.id, sandbox_id=sb1.id, type_="shell_command",
@@ -130,7 +142,8 @@ def analytics_run(session_factory: sessionmaker[Session]):
                 _ev(run.id, sandbox_id=sb1.id, type_="error",
                     ts=T0 + timedelta(minutes=7),
                     payload={"message": "flaky"}),
-                resp(sb1, T0 + timedelta(minutes=8), 200, 60, 1500),
+                resp(sb1, T0 + timedelta(minutes=8), 200, 60, 1500,
+                     ttft=300, tps=40.0),
                 _ev(run.id, sandbox_id=sb1.id, type_="terminal_state",
                     ts=T0 + timedelta(minutes=9),
                     payload={"terminal_state": "agent_done", "iters": 9}),
@@ -139,7 +152,7 @@ def analytics_run(session_factory: sessionmaker[Session]):
                     type_="checkpoint", ts=T0 + timedelta(minutes=20),
                     payload={"phase": "eval_started"}),
                 resp(sb1, T0 + timedelta(minutes=21), 1000, 90, 800,
-                     model="gpt-4o"),
+                     model="gpt-4o", ttft=50, tps=112.5),
                 _ev(run.id, sandbox_id=sb1.id, source="evaluator",
                     type_="error", ts=T0 + timedelta(minutes=21, seconds=30),
                     payload={"message": "judge timeout"}),
@@ -208,6 +221,193 @@ def test_per_sandbox_aggregation(client: TestClient, analytics_run) -> None:
     assert sb1["errors"] == 1
     # run_started @t0 → terminal_state @t0+9m (judge events excluded)
     assert sb1["wall_clock_seconds"] == pytest.approx(540.0)
+
+
+def test_speed_metrics_per_sandbox_and_model_rollup(
+    client: TestClient, analytics_run
+) -> None:
+    """PR30: ttft stats + avg tok/s roll up per cell and per model.
+
+    Hand-worked oracles on sb1's two participant responses (ttft 100/300,
+    tok/s 80/40): avg = mean; p95 = nearest-rank → the larger sample. The
+    judge-phase response (ttft 50, tok/s 112.5) must NOT leak into
+    participant stats — it lands on the evaluator side of the boundary.
+    """
+    body = _get(client, analytics_run["run_id"])
+    sb1 = next(x for x in body["sandboxes"] if x["sandbox_id"] == str(analytics_run["sb1"]))
+    assert sb1["ttft_ms"] == {"avg": 200.0, "p95": 300.0, "max": 300.0}
+    assert sb1["avg_tokens_per_sec"] == pytest.approx(60.0)
+
+    # sb2's response predates the speed fields → stats stay null, not a
+    # phantom-zero average.
+    sb2 = next(x for x in body["sandboxes"] if x["sandbox_id"] == str(analytics_run["sb2"]))
+    assert sb2["ttft_ms"] == {"avg": None, "p95": None, "max": None}
+    assert sb2["avg_tokens_per_sec"] is None
+
+    # Model rollup (single-model run): same samples pooled across cells —
+    # sb2 contributes no ttft sample, so the model stats equal sb1's.
+    (model_row,) = body["models"]
+    assert model_row["model"] == "qwen3:8b"
+    assert model_row["ttft_ms"] == {"avg": 200.0, "p95": 300.0, "max": 300.0}
+    assert model_row["avg_tokens_per_sec"] == pytest.approx(60.0)
+
+    # Cell rollup (PR27) pools the same samples per config × model group —
+    # sb1's cell shows the speed axis, sb2's uninstrumented cell stays
+    # null rather than reporting phantom zeros.
+    sup = _cell(body, "miniloop · superpowers")
+    assert sup["ttft_ms"] == {"avg": 200.0, "p95": 300.0, "max": 300.0}
+    assert sup["avg_tokens_per_sec"] == pytest.approx(60.0)
+    bare = _cell(body, "miniloop")
+    assert bare["ttft_ms"] == {"avg": None, "p95": None, "max": None}
+    assert bare["avg_tokens_per_sec"] is None
+
+
+def test_cached_replay_stays_off_the_speed_axis(
+    client: TestClient, session_factory: sessionmaker[Session]
+) -> None:
+    """A cache replay's ttft_ms is the store's lookup time (~ms), not
+    model speed — like the nulled tokens_per_sec it must not sample the
+    comparison stats, and its latency_ms is the same serve-time on the
+    same chart. Oracle: only the live call's 120ms counts (the
+    pre-fix read would average in the 2ms replay → ~61ms), and a
+    cache-only lane reports null stats rather than an ~3ms "instant"
+    first-byte time."""
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="x", model_name="qwen3:8b", config={}, status="done"
+        )
+        s.add(run)
+        s.flush()
+        live = Sandbox(
+            run_id=run.id, harness_config={"adapter": "miniloop"}, status="done"
+        )
+        replay = Sandbox(
+            run_id=run.id, harness_config={"adapter": "miniloop"}, status="done"
+        )
+        s.add_all([live, replay])
+        s.flush()
+
+        def resp(sb, ts, latency, ttft, tps, cached=False):
+            payload = {
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+                "latency_ms": latency,
+                "ttft_ms": ttft,
+                "tokens_per_sec": tps,
+                "http_status": 200,
+            }
+            if cached:
+                payload["cached"] = True
+            return _ev(
+                run.id,
+                sandbox_id=sb.id,
+                type_="llm_response",
+                ts=ts,
+                payload=payload,
+            )
+
+        s.add_all(
+            [
+                resp(live, T0, 500, 120, 10.0),
+                resp(live, T0 + timedelta(seconds=1), 2, 2, None, cached=True),
+                resp(replay, T0, 3, 3, None, cached=True),
+            ]
+        )
+        s.commit()
+        run_id, live_id, replay_id = run.id, live.id, replay.id
+    finally:
+        s.close()
+
+    body = _get(client, run_id)
+    rows = {r["sandbox_id"]: r for r in body["sandboxes"]}
+    live_row = rows[str(live_id)]
+    # replays still count as traffic — just not as measured speed
+    assert live_row["llm_turns"] == 2
+    assert live_row["latency_ms"] == {
+        "avg": 500.0,
+        "p95": 500.0,
+        "max": 500.0,
+    }
+    assert live_row["ttft_ms"] == {"avg": 120.0, "p95": 120.0, "max": 120.0}
+    assert live_row["avg_tokens_per_sec"] == pytest.approx(10.0)
+    replay_row = rows[str(replay_id)]
+    assert replay_row["latency_ms"] == {"avg": None, "p95": None, "max": None}
+    assert replay_row["ttft_ms"] == {"avg": None, "p95": None, "max": None}
+    assert replay_row["avg_tokens_per_sec"] is None
+    # sibling site: the pooled model rollup excludes the replay too
+    (model_row,) = body["models"]
+    assert model_row["latency_ms"] == {
+        "avg": 500.0,
+        "p95": 500.0,
+        "max": 500.0,
+    }
+    assert model_row["ttft_ms"] == {"avg": 120.0, "p95": 120.0, "max": 120.0}
+    assert model_row["avg_tokens_per_sec"] == pytest.approx(10.0)
+
+
+def test_malformed_speed_fields_do_not_poison_stats(
+    client: TestClient, session_factory: sessionmaker[Session]
+) -> None:
+    """Speed fields bypass ingest normalization, so the sampling guards
+    them: negative latency/ttft and a bool or negative tok/s are dropped
+    rather than dragging avg/p95/max below zero. Non-finite floats can't
+    appear here — Postgres JSONB rejects ``Infinity``/``NaN`` at insert,
+    so the persisted malformed axis is type confusion and negatives.
+    Oracle: only the sane response's values appear in every stat."""
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="x", model_name="qwen3:8b", config={}, status="done"
+        )
+        s.add(run)
+        s.flush()
+        sb = Sandbox(
+            run_id=run.id, harness_config={"adapter": "miniloop"}, status="done"
+        )
+        s.add(sb)
+        s.flush()
+
+        def resp(ts, latency, ttft, tps):
+            return _ev(
+                run.id,
+                sandbox_id=sb.id,
+                type_="llm_response",
+                ts=ts,
+                payload={
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                        "total_tokens": 15,
+                    },
+                    "latency_ms": latency,
+                    "ttft_ms": ttft,
+                    "tokens_per_sec": tps,
+                    "http_status": 200,
+                },
+            )
+
+        s.add_all(
+            [
+                resp(T0, -500, -5, -3.0),
+                resp(T0 + timedelta(seconds=1), 400, 90, 25.0),
+                resp(T0 + timedelta(seconds=2), 600, 110, True),
+            ]
+        )
+        s.commit()
+        run_id = run.id
+    finally:
+        s.close()
+
+    body = _get(client, run_id)
+    (row,) = body["sandboxes"]
+    assert row["llm_turns"] == 3
+    assert row["latency_ms"] == {"avg": 500.0, "p95": 600.0, "max": 600.0}
+    assert row["ttft_ms"] == {"avg": 100.0, "p95": 110.0, "max": 110.0}
+    assert row["avg_tokens_per_sec"] == pytest.approx(25.0)
 
 
 def test_terminal_reason_falls_back_to_event(

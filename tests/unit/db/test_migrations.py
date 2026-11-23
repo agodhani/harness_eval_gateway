@@ -24,7 +24,9 @@ SANDBOX_NAME_REV = "a2b3c4d5e6f7"
 RUNS_TRIALS_REV = "d7e9f1a3b5c7"
 # PR28 — re-chained on top of RUNS_TRIALS_REV.
 MODEL_PRICES_REV = "c4e8d1a7f3b5"
-# PR22 — re-chained on top of MODEL_PRICES_REV.
+# PR28 follow-up — case-insensitive glob uniqueness.
+PRICE_GLOB_LOWER_REV = "d6e2b8f4a1c9"
+# PR22 — re-chained on top of PRICE_GLOB_LOWER_REV.
 TASK_PRESETS_REV = "d1e2f3a4b5c6"
 # PR26 — benchmark suites + checker results; current chain head.
 SUITES_REV = "e4f5a6b7c8d9"
@@ -318,5 +320,29 @@ def test_runs_trials_matches_model(sqlite_url: str) -> None:
         )
         assert col["nullable"] is False
         assert "INT" in str(col["type"]).upper()
+    finally:
+        engine.dispose()
+
+
+def test_model_prices_lower_glob_unique(sqlite_url: str) -> None:
+    """A differently-cased insert collides on the lower() unique index —
+    glob matching is case-insensitive, so a second casing would be a
+    permanently shadowed duplicate the schema must refuse."""
+    from sqlalchemy.exc import IntegrityError
+
+    from db.models import ModelPriceRow
+    from db.session import make_engine, make_session_factory
+
+    command.upgrade(_cfg(), "head")
+    engine = make_engine(sqlite_url)
+    sf = make_session_factory(engine)
+    try:
+        with sf() as s:
+            s.add(ModelPriceRow(model_glob="mig-lower-*", source="user"))
+            s.commit()
+        with sf() as s:
+            s.add(ModelPriceRow(model_glob="MIG-LOWER-*", source="user"))
+            with pytest.raises(IntegrityError):
+                s.commit()
     finally:
         engine.dispose()

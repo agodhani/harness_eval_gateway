@@ -32,6 +32,11 @@ lifecycle routes to):
 5. ``terminal_state`` + ``sandbox_finalized`` events and the sandbox
    transition — ``harness_complete`` on a usable response, ``timeout`` /
    ``budget_exceeded`` / ``error`` on the matching failure modes.
+   ``budget_exceeded`` also fires post-call when metered usage overshoots
+   ``budgets.token_budget``/``budgets.sandbox_token_budget`` or the cell's
+   spend reaches ``budgets.max_cost_usd`` — the monitor's poll enforces
+   those caps for containers, but a prompt cell finishes before the
+   monitor exists, so ``_budget_cap_detail`` runs the same checks inline.
 """
 
 from __future__ import annotations
@@ -53,7 +58,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from db.models import Artifact, Run, Sandbox
 from sandbox.runtime import SandboxRuntime
 
-from . import provision, state_machine
+from . import monitor, provision, state_machine
 from .events import emit
 from .matrix import sandbox_model
 
@@ -569,6 +574,67 @@ def _finalize(
         session.commit()
 
 
+def _budget_cap_detail(
+    session_factory: sessionmaker[Session],
+    *,
+    run: Run,
+    sandbox_id: uuid.UUID,
+    call: _CallResult,
+    budgets: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Post-call budget verdict for a completed cell (monitor parity).
+
+    Containers get ``token_budget``, ``sandbox_token_budget``, and
+    ``max_cost_usd`` from ``watch_sandbox``'s poll — the minted claims
+    gate admission pre-call but a reply can still overshoot, and the
+    monitor's post-hoc check is what stamps the verdict. A prompt cell
+    is already finished before the monitor could run, so the same
+    metered-usage checks run inline, in the monitor's order (run tokens
+    → sandbox tokens → cost): the run check sums the whole run's
+    ``llm_response`` usage (``monitor._run_tokens_used``), the sandbox
+    check the cell's own (``monitor._sandbox_tokens_used``), the cost
+    check is the same layered-price estimate
+    (``monitor._sandbox_estimated_cost_usd`` — same unpriced→None honesty).
+    Only a clean completion is overridden — error/timeout verdicts and the
+    gateway's own token-gate 429 stand. Returns the terminate detail on a
+    breach, else None.
+    """
+    if call.terminal_reason != "harness_complete":
+        return None
+    if run_budget := budgets.get("token_budget"):
+        used = monitor._run_tokens_used(session_factory, run.id)
+        if used >= int(run_budget):
+            return {
+                "limit": "run_tokens",
+                "used_tokens": used,
+                "budget": int(run_budget),
+            }
+    if sandbox_budget := budgets.get("sandbox_token_budget"):
+        used = monitor._sandbox_tokens_used(
+            session_factory, run.id, sandbox_id
+        )
+        if used >= int(sandbox_budget):
+            return {
+                "limit": "sandbox_tokens",
+                "used_tokens": used,
+                "budget": int(sandbox_budget),
+            }
+    max_cost = budgets.get("max_cost_usd")
+    if not max_cost:
+        return None
+    sb = monitor._load_sandbox(session_factory, sandbox_id)
+    if sb is None:
+        return None
+    est = monitor._sandbox_estimated_cost_usd(session_factory, run, sb)
+    if est is None or est < float(max_cost):
+        return None
+    return {
+        "limit": "cost",
+        "estimated_cost_usd": round(est, 6),
+        "budget_usd": float(max_cost),
+    }
+
+
 def _mark_cell_failed(
     session_factory: sessionmaker[Session],
     *,
@@ -683,6 +749,23 @@ async def run_prompt_cell(
         finally:
             if own_client:
                 await client.aclose()
+
+        cap_detail = _budget_cap_detail(
+            session_factory,
+            run=run,
+            sandbox_id=sid,
+            call=call,
+            budgets=budgets,
+        )
+        if cap_detail is not None:
+            call.terminal_reason = "budget_exceeded"
+            monitor._mark_terminating(
+                session_factory,
+                run_id=run_id,
+                sandbox_id=sid,
+                reason="budget_exceeded",
+                detail=cap_detail,
+            )
 
         artifact_dir = Path(runtime.artifact_root) / str(run_id) / str(sid)
         await asyncio.to_thread(

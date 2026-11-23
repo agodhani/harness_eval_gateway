@@ -1799,6 +1799,41 @@ table.matrix {
   font-size: 0.76rem;
 }
 
+/* PR33 — auto summary ("verdict") card under the quality scatter:
+ * accent-tinted sibling of .winner — a deterministic template, not a
+ * judge call. */
+.verdict {
+  margin: 0.3rem 0.7rem 0.6rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+  padding: 0.6rem 0.9rem;
+}
+.verdict__tag {
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.verdict__lines {
+  list-style: none;
+  margin: 0.3rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.verdict__line {
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.verdict__line--head {
+  color: var(--text);
+  font-weight: 600;
+}
+
 /* Heatmap table — reuses .matrix chrome; cells carry the color fill. */
 .grid-table thead th {
   min-width: 120px;

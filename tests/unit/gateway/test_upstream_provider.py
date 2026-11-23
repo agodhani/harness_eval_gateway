@@ -526,15 +526,23 @@ class TestRealDepRouting:
             async def __aexit__(self, *exc: object) -> None:
                 return None
 
-            async def post(
-                self, path: str, json: Any = None, headers: Any = None
-            ) -> httpx.Response:
+            def build_request(
+                self, method: str, path: str, json: Any = None, headers: Any = None
+            ) -> httpx.Request:
                 seen["path"], seen["json"], seen["req_headers"] = (
                     path,
                     json,
                     headers,
                 )
-                return httpx.Response(200, json=_UPSTREAM_OK)
+                return httpx.Request(
+                    method, f"http://upstream.test{path}", json=json, headers=headers
+                )
+
+            async def send(
+                self, request: httpx.Request, stream: bool = False
+            ) -> httpx.Response:
+                seen["stream"] = stream
+                return httpx.Response(200, json=_UPSTREAM_OK, request=request)
 
         monkeypatch.setattr(
             deps.httpx, "AsyncClient", lambda **kw: _Client(**kw)

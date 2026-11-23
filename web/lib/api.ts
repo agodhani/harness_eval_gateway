@@ -878,6 +878,11 @@ export interface SandboxAnalytics {
   llm_turns: number;
   tokens: TokenUsage;
   latency_ms: LatencyStats;
+  /** PR30 speed metrics: time-to-first-byte stats + mean output tok/s.
+   * Optional — absent on backends predating the gateway speed fields, and
+   * null-valued when no event carried them. */
+  ttft_ms?: LatencyStats;
+  avg_tokens_per_sec?: number | null;
   tool_calls: ToolCallStats;
   skill_calls: SkillCallStats;
   shell_commands: number;
@@ -897,6 +902,9 @@ export interface ModelAnalytics {
   llm_turns: number;
   tokens: TokenUsage;
   latency_ms: LatencyStats;
+  /** PR30 speed metrics, pooled across the model's sandboxes. */
+  ttft_ms?: LatencyStats;
+  avg_tokens_per_sec?: number | null;
   tool_calls: ToolCallStats;
   skill_calls: SkillCallStats;
   shell_commands: number;
@@ -920,6 +928,9 @@ export interface CellAnalytics {
   llm_turns: number;
   tokens: TokenUsage;
   latency_ms: LatencyStats;
+  /** PR30 speed metrics, pooled across the cell's trials. */
+  ttft_ms?: LatencyStats;
+  avg_tokens_per_sec?: number | null;
   tool_calls: ToolCallStats;
   skill_calls: SkillCallStats;
   shell_commands: number;

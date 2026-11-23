@@ -523,6 +523,25 @@ async def emit_llm_request(
     )
 
 
+def _tokens_per_sec(usage: dict[str, int | None], latency_ms: int) -> float | None:
+    """Output-token throughput over the call's whole wall time (PR30).
+
+    ``completion_tokens / total_seconds`` — the end-to-end speed axis for
+    analytics. ``ttft_ms`` rides the payload separately so a reader can
+    still derive the post-first-token decode rate when it wants it.
+    ``None`` when the call recorded no completion count or no measurable
+    elapsed time (an instant replay/mocked call has no honest rate).
+    """
+    completion = usage.get("completion_tokens") if isinstance(usage, dict) else None
+    if (
+        isinstance(completion, int)
+        and not isinstance(completion, bool)
+        and latency_ms > 0
+    ):
+        return round(completion / (latency_ms / 1000), 1)
+    return None
+
+
 async def emit_llm_response(
     claims: CredClaims,
     *,
@@ -533,12 +552,28 @@ async def emit_llm_response(
     provider: str | None = None,
     cached: bool = False,
     usage_estimated: bool = False,
+    ttft_ms: int | None = None,
 ) -> None:
+    """Meter one completed upstream call.
+
+    Timing (PR30): ``latency_ms`` stays the established field; ``total_ms``
+    carries the same end-to-end value under the canonical name, and
+    ``ttft_ms`` is the time to the first response byte/chunk — for a
+    streamed body the first ``aiter_bytes`` chunk, for a buffered body the
+    first content byte read off the wire. ``ttft_ms`` falls back to the
+    total when no first byte was ever observed (pre-start disconnect,
+    empty stream, cache replay). ``tokens_per_sec`` is the derived output
+    throughput — null on cache replays, which measure the store, not the
+    model.
+    """
     payload: dict[str, Any] = {
         "model": model,
         "provider": provider or _resolve_provider(model),
         "usage": usage,
         "latency_ms": latency_ms,
+        "total_ms": latency_ms,
+        "ttft_ms": ttft_ms if ttft_ms is not None else latency_ms,
+        "tokens_per_sec": None if cached else _tokens_per_sec(usage, latency_ms),
         "http_status": http_status,
         "run_id": claims.run_id,
         "sandbox_id": claims.sandbox_id,
