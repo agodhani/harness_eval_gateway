@@ -1889,7 +1889,7 @@ def _export_csv(
             "run_id": str(run_id),
             "sandbox_id": str(sb.sandbox_id),
             "sandbox_name": sb.name or "",
-            "adapter": hc.get("adapter") or "",
+            "adapter": hc.get("adapter") or hc.get("harness") or "",
             "model": sb.model,
             # The analytics cell key (config × model group) — lets a sheet
             # pivot trials of one cell; empty only when analytics lacks

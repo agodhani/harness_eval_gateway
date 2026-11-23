@@ -273,6 +273,30 @@ def test_export_csv_empty_run(client, session_factory) -> None:
     assert "sandbox_id" in resp.text  # header still present
 
 
+def test_export_csv_legacy_harness_key(client, session_factory) -> None:
+    """A sandbox carrying the legacy ``harness`` key exports its adapter
+    name — same fallback the matrix label + analytics apply."""
+    s = session_factory()
+    run = Run(task_prompt="t", model_name="m", status="done")
+    s.add(run)
+    s.flush()
+    s.add(
+        Sandbox(
+            run_id=run.id,
+            name="cfg-x",
+            harness_config={"harness": "codex"},
+            status="done",
+        )
+    )
+    s.commit()
+    s.close()
+    resp = client.get(f"/api/runs/{run.id}/export?fmt=csv")
+    assert resp.status_code == 200
+    rows = _csv_rows(resp.text)
+    assert len(rows) == 1
+    assert rows[0]["adapter"] == "codex"
+
+
 def test_export_json_empty_run(client, session_factory) -> None:
     """A run with no sandboxes/events still validates + downloads."""
     s = session_factory()
