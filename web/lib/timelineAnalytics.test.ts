@@ -41,6 +41,8 @@ function fixture(): RunAnalytics {
         llm_turns: 12,
         tokens: { input: 4204, output: 913, cache_read: 128, total: 5117 },
         latency_ms: { avg: 812.4, p95: 1500, max: 2100 },
+        ttft_ms: { avg: 210.5, p95: 400, max: 500 },
+        avg_tokens_per_sec: 47.3,
         tool_calls: { total: 30, by_tool: { shell: 20, read_file: 10 } },
         skill_calls: { total: 2, by_skill: { brainstorming: 2 } },
         shell_commands: 20,
@@ -105,6 +107,10 @@ describe("sandboxStrips", () => {
     assert.match(chip(a, "tok").title ?? "", /128 cached/);
     assert.equal(chip(a, "lat").value, "812ms");
     assert.match(chip(a, "lat").title ?? "", /p95 1500ms/);
+    // PR30 speed chip: avg output tok/s + ttft detail on the hover.
+    assert.equal(chip(a, "spd").value, "47.3 t/s");
+    assert.match(chip(a, "spd").title ?? "", /ttft avg 211ms/);
+    assert.match(chip(a, "spd").title ?? "", /p95 400ms/);
     // cost oracle: (4204 × 2.5 + 913 × 10) / 1e6 = 0.01964 → 2dp → $0.02
     assert.equal(chip(a, "cost").value, "$0.02");
     assert.match(chip(a, "cost").title ?? "", /gpt-4o/);
@@ -117,6 +123,8 @@ describe("sandboxStrips", () => {
     assert.equal(chip(b, "llm").value, "0");
     assert.equal(chip(b, "tok").value, "0→0");
     assert.equal(chip(b, "lat").value, "—");
+    // PR30: no speed fields on this sandbox → an honest dash, not 0 t/s.
+    assert.equal(chip(b, "spd").value, "—");
     assert.equal(chip(b, "cost").value, "$0.00");
     assert.equal(chip(b, "err").tone, "default");
     assert.equal(b.evalLine, null);

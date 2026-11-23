@@ -31,8 +31,8 @@ append-mostly; rebase on main before merge.
   `_spawn_isolated` runner+sidecar topology; `_PROXIED_PORTS` per-type port
   resolution. Details: `FEATURE_MAP.md` F12.
 - **PR9 timeline-side analytics**: per-sandbox metrics strip on
-  `web/app/runs/[id]/timeline/` (turns/tokens/latency/cost/errors chips +
-  judge line; chips double as sandbox-filter selectors; `sandboxStrips`
+  `web/app/runs/[id]/timeline/` (turns/tokens/latency/speed/cost/errors
+  chips + judge line; chips double as sandbox-filter selectors; `sandboxStrips`
   transform in `web/lib/timelineAnalytics.ts` + `node --test` unit tests).
   Leftover idea: on-event-hover cumulative stats.
 - **PR10 split-view trace comparison**: `merged | split` toggle on the

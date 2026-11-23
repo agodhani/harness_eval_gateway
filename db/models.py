@@ -221,6 +221,20 @@ class ModelPriceRow(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
+    __table_args__ = (
+        # The upsert/match key folds case (func.lower lookups, PriceBook,
+        # sync's existing map) — the case-sensitive column constraint can't
+        # see a differently-cased insert, which would store a permanently
+        # shadowed duplicate. This index makes the DB enforce the identity
+        # the lookups assume, turning a lost insert race into an
+        # IntegrityError the writers converge on.
+        Index(
+            "uq_model_prices_model_glob_lower",
+            func.lower(model_glob),
+            unique=True,
+        ),
+    )
+
 
 class Artifact(Base):
     """Metadata for files in the artifact store (./data/artifacts/)."""

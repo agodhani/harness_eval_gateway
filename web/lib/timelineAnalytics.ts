@@ -79,6 +79,7 @@ function toStrip(
           : ""),
     },
     latencyChip(sb),
+    speedChip(sb),
     costChip(sb, price, priceName),
     {
       label: "err",
@@ -106,6 +107,33 @@ function latencyChip(sb: SandboxAnalytics): StatChip {
     label: "lat",
     value: `${Math.round(avg)}ms`,
     title: `latency avg · p95 ${Math.round(p95 ?? 0)}ms · max ${Math.round(max ?? 0)}ms`,
+  };
+}
+
+/** PR30 speed chip: avg output tok/s, with the ttft stats on the hover.
+ * "—" when no llm_response carried the gateway's speed fields yet (an
+ * all-legacy or fully cache-replayed lane has no honest rate). */
+function speedChip(sb: SandboxAnalytics): StatChip {
+  const tps = sb.avg_tokens_per_sec;
+  const ttftAvg = sb.ttft_ms?.avg;
+  const ttftP95 = sb.ttft_ms?.p95;
+  if (tps == null) {
+    return {
+      label: "spd",
+      value: "—",
+      title:
+        `no output tok/s measured` +
+        (ttftAvg != null ? ` · ttft avg ${Math.round(ttftAvg)}ms` : ""),
+    };
+  }
+  return {
+    label: "spd",
+    value: `${formatNum(tps)} t/s`,
+    title:
+      `avg output tok/s (completion tokens ÷ call wall time)` +
+      (ttftAvg != null
+        ? ` · ttft avg ${Math.round(ttftAvg)}ms · p95 ${Math.round(ttftP95 ?? 0)}ms`
+        : ""),
   };
 }
 

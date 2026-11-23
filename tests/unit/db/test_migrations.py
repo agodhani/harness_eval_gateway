@@ -22,8 +22,10 @@ INITIAL_REV = "f0a1b2c3d4e5"
 SANDBOX_NAME_REV = "a2b3c4d5e6f7"
 # PR27: adds ``runs.trials`` (int, default 1).
 RUNS_TRIALS_REV = "d7e9f1a3b5c7"
-# PR28 — current chain head (re-chained on top of RUNS_TRIALS_REV).
+# PR28 (re-chained on top of RUNS_TRIALS_REV).
 MODEL_PRICES_REV = "c4e8d1a7f3b5"
+# case-insensitive glob uniqueness — current chain head
+PRICE_GLOB_LOWER_REV = "d6e2b8f4a1c9"
 
 
 @pytest.fixture()
@@ -55,7 +57,7 @@ def _columns(url: str, table: str) -> set[str]:
 
 def test_migration_chain_single_headed() -> None:
     heads = ScriptDirectory.from_config(_cfg()).get_heads()
-    assert list(heads) == [MODEL_PRICES_REV]
+    assert list(heads) == [PRICE_GLOB_LOWER_REV]
 
 
 def test_sandbox_name_upgrade_downgrade(sqlite_url: str) -> None:
@@ -181,5 +183,29 @@ def test_runs_trials_matches_model(sqlite_url: str) -> None:
         )
         assert col["nullable"] is False
         assert "INT" in str(col["type"]).upper()
+    finally:
+        engine.dispose()
+
+
+def test_model_prices_lower_glob_unique(sqlite_url: str) -> None:
+    """A differently-cased insert collides on the lower() unique index —
+    glob matching is case-insensitive, so a second casing would be a
+    permanently shadowed duplicate the schema must refuse."""
+    from sqlalchemy.exc import IntegrityError
+
+    from db.models import ModelPriceRow
+    from db.session import make_engine, make_session_factory
+
+    command.upgrade(_cfg(), "head")
+    engine = make_engine(sqlite_url)
+    sf = make_session_factory(engine)
+    try:
+        with sf() as s:
+            s.add(ModelPriceRow(model_glob="mig-lower-*", source="user"))
+            s.commit()
+        with sf() as s:
+            s.add(ModelPriceRow(model_glob="MIG-LOWER-*", source="user"))
+            with pytest.raises(IntegrityError):
+                s.commit()
     finally:
         engine.dispose()
