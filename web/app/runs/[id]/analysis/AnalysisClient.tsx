@@ -35,6 +35,7 @@ import {
   type RunResults,
   type RunTrends,
 } from "@/lib/api";
+import { latencyChartRows, speedChartRows } from "@/lib/analysisRows";
 import { formatNum, formatUsd, shortId } from "@/lib/format";
 import { dimensionSpecMap, weightedDimTotal } from "@/lib/scoreMath";
 import { fmtMeanSd } from "@/lib/trialGroups";
@@ -239,16 +240,11 @@ export default function AnalysisClient({ runId }: { runId: string }) {
     [sbs],
   );
 
-  const latencyRows: Row[] = useMemo(
-    () =>
-      sbs.map((sb) => ({
-        name: shortId(sb.sandbox_id),
-        avg: sb.latency_ms.avg ?? 0,
-        p95: sb.latency_ms.p95 ?? 0,
-        max: sb.latency_ms.max ?? 0,
-      })),
-    [sbs],
-  );
+  const latencyRows: Row[] = useMemo(() => latencyChartRows(sbs), [sbs]);
+
+  // PR30 speed axis: mean output tok/s per cell — the model-comparison
+  // chart for how fast each lane actually generates.
+  const speedRows: Row[] = useMemo(() => speedChartRows(sbs), [sbs]);
 
   /** PR28: the effective picker table — server price_table plus rates added
    * inline this session (persisted server-side as model_prices rows). */
@@ -398,6 +394,8 @@ export default function AnalysisClient({ runId }: { runId: string }) {
 
   const anyToolCalls = sbs.some((sb) => sb.tool_calls.total > 0);
   const anyLatency = sbs.some((sb) => sb.latency_ms.avg != null);
+  const anyTtft = sbs.some((sb) => sb.ttft_ms?.avg != null);
+  const anySpeed = sbs.some((sb) => sb.avg_tokens_per_sec != null);
   const anyEval = sbs.some((sb) => sb.evaluator != null && sb.evaluator.llm_turns > 0);
 
   return (
@@ -552,7 +550,7 @@ export default function AnalysisClient({ runId }: { runId: string }) {
           )}
         </Card>
 
-        <Card title="LLM latency (ms)" className="card--flush">
+        <Card title="LLM latency / TTFT (ms)" className="card--flush">
           {notes.analytics && !data.analytics ? (
             <InfoNote>Metrics unavailable: {notes.analytics}</InfoNote>
           ) : !anyLatency ? (
@@ -562,6 +560,14 @@ export default function AnalysisClient({ runId }: { runId: string }) {
               <VBars
                 rows={latencyRows}
                 series={[
+                  // TTFT bars first — first-byte time precedes the rest of
+                  // the call; only rendered when the gateway records it.
+                  ...(anyTtft
+                    ? [
+                        { key: "ttft_avg", name: "ttft avg", color: C.blue },
+                        { key: "ttft_p95", name: "ttft p95", color: C.violet },
+                      ]
+                    : []),
                   { key: "avg", name: "avg", color: C.teal },
                   { key: "p95", name: "p95", color: C.amber },
                   { key: "max", name: "max", color: C.red },
@@ -570,10 +576,35 @@ export default function AnalysisClient({ runId }: { runId: string }) {
               />
               <SeriesChips
                 items={[
+                  ...(anyTtft
+                    ? [
+                        { color: C.blue, label: "ttft avg" },
+                        { color: C.violet, label: "ttft p95" },
+                      ]
+                    : []),
                   { color: C.teal, label: "avg" },
                   { color: C.amber, label: "p95" },
                   { color: C.red, label: "max" },
                 ]}
+              />
+            </>
+          )}
+        </Card>
+
+        <Card title="Output speed (avg tok/s)" className="card--flush">
+          {notes.analytics && !data.analytics ? (
+            <InfoNote>Metrics unavailable: {notes.analytics}</InfoNote>
+          ) : !anySpeed ? (
+            <EmptyState>No output-rate measurements recorded.</EmptyState>
+          ) : (
+            <>
+              <VBars
+                rows={speedRows}
+                series={[{ key: "tps", name: "avg tok/s", color: C.blue }]}
+                fmt={(v) => `${formatNum(v)} t/s`}
+              />
+              <SeriesChips
+                items={[{ color: C.blue, label: "completion tokens ÷ call wall time" }]}
               />
             </>
           )}

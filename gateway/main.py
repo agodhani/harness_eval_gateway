@@ -220,6 +220,36 @@ _RETRYABLE_UPSTREAM_ERRORS = (
 _STREAM_CAPTURE_LIMIT = 2 * 1024 * 1024
 
 
+class _FirstByteTimedStream(httpx.AsyncByteStream):
+    """Wrap an upstream byte stream, stamping first-body-byte arrival.
+
+    The buffered upstream read goes through ``Response.aread``, which gives
+    no per-chunk hook — wrapping ``resp.stream`` before the read timestamps
+    the first content byte (the streamed path's ``ttft_ms`` analogue) while
+    ``aread`` still assembles ``_content`` itself, same as ``client.post``.
+    """
+
+    def __init__(
+        self, stream: httpx.AsyncByteStream, *, started: float, timing: dict[str, int]
+    ) -> None:
+        self._stream = stream
+        self._started = started
+        self._timing = timing
+        self._seen = False
+
+    async def __aiter__(self) -> Any:
+        async for chunk in self._stream:
+            if not self._seen:
+                self._seen = True
+                self._timing["ttft_ms"] = int(
+                    (time.monotonic() - self._started) * 1000
+                )
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+
 async def _emit_upstream_retry(
     claims: CredClaims,
     *,
@@ -284,6 +314,7 @@ async def _upstream_post(
     stream: bool,
     started: float,
     meter: bool = True,
+    timing: dict[str, int] | None = None,
 ) -> httpx.Response | JSONResponse:
     """POST ``body`` upstream, retrying transient failures before giving up.
 
@@ -292,6 +323,11 @@ async def _upstream_post(
     statuses, which callers meter and forward verbatim — or a 502
     ``JSONResponse`` when every attempt died in transport (the historical
     upstream-error path). The request body is identical across attempts.
+
+    ``timing`` (PR30) is an out-param: on the buffered path (``stream=False``)
+    it receives ``ttft_ms`` — the time from ``started`` to the first content
+    byte of the final attempt's body. Streamed callers measure their own
+    first chunk in the metering tee instead.
     """
     settings = get_settings()
     max_tries = 1 + max(0, settings.UPSTREAM_RETRY_ATTEMPTS)
@@ -301,13 +337,25 @@ async def _upstream_post(
     while True:
         attempt += 1
         try:
-            if stream:
-                req = upstream.build_request(
-                    "POST", path, json=body, headers=headers
-                )
-                resp = await upstream.send(req, stream=True)
-            else:
-                resp = await upstream.post(path, json=body, headers=headers)
+            req = upstream.build_request(
+                "POST", path, json=body, headers=headers
+            )
+            resp = await upstream.send(req, stream=True)
+            if not stream:
+                # Buffer the body through a first-byte timing shim —
+                # client.post() reads internally and would leave only the
+                # end-to-end time observable. aread() reassembles _content,
+                # so .content/.json()/.text keep working downstream.
+                if timing is not None:
+                    resp.stream = _FirstByteTimedStream(
+                        resp.stream, started=started, timing=timing
+                    )
+                try:
+                    await resp.aread()
+                finally:
+                    # Deterministic release — a mid-body transport error
+                    # skips aiter_raw's own end-of-stream close.
+                    await resp.aclose()
         except httpx.HTTPError as exc:
             if isinstance(exc, _RETRYABLE_UPSTREAM_ERRORS) and attempt < max_tries:
                 delay = backoff_base * (2 ** (attempt - 1))
@@ -503,6 +551,8 @@ async def chat_completions(
         )
 
     started = time.monotonic()
+    # PR30: first-body-byte timing lands in ``timing`` (see _upstream_post).
+    timing: dict[str, int] = {}
     try:
         result = await _upstream_post(
             upstream=upstream,
@@ -513,6 +563,7 @@ async def chat_completions(
             request_headers=request.headers,
             stream=False,
             started=started,
+            timing=timing,
         )
     except asyncio.CancelledError:
         await _emit_client_disconnected(
@@ -527,6 +578,7 @@ async def chat_completions(
         return result
     upstream_resp = result
     latency_ms = int((time.monotonic() - started) * 1000)
+    ttft_ms = timing.get("ttft_ms")
 
     # --- meter the outcome; always return upstream verbatim ---
     try:
@@ -543,6 +595,7 @@ async def chat_completions(
             latency_ms=latency_ms,
             http_status=upstream_resp.status_code,
             provider=provider,
+            ttft_ms=ttft_ms,
         )
         response_emitted = True
         if not 200 <= upstream_resp.status_code < 300:
@@ -574,6 +627,7 @@ async def chat_completions(
                     latency_ms=latency_ms,
                     http_status=upstream_resp.status_code,
                     provider=provider,
+                    ttft_ms=ttft_ms,
                 )
             await metering.emit_error(
                 claims,
@@ -854,8 +908,13 @@ async def _passthrough(
         complete = False
         abandoned = False
         stream_error: Exception | None = None
+        first_chunk_ms: int | None = None
         try:
             async for chunk in upstream_resp.aiter_bytes():
+                if first_chunk_ms is None:
+                    # PR30 ttft: arrival of the first body chunk (the SSE
+                    # headers landed back at send() — pre-generation).
+                    first_chunk_ms = int((time.monotonic() - started) * 1000)
                 if meter:
                     if len(captured) < _STREAM_CAPTURE_LIMIT:
                         captured += chunk[
@@ -906,6 +965,7 @@ async def _passthrough(
                             http_status=upstream_resp.status_code,
                             provider=provider,
                             usage_estimated=parsed["estimated"],
+                            ttft_ms=first_chunk_ms,
                         )
                         if abandoned:
                             # Mid-stream disconnect: the llm_response

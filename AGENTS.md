@@ -93,7 +93,9 @@ adapters are added.
    `qwen2.5-coder:3b`). Anthropic-compatible (`/v1/messages`) endpoint added
    when a CLI adapter requires it. Per-run credentials map traffic to
    run+sandbox. Records: model, tokens in/out, cache read/write, latency,
-   cost, failures. Emits events to Postgres. Enforces token/cost budgets.
+   per-call speed (`ttft_ms` first-byte, `total_ms`, `tokens_per_sec` —
+   PR30), cost, failures. Emits events to Postgres. Enforces token/cost
+   budgets.
 4. **Sandboxes (Docker)** — per-harness image + installed skill packs + clean
    workspace + injected `done` mechanism. Env points harness at gateway with
    run-scoped creds. Egress locked to gateway — no telemetry holes.
@@ -189,7 +191,8 @@ done skill pack) that signals the orchestrator — `agent_done` is distinct from
 
 - **sources**: `gateway`, `harness`, `sandbox`, `evaluator`, `orchestrator`
 - **types**: `llm_request`, `llm_response` (tokens in/out, cache r/w, latency,
-  cost, model), `tool_call`, `tool_result` (hook-sourced tool outcomes),
+  ttft_ms/total_ms/tokens_per_sec speed fields, cost, model), `tool_call`,
+  `tool_result` (hook-sourced tool outcomes),
   `shell_command`, `file_op`, `test_execution`, `checkpoint`,
   `skill_invocation`, `done_signal`, `error`, `run_started`,
   `terminal_state`, `context_compacted`, `miniloop_result` (authoritative
@@ -261,7 +264,11 @@ deadline cancels an in-flight call and skips the remaining retry
 container cells interleave in one run; evaluation receives
 `prompt_output_path` so `output.txt` stages as the submission.
 `system_prompt_extra` becomes a `system` message. Preview/thumbnail
-endpoints 404 early for prompt cells.
+endpoints 404 early for prompt cells. Budgets still apply: the cred
+carries `max_tokens`/`sandbox_max_tokens`, and `_budget_cap_detail`
+enforces the run ceiling, the per-cell token overshoot, and
+`max_cost_usd` inline post-call (the monitor's poll never sees a
+no-sandbox cell).
 
 **Default skill packs** (named presets, vendored under `skillpacks/`):
 `superpowers`, `mattpocock-skills`, `spec-kit`.
@@ -715,10 +722,14 @@ or tests change.
   the gateway's `x-heg-provider` override — entries with no parseable
   rate are skipped rather than priced-free. Per-cell budgets:
   `sandbox_token_budget` mints a `sandbox_max_tokens` cred claim
-  (gateway gate + monitor backstop → `limit="sandbox_tokens"`);
-  `max_cost_usd` is monitor-polled against the cell's layered-price
-  estimate → `limit="cost"`, and it can't trip an unpriced model
-  (no honest rate to bill against). Cache-read tokens bill at
+  (gateway gate + monitor backstop → `limit="sandbox_tokens"`;
+  `prompt_cell._budget_cap_detail` gives the same overshoot verdict
+  inline post-call for no-sandbox cells, run ceiling
+  `token_budget` → `limit="run_tokens"` included);
+  `max_cost_usd` is monitor-polled for containers and checked inline
+  post-call for prompt cells (`prompt_cell._budget_cap_detail`) against
+  the cell's layered-price estimate → `limit="cost"`, and it can't
+  trip an unpriced model (no honest rate to bill against). Cache-read tokens bill at
   `cache_read_per_mtok_usd` when declared, else the input rate.
   Price pickers (results + analysis) grow rates inline via "+ add rate".
 - **Config × model heatmap + winner card (PR31)** — the results page's
@@ -775,6 +786,23 @@ or tests change.
   rows; analytics adds a `cells` rollup (`overall_mean`/`overall_sd`/
   `overall_n` counting only scored trials) plus per-sandbox `cell`/
   `trial_index`, and a by-cell view in the results analytics table.
+- **Speed is a first-class metric (PR30)** — every metered
+  `llm_response` carries `ttft_ms` (first response byte: first content
+  chunk for streams, first body byte for buffered — the buffered path
+  reads upstream through a `_FirstByteTimedStream` shim so
+  `Response.aread` still owns body assembly), `total_ms` (same value as
+  the established `latency_ms`, kept for readers), and derived
+  `tokens_per_sec` = completion tokens ÷ call wall seconds. Cache
+  replays emit the timing but a null rate — they measure the store, not
+  the model — and are excluded from every analytics timing stat
+  (latency included). Analytics rolls them up as `ttft_ms` stats
+  (avg/p95/max, pooled) + `avg_tokens_per_sec` per sandbox, cell, and
+  model;
+  events predating the fields contribute no sample. The analysis page's
+  latency chart renders ttft avg/p95 bars next to avg/p95/max (hidden
+  when a backend emits no ttft) plus an output-speed card (mean avg
+  tok/s per cell), the timeline metrics strip gains a `spd` chip, and
+  the results Analytics table adds `ttft ms` + `tok/s` rows.
 
 ## Working conventions
 

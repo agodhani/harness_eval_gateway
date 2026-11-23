@@ -211,6 +211,12 @@ class BudgetsIn(BaseModel):
       through the layered price table (api/pricing.py::PriceBook). It only
       bites on priced models — an unpriced cell has no honest rate to bill
       against, so the cap simply can't trip it (PR21 honesty preserved).
+
+    Poll-side checks only see container cells — a no-sandbox ``prompt``
+    cell finishes before the monitor exists, so
+    ``orchestrator/prompt_cell.py::_budget_cap_detail`` runs the same
+    overshoot verdicts (run ceiling, per-cell tokens, cost) inline
+    post-call.
     """
 
     max_iters: int = Field(default=50, ge=1, le=1000)
@@ -560,6 +566,11 @@ class SandboxAnalytics(BaseModel):
     llm_turns: int = 0
     tokens: TokenUsage = Field(default_factory=TokenUsage)
     latency_ms: LatencyStats = Field(default_factory=LatencyStats)
+    # PR30 speed metrics: time-to-first-byte stats (ms) + mean output
+    # throughput across the sandbox's llm_response events — both all-null
+    # when no event carried the new gateway timing fields.
+    ttft_ms: LatencyStats = Field(default_factory=LatencyStats)
+    avg_tokens_per_sec: float | None = None
     tool_calls: ToolCallStats = Field(default_factory=ToolCallStats)
     skill_calls: SkillCallStats = Field(default_factory=SkillCallStats)
     shell_commands: int = 0
@@ -589,6 +600,10 @@ class ModelAnalytics(BaseModel):
     llm_turns: int = 0
     tokens: TokenUsage = Field(default_factory=TokenUsage)
     latency_ms: LatencyStats = Field(default_factory=LatencyStats)
+    # PR30 speed metrics — pooled across the model's sandboxes (see
+    # SandboxAnalytics.ttft_ms / avg_tokens_per_sec).
+    ttft_ms: LatencyStats = Field(default_factory=LatencyStats)
+    avg_tokens_per_sec: float | None = None
     tool_calls: ToolCallStats = Field(default_factory=ToolCallStats)
     skill_calls: SkillCallStats = Field(default_factory=SkillCallStats)
     shell_commands: int = 0
@@ -616,6 +631,10 @@ class CellAnalytics(BaseModel):
     llm_turns: int = 0
     tokens: TokenUsage = Field(default_factory=TokenUsage)
     latency_ms: LatencyStats = Field(default_factory=LatencyStats)
+    # PR30 speed metrics — pooled across the cell's trials (see
+    # SandboxAnalytics.ttft_ms / avg_tokens_per_sec).
+    ttft_ms: LatencyStats = Field(default_factory=LatencyStats)
+    avg_tokens_per_sec: float | None = None
     tool_calls: ToolCallStats = Field(default_factory=ToolCallStats)
     skill_calls: SkillCallStats = Field(default_factory=SkillCallStats)
     shell_commands: int = 0

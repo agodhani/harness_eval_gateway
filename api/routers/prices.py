@@ -43,6 +43,7 @@ from pydantic import (
     model_validator,
 )
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from api.config import get_settings
@@ -147,6 +148,26 @@ def _price_rows(session: Session) -> list[ModelPriceRow]:
     )
 
 
+def _match_row(session: Session, model_glob: str) -> ModelPriceRow | None:
+    """First declaration-order row whose glob case-folds to ``model_glob``."""
+    return (
+        session.execute(
+            select(ModelPriceRow)
+            .where(func.lower(ModelPriceRow.model_glob) == model_glob.lower())
+            .order_by(ModelPriceRow.created_at, ModelPriceRow.id)
+        )
+        .scalars()
+        .first()
+    )
+
+
+def _apply_upsert(row: ModelPriceRow, body: PriceUpsertIn) -> None:
+    row.input_per_mtok_usd = body.input_per_mtok_usd
+    row.output_per_mtok_usd = body.output_per_mtok_usd
+    row.cache_read_per_mtok_usd = body.cache_read_per_mtok_usd
+    row.local = body.local
+
+
 def _openrouter_configured(settings: Any) -> bool:
     """OpenRouter is a configured provider for this deployment.
 
@@ -213,25 +234,27 @@ def upsert_price(body: PriceUpsertIn, session: DbSession) -> PriceEntryOut:
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="rates must be finite numbers",
         )
-    row = (
-        session.execute(
-            select(ModelPriceRow)
-            .where(func.lower(ModelPriceRow.model_glob) == body.model_glob.lower())
-            .order_by(ModelPriceRow.created_at, ModelPriceRow.id)
-        )
-        .scalars()
-        .first()
-    )
+    row = _match_row(session, body.model_glob)
     if row is None:
         row = ModelPriceRow(model_glob=body.model_glob, source="user")
         session.add(row)
     else:
         row.source = "user"
-    row.input_per_mtok_usd = body.input_per_mtok_usd
-    row.output_per_mtok_usd = body.output_per_mtok_usd
-    row.cache_read_per_mtok_usd = body.cache_read_per_mtok_usd
-    row.local = body.local
-    session.commit()
+    _apply_upsert(row, body)
+    try:
+        session.commit()
+    except IntegrityError:
+        # Lost an insert race: a concurrent writer committed a row for this
+        # glob (any casing — uq_model_prices_model_glob_lower rejects it)
+        # between our select and our commit. Converge on the winner instead
+        # of erroring or storing a shadowed duplicate.
+        session.rollback()
+        row = _match_row(session, body.model_glob)
+        if row is None:
+            raise
+        row.source = "user"
+        _apply_upsert(row, body)
+        session.commit()
     session.refresh(row)
     return PriceEntryOut.model_validate(row)
 
@@ -290,46 +313,58 @@ async def sync_prices(session: DbSession, client: GatewayClient) -> PriceSyncOut
     data = body.get("data") if isinstance(body, dict) else None
     entries = [m for m in (data if isinstance(data, list) else []) if isinstance(m, dict)]
 
-    existing: dict[str, ModelPriceRow] = {}
-    for r in _price_rows(session):
-        existing.setdefault(r.model_glob.lower(), r)
-    added = updated = skipped_user = skipped_unpriced = 0
-    for entry in entries[:_MAX_SYNC_ROWS]:
-        mid = entry.get("id")
-        if not isinstance(mid, str):
-            continue
-        mid = mid.strip()
-        # model_glob is String(255) — an oversized id can't persist, so
-        # skip it like a malformed entry rather than failing the commit.
-        if not mid or len(mid) > 255:
-            continue
-        pricing = entry.get("pricing")
-        pricing = pricing if isinstance(pricing, dict) else {}
-        inp = _per_mtok(pricing.get("prompt"))
-        out = _per_mtok(pricing.get("completion"))
-        if inp is None or out is None:
-            # Either side missing → skip rather than bill it $0 — a
-            # half-priced model is the guessing PR28 exists to kill.
-            skipped_unpriced += 1
-            continue
-        row = existing.get(mid.lower())
-        if row is not None and row.source == "user":
-            skipped_user += 1
-            continue
-        if row is None:
-            row = ModelPriceRow(model_glob=mid, source="openrouter")
-            session.add(row)
-            existing[row.model_glob.lower()] = row
-            added += 1
-        else:
-            updated += 1
-        row.input_per_mtok_usd = inp or 0.0
-        row.output_per_mtok_usd = out or 0.0
-        # OpenRouter keys the cache discount "input_cache_read"; absent →
-        # NULL → those tokens bill at the input rate like before.
-        row.cache_read_per_mtok_usd = _per_mtok(pricing.get("input_cache_read"))
-        row.local = False
-    session.commit()
+    def _apply() -> tuple[int, int, int, int]:
+        """Apply the catalog against the rows that exist now. Re-runnable:
+        a lost insert race rolls back and re-scans, converging on the
+        winner's row the second pass."""
+        existing: dict[str, ModelPriceRow] = {}
+        for r in _price_rows(session):
+            existing.setdefault(r.model_glob.lower(), r)
+        added = updated = skipped_user = skipped_unpriced = 0
+        for entry in entries[:_MAX_SYNC_ROWS]:
+            mid = entry.get("id")
+            if not isinstance(mid, str):
+                continue
+            mid = mid.strip()
+            # model_glob is String(255) — an oversized id can't persist, so
+            # skip it like a malformed entry rather than failing the commit.
+            if not mid or len(mid) > 255:
+                continue
+            pricing = entry.get("pricing")
+            pricing = pricing if isinstance(pricing, dict) else {}
+            inp = _per_mtok(pricing.get("prompt"))
+            out = _per_mtok(pricing.get("completion"))
+            if inp is None or out is None:
+                # Either side missing → skip rather than bill it $0 — a
+                # half-priced model is the guessing PR28 exists to kill.
+                skipped_unpriced += 1
+                continue
+            row = existing.get(mid.lower())
+            if row is not None and row.source == "user":
+                skipped_user += 1
+                continue
+            if row is None:
+                row = ModelPriceRow(model_glob=mid, source="openrouter")
+                session.add(row)
+                existing[row.model_glob.lower()] = row
+                added += 1
+            else:
+                updated += 1
+            row.input_per_mtok_usd = inp or 0.0
+            row.output_per_mtok_usd = out or 0.0
+            # OpenRouter keys the cache discount "input_cache_read"; absent →
+            # NULL → those tokens bill at the input rate like before.
+            row.cache_read_per_mtok_usd = _per_mtok(pricing.get("input_cache_read"))
+            row.local = False
+        return added, updated, skipped_user, skipped_unpriced
+
+    try:
+        added, updated, skipped_user, skipped_unpriced = _apply()
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        added, updated, skipped_user, skipped_unpriced = _apply()
+        session.commit()
     return PriceSyncOut(
         synced=added + updated,
         added=added,
