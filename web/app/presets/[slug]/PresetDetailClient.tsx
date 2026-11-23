@@ -7,6 +7,10 @@
  * itself, every run submitted from it, per-model + per-config score
  * leaderboards (mean `overall` pooled over each bucket's scored cells),
  * the pooled mean + n, and the score-over-time trend (recharts line).
+ * PR32 swaps the local leaderboard tables for the shared global boards
+ * (GET /api/analytics/leaderboard?preset=slug — mean ± sd, n, runs) so a
+ * preset's ranking reads the same here as on /leaderboard; the local
+ * aggregates stay as the KPI strip.
  * User presets get edit/delete actions (PATCH bumps revision; delete is
  * confirmed); vendored presets are read-only by design.
  */
@@ -24,12 +28,14 @@ import {
 import {
   ApiError,
   deletePreset,
+  getLeaderboard,
   getPresetAnalytics,
+  type Leaderboard as GlobalLeaderboard,
   type PresetAnalytics,
-  type PresetLeaderboardEntry,
 } from "@/lib/api";
 import { formatTs, shortId } from "@/lib/format";
 import { C, ChartFrame, ChartTip } from "@/app/runs/[id]/analysis/charts";
+import LeaderboardBoards from "@/components/LeaderboardBoards";
 import { SavePresetDialog } from "@/components/SavePresetDialog";
 import {
   Badge,
@@ -47,66 +53,10 @@ function scoreTone(score: number): "good" | "mid" | "bad" {
   return "bad";
 }
 
-function Leaderboard({
-  title,
-  entries,
-  kind,
-}: {
-  title: string;
-  entries: PresetLeaderboardEntry[];
-  kind: "model" | "config";
-}) {
-  return (
-    <Card title={title}>
-      {entries.length === 0 ? (
-        <EmptyState>No scored cells yet.</EmptyState>
-      ) : (
-        <div className="table-wrap">
-          <table className="table">
-            <thead>
-              <tr>
-                <th>{kind === "model" ? "Model" : "Config"}</th>
-                {kind === "config" ? <th>Adapter</th> : null}
-                <th>Mean overall</th>
-                <th>Cells (n)</th>
-                <th>Runs</th>
-              </tr>
-            </thead>
-            <tbody>
-              {entries.map((e) => (
-                <tr key={e.key}>
-                  <td className="mono">{e.label}</td>
-                  {kind === "config" ? (
-                    <td>
-                      {e.adapter ? (
-                        <Badge tone="outline">{e.adapter}</Badge>
-                      ) : (
-                        <span className="faint">—</span>
-                      )}
-                    </td>
-                  ) : null}
-                  <td className="num">
-                    <span
-                      className={`score-value score-value--${scoreTone(e.mean_overall_score)}`}
-                    >
-                      {e.mean_overall_score}
-                    </span>
-                  </td>
-                  <td className="num">{e.n}</td>
-                  <td className="num">{e.runs}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </Card>
-  );
-}
-
 export default function PresetDetailClient({ slug }: { slug: string }) {
   const router = useRouter();
   const [data, setData] = useState<PresetAnalytics | null>(null);
+  const [board, setBoard] = useState<GlobalLeaderboard | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
@@ -127,8 +77,9 @@ export default function PresetDetailClient({ slug }: { slug: string }) {
     let cancelled = false;
     void (async () => {
       await Promise.resolve();
+      let d: PresetAnalytics | null = null;
       try {
-        const d = await getPresetAnalytics(slug);
+        d = await getPresetAnalytics(slug);
         if (cancelled) return;
         setData(d);
         setError(null);
@@ -141,6 +92,40 @@ export default function PresetDetailClient({ slug }: { slug: string }) {
               : err.detail
             : "Failed to load preset.",
         );
+      }
+      // PR32: the global leaderboard filtered to this preset (mean±sd, n,
+      // runs). On an older backend without the endpoint, fold the
+      // preset-local aggregates into the same board shape — the shared
+      // tables keep rendering (±sd honestly absent).
+      try {
+        const b = await getLeaderboard({ preset: slug });
+        if (!cancelled) setBoard(b);
+      } catch {
+        if (!cancelled && d) {
+          const fold = (entries: PresetAnalytics["by_model"]) =>
+            entries.map((e) => ({
+              key: e.key,
+              label: e.label,
+              adapter: e.adapter ?? null,
+              name: null,
+              mean_overall_score: e.mean_overall_score,
+              sd_overall_score: null,
+              n: e.n,
+              runs: e.runs,
+              sandboxes: e.n,
+            }));
+          setBoard({
+            preset: slug,
+            since: null,
+            until: null,
+            min_trials: 1,
+            runs_count: d.runs.length,
+            sandboxes_count: d.runs.reduce((acc, r) => acc + r.sandbox_count, 0),
+            n_scored: d.n_scored,
+            by_model: fold(d.by_model),
+            by_config: fold(d.by_config),
+          });
+        }
       }
     })();
     return () => {
@@ -355,10 +340,34 @@ export default function PresetDetailClient({ slug }: { slug: string }) {
           )}
         </Card>
 
-        <div className="split">
-          <Leaderboard title="Leaderboard — by model" entries={data?.by_model ?? []} kind="model" />
-          <Leaderboard title="Leaderboard — by config" entries={data?.by_config ?? []} kind="config" />
-        </div>
+        {board ? (
+          <div>
+            <LeaderboardBoards data={board} />
+            <p className="faint" style={{ marginTop: "0.6rem", fontSize: "0.75rem" }}>
+              mean ± sample sd over every scored cell on this preset —{" "}
+              <Link href={`/leaderboard?preset=${encodeURIComponent(slug)}`}>
+                open with filters →
+              </Link>
+            </p>
+          </div>
+        ) : (
+          <div className="split">
+            <Card title="Leaderboard — by model">
+              <EmptyState>
+                {data?.by_model?.length
+                  ? `${data.by_model.length} models scored — global board loading…`
+                  : "No scored cells yet."}
+              </EmptyState>
+            </Card>
+            <Card title="Leaderboard — by config family">
+              <EmptyState>
+                {data?.by_config?.length
+                  ? `${data.by_config.length} families scored — global board loading…`
+                  : "No scored cells yet."}
+              </EmptyState>
+            </Card>
+          </div>
+        )}
 
         <Card title={`Runs on this preset (${data?.runs.length ?? 0})`}>
           {(data?.runs.length ?? 0) === 0 ? (
