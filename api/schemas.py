@@ -1288,3 +1288,41 @@ class SuiteRunResults(BaseModel):
     created_at: datetime | None = None
     runs: list[SuiteRunTaskOut] = Field(default_factory=list)
     aggregate: SuiteRunAggregate = Field(default_factory=SuiteRunAggregate)
+
+
+# ---------------------------------------------------------------------------
+# PR32 — cross-run leaderboard (api/routers/analytics.py
+# GET /api/analytics/leaderboard)
+# ---------------------------------------------------------------------------
+
+
+class LeaderboardEntry(BaseModel):
+    """One leaderboard row — mean ``overall`` pooled over the bucket's
+    scored sandbox cells across every run in the filter scope."""
+
+    key: str  # model name, or config-family key ``family:<adapter>|<packs>``
+    label: str  # display label — model name, or ``adapter · packs``
+    adapter: str | None = None  # config board only: the family's adapter
+    name: str | None = None  # config board only: shared PR1 config name
+    mean_overall_score: float
+    # Sample standard deviation (n−1, mirrors CellAnalytics.overall_sd);
+    # null under two scored cells — a lone score has no spread to report.
+    sd_overall_score: float | None = None
+    n: int  # scored sandbox cells contributing to the mean
+    runs: int  # distinct runs contributing a scored cell
+    sandboxes: int  # every cell in the bucket (scored + unscored)
+
+
+class Leaderboard(BaseModel):
+    """GET /api/analytics/leaderboard response — the two rankings plus a
+    filter echo and scope totals (so "3 of 8 cells scored" stays honest)."""
+
+    preset: str | None = None
+    since: datetime | None = None
+    until: datetime | None = None
+    min_trials: int = 1
+    runs_count: int = 0  # runs in scope (any status, scored or not)
+    sandboxes_count: int = 0  # sandbox cells in scope
+    n_scored: int = 0  # cells carrying a latest ``overall`` score
+    by_model: list[LeaderboardEntry] = Field(default_factory=list)
+    by_config: list[LeaderboardEntry] = Field(default_factory=list)
