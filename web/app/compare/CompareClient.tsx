@@ -74,19 +74,28 @@ async function loadBundle(id: string): Promise<RunBundle> {
     getRunResults(id),
     getRunAnalytics(id),
   ]);
+  const notes: string[] = [];
+  if (run.status === "rejected") {
+    notes.push(errMsg(run.reason, "run not found"));
+  }
+  if (results.status === "rejected") {
+    notes.push(
+      results.reason instanceof ApiError && results.reason.status === 404
+        ? "results unavailable — run not evaluated yet"
+        : `results failed to load: ${errMsg(results.reason, "request failed")}`,
+    );
+  }
+  if (analytics.status === "rejected") {
+    notes.push(
+      `analytics failed to load: ${errMsg(analytics.reason, "request failed")}`,
+    );
+  }
   return {
     id,
     run: run.status === "fulfilled" ? run.value : null,
     results: results.status === "fulfilled" ? results.value : null,
     analytics: analytics.status === "fulfilled" ? analytics.value : null,
-    error:
-      run.status === "rejected"
-        ? errMsg(run.reason, "run not found")
-        : results.status === "rejected" &&
-            (results.reason as unknown) instanceof ApiError &&
-            (results.reason as ApiError).status === 404
-          ? "results unavailable — run not evaluated yet"
-          : null,
+    error: notes.length ? notes.join(" · ") : null,
   };
 }
 
@@ -267,9 +276,11 @@ function SpecDiffTable({ rows }: { rows: SpecDiffRow[] }) {
 function MiniScoreGrid({
   run,
   results,
+  error,
 }: {
   run: RunOut | null;
   results: RunResults | null;
+  error?: string | null;
 }) {
   const specMap = useMemo(
     () => dimensionSpecMap(run?.rubric?.content?.dimensions ?? []),
@@ -294,7 +305,9 @@ function MiniScoreGrid({
   );
 
   if (!results) {
-    return <EmptyState>No results — run not evaluated yet.</EmptyState>;
+    return (
+      <EmptyState>{error ?? "No results — run not evaluated yet."}</EmptyState>
+    );
   }
   if (grid.rows.length === 0) {
     return <EmptyState>No sandboxes on this run.</EmptyState>;
@@ -377,6 +390,10 @@ interface DeltaRow {
   fmt: (v: number) => string;
   /** "unpriced" marker for null cost cells instead of "—" */
   nullText?: string;
+  /** Per-side overrides for `nullText` when the null reason can differ
+   * between A and B (e.g. eval cost: unpriced vs no judge traffic). */
+  aNullText?: string;
+  bNullText?: string;
   /** lower-is-better metrics get their Δ tone flipped */
   lowerBetter?: boolean;
 }
@@ -451,17 +468,25 @@ export default function CompareClient() {
     return [
       { label: "mean judge overall", a: scoreA.mean, b: scoreB.mean, fmt: (v) => v.toFixed(2) },
       { label: "scored cells", a: scoreA.n, b: scoreB.n, fmt: num },
-      { label: "llm turns", a: totalsA.llmTurns, b: totalsB.llmTurns, fmt: num },
-      { label: "tokens in", a: totalsA.tokensIn, b: totalsB.tokensIn, fmt: num },
-      { label: "tokens out", a: totalsA.tokensOut, b: totalsB.tokensOut, fmt: num },
+      { label: "llm turns", a: totalsA.llmTurns, b: totalsB.llmTurns, fmt: num, lowerBetter: true },
+      { label: "tokens in", a: totalsA.tokensIn, b: totalsB.tokensIn, fmt: num, lowerBetter: true },
+      { label: "tokens out", a: totalsA.tokensOut, b: totalsB.tokensOut, fmt: num, lowerBetter: true },
       { label: "tokens total", a: totalsA.tokensTotal, b: totalsB.tokensTotal, fmt: num, lowerBetter: true },
       { label: "wall clock", a: totalsA.wallClockSeconds, b: totalsB.wallClockSeconds, fmt: sec, lowerBetter: true },
       { label: "est. cost", a: totalsA.costUsd, b: totalsB.costUsd, fmt: usd, nullText: "unpriced", lowerBetter: true },
       { label: "avg tok/s", a: totalsA.avgTokensPerSec, b: totalsB.avgTokensPerSec, fmt: (v) => v.toFixed(1) },
       { label: "avg ttft", a: totalsA.ttftAvgMs, b: totalsB.ttftAvgMs, fmt: ms, lowerBetter: true },
       { label: "errors", a: totalsA.errors, b: totalsB.errors, fmt: num, lowerBetter: true },
-      { label: "eval turns", a: totalsA.evalTurns, b: totalsB.evalTurns, fmt: num },
-      { label: "eval cost", a: totalsA.evalCostUsd, b: totalsB.evalCostUsd, fmt: usd, nullText: "unpriced" },
+      { label: "eval turns", a: totalsA.evalTurns, b: totalsB.evalTurns, fmt: num, lowerBetter: true },
+      {
+        label: "eval cost",
+        a: totalsA.evalCostUsd,
+        b: totalsB.evalCostUsd,
+        fmt: usd,
+        aNullText: totalsA.evalSeen ? "unpriced" : "no eval traffic",
+        bNullText: totalsB.evalSeen ? "unpriced" : "no eval traffic",
+        lowerBetter: true,
+      },
       { label: "sandboxes", a: totalsA.sandboxCount, b: totalsB.sandboxCount, fmt: num },
     ];
   }, [totalsA, totalsB, scoreA, scoreB]);
@@ -545,68 +570,96 @@ export default function CompareClient() {
 
             <div className="split">
               <Card title={`Score grid — A ${shortId(data.a.id)}`}>
-                <MiniScoreGrid run={data.a.run} results={data.a.results} />
+                <MiniScoreGrid
+                  run={data.a.run}
+                  results={data.a.results}
+                  error={data.a.error}
+                />
               </Card>
               <Card title={`Score grid — B ${shortId(data.b.id)}`}>
-                <MiniScoreGrid run={data.b.run} results={data.b.results} />
+                <MiniScoreGrid
+                  run={data.b.run}
+                  results={data.b.results}
+                  error={data.b.error}
+                />
               </Card>
             </div>
 
             <Card title="Analytics deltas">
-              <div className="table-wrap">
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th>metric</th>
-                      <th>A</th>
-                      <th>B</th>
-                      <th>Δ (B−A)</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {deltaRows.map((r) => {
-                      const d = delta(r.a, r.b);
-                      const cell = (v: number | null) =>
-                        v == null ? (
-                          <span className="faint">{r.nullText ?? "—"}</span>
-                        ) : (
-                          r.fmt(v)
-                        );
-                      let dCell: React.ReactNode = <span className="faint">—</span>;
-                      if (d != null) {
-                        const positiveGood = !r.lowerBetter;
-                        const cls =
-                          d === 0
-                            ? "faint"
-                            : (d > 0) === positiveGood
-                              ? "score-value score-value--good"
-                              : "score-value score-value--bad";
-                        const abs = Math.abs(d);
-                        dCell = (
-                          <span className={cls}>
-                            {d > 0 ? "+" : "−"}
-                            {r.fmt(abs)}
-                          </span>
-                        );
-                      }
-                      return (
-                        <tr key={r.label}>
-                          <td className="faint">{r.label}</td>
-                          <td className="num">{cell(r.a)}</td>
-                          <td className="num">{cell(r.b)}</td>
-                          <td className="num">{dCell}</td>
+              {!data.a.analytics || !data.b.analytics ? (
+                <EmptyState>
+                  Analytics didn&apos;t load for{" "}
+                  {!data.a.analytics && !data.b.analytics
+                    ? "either run"
+                    : !data.a.analytics
+                      ? "run A"
+                      : "run B"}{" "}
+                  — see the note above.
+                </EmptyState>
+              ) : (
+                <>
+                  <div className="table-wrap">
+                    <table className="table">
+                      <thead>
+                        <tr>
+                          <th>metric</th>
+                          <th>A</th>
+                          <th>B</th>
+                          <th>Δ (B−A)</th>
                         </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-              <p className="faint" style={{ marginTop: "0.6rem", fontSize: "0.72rem" }}>
-                participant-phase totals only (judge traffic reported separately
-                under eval rows) · green Δ = better for B · cost is the summed
-                per-model estimate — <b>unpriced</b> when any contributing model
-                has no price-table rate (never a partial total)
-              </p>
+                      </thead>
+                      <tbody>
+                        {deltaRows.map((r) => {
+                          const d = delta(r.a, r.b);
+                          const cell = (v: number | null, nullText?: string) =>
+                            v == null ? (
+                              <span className="faint">{nullText ?? "—"}</span>
+                            ) : (
+                              r.fmt(v)
+                            );
+                          let dCell: React.ReactNode = (
+                            <span className="faint">—</span>
+                          );
+                          if (d != null) {
+                            const positiveGood = !r.lowerBetter;
+                            const cls =
+                              d === 0
+                                ? "faint"
+                                : (d > 0) === positiveGood
+                                  ? "score-value score-value--good"
+                                  : "score-value score-value--bad";
+                            const abs = Math.abs(d);
+                            dCell = (
+                              <span className={cls}>
+                                {d > 0 ? "+" : "−"}
+                                {r.fmt(abs)}
+                              </span>
+                            );
+                          }
+                          return (
+                            <tr key={r.label}>
+                              <td className="faint">{r.label}</td>
+                              <td className="num">
+                                {cell(r.a, r.aNullText ?? r.nullText)}
+                              </td>
+                              <td className="num">
+                                {cell(r.b, r.bNullText ?? r.nullText)}
+                              </td>
+                              <td className="num">{dCell}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <p className="faint" style={{ marginTop: "0.6rem", fontSize: "0.72rem" }}>
+                    participant-phase totals only (judge traffic reported separately
+                    under eval rows) · green Δ = better for B · cost is the summed
+                    per-model estimate — <b>unpriced</b> when any contributing model
+                    has no price-table rate (never a partial total)
+                  </p>
+                </>
+              )}
             </Card>
 
             <Card title="Terminal-reason mix">

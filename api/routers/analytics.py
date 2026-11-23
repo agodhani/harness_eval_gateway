@@ -946,17 +946,18 @@ def get_leaderboard(
     repeat-per-cell axis (``harness_config.trial_index`` members share
     their cell's family/model the same as single-shot cells).
     """
+    # A date-only input parses naive — read it as UTC so the bound
+    # compares and binds honestly against the timestamptz column on every
+    # backend (a naive/aware ``>`` would itself raise TypeError).
+    if since is not None and since.tzinfo is None:
+        since = since.replace(tzinfo=UTC)
+    if until is not None and until.tzinfo is None:
+        until = until.replace(tzinfo=UTC)
     if since is not None and until is not None and since > until:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="since must be <= until",
         )
-    # A date-only input parses naive — read it as UTC so the bound binds
-    # honestly against the timestamptz column on every backend.
-    if since is not None and since.tzinfo is None:
-        since = since.replace(tzinfo=UTC)
-    if until is not None and until.tzinfo is None:
-        until = until.replace(tzinfo=UTC)
 
     stmt = select(Run).order_by(Run.created_at.desc(), Run.id)
     if preset:

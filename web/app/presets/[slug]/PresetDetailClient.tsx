@@ -57,6 +57,7 @@ export default function PresetDetailClient({ slug }: { slug: string }) {
   const router = useRouter();
   const [data, setData] = useState<PresetAnalytics | null>(null);
   const [board, setBoard] = useState<GlobalLeaderboard | null>(null);
+  const [boardError, setBoardError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
@@ -77,9 +78,8 @@ export default function PresetDetailClient({ slug }: { slug: string }) {
     let cancelled = false;
     void (async () => {
       await Promise.resolve();
-      let d: PresetAnalytics | null = null;
       try {
-        d = await getPresetAnalytics(slug);
+        const d = await getPresetAnalytics(slug);
         if (cancelled) return;
         setData(d);
         setError(null);
@@ -94,37 +94,20 @@ export default function PresetDetailClient({ slug }: { slug: string }) {
         );
       }
       // PR32: the global leaderboard filtered to this preset (mean±sd, n,
-      // runs). On an older backend without the endpoint, fold the
-      // preset-local aggregates into the same board shape — the shared
-      // tables keep rendering (±sd honestly absent).
+      // runs) — the shared boards read the same here as on /leaderboard.
       try {
         const b = await getLeaderboard({ preset: slug });
-        if (!cancelled) setBoard(b);
-      } catch {
-        if (!cancelled && d) {
-          const fold = (entries: PresetAnalytics["by_model"]) =>
-            entries.map((e) => ({
-              key: e.key,
-              label: e.label,
-              adapter: e.adapter ?? null,
-              name: null,
-              mean_overall_score: e.mean_overall_score,
-              sd_overall_score: null,
-              n: e.n,
-              runs: e.runs,
-              sandboxes: e.n,
-            }));
-          setBoard({
-            preset: slug,
-            since: null,
-            until: null,
-            min_trials: 1,
-            runs_count: d.runs.length,
-            sandboxes_count: d.runs.reduce((acc, r) => acc + r.sandbox_count, 0),
-            n_scored: d.n_scored,
-            by_model: fold(d.by_model),
-            by_config: fold(d.by_config),
-          });
+        if (!cancelled) {
+          setBoard(b);
+          setBoardError(null);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setBoardError(
+            err instanceof ApiError
+              ? err.detail
+              : "Failed to load the leaderboard.",
+          );
         }
       }
     })();
@@ -350,6 +333,8 @@ export default function PresetDetailClient({ slug }: { slug: string }) {
               </Link>
             </p>
           </div>
+        ) : boardError ? (
+          <ErrorNote>{boardError}</ErrorNote>
         ) : (
           <div className="split">
             <Card title="Leaderboard — by model">

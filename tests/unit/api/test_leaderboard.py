@@ -343,6 +343,29 @@ def test_leaderboard_bad_range_422(api) -> None:
     assert resp.status_code == 422
 
 
+def test_leaderboard_bad_range_mixed_tz_422(api) -> None:
+    """The UI's date filter sends a bare date ``since`` (parses naive)
+    with an end-of-day ``Z`` ``until`` (parses aware) — the bounds check
+    must normalize tz before comparing, not 500 on a naive/aware ``>``."""
+    resp = api.client.get(
+        "/api/analytics/leaderboard",
+        params={"since": "2026-02-01", "until": "2026-01-01T23:59:59.999Z"},
+    )
+    assert resp.status_code == 422
+
+
+def test_leaderboard_mixed_tz_range_ok(api, leaderboard_data) -> None:
+    """The valid-direction version of the UI's shipped filter shape —
+    naive date ``since`` + aware end-of-day ``until`` — filters, not 500s."""
+    body = _get(
+        api.client,
+        since=(T0 + timedelta(days=1)).date().isoformat(),
+        until=f"{(T0 + timedelta(days=2)).date().isoformat()}T23:59:59.999Z",
+    )
+    assert body["runs_count"] == 2  # run_b + run_c
+    assert body["n_scored"] == 2
+
+
 def test_leaderboard_naive_since_treated_as_utc(api, leaderboard_data) -> None:
     """A date-only ``?since=`` (HTML date input) parses naive — the filter
     must still bind honestly against the timestamptz column."""

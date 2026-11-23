@@ -37,11 +37,22 @@ export default function LeaderboardClient() {
   const urlUntil = params.get("until") ?? "";
   const urlMinTrials = params.get("min_trials") ?? "";
 
-  // Filter form state seeds from the URL once; Apply writes them back.
+  // Filter form state seeds from the URL params (which drive the fetch);
+  // Apply writes them back, and back/forward navigation re-syncs them via
+  // the prev-key compare below so the form always shows applied filters.
   const [preset, setPreset] = useState(urlPreset);
   const [since, setSince] = useState(urlSince);
   const [until, setUntil] = useState(urlUntil);
   const [minTrials, setMinTrials] = useState(urlMinTrials);
+  const urlKey = [urlPreset, urlSince, urlUntil, urlMinTrials].join("|");
+  const [syncedKey, setSyncedKey] = useState(urlKey);
+  if (syncedKey !== urlKey) {
+    setSyncedKey(urlKey);
+    setPreset(urlPreset);
+    setSince(urlSince);
+    setUntil(urlUntil);
+    setMinTrials(urlMinTrials);
+  }
   const [data, setData] = useState<Leaderboard | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -142,6 +153,9 @@ export default function LeaderboardClient() {
                 onChange={(e) => setPreset(e.target.value)}
               >
                 <option value="">all presets + freeform</option>
+                {preset && !presets.some((p) => p.slug === preset) ? (
+                  <option value={preset}>{preset}</option>
+                ) : null}
                 {presets.map((p) => (
                   <option key={p.slug} value={p.slug}>
                     {p.slug}

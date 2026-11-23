@@ -220,7 +220,11 @@ export interface AnalyticsTotals {
   evalTurns: number;
   evalTokensTotal: number;
   evalErrors: number;
-  /** Summed judge cost; null when the evaluator model is unpriced. */
+  /** Whether the run produced judge-phase activity — distinguishes "no
+   * eval traffic" from "unpriced judge model" on a null evalCostUsd. */
+  evalSeen: boolean;
+  /** Summed judge cost; null when the evaluator model is unpriced or no
+   * judge traffic was recorded. */
   evalCostUsd: number | null;
 }
 
@@ -241,6 +245,7 @@ export function analyticsTotals(a: RunAnalytics | null | undefined): AnalyticsTo
     evalTurns: 0,
     evalTokensTotal: 0,
     evalErrors: 0,
+    evalSeen: false,
     evalCostUsd: null,
   };
   if (!a) return t;
@@ -252,7 +257,6 @@ export function analyticsTotals(a: RunAnalytics | null | undefined): AnalyticsTo
   let ttftSum = 0;
   let ttftTurns = 0;
   let evalCost = 0;
-  let evalCostSeen = false;
   let evalCostKnown = true;
   for (const m of a.models ?? []) {
     t.llmTurns += m.llm_turns;
@@ -280,7 +284,7 @@ export function analyticsTotals(a: RunAnalytics | null | undefined): AnalyticsTo
       t.evalTurns += ev.llm_turns;
       t.evalTokensTotal += ev.tokens.total;
       t.evalErrors += ev.errors;
-      evalCostSeen = true;
+      t.evalSeen = true;
       if (ev.estimated_cost_usd == null) evalCostKnown = false;
       else evalCost += ev.estimated_cost_usd;
     }
@@ -288,7 +292,7 @@ export function analyticsTotals(a: RunAnalytics | null | undefined): AnalyticsTo
   t.costUsd = costKnown ? cost : null;
   t.avgTokensPerSec = tpsTurns > 0 ? tpsSum / tpsTurns : null;
   t.ttftAvgMs = ttftTurns > 0 ? ttftSum / ttftTurns : null;
-  t.evalCostUsd = evalCostSeen ? (evalCostKnown ? evalCost : null) : null;
+  t.evalCostUsd = t.evalSeen ? (evalCostKnown ? evalCost : null) : null;
   return t;
 }
 
