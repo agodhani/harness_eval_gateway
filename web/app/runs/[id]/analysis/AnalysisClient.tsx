@@ -49,6 +49,7 @@ import {
   Loading,
   statusTone,
 } from "@/components/ui";
+import ExportButtons from "@/components/ExportButtons";
 import AddRate from "@/components/AddRate";
 import QualityScatter from "./QualityScatter";
 import {
@@ -458,6 +459,8 @@ export default function AnalysisClient({ runId }: { runId: string }) {
             ) : null}
           </p>
         </div>
+        {/* PR35 — export downloads (json/csv) + share-link mint/revoke. */}
+        <ExportButtons runId={runId} shareUrl={data.run?.share_url ?? null} />
       </div>
 
       {fatal ? <ErrorNote title="Could not load run">{fatal}</ErrorNote> : null}

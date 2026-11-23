@@ -17,10 +17,12 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  API_BASE,
   estimateCostUsd,
   globMatch,
   matchPriceKey,
   resolvePricePick,
+  runExportUrl,
   type ModelPrice,
 } from "./api.ts";
 
@@ -225,6 +227,22 @@ describe("estimateCostUsd", () => {
     assert.equal(
       estimateCostUsd(price, { input: 10, output: 20, cache_read: 50 }),
       (10 * 1 + 20 * 20) / 1_000_000,
+    );
+  });
+});
+
+// PR35 — the export URL contract: /api/runs/{id}/export?fmt=<fmt>, id is
+// percent-encoded (uuids are safe anyway, but the helper must not regress).
+describe("runExportUrl", () => {
+  test("json + csv paths carry the fmt query", () => {
+    const id = "11111111-2222-3333-4444-555555555555";
+    assert.equal(
+      runExportUrl(id, "json"),
+      `${API_BASE}/api/runs/${id}/export?fmt=json`,
+    );
+    assert.equal(
+      runExportUrl(id, "csv"),
+      `${API_BASE}/api/runs/${id}/export?fmt=csv`,
     );
   });
 });
