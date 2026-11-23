@@ -8,6 +8,7 @@
  */
 import {
   harnessConfigLabel,
+  runModels,
   type RunAnalytics,
   type RunOut,
   type RunResults,
@@ -110,20 +111,10 @@ function budgetVal(run: RunOut, key: string): string {
   return String(v);
 }
 
-/** Participant-model set shown on the diff — persisted `config.models`
- * ([model_name] + extras), falling back to model_name alone. */
+/** Participant-model set shown on the diff — the shared `runModels` rule:
+ * [model_name] + `config.models` extras + per-config model pins. */
 export function participantModels(run: RunOut): string[] {
-  const cfg = run.config ?? {};
-  const list = Array.isArray(cfg.models)
-    ? (cfg.models as unknown[]).map(String).filter(Boolean)
-    : [];
-  const out = run.model_name ? [run.model_name] : [];
-  for (const m of list) if (m && !out.includes(m)) out.push(m);
-  for (const hc of (cfg.harness_configs ?? []) as { model?: unknown }[]) {
-    const m = String(hc?.model ?? "").trim();
-    if (m && !out.includes(m)) out.push(m);
-  }
-  return out;
+  return runModels(run.model_name, run.config?.models, run.config?.harness_configs);
 }
 
 /**

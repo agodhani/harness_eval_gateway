@@ -4,9 +4,10 @@ Cross-run aggregate like the leaderboard — it can't ride the shared
 in-memory fixture, so same per-test tmp_path sqlite pattern as
 test_leaderboard.py.
 
-Timestamps are relative to ``datetime.now(UTC)`` in exact 7-day offsets —
-one ISO week is always exactly one bucket earlier regardless of the
-time-of-day the suite runs at, so bucket assertions stay deterministic.
+Timestamps anchor to ``datetime.now(UTC)``: prior-week rows ride exact
+7-day offsets (always exactly one ISO bucket earlier), while current-week
+events sit at small hour offsets from the week's Monday 00:00 — a
+NOW-relative +Nh could tip into the following week near Sunday EOD.
 """
 
 from __future__ import annotations
@@ -25,6 +26,9 @@ from db.models import Base, Event, Run, Sandbox, Score
 from db.session import make_engine, make_session_factory
 
 NOW = datetime.now(UTC)
+WEEK_BASE = (NOW - timedelta(days=NOW.weekday())).replace(
+    hour=0, minute=0, second=0, microsecond=0
+)
 
 
 @pytest.fixture()
@@ -151,21 +155,21 @@ def seeded(api):
         s.add_all(
             [
                 # Participant call on sb_a1 — gpt-4o: (1000·2.5 + 500·10)/1e6.
-                _llm(run_a.id, ts=NOW, sandbox_id=sb_a1.id, model="gpt-4o", inp=1000, out=500),
+                _llm(run_a.id, ts=WEEK_BASE + timedelta(hours=1), sandbox_id=sb_a1.id, model="gpt-4o", inp=1000, out=500),
                 # Judge boundary — everything at/after it is eval traffic.
                 Event(
                     run_id=run_a.id,
                     sandbox_id=sb_a1.id,
                     source="evaluator",
                     type="checkpoint",
-                    ts=NOW + timedelta(hours=1),
+                    ts=WEEK_BASE + timedelta(hours=2),
                     payload={"stage": "eval_started"},
                 ),
                 # Judge call on the SAME sandbox (eval cred shares the id)
                 # → priced at claude-sonnet-4.5: (2000·3 + 100·15)/1e6.
                 _llm(
                     run_a.id,
-                    ts=NOW + timedelta(hours=2),
+                    ts=WEEK_BASE + timedelta(hours=3),
                     sandbox_id=sb_a1.id,
                     model="claude-sonnet-4.5",
                     inp=2000,

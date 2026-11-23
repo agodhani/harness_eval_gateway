@@ -631,7 +631,7 @@ export default function CompareClient() {
                             const abs = Math.abs(d);
                             dCell = (
                               <span className={cls}>
-                                {d > 0 ? "+" : "−"}
+                                {d >= 0 ? "+" : "−"}
                                 {r.fmt(abs)}
                               </span>
                             );
