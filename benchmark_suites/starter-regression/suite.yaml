@@ -3,7 +3,7 @@
 # One suite run = one run per task (POST /api/suites/starter-regression/run
 # with the usual model/harness_configs spec). Each task's `check:` block is
 # measured post-artifact by the deterministic checkers and lands as
-# checker_results rows beside the judge scores.
+# checker_results rows + the `suite` signal beside the judge scores.
 #
 # Tasks demonstrate both task kinds and a container + prompt cell:
 # - preset_ref tasks resolve the vendored task preset at submit (same
@@ -14,12 +14,12 @@
 #   prompt-only cell (register `adapter: prompt` configs once PR25 is in;
 #   until then a run of this suite 422s on the pinned task — by design).
 id: starter-regression
-version: 1
+version: 2
 title: Starter regression suite
 description: >-
-  Two-task smoke suite: a container-cell file/grep/pytest check on the
-  wordle-html preset, and a prompt-cell output_grep check on an inline
-  arithmetic-extraction prompt.
+  Three-task smoke suite: a container-cell file/grep/pytest check on the
+  wordle-html preset, plus prompt-cell output checks (regex, substring,
+  numeric tolerance, JSON schema) on inline extraction prompts.
 tasks:
   - id: wordle-container
     preset_ref: wordle-html
@@ -45,3 +45,29 @@ tasks:
       # (written at the artifact root; workspace output.txt is the
       # fallback).
       output_grep: 'TOTAL:\s*42'
+      # contains — literal substring in output.txt (no regex).
+      contains: 'TOTAL'
+      # numeric_tol — first number in output.txt within tolerance.
+      numeric_tol:
+        value: 42
+        tolerance: 0
+  - id: json-reporter
+    prompt: >-
+      Reply with a single JSON object and nothing else, of the form
+      {"answer": <integer>, "unit": "items"} where answer is 17 + 25.
+    adapter: prompt
+    check:
+      # json_schema — output.txt parses as JSON and validates against a
+      # documented subset of JSON Schema (type/required/properties/...
+      # see scoring.checkers.JSON_SCHEMA_KEYS).
+      json_schema:
+        type: object
+        required: [answer, unit]
+        properties:
+          answer: {type: integer, minimum: 0}
+          unit: {type: string}
+        additionalProperties: false
+      # exact — output.txt (trimmed) equals this text verbatim. A strict
+      # check — most models will fail this one; it's here to exercise the
+      # red path on the example suite.
+      exact: '{"answer": 42, "unit": "items"}'

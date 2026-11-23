@@ -43,6 +43,7 @@ from api.schemas import (
     SuiteCheckOut,
     SuiteDetailOut,
     SuiteOut,
+    SuiteRunAggregate,
     SuiteRunChildOut,
     SuiteRunIn,
     SuiteRunOut,
@@ -434,10 +435,31 @@ def get_suite_run(suite_run_id: uuid.UUID, session: DbSession) -> SuiteRunResult
                 cells=cells,
             )
         )
+
+    # Batch roll-up — pooled checker pass rate + mean judge overall, the
+    # "mean" beside each task's per-case pass/fail.
+    all_cells = [c for t in tasks for c in t.cells]
+    c_passed = sum(c.checks.passed for c in all_cells)
+    c_failed = sum(c.checks.failed for c in all_cells)
+    c_measured = c_passed + c_failed
+    judged = [c.judge_overall for c in all_cells if c.judge_overall is not None]
+    aggregate = SuiteRunAggregate(
+        tasks=len(tasks),
+        cells=len(all_cells),
+        checks_total=sum(c.checks.total for c in all_cells),
+        checks_passed=c_passed,
+        checks_failed=c_failed,
+        checks_skipped=sum(c.checks.skipped for c in all_cells),
+        checks_errors=sum(c.checks.errors for c in all_cells),
+        check_pass_rate=(c_passed / c_measured) if c_measured else None,
+        cells_scored=len(judged),
+        mean_judge_overall=(sum(judged) / len(judged)) if judged else None,
+    )
     return SuiteRunResults(
         id=suite_run.id,
         suite_slug=suite_run.suite_slug,
         suite_version=suite_run.suite_version,
         created_at=suite_run.created_at,
         runs=tasks,
+        aggregate=aggregate,
     )

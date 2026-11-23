@@ -992,6 +992,26 @@ class SuiteRunTaskOut(BaseModel):
     cells: list[SuiteCellOut] = Field(default_factory=list)
 
 
+class SuiteRunAggregate(BaseModel):
+    """Batch-level roll-up — the "mean" beside per-case pass/fail.
+
+    ``check_pass_rate`` pools every cell's measured checks (passed /
+    measured); ``mean_judge_overall`` averages cell-level judge overalls
+    (each cell counted once). Nulls = nothing measured yet.
+    """
+
+    tasks: int = 0
+    cells: int = 0
+    checks_total: int = 0
+    checks_passed: int = 0
+    checks_failed: int = 0
+    checks_skipped: int = 0
+    checks_errors: int = 0
+    check_pass_rate: float | None = None
+    cells_scored: int = 0
+    mean_judge_overall: float | None = None
+
+
 class SuiteRunResults(BaseModel):
     """GET /api/suite-runs/{id} — the task × cell aggregation for one
     fan-out batch: per task, per sandbox cell, the judge ``overall`` score
@@ -1002,3 +1022,4 @@ class SuiteRunResults(BaseModel):
     suite_version: int | None = None
     created_at: datetime | None = None
     runs: list[SuiteRunTaskOut] = Field(default_factory=list)
+    aggregate: SuiteRunAggregate = Field(default_factory=SuiteRunAggregate)

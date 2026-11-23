@@ -61,6 +61,7 @@ from orchestrator.matrix import run_models, sandbox_model
 from orchestrator.rubric import RubricContent, create_rubric_version
 from sandbox.preview import ScanCache, resolve_artifact_dir
 from sandbox.thumbnails import THUMB_FILENAME, THUMB_META_FILENAME
+from scoring.checkers import SUITE_PASS_DIMENSION
 from scoring.exec import exec_summary_dict
 from scoring.render import ANALYSIS_JSON_FILENAME
 
@@ -130,6 +131,23 @@ class GeneratedTestsSummary(BaseModel):
     coverage_percent: float | None = None
     timed_out: bool = False
     detail: str | None = None  # skip reason / error message
+
+
+class SuiteSummary(BaseModel):
+    """PR26 flat suite headline — the deterministic checker roll-up over
+    the sandbox's merged ``checker_results`` rows (newest-wins per check).
+    DB-sourced, so it lands even when no judge ever ran — the "per-case
+    pass/fail + mean without judge involvement" contract. ``pass_rate``
+    excludes skipped/error checks (not measured outcomes); null when
+    nothing measured. ``suite_pass`` mirrors the Score dimension ×10."""
+
+    total: int = 0
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    errors: int = 0
+    pass_rate: float | None = None
+    suite_pass: float | None = None  # the suite_pass Score value (0–10)
 
 
 class ArtifactRef(BaseModel):
@@ -215,6 +233,9 @@ class SandboxResult(BaseModel):
     # (check_type, spec), mirroring the score merge; empty for non-suite
     # runs and suites without ``check:`` blocks.
     checker_results: list[CheckerResultOut] = Field(default_factory=list)
+    # PR26: flat roll-up of those rows — counts + pass rate (+ the
+    # ``suite_pass`` score value). None for non-suite runs.
+    suite: SuiteSummary | None = None
 
 
 class RubricVersionOut(BaseModel):
@@ -639,6 +660,24 @@ def get_run_results(
         key = (cr.check_type, json.dumps(cr.spec or {}, sort_keys=True))
         checker_by_sandbox.setdefault(cr.sandbox_id, {})[key] = cr
 
+    # Flat suite roll-up per sandbox — the card's "per-case pass/fail +
+    # mean without judge involvement": computed from the DB rows, so it
+    # exists even when analysis.json/the judge never did.
+    suite_by_sandbox: dict[UUID, dict[str, Any]] = {}
+    for sid, merged in checker_by_sandbox.items():
+        rows = list(merged.values())
+        passed = sum(1 for r in rows if r.status == "pass")
+        failed = sum(1 for r in rows if r.status == "fail")
+        measured = passed + failed
+        suite_by_sandbox[sid] = {
+            "total": len(rows),
+            "passed": passed,
+            "failed": failed,
+            "skipped": sum(1 for r in rows if r.status == "skipped"),
+            "errors": sum(1 for r in rows if r.status == "error"),
+            "pass_rate": (passed / measured) if measured else None,
+        }
+
     # Eval-failure events — latest label per sandbox. Only surfaced on
     # sandboxes with NO Score rows: a retry that eventually produced scores
     # supersedes its earlier failed attempts.
@@ -687,6 +726,7 @@ def get_run_results(
         overall: DimensionScore | None = None
         rubric_id: UUID | None = None
         sb_rubric_version: int | None = None
+        suite_pass_score: float | None = None
         for sc in by_sandbox.get(sb.id, []):
             if sc.rubric_id is not None:
                 rubric_id = sc.rubric_id  # rows ordered asc -> newest wins
@@ -700,6 +740,9 @@ def get_run_results(
                 overall = entry
             else:
                 dimensions[sc.dimension] = entry
+                if sc.dimension == SUITE_PASS_DIMENSION:
+                    suite_pass_score = sc.score
+        suite_block = suite_by_sandbox.get(sb.id)
         results.append(
             SandboxResult(
                 sandbox_id=sb.id,
@@ -715,7 +758,14 @@ def get_run_results(
                 dimensions=dimensions,
                 overall=overall,
                 eval_error=(
-                    None if by_sandbox.get(sb.id) else eval_failures.get(sb.id)
+                    # A suite_pass row is a checker measurement, not a
+                    # judge verdict — it must not mask "judge failed".
+                    None
+                    if any(
+                        sc.dimension != SUITE_PASS_DIMENSION
+                        for sc in by_sandbox.get(sb.id, [])
+                    )
+                    else eval_failures.get(sb.id)
                 ),
                 artifacts=[
                     ArtifactRef(id=a.id, kind=a.kind, path=a.path)
@@ -746,6 +796,11 @@ def get_run_results(
                     )
                     for cr in checker_by_sandbox.get(sb.id, {}).values()
                 ],
+                suite=(
+                    SuiteSummary(**suite_block, suite_pass=suite_pass_score)
+                    if suite_block is not None
+                    else None
+                ),
             )
         )
 

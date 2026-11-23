@@ -208,6 +208,42 @@ def _render_generated_tests(sig: SignalReport) -> list[str]:
     return lines
 
 
+def _render_suite(sig: SignalReport) -> list[str]:
+    """PR26 block — the suite task's deterministic checks measured
+    post-artifact by the orchestrator (not by the judge). A red check is
+    objective evidence the judge should not smooth over."""
+    m = sig.metrics
+    rate = m.get("pass_rate")
+    rate_txt = f"{rate * 100:g}%" if isinstance(rate, (int, float)) else "n/a"
+    suite_ref = m.get("suite_ref") or "?"
+    lines = [
+        "## Suite checks (deterministic)",
+        "",
+        f"- Suite: `{suite_ref}` task {m.get('suite_index', '?')}",
+        (
+            f"- Result: **{m.get('passed', 0)} passed** /"
+            f" {m.get('failed', 0)} failed /"
+            f" {m.get('skipped', 0)} skipped /"
+            f" {m.get('errors', 0)} errors"
+            f" (pass rate **{rate_txt}**)"
+        ),
+    ]
+    checks = m.get("checks") or []
+    if checks:
+        lines.append("- Per-check verdicts:")
+        for c in checks[:20]:
+            icon = {"pass": "PASS", "fail": "FAIL", "skipped": "SKIP", "error": "ERR"}.get(
+                c.get("status"), "?"
+            )
+            detail = str(c.get("detail") or "")
+            lines.append(
+                f"  - [{icon}] `{c.get('check')}`"
+                + (f" — {detail[:160]}" if detail else "")
+            )
+    lines.append("")
+    return lines
+
+
 def _render_generic(sig: SignalReport) -> list[str]:
     """Fallback block for collectors without a custom section."""
     lines = [f"## Signal: {sig.name} ({sig.status})", ""]
@@ -269,6 +305,8 @@ def render_analysis_markdown(report: AnalysisReport) -> str:
             lines += _render_exec(sig)
         elif sig.name == "generated_tests":
             lines += _render_generated_tests(sig)
+        elif sig.name == "suite":
+            lines += _render_suite(sig)
         else:
             lines += _render_generic(sig)
         for w in sig.warnings[:10]:

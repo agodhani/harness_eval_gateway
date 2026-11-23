@@ -106,7 +106,7 @@ from evaluator.scores import (
 )
 from evaluator.testgen import GENERATED_TESTS_DIRNAME, generate_tests_signal
 from sandbox.runtime import DEFAULT_IMAGE, SandboxRuntime
-from scoring import AnalysisReport, SignalReport, collect_signals
+from scoring import AnalysisReport, SignalReport, checkers, collect_signals
 from scoring.exec import exec_summary_dict
 from scoring.render import (
     ANALYSIS_JSON_FILENAME,
@@ -254,6 +254,30 @@ async def _collect_generated_tests(
     except Exception:
         logger.warning(
             "evaluator: test-suite generation failed for %s", ws_path, exc_info=True
+        )
+        return None
+
+
+def _load_suite_signal(artifact_dir: Path) -> SignalReport | None:
+    """PR26: fold the orchestrator's ``suite_checks.json`` measurement into
+    the analysis report as the ``suite`` signal — the deterministic pass
+    rate lands in ``analysis.json``/``ANALYSIS.md`` as judge evidence
+    alongside the other objective signals. Returns None when no suite ran
+    checks on this artifact (file absent or unreadable — never raises)."""
+    try:
+        path = Path(artifact_dir) / checkers.SUITE_CHECKS_FILENAME
+        if not path.is_file():
+            return None
+        doc = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        if not isinstance(doc, dict) or not doc.get("checks"):
+            return None
+        return SignalReport(name="suite", metrics=checkers.signal_metrics(doc))
+    except Exception:  # evidence must not break the eval
+        logger.warning(
+            "evaluator: could not read %s/%s",
+            artifact_dir,
+            checkers.SUITE_CHECKS_FILENAME,
+            exc_info=True,
         )
         return None
 
@@ -705,6 +729,20 @@ async def evaluate_sandbox(
         if gen_sig is not None and gen_sig.metrics.get("files_written")
         else None
     )
+
+    # PR26: the suite's deterministic checks ran pre-judge (orchestrator)
+    # and left suite_checks.json on the artifact — fold it in as the
+    # ``suite`` signal so the judge sees the pass rate and analysis.json
+    # carries the machine-readable form. Unlike a skipped gen_tests signal
+    # this IS fresh evidence, so it may open a report when the collectors
+    # failed (mirrors the gen_sig non-skipped path).
+    suite_sig = _load_suite_signal(art_path)
+    if suite_sig is not None:
+        if analysis_report is not None:
+            analysis_report.signals.append(suite_sig)
+        else:
+            analysis_report = AnalysisReport(workspace=str(ws_path))
+            analysis_report.signals.append(suite_sig)
 
     analysis_path = await asyncio.to_thread(
         _persist_analysis, art_path, analysis_report

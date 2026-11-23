@@ -24,6 +24,7 @@ run (zero scores), never a crash.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable, Collection
@@ -342,10 +343,42 @@ def _suite_check_specs(
     return task.checks(), suite.suite_dir
 
 
+def _suite_pass_score_row(
+    session: Session,
+    *,
+    sandbox_id: uuid.UUID,
+    outcomes: list[checkers.CheckOutcome],
+) -> Score | None:
+    """The ``suite_pass`` Score row — pass rate on the 0–10 scale every
+    other dimension uses. Rubric-free (``rubric_id`` NULL): the verdict is
+    the suite.yaml spec's, not the judge's, and the row exists even when
+    no judge ever ran. ``seq`` stamps above the sandbox's current max so
+    re-measurement merges newest-wins like a re-score. Returns None when
+    nothing measured (all skipped/error — no verdict to report)."""
+    roll = checkers.summarize(outcomes)
+    if not roll["measured"]:
+        return None
+    max_seq = session.scalar(
+        select(func.max(Score.seq)).where(Score.sandbox_id == sandbox_id)
+    ) or 0
+    return Score(
+        sandbox_id=sandbox_id,
+        rubric_id=None,
+        rubric_version=None,
+        seq=max_seq + 1,
+        dimension=checkers.SUITE_PASS_DIMENSION,
+        score=round(10.0 * roll["pass_rate"], 2),
+        rationale=(
+            f"{roll['passed']}/{roll['measured']} deterministic suite "
+            f"checks passed"
+        ),
+    )
+
+
 async def _run_suite_checks(
     *,
     session_factory: sessionmaker[Session],
-    run_id: uuid.UUID,
+    run: Run,
     sandbox_id: uuid.UUID,
     artifact_dir: Path,
     entries: list[dict[str, Any]],
@@ -357,6 +390,10 @@ async def _run_suite_checks(
     (the sqlite :memory: single-connection rule). A red check is a
     measurement — it lands as a ``fail`` row, never an exception, and
     never blocks the eval pass.
+
+    Also writes ``<artifact>/suite_checks.json`` — the evaluator folds it
+    into ``analysis.json``/``ANALYSIS.md`` as the ``suite`` signal — and
+    persists the ``suite_pass`` Score row (pass rate ×10).
     """
     try:
         outcomes = await asyncio.to_thread(
@@ -371,7 +408,7 @@ async def _run_suite_checks(
         log.warning("suite checks crashed for sandbox %s: %s", sandbox_id, exc)
         _emit_run_event(
             session_factory,
-            run_id,
+            run.id,
             sandbox_id=sandbox_id,
             event_type="error",
             payload={
@@ -381,6 +418,24 @@ async def _run_suite_checks(
         )
         return
 
+    # Artifact-side measurement file — judge evidence + the analysis.json
+    # signal source. Best-effort: a bad artifact dir must not eat the rows.
+    try:
+        (artifact_dir / checkers.SUITE_CHECKS_FILENAME).write_text(
+            json.dumps(
+                checkers.suite_checks_doc(
+                    outcomes,
+                    suite_ref=run.suite_ref or "",
+                    suite_index=int(run.suite_index or 0),
+                ),
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        log.warning("could not write suite_checks.json: %s", exc)
+
     counts = {"pass": 0, "fail": 0, "skipped": 0, "error": 0}
     for o in outcomes:
         counts[o.status] = counts.get(o.status, 0) + 1
@@ -388,7 +443,7 @@ async def _run_suite_checks(
         for o in outcomes:
             session.add(
                 CheckerResult(
-                    run_id=run_id,
+                    run_id=run.id,
                     sandbox_id=sandbox_id,
                     check_type=o.check_type,
                     spec=o.spec,
@@ -397,9 +452,14 @@ async def _run_suite_checks(
                     detail=o.detail,
                 )
             )
+        score_row = _suite_pass_score_row(
+            session, sandbox_id=sandbox_id, outcomes=outcomes
+        )
+        if score_row is not None:
+            session.add(score_row)
         emit(
             session,
-            run_id=run_id,
+            run_id=run.id,
             sandbox_id=sandbox_id,
             event_type="checkpoint",
             payload={
@@ -426,7 +486,7 @@ async def _run_suite_checks(
                 s = o.test_summary
                 emit(
                     session,
-                    run_id=run_id,
+                    run_id=run.id,
                     sandbox_id=sandbox_id,
                     event_type="test_execution",
                     payload={
@@ -507,7 +567,7 @@ async def _evaluate_all(
             # objective verdict is persisted even if eval later fails.
             await _run_suite_checks(
                 session_factory=session_factory,
-                run_id=run.id,
+                run=run,
                 sandbox_id=sb.id,
                 artifact_dir=artifact_dir,
                 entries=check_entries,

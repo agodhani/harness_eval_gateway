@@ -14,9 +14,11 @@ Each task may also declare:
   PR25 prompt-only cell). Omit → the task runs on every submitted config.
 - ``check`` — deterministic checkers the post-artifact step measures on
   the sandbox's artifact dir (``scoring.checkers``): ``file_exists``,
-  ``grep``, ``py_test`` (locked ``heg-exec`` container), ``output_grep``
-  (prompt-cell ``output.txt``). They complement the LLM judge — never
-  mutate scores or events.
+  ``grep``, ``py_test`` (locked ``heg-exec`` container), plus the
+  ``output.txt`` output checkers ``output_grep``/``exact``/``contains``/
+  ``json_schema``/``numeric_tol`` (prompt cells). They complement the LLM
+  judge — never mutate scores or events (the ``suite_pass`` score row
+  they produce is a measurement, not a judge override).
 
 Unlike presets there is no user/DB side — suites are vendored only.
 
@@ -44,7 +46,39 @@ SUITE_FILENAME = "suite.yaml"
 
 #: Checker type names accepted under ``tasks[].check`` — the keys of the
 #: normalized check spec dicts scoring.checkers consumes.
-CHECK_TYPES = ("file_exists", "grep", "py_test", "output_grep")
+CHECK_TYPES = (
+    "file_exists",
+    "grep",
+    "py_test",
+    "output_grep",
+    "exact",
+    "contains",
+    "json_schema",
+    "numeric_tol",
+)
+
+#: JSON Schema keys the checkers' subset validator understands — parse
+#: rejects unknown keys so a vendored schema bug fails the contract test
+#: instead of silently passing at measure time (mirrors
+#: scoring.checkers.JSON_SCHEMA_KEYS).
+_JSON_SCHEMA_KEYS = frozenset(
+    {
+        "type",
+        "required",
+        "properties",
+        "items",
+        "enum",
+        "const",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "additionalProperties",
+    }
+)
 
 _MAX_TASKS = 64
 _MAX_PROMPT_LEN = 100_000
@@ -120,11 +154,48 @@ def _compile_pattern(pattern: str, *, what: str) -> None:
         raise ValueError(f"{what} is not a valid regex ({pattern!r}): {exc}") from exc
 
 
+def _validate_schema_node(node: Any, *, where: str) -> None:
+    """Eagerly reject unsupported JSON-Schema keys inside a ``json_schema``
+    check — recurses through properties/items/additionalProperties. The
+    measure-time validator is a documented subset; a vendored suite using
+    an unknown key is a repo bug, caught here (contract test) rather than
+    surfacing as a checker ``error`` on the first run."""
+    if not isinstance(node, dict):
+        raise TypeError(f"{where} must be a schema mapping")
+    bad = sorted(set(node) - _JSON_SCHEMA_KEYS)
+    if bad:
+        raise ValueError(
+            f"{where}: unsupported schema keys {bad} — supported: {sorted(_JSON_SCHEMA_KEYS)}"
+        )
+    for key, sub in (node.get("properties") or {}).items():
+        _validate_schema_node(sub, where=f"{where}.properties.{key}")
+    if isinstance(node.get("items"), dict):
+        _validate_schema_node(node["items"], where=f"{where}.items")
+    if isinstance(node.get("additionalProperties"), dict):
+        _validate_schema_node(
+            node["additionalProperties"], where=f"{where}.additionalProperties"
+        )
+
+
+class NumericTolCheck(BaseModel):
+    """``check.numeric_tol`` — first number in ``output.txt`` within
+    ``tolerance`` of ``value``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: float
+    tolerance: float = Field(default=0.0, ge=0.0)
+
+
 class CheckSpec(BaseModel):
     """The ``check`` block on a suite task — one entry per checker type.
 
     Scalar forms: ``file_exists: <path>``, ``py_test: <suite-rel dir>``,
-    ``output_grep: <pattern>``. ``grep`` takes ``{path, pattern}``.
+    ``output_grep: <pattern>``, ``exact: <expected>``,
+    ``contains: <substring>``. Mapping forms: ``grep: {path, pattern}``,
+    ``json_schema: {schema: {...}}`` (or the bare schema mapping —
+    normalized to ``{"schema": ...}``), ``numeric_tol: {value,
+    tolerance}``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -133,6 +204,10 @@ class CheckSpec(BaseModel):
     grep: GrepCheck | None = None
     py_test: str | None = None
     output_grep: str | None = None
+    exact: str | None = None
+    contains: str | None = None
+    json_schema: dict[str, Any] | None = None
+    numeric_tol: NumericTolCheck | None = None
 
     @field_validator("file_exists")
     @classmethod
@@ -151,6 +226,22 @@ class CheckSpec(BaseModel):
             _compile_pattern(v, what="check.output_grep")
         return v
 
+    @field_validator("json_schema")
+    @classmethod
+    def _json_schema_ok(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        if v is None:
+            return None
+        # Bare schema mapping is sugar for {"schema": {...}} — either way
+        # the checker sees spec["schema"].
+        schema = v.get("schema") if set(v) == {"schema"} else v
+        try:
+            _validate_schema_node(schema, where="check.json_schema")
+        except (TypeError, ValueError) as exc:
+            # TypeError (non-mapping schema node) must still become a
+            # ValidationError — pydantic only converts ValueError.
+            raise ValueError(str(exc)) from exc
+        return {"schema": schema}
+
     def entries(self) -> list[dict[str, Any]]:
         """Normalized flat check list — canonical type order, each dict
         ``{"check": <type>, ...spec}``; serializes straight into
@@ -166,6 +257,20 @@ class CheckSpec(BaseModel):
             out.append({"check": "py_test", "path": self.py_test})
         if self.output_grep is not None:
             out.append({"check": "output_grep", "pattern": self.output_grep})
+        if self.exact is not None:
+            out.append({"check": "exact", "equals": self.exact})
+        if self.contains is not None:
+            out.append({"check": "contains", "substring": self.contains})
+        if self.json_schema is not None:
+            out.append({"check": "json_schema", "schema": self.json_schema["schema"]})
+        if self.numeric_tol is not None:
+            out.append(
+                {
+                    "check": "numeric_tol",
+                    "value": self.numeric_tol.value,
+                    "tolerance": self.numeric_tol.tolerance,
+                }
+            )
         return out
 
 

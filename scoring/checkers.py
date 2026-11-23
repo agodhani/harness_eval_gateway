@@ -18,11 +18,31 @@ Checker types (the ``check`` key in a normalized spec dict):
 - ``output_grep`` — ``{"pattern": regex}``: the pattern matches the
   prompt-cell ``output.txt`` (PR25 convention: written at the ARTIFACT
   root, not inside workspace/; workspace ``output.txt`` is the fallback).
+- ``exact`` — ``{"equals": str}``: ``output.txt`` (whitespace-trimmed)
+  equals the expected text exactly.
+- ``contains`` — ``{"substring": str}``: literal substring appears in
+  ``output.txt`` — the no-regex sibling of ``output_grep``.
+- ``json_schema`` — ``{"schema": dict}``: ``output.txt`` parses as JSON
+  and validates against a documented subset of JSON Schema (``type``,
+  ``required``, ``properties``, ``items``, ``enum``, ``const``,
+  ``minimum``/``maximum``, ``exclusiveMinimum``/``exclusiveMaximum``,
+  ``minLength``/``maxLength``, ``pattern``, ``additionalProperties``).
+  No external validator dep — suite authors get a strict, enumerable
+  contract; unsupported keys are a spec ``error``, not a silent skip.
+- ``numeric_tol`` — ``{"value": number, "tolerance": number}``: the first
+  number found in ``output.txt`` is within ``tolerance`` of ``value``.
 - ``py_test`` — ``{"path": rel}``: run the pytest suite vendored under
   ``benchmark_suites/<slug>/<path>`` against the candidate workspace,
   inside the locked ``heg-exec`` container (``sandbox.exec.ExecRunner``
   ``test_target=`` — same ``--network none`` / demoted-uid / read-only
   posture as scoring exec + PR8 generated tests).
+
+Roadmap-card mapping: the card names checkers ``exact | regex | contains
+| json_schema | numeric_tol | file_exists | exec_exit_zero`` — ``regex``
+ships as ``output_grep`` (output) + ``grep`` (any artifact file), and the
+exec check ships as ``py_test`` (a pytest run is the concrete
+exit-nonzero signal ExecRunner supports); the names above are the
+implementation spellings.
 
 Status semantics mirror the exec collector's: ``pass``/``fail`` are real
 measurements (a missing file or failing test suite is a fail, never an
@@ -41,7 +61,9 @@ wraps calls in ``asyncio.to_thread``.
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -54,13 +76,59 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 #: Checker type names — must stay in sync with api.suites.CHECK_TYPES.
-CHECK_TYPES = frozenset({"file_exists", "grep", "py_test", "output_grep"})
+CHECK_TYPES = frozenset(
+    {
+        "file_exists",
+        "grep",
+        "py_test",
+        "output_grep",
+        "exact",
+        "contains",
+        "json_schema",
+        "numeric_tol",
+    }
+)
 
-#: Byte cap on grep/output_grep reads — a multi-GB artifact file can't be
+#: ``scores.dimension`` for the deterministic suite pass rate (0–10 scale,
+#: matching every other dimension). Persisted alongside checker_results so
+#: the suite verdict surfaces anywhere scores are read — rubric-free
+#: (``rubric_id`` NULL), the row exists even when no judge ever ran.
+SUITE_PASS_DIMENSION = "suite_pass"
+
+#: Artifact-side measurement file: ``_run_suite_checks`` writes the raw
+#: outcomes here so the evaluator can fold them into ``analysis.json`` /
+#: ``ANALYSIS.md`` (the ``suite`` signal) without re-measuring.
+SUITE_CHECKS_FILENAME = "suite_checks.json"
+
+#: Byte cap on grep/output reads — a multi-GB artifact file can't be
 #: slurped into api memory; the pattern still sees the head of the file.
 _MAX_READ_BYTES = 8 * 1024 * 1024
 
 _MAX_DETAIL_LEN = 500
+
+#: First signed number anywhere in the output (numeric_tol's measurement).
+_NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+
+#: JSON Schema keys the subset validator understands — anything else is a
+#: spec error at parse AND at measure time (strict beats silently ignored).
+JSON_SCHEMA_KEYS = frozenset(
+    {
+        "type",
+        "required",
+        "properties",
+        "items",
+        "enum",
+        "const",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "additionalProperties",
+    }
+)
 
 
 @dataclass
@@ -110,8 +178,9 @@ def _resolve_jailed(root: Path, rel: str) -> Path | None:
     rejected rather than read. ``..`` components and absolute paths land
     outside the jail by construction once resolved.
     """
-    p = PurePosixPath(str(rel).strip().replace("\\", "/"))
-    if not str(rel).strip() or p.is_absolute() or ".." in p.parts or "\x00" in rel:
+    rel_str = str(rel).strip()
+    p = PurePosixPath(rel_str.replace("\\", "/"))
+    if not rel_str or p.is_absolute() or ".." in p.parts or "\x00" in rel_str:
         return None
     try:
         base = root.resolve()
@@ -221,34 +290,228 @@ def _check_output_grep(
         return _outcome(
             "output_grep", spec, "error", f"invalid pattern {pattern!r}: {exc}"
         )
-    # PR25 prompt-cell convention: output.txt at the ARTIFACT ROOT (prompt
-    # cells write it there — no workspace/ exists). The workspace copy is
-    # the fallback so container cells that deliberately wrote output.txt
-    # still satisfy the check.
-    for cand in (artifact_dir / "output.txt", artifact_dir / "workspace" / "output.txt"):
-        resolved = _resolve_jailed(
-            artifact_dir, cand.relative_to(artifact_dir)
+    text = _output_text(artifact_dir)
+    if text is None:
+        return _outcome("output_grep", spec, "fail", "output.txt not found")
+    m = rx.search(text)
+    if m:
+        return _outcome(
+            "output_grep",
+            spec,
+            "pass",
+            f"matched at line {_match_line(text, m.start())} of output.txt",
         )
+    return _outcome(
+        "output_grep", spec, "fail", f"no match for {pattern!r} in output.txt"
+    )
+
+
+def _output_text(artifact_dir: Path) -> str | None:
+    """The prompt-cell output — ``output.txt`` at the ARTIFACT ROOT first
+    (PR25 convention: prompt cells write it there, no workspace/ exists),
+    the workspace copy as fallback so container cells that deliberately
+    wrote output.txt still satisfy output checks. None when absent or
+    unreadable."""
+    for cand in (artifact_dir / "output.txt", artifact_dir / "workspace" / "output.txt"):
+        resolved = _resolve_jailed(artifact_dir, cand.relative_to(artifact_dir))
         if resolved is None or not resolved.exists():
             continue
-        text = _read_text_bounded(resolved)
-        if text is None:
-            return _outcome(
-                "output_grep", spec, "fail", "output.txt is not a readable file"
-            )
-        m = rx.search(text)
-        if m:
-            where = resolved.relative_to(artifact_dir)
-            return _outcome(
-                "output_grep",
-                spec,
-                "pass",
-                f"matched at line {_match_line(text, m.start())} of {where}",
-            )
+        return _read_text_bounded(resolved)
+    return None
+
+
+def _check_exact(
+    spec: dict[str, Any], artifact_dir: Path, **_kw: Any
+) -> CheckOutcome:
+    expected = spec.get("equals")
+    if not isinstance(expected, str):
+        return _outcome("exact", spec, "error", "missing 'equals' in spec")
+    text = _output_text(artifact_dir)
+    if text is None:
+        return _outcome("exact", spec, "fail", "output.txt not found")
+    if text.strip() == expected.strip():
+        return _outcome("exact", spec, "pass", "output.txt matches expected text")
+    return _outcome(
+        "exact",
+        spec,
+        "fail",
+        f"output differs: got {text.strip()[:120]!r}, expected {expected.strip()[:120]!r}",
+    )
+
+
+def _check_contains(
+    spec: dict[str, Any], artifact_dir: Path, **_kw: Any
+) -> CheckOutcome:
+    needle = spec.get("substring")
+    if not isinstance(needle, str) or not needle:
+        return _outcome("contains", spec, "error", "missing 'substring' in spec")
+    text = _output_text(artifact_dir)
+    if text is None:
+        return _outcome("contains", spec, "fail", "output.txt not found")
+    if needle in text:
         return _outcome(
-            "output_grep", spec, "fail", f"no match for {pattern!r} in output.txt"
+            "contains",
+            spec,
+            "pass",
+            f"found {needle[:80]!r} in output.txt",
         )
-    return _outcome("output_grep", spec, "fail", "output.txt not found")
+    return _outcome(
+        "contains", spec, "fail", f"{needle[:80]!r} not found in output.txt"
+    )
+
+
+def _check_numeric_tol(
+    spec: dict[str, Any], artifact_dir: Path, **_kw: Any
+) -> CheckOutcome:
+    try:
+        value = float(spec.get("value"))
+        tolerance = float(spec.get("tolerance", 0))
+    except (TypeError, ValueError):
+        return _outcome(
+            "numeric_tol", spec, "error", "spec needs numeric value/tolerance"
+        )
+    if not (math.isfinite(value) and math.isfinite(tolerance)) or tolerance < 0:
+        return _outcome(
+            "numeric_tol", spec, "error", "value/tolerance must be finite, tolerance >= 0"
+        )
+    text = _output_text(artifact_dir)
+    if text is None:
+        return _outcome("numeric_tol", spec, "fail", "output.txt not found")
+    m = _NUM_RE.search(text)
+    if m is None:
+        return _outcome(
+            "numeric_tol", spec, "fail", "no number found in output.txt"
+        )
+    got = float(m.group(0))
+    if abs(got - value) <= tolerance:
+        return _outcome(
+            "numeric_tol",
+            spec,
+            "pass",
+            f"found {got:g} within ±{tolerance:g} of {value:g}",
+        )
+    return _outcome(
+        "numeric_tol",
+        spec,
+        "fail",
+        f"found {got:g}, outside ±{tolerance:g} of {value:g}",
+    )
+
+
+def _check_json_schema(
+    spec: dict[str, Any], artifact_dir: Path, **_kw: Any
+) -> CheckOutcome:
+    schema = spec.get("schema")
+    if not isinstance(schema, dict):
+        return _outcome(
+            "json_schema", spec, "error", "missing 'schema' mapping in spec"
+        )
+    unsupported = sorted(set(schema) - JSON_SCHEMA_KEYS)
+    if unsupported:
+        return _outcome(
+            "json_schema",
+            spec,
+            "error",
+            f"unsupported schema keys {unsupported} — supported: {sorted(JSON_SCHEMA_KEYS)}",
+        )
+    text = _output_text(artifact_dir)
+    if text is None:
+        return _outcome("json_schema", spec, "fail", "output.txt not found")
+    try:
+        instance = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return _outcome(
+            "json_schema", spec, "fail", f"output.txt is not valid JSON: {exc}"
+        )
+    problem = _schema_violation(instance, schema)
+    if problem is None:
+        return _outcome("json_schema", spec, "pass", "output validates against schema")
+    return _outcome("json_schema", spec, "fail", problem)
+
+
+def _schema_violation(instance: Any, schema: dict[str, Any], path: str = "$") -> str | None:
+    """Subset JSON-Schema validator — returns a human-readable violation or
+    None (valid). Supported keys are ``JSON_SCHEMA_KEYS``; nested schemas in
+    ``properties``/``items``/``additionalProperties`` validate recursively.
+    Suite files are repo-vendored, so strictness on unknown keys is a spec
+    bug the parse layer already rejects — this assumes a clean schema."""
+    expected = schema.get("type")
+    if expected is not None and not _type_matches(instance, expected):
+        return f"{path}: expected type {expected!r}, got {_json_type(instance)}"
+    if "const" in schema and instance != schema["const"]:
+        return f"{path}: expected const {schema['const']!r}, got {instance!r}"
+    if "enum" in schema and instance not in schema["enum"]:
+        return f"{path}: {instance!r} not in enum {schema['enum']!r}"
+    if isinstance(instance, (int, float)) and not isinstance(instance, bool):
+        for key, op in (
+            ("minimum", lambda v, b: v >= b),
+            ("maximum", lambda v, b: v <= b),
+            ("exclusiveMinimum", lambda v, b: v > b),
+            ("exclusiveMaximum", lambda v, b: v < b),
+        ):
+            bound = schema.get(key)
+            if bound is not None and not op(instance, bound):
+                return f"{path}: {instance!r} violates {key}={bound!r}"
+    if isinstance(instance, str):
+        if "minLength" in schema and len(instance) < schema["minLength"]:
+            return f"{path}: string shorter than minLength={schema['minLength']}"
+        if "maxLength" in schema and len(instance) > schema["maxLength"]:
+            return f"{path}: string longer than maxLength={schema['maxLength']}"
+        if "pattern" in schema and re.search(schema["pattern"], instance) is None:
+            return f"{path}: {instance[:80]!r} fails pattern {schema['pattern']!r}"
+    if isinstance(instance, dict):
+        for req in schema.get("required") or []:
+            if req not in instance:
+                return f"{path}: missing required key {req!r}"
+        props = schema.get("properties") or {}
+        for key, sub in props.items():
+            if key in instance and isinstance(sub, dict):
+                problem = _schema_violation(instance[key], sub, f"{path}.{key}")
+                if problem:
+                    return problem
+        additional = schema.get("additionalProperties", True)
+        extras = [k for k in instance if k not in props]
+        if additional is False and extras:
+            return f"{path}: unexpected keys {extras!r}"
+        if isinstance(additional, dict):
+            for key in extras:
+                problem = _schema_violation(instance[key], additional, f"{path}.{key}")
+                if problem:
+                    return problem
+    if isinstance(instance, list):
+        items = schema.get("items")
+        if isinstance(items, dict):
+            for i, elt in enumerate(instance):
+                problem = _schema_violation(elt, items, f"{path}[{i}]")
+                if problem:
+                    return problem
+    return None
+
+
+def _json_type(instance: Any) -> str:
+    if instance is None:
+        return "null"
+    if isinstance(instance, bool):
+        return "boolean"
+    if isinstance(instance, int):
+        return "integer"
+    if isinstance(instance, float):
+        return "number"
+    if isinstance(instance, str):
+        return "string"
+    if isinstance(instance, list):
+        return "array"
+    return "object"
+
+
+def _type_matches(instance: Any, expected: Any) -> bool:
+    if isinstance(expected, list):
+        return any(_type_matches(instance, e) for e in expected)
+    if expected == "number":
+        return isinstance(instance, (int, float)) and not isinstance(instance, bool)
+    if expected == "integer":
+        return isinstance(instance, int) and not isinstance(instance, bool)
+    return _json_type(instance) == expected
 
 
 def _check_py_test(
@@ -344,6 +607,10 @@ _CHECKS: dict[str, Any] = {
     "file_exists": _check_file_exists,
     "grep": _check_grep,
     "output_grep": _check_output_grep,
+    "exact": _check_exact,
+    "contains": _check_contains,
+    "json_schema": _check_json_schema,
+    "numeric_tol": _check_numeric_tol,
     "py_test": _check_py_test,
 }
 
@@ -400,3 +667,67 @@ def run_checks(
                 _outcome(check_type, spec, "error", f"check crashed: {type(exc).__name__}: {exc}")
             )
     return outcomes
+
+
+# ---------------------------------------------------------------------------
+# roll-ups — shared by the lifecycle (score row / artifact file) and the
+# evaluator's ``suite`` signal, so all surfaces read the same numbers
+# ---------------------------------------------------------------------------
+
+
+def summarize(outcomes: Iterable[CheckOutcome]) -> dict[str, Any]:
+    """Counts + pass rate over one set of outcomes.
+
+    ``pass_rate`` is ``passed / measured`` where measured = pass + fail —
+    ``skipped`` (couldn't measure) and ``error`` (check itself broke) are
+    excluded so a red check and an unmeasurable check aren't conflated.
+    """
+    counts = {"pass": 0, "fail": 0, "skipped": 0, "error": 0}
+    total = 0
+    for o in outcomes:
+        counts[o.status] = counts.get(o.status, 0) + 1
+        total += 1
+    measured = counts["pass"] + counts["fail"]
+    return {
+        "total": total,
+        "passed": counts["pass"],
+        "failed": counts["fail"],
+        "skipped": counts["skipped"],
+        "errors": counts["error"],
+        "measured": measured,
+        "pass_rate": (counts["pass"] / measured) if measured else None,
+    }
+
+
+def suite_checks_doc(
+    outcomes: list[CheckOutcome], *, suite_ref: str, suite_index: int
+) -> dict[str, Any]:
+    """The ``suite_checks.json`` artifact document — provenance + per-check
+    results + the roll-up. The evaluator folds this into ``analysis.json``
+    as the ``suite`` signal without re-measuring."""
+    return {
+        "suite_ref": suite_ref,
+        "suite_index": suite_index,
+        "checks": [
+            {"check": o.check_type, "spec": o.spec, "status": o.status, "detail": o.detail}
+            for o in outcomes
+        ],
+        **summarize(outcomes),
+    }
+
+
+def signal_metrics(doc: dict[str, Any]) -> dict[str, Any]:
+    """``suite`` signal metrics for ``analysis.json`` — the same numbers the
+    artifact document carries, flattened into the SignalReport envelope."""
+    return {
+        "suite_ref": doc.get("suite_ref"),
+        "suite_index": doc.get("suite_index"),
+        "total": doc.get("total", 0),
+        "passed": doc.get("passed", 0),
+        "failed": doc.get("failed", 0),
+        "skipped": doc.get("skipped", 0),
+        "errors": doc.get("errors", 0),
+        "measured": doc.get("measured", 0),
+        "pass_rate": doc.get("pass_rate"),
+        "checks": doc.get("checks") or [],
+    }
