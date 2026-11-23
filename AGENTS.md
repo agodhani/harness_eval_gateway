@@ -399,9 +399,10 @@ or tests change.
 - ~~Dynamic model picker~~ + ~~named harness configs~~ — **landed as F15**
 - Cross-run analytics & cost dashboards
 - Timeline-side analytics — **landed (PR9)**: per-sandbox metrics strip on
-  `web/app/runs/[id]/timeline/` (turns/tokens/latency/cost/errors chips +
-  judge line; chips double as sandbox-filter selectors; 15s refresh while
-  non-terminal). Leftover idea: on-event-hover cumulative stats.
+  `web/app/runs/[id]/timeline/` (turns/tokens/latency/speed/cost/errors
+  chips + judge line; chips double as sandbox-filter selectors; 15s
+  refresh while non-terminal). Leftover idea: on-event-hover cumulative
+  stats.
 - Split-view trace comparison — **landed (PR10)**: `merged | split` toggle
   on `web/app/runs/[id]/timeline/`. Split renders two sandbox lanes on ONE
   merged `(ts,id)` ordering inside a single scroll container — synchronized

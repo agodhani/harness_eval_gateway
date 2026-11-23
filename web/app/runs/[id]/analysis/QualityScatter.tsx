@@ -316,7 +316,8 @@ export default function QualityScatter({
           {data.unscoredCells > 0 ? (
             <p className="chart-legend">
               {data.unscoredCells} cell{data.unscoredCells === 1 ? "" : "s"}{" "}
-              have no weighted scores — not plotted
+              {data.unscoredCells === 1 ? "has" : "have"} no weighted scores —
+              not plotted
             </p>
           ) : null}
           {lines.length > 0 ? (
