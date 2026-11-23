@@ -96,6 +96,12 @@ services:
       TESTGEN_MAX_FILES: ${TESTGEN_MAX_FILES:-}
       TESTGEN_MAX_TOKENS: ${TESTGEN_MAX_TOKENS:-}
       TESTGEN_TIMEOUT_SECONDS: ${TESTGEN_TIMEOUT_SECONDS:-}
+      # --- Task-input seeds (PR24) ---
+      # UPLOADS_DIR / UPLOAD_MAX_BYTES / SEED_MAX_BYTES / SEED_MAX_FILES /
+      # SEED_GIT_TIMEOUT_SECONDS are Settings fields (typed — never
+      # ${X:-} an empty string in); defaults in api/config.py. Seeds +
+      # uploads land under /data/{seeds,uploads} on this service's
+      # ./data mount; git runs on the api host (spawn_one materializes).
     ports:
       - "8001:8000"
     volumes:

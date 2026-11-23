@@ -204,12 +204,23 @@ class FakeRuntime:
         if spec.sandbox_id in self.spawn_fail_ids:
             raise RuntimeError(f"simulated spawn failure for {spec.sandbox_id}")
         self.spawned.append(spec)
+        # PR24 contract: a spec carrying seed_host_path gets the tree copied
+        # into its workspace + the copy's content hash on the result — same
+        # semantics as the real SandboxRuntime.spawn.
+        seed_sha: str | None = None
+        if getattr(spec, "seed_host_path", None) is not None:
+            from sandbox import seeds
+
+            ws = Path(spec.workspace_host_path)
+            ws.mkdir(parents=True, exist_ok=True)
+            seed_sha = seeds.copy_seed(Path(spec.seed_host_path), ws)
         return SpawnResult(
             sandbox_id=spec.sandbox_id,
             run_id=spec.run_id,
             container_id=f"cid-{spec.sandbox_id}",
             container_name=f"heg-{spec.sandbox_id}",
             image=spec.image,
+            seed_sha=seed_sha,
         )
 
     def status(self, sandbox_id: str) -> dict[str, Any]:

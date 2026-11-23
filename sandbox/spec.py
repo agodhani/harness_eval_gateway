@@ -23,6 +23,12 @@ class SandboxSpec(BaseModel):
     docker-compose so ``-v`` sources are valid host-daemon paths), paths under
     the data tree are translated before being handed to ``docker run``;
     otherwise they are used verbatim.
+
+    ``seed_host_path`` (PR24) optionally points at a prepared seed tree —
+    the materialized task input under ``<data>/seeds/<run_id>/content/``.
+    ``runtime.spawn`` copies it into the workspace BEFORE ``docker run``, so
+    every matrix cell starts from identical bytes (the copy's content hash
+    lands on ``SpawnResult.seed_sha`` → ``harness_config.seed_sha``).
     """
 
     sandbox_id: str
@@ -31,4 +37,5 @@ class SandboxSpec(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     workspace_host_path: Path
     skillpacks_host_path: Path | None = None
+    seed_host_path: Path | None = None
     cmd: list[str] | None = None

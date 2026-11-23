@@ -93,4 +93,26 @@ describe("specFromRun", () => {
     const freeform = specFromRun(run({ preset_ref: null }));
     assert.equal(freeform.preset_ref, null);
   });
+
+  test("task_inputs (PR24) rides the spec; absent stays null", () => {
+    const seeded = specFromRun(
+      run({
+        config: {
+          task_inputs: {
+            repo_url: "https://github.com/acme/widget",
+            ref: "v1.0",
+          },
+        },
+      }),
+    );
+    assert.deepEqual(seeded.task_inputs, {
+      repo_url: "https://github.com/acme/widget",
+      ref: "v1.0",
+    });
+    const archived = specFromRun(
+      run({ config: { task_inputs: { archive_id: "up-1" } } }),
+    );
+    assert.deepEqual(archived.task_inputs, { archive_id: "up-1" });
+    assert.equal(specFromRun(run({ config: {} })).task_inputs, null);
+  });
 });

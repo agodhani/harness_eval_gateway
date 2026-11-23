@@ -49,6 +49,7 @@ from orchestrator import events as orch_events
 from orchestrator import pacing, provision, runner, state_machine
 from orchestrator.matrix import participant_models, run_models
 from orchestrator.rubric import RubricContent
+from sandbox import seeds
 from skillpack_import.store import imported_root
 
 log = logging.getLogger(__name__)
@@ -183,6 +184,25 @@ def _validate_harness_configs(body: RunCreate) -> None:
         )
 
 
+def _validate_task_inputs(body: RunCreate) -> None:
+    """PR24 — reject a ``task_inputs.archive_id`` that doesn't resolve to a
+    staged upload BEFORE the run persists (the schema already enforced the
+    shape; this checks the store — a dangling id would otherwise only fail
+    at provisioning time)."""
+    ti = body.task_inputs
+    if ti is None or not ti.archive_id:
+        return
+    root = seeds.uploads_root(get_settings())
+    if seeds.resolve_upload_archive(root, ti.archive_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"task_inputs.archive_id {ti.archive_id!r} does not match a "
+                "staged upload — POST the archive to /api/uploads first"
+            ),
+        )
+
+
 # ---------------------------------------------------------------------------
 # endpoints
 # ---------------------------------------------------------------------------
@@ -238,6 +258,15 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
         "models": models,
         "evaluator_model": evaluator_model,
         "budgets": body.budgets.model_dump(),
+        # PR24: the seed spec — only present on seeded runs (unseeded keeps
+        # the legacy config shape). Provisioning materializes it once and
+        # copies it into every cell's workspace; results echo it back so
+        # the UI can show what seeded the run.
+        **(
+            {"task_inputs": body.task_inputs.model_dump(exclude_none=True)}
+            if body.task_inputs is not None
+            else {}
+        ),
         # PR27: repeats-per-cell — duplicated on the Run column so GETs can
         # read it without parsing config; the matrix expansion reads config.
         "trials": body.trials,
@@ -289,6 +318,7 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
 async def create_run(body: RunCreate, session: DbSession) -> RunOut:
     """Submit a run: persist the spec, kick off rubric drafting in background."""
     _validate_harness_configs(body)
+    _validate_task_inputs(body)
     # gt=0 accepts inf — a non-finite cap would silently never trip (and a
     # field-level rejection serializes the echoed body into the 422 → 500).
     if body.budgets.max_cost_usd is not None and not math.isfinite(
@@ -482,16 +512,60 @@ def _hard_delete_run(session: Session, run: Run) -> None:
     session.execute(delete(Run).where(Run.id == run.id))
 
 
-def _remove_artifact_dir(run_id: uuid.UUID) -> None:
-    """Best-effort ``<ARTIFACT_ROOT>/<run_id>/`` removal — jailed like the
-    download endpoint; a failure only leaves files behind, never 500s."""
+def _remove_data_dir(jail: Path, run_id: uuid.UUID, *, label: str) -> None:
+    """Best-effort ``<jail>/<run_id>/`` removal — jailed like the download
+    endpoint; a failure only leaves files behind, never 500s."""
     try:
-        jail = Path(get_settings().ARTIFACT_ROOT).resolve()
         target = (jail / str(run_id)).resolve()
         if target != jail and jail in target.parents and target.is_dir():
             shutil.rmtree(target)
     except OSError:
-        log.warning("could not remove artifact dir for run %s", run_id, exc_info=True)
+        log.warning("could not remove %s dir for run %s", label, run_id, exc_info=True)
+
+
+def _remove_artifact_dir(run_id: uuid.UUID) -> None:
+    """Best-effort removal of the run's data-tree dirs — artifacts AND the
+    materialized seed (PR24: ``<data>/seeds/<run_id>/``)."""
+    artifact_jail = Path(get_settings().ARTIFACT_ROOT).resolve()
+    _remove_data_dir(artifact_jail, run_id, label="artifact")
+    _remove_data_dir(artifact_jail.parent / "seeds", run_id, label="seed")
+
+
+def _remove_staged_upload(
+    session: Session, archive_id: object, run_id: uuid.UUID
+) -> None:
+    """Best-effort removal of the deleted run's staged upload
+    (``<data>/uploads/<archive_id>/``). Skipped while another NON-terminal
+    run still references the same id — resubmit and queued siblings share
+    staged uploads, and a pending sibling would fail provisioning on a
+    dangling id. Uploads that were never linked to a run are orphaned until
+    a future retention sweep."""
+    if not isinstance(archive_id, str) or not archive_id:
+        return
+    try:
+        upload_id = uuid.UUID(archive_id)
+    except ValueError:
+        return
+    configs = session.execute(
+        select(Run.config).where(
+            Run.id != run_id,
+            Run.status.notin_(state_machine.RUN_TERMINAL),
+        )
+    ).scalars()
+    if any(
+        ((cfg or {}).get("task_inputs") or {}).get("archive_id") == archive_id
+        for cfg in configs
+    ):
+        return
+    try:
+        uploads = seeds.uploads_root(get_settings())
+    except seeds.SeedError:
+        log.warning(
+            "uploads root unusable; upload %s left on disk", upload_id,
+            exc_info=True,
+        )
+        return
+    _remove_data_dir(uploads, upload_id, label="upload")
 
 
 @router.delete("/{run_id}")
@@ -503,7 +577,9 @@ async def delete_run(run_id: uuid.UUID, session: DbSession) -> RunDeleteOut:
       pending rubric-draft task is cancelled and a freed queue position
       promotes the next parked run.
     - ``done`` / ``failed`` / ``cancelled`` → hard delete of the run and its
-      rows, plus best-effort ``data/artifacts/<run_id>/`` removal.
+      rows, plus best-effort data-dir removal: ``artifacts/<run_id>/``,
+      the materialized ``seeds/<run_id>/``, and its staged upload under
+      ``uploads/`` when no other non-terminal run references it.
     - ``provisioning`` / ``running`` / ``evaluating`` → 409: in-flight
       sandbox teardown is out of scope — wait for a terminal state.
     """
@@ -521,9 +597,13 @@ async def delete_run(run_id: uuid.UUID, session: DbSession) -> RunDeleteOut:
         )
 
     if run.status in state_machine.RUN_TERMINAL:
+        archive_id = ((run.config or {}).get("task_inputs") or {}).get(
+            "archive_id"
+        )
         _hard_delete_run(session, run)
         session.commit()
         _remove_artifact_dir(run_id)
+        _remove_staged_upload(session, archive_id, run_id)
         return RunDeleteOut(status="deleted")
 
     # submitted | rubric_review | queued — safe: no sandboxes exist yet and

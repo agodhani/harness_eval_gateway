@@ -97,6 +97,20 @@ class Settings(BaseSettings):
     # codeload accepts a Bearer token). Public repos work without it.
     GITHUB_TOKEN: str = ""
 
+    # --- Task-input seeds (PR24) ---
+    # Root of staged task-input archives: None => <data>/uploads (sibling of
+    # artifacts/ + sandboxes/ + skillpacks/, so the compose ./data mount
+    # covers it). Set explicitly to relocate.
+    UPLOADS_DIR: Path | None = None
+    # Upload POST byte cap — applies to the raw archive file.
+    UPLOAD_MAX_BYTES: int = 256 * 1024 * 1024
+    # Extraction caps — an archive that passed the upload cap can still be a
+    # decompression bomb; these bound the materialized seed tree.
+    SEED_MAX_BYTES: int = 256 * 1024 * 1024
+    SEED_MAX_FILES: int = 20_000
+    # Wall-clock cap on the whole git fetch+checkout for a repo seed.
+    SEED_GIT_TIMEOUT_SECONDS: float = 300.0
+
     # --- Objective scoring (PR7) ---
     # Exec-signal kill switch — when false the collector reports "skipped"
     # instead of running candidate build/tests/coverage inside the locked

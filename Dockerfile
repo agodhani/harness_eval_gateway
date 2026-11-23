@@ -9,6 +9,12 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # to `docker` against the mounted /var/run/docker.sock (compose).
 COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
 
+# git — task-input repo seeds (PR24) shallow-fetch public repos at
+# provisioning time (sandbox/seeds.py `_git`). slim ships without it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Install deps first for layer caching (dev deps excluded).
