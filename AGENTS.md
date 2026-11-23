@@ -399,9 +399,10 @@ or tests change.
 - ~~Dynamic model picker~~ + ~~named harness configs~~ — **landed as F15**
 - Cross-run analytics & cost dashboards
 - Timeline-side analytics — **landed (PR9)**: per-sandbox metrics strip on
-  `web/app/runs/[id]/timeline/` (turns/tokens/latency/cost/errors chips +
-  judge line; chips double as sandbox-filter selectors; 15s refresh while
-  non-terminal). Leftover idea: on-event-hover cumulative stats.
+  `web/app/runs/[id]/timeline/` (turns/tokens/latency/speed/cost/errors
+  chips + judge line; chips double as sandbox-filter selectors; 15s
+  refresh while non-terminal). Leftover idea: on-event-hover cumulative
+  stats.
 - Split-view trace comparison — **landed (PR10)**: `merged | split` toggle
   on `web/app/runs/[id]/timeline/`. Split renders two sandbox lanes on ONE
   merged `(ts,id)` ordering inside a single scroll container — synchronized
@@ -803,6 +804,17 @@ or tests change.
   when a backend emits no ttft) plus an output-speed card (mean avg
   tok/s per cell), the timeline metrics strip gains a `spd` chip, and
   the results Analytics table adds `ttft ms` + `tok/s` rows.
+- **Quality × cost/speed scatter + deterministic verdict (PR33/F22)** —
+  the analysis page's "Quality × cost | wall clock" card plots one dot
+  per config × model cell (the same `buildScoreGrid` fold as the PR31
+  grid — trials mean in), y = mean weighted total, x = mean est. cost or
+  wall-clock, color/shape = model, size = mean avg tok/s. Accent rings +
+  a dashed line mark the Pareto frontier (nothing is both cheaper/
+  faster AND better). Cells missing the active axis are EXCLUDED and
+  named in the legend — unpriced never plots at $0 — and the summary
+  "verdict" card under the chart is a pure template from
+  `web/lib/scatterMatrix.ts` (`paretoFrontier`, `buildVerdict`,
+  `verdictLines`), `node --test`-covered like `gridMatrix.ts`.
 
 ## Working conventions
 

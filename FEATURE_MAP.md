@@ -34,6 +34,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F19 | Artifact file browser + side-by-side diff (jailed listing/read endpoints; prompt cells browse the artifact root so `output.txt` stays reachable; server-side unified diffs) | ✅ | `api/routers/results.py` (`/api/sandboxes/{id}/files[/{path}]`), `web/app/runs/[id]/results/FileBrowser.tsx`, `web/lib/fileBrowser.ts`, `web/lib/api.ts` | `tests/unit/api/test_results.py` (PR34 section), `web/lib/fileBrowser.test.ts` |
 | F20 | Trials per cell + per-config model options (config × model × trials expansion, `mean ± sample sd (n=N)` grouped results + cell rollups, adapter-filtered `model_options`) | ✅ | `api/schemas.py`, `api/routers/{runs,results,analytics}.py`, `orchestrator/{matrix,lifecycle,provision,prompt_cell,adapters}.py`, `adapters/common/contract.py`, `db/migrations/versions/d7e9f1a3b5c7_runs_trials.py`, `web/lib/{api,trialGroups,resubmit}.ts`, `web/app/submit/page.tsx`, `web/app/runs/[id]/results/`, `web/app/runs/[id]/analysis/` | `tests/unit/orchestrator/test_matrix.py`, `test_provision.py`, `tests/unit/api/test_runs.py`, `test_analytics.py`, `tests/unit/db/test_migrations.py` |
 | F21 | Budgets & pricing accuracy (per-cell `sandbox_max_tokens`/`max_cost_usd` caps; `model_prices` glob rate table layered over the static `PRICE_TABLE` via `GET/PUT/DELETE /api/prices` + OpenRouter sync) | ✅ | `api/pricing.py` (`PriceBook`), `api/routers/prices.py`, `db/models.py::ModelPriceRow`, `gateway/creds.py`, `gateway/metering.py`, `orchestrator/monitor.py`, `web/components/AddRate.tsx`, `web/lib/api.ts` | `tests/unit/api/test_pricing.py`, `test_prices.py`, `tests/unit/gateway/` (creds/metering/proxy), `tests/unit/orchestrator/` (monitor/provision), `tests/unit/db/test_migrations.py` |
+| F22 | Quality × cost/speed scatter + auto summary (per-cell scatter on the analysis page, Pareto frontier, deterministic verdict card — no LLM call) | ✅ | `web/lib/scatterMatrix.ts`, `web/app/runs/[id]/analysis/QualityScatter.tsx`, `web/app/runs/[id]/analysis/AnalysisClient.tsx` | `web/lib/scatterMatrix.test.ts` |
 
 ## Feature details
 
@@ -828,8 +829,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (grouped horizontal bars + "weighted total leader" line), tool-call mix
   (stacked, top-7 tools + `other`), tokens in/out (stacked), LLM latency /
   TTFT (avg/p95/max plus ttft avg/p95 bars when the backend records them —
-  PR30), output speed per sandbox (mean avg tok/s — PR30), estimated cost
-  per sandbox (price-model dropdown →
+  PR30), output speed per sandbox (mean avg tok/s — PR30), quality ×
+  cost|wall-clock scatter + deterministic verdict card (F22), estimated
+  cost per sandbox (price-model dropdown →
   client-side recompute, same trick as AnalyticsSection — local models show
   a note instead of empty bars), participant-vs-evaluator spend split
   (stacked; judge priced at the evaluator model's rate when listed), and a
@@ -859,7 +861,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `_eval_boundaries`/`_is_eval_event` helpers, also used by the per-run
   endpoint), `api/schemas.py` (`RunTrendPoint`, `RunTrends`),
   `web/app/runs/[id]/analysis/` (`page.tsx`, `AnalysisClient.tsx`,
-  `charts.tsx`), `web/lib/analysisRows.ts` + `analysisRows.test.ts`
+  `charts.tsx`, `QualityScatter.tsx` — F22), `web/lib/analysisRows.ts` +
+  `analysisRows.test.ts`
   (chart-row shapers — an absent metric stays absent, no phantom-zero
   bar), `web/app/runs/[id]/results/ResultsClient.tsx` (`row-total`
   + `dimTotals`/`maxTotal` memos), `web/lib/scoreMath.ts` (weighted-total
@@ -1222,6 +1225,9 @@ workspace to produce.
   usual. Assistant text → `output.txt` (+ `meta.json` +
   `transcript.log`) under the standard artifact dir; `sandbox_finalized`
   + `terminal_state` events + `done`/`harness_complete` close the cell.
+  Post-call, `_budget_cap_detail` applies the run ceiling, per-cell token,
+  and cost caps inline (the monitor's poll never sees a no-sandbox cell —
+  F21) and flips a clean completion to `budget_exceeded`.
 - `harness_configs[].system_prompt_extra` lands as a `system` message
   before the task prompt.
 - Mixed runs interleave: prompt cells resolve inline, container cells
@@ -1249,7 +1255,8 @@ workspace to produce.
 - Tests:
   - `tests/unit/orchestrator/test_prompt_cell.py` — request shape, cred
     scope, single retry on 5xx/timeout, artifact/meta/events/finalize,
-    failure paths.
+    failure paths, inline budget caps (run/sandbox/cost →
+    `budget_exceeded`).
   - `tests/unit/orchestrator/test_lifecycle.py::test_lifecycle_prompt_only_run`
     + `test_lifecycle_mixed_prompt_and_container` — zero spawns, mixed
     routing, all-fail → run failed.
@@ -1507,6 +1514,47 @@ configurable per cell (e.g. temperature sweeps).
   unlisted model still shows `unpriced`.
 - **Depends on:** PR21 (unpriced honesty this makes permanent), F3
   (creds/metering), F9 (analytics cost surface).
+
+### F22 — Quality × cost/speed scatter + auto summary (PR33) ✅
+
+- **What:** the analysis page gains a "Quality × cost | wall clock"
+  scatter card (full-width, after the score cards): one dot per
+  config × model matrix cell — the same `buildScoreGrid` fold as the
+  PR31 results grid, so trials mean into their cell. y = mean PR21
+  **weighted** total (never the judge's self-reported `overall`); x =
+  mean per-sandbox estimated cost (PR28 honest prices) or mean
+  wall-clock on the segmented toggle; color + marker shape = model
+  (first-seen order is stable); dot size = mean avg output tok/s
+  (smallest = unmeasured speed). Accent rings + a dashed connector mark
+  the **Pareto frontier** — the cells nothing beats on both axes at
+  once. Under the chart a deterministic **verdict** card (no LLM call)
+  names the best cell with the runner-up delta, the value pick (max
+  quality-per-$ or per-minute over the frontier), and the cheap/fast
+  alternative ("88% cheaper for −4").
+- **Honesty/sparse handling:** cells missing the active axis are
+  EXCLUDED and named in the legend — an unpriced cell never plots at
+  $0 (PR21 rule) — while scored-but-unclocked cells drop only on the
+  wall-clock toggle. Cells with no weighted score never become points;
+  `unscoredCells`/`excluded`/`partialCostCells` counts are disclosed in
+  the legend (a cell priced over only some members still plots, flagged).
+- **Where:** `web/lib/scatterMatrix.ts` — pure transform mirroring
+  `gridMatrix.ts` (`buildScatterPoints` folds `cellExtras` + tok/s
+  means, `axisValue`/`withAxis` resolve x, `paretoFrontier` =
+  non-dominated set x-asc, `buildVerdict` + `verdictLines` = the
+  template, `buildScatterData` bundles it all) +
+  `web/lib/scatterMatrix.test.ts` (hand-computed Pareto oracles, sparse
+  handling, determinism under shuffle); `web/app/runs/[id]/analysis/
+  QualityScatter.tsx` (recharts `ScatterChart` + custom tip/ring) wired
+  into `AnalysisClient.tsx` (shared specMap/dimensionKeys); `.verdict`
+  styles in `web/app/globals.css`.
+- **Verify:** `cd web && node --test lib/scatterMatrix.test.ts` (22
+  tests); manual: analysis page on a scored run → dots per cell, toggle
+  cost↔wall clock changes the frontier + verdict wording
+  (cheaper↔faster, pts/$↔pts/min); a run with an unpriced model lists
+  that cell under "excluded" rather than plotting it at $0.
+- **Depends on:** F16 (PR31 grid fold + weighted totals), F21 (PR28
+  honest prices), F9/F13 (analytics payload + analysis page), PR30
+  speed fields.
 
 ## Implementation sequence
 
