@@ -31,6 +31,12 @@ export interface ResubmitSpec {
    * restore as an already-staged upload id (the staged bytes persist
    * server-side under data/uploads). */
   task_inputs?: TaskInputs | null;
+  /** PR23: the run's resolved rubric template name + domain hint ride
+   * along so a resubmit regenerates with the same basis (an inline
+   * `rubric_basis` isn't resubmittable — a preset-attached resubmit
+   * re-resolves the CURRENT suggested_rubric like preset_ref semantics). */
+  rubric_template?: string | null;
+  rubric_hint?: string | null;
   /** PR27: repeats per matrix cell (undefined = the form's default 1). */
   trials?: number;
 }
@@ -67,6 +73,10 @@ export function specFromRun(run: RunOut): ResubmitSpec {
     })),
     budgets: cfg.budgets ?? null,
     task_inputs: (cfg.task_inputs as TaskInputs | null | undefined) ?? null,
+    // PR23: resolved rubric basis + hint persist on config — carry them so
+    // a resubmit regenerates the same kind of rubric.
+    rubric_template: (cfg.rubric_template as string | null | undefined) ?? null,
+    rubric_hint: (cfg.rubric_hint as string | null | undefined) ?? null,
     // PR27: repeats ride along — the stored column first, then the config
     // copy (specs written before the column existed), defaulting to 1.
     trials: run.trials ?? (cfg.trials as number | undefined) ?? 1,

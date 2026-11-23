@@ -7,9 +7,10 @@
  *   ("Latest" = server's newest-wins view across all passes).
  * - "Re-score" re-runs the evaluator on stored artifacts (no participant
  *   sandboxes), optionally pinned to the selected version.
- * - "Edit rubric" prefills a JSON editor from the selected/latest version and
- *   saves as a NEW version (the frozen row is never mutated); optionally
- *   queues a re-score against it in the same request.
+ * - "Edit rubric" prefills the structured editor (PR23 — form fields with a
+ *   raw-JSON toggle) from the selected/latest version and saves as a NEW
+ *   version (the frozen row is never mutated); optionally queues a re-score
+ *   against it in the same request.
  *
  * Only meaningful once the run is terminal — buttons are disabled otherwise.
  */
@@ -24,6 +25,7 @@ import {
   type RubricOut,
   type RunResults,
 } from "@/lib/api";
+import RubricEditor from "@/components/RubricEditor";
 import { ErrorNote, InfoNote } from "@/components/ui";
 
 function errMsg(err: unknown, fallback: string): string {
@@ -54,7 +56,8 @@ export default function RescoreControls({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
-  const [draftJson, setDraftJson] = useState("");
+  const [draftContent, setDraftContent] = useState<RubricContent>({});
+  const [draftValid, setDraftValid] = useState(false);
   const [baseRubricId, setBaseRubricId] = useState<string | null>(null);
   const [baseLabel, setBaseLabel] = useState("");
 
@@ -87,7 +90,8 @@ export default function RescoreControls({
     }
     setBaseRubricId(base.id);
     setBaseLabel(`v${base.version}`);
-    setDraftJson(JSON.stringify(base.content ?? {}, null, 2));
+    setDraftContent(base.content ?? {});
+    setDraftValid(true);
     setEditing(true);
   }
 
@@ -115,21 +119,10 @@ export default function RescoreControls({
   async function saveVersion(andRescore: boolean) {
     setError(null);
     setNotice(null);
-    let parsed: RubricContent;
-    try {
-      const v: unknown = JSON.parse(draftJson);
-      if (v === null || typeof v !== "object" || Array.isArray(v)) {
-        throw new Error("rubric content must be a JSON object");
-      }
-      parsed = v as RubricContent;
-    } catch (err) {
-      setError(`Invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
-      return;
-    }
     setBusy(andRescore ? "save_rescore" : "save");
     try {
       const out = await createRubricVersion(runId, {
-        content: parsed,
+        content: draftContent,
         base_rubric_id: baseRubricId,
         rescore: andRescore,
       });
@@ -219,26 +212,29 @@ export default function RescoreControls({
 
       {editing ? (
         <div className="stack">
-          <p className="field__hint" style={{ margin: 0 }}>
-            Editing <b>{baseLabel}</b> — saving creates <b>v{nextVersion}</b>;{" "}
-            {baseLabel} stays frozen. <code>dimensions</code> must contain exactly:{" "}
-            <code>functional_requirements</code>, <code>acceptance_criteria</code>,{" "}
-            <code>code_quality</code>, <code>cyclomatic_complexity</code>.
-          </p>
-          <textarea
-            className="textarea"
-            style={{ minHeight: "280px" }}
-            value={draftJson}
-            onChange={(e) => setDraftJson(e.target.value)}
+          <RubricEditor
+            key={baseRubricId ?? "base"}
+            content={draftContent}
+            onChange={(c, meta) => {
+              setDraftContent(c);
+              setDraftValid(meta.valid);
+            }}
             disabled={busy !== null}
-            spellCheck={false}
+            note={
+              <>
+                Editing <b>{baseLabel}</b> — saving creates <b>v{nextVersion}</b>;{" "}
+                {baseLabel} stays frozen. 1–12 arbitrary dimensions; raw JSON
+                behind the toggle.
+              </>
+            }
           />
           <div className="row" style={{ gap: "0.5rem" }}>
             <button
               type="button"
               className="btn btn--sm"
               onClick={() => saveVersion(false)}
-              disabled={busy !== null}
+              disabled={busy !== null || !draftValid}
+              title={!draftValid ? "fix the rubric errors above first" : undefined}
             >
               {busy === "save" ? "Saving…" : `Save as v${nextVersion}`}
             </button>
@@ -246,7 +242,8 @@ export default function RescoreControls({
               type="button"
               className="btn btn--sm btn--primary"
               onClick={() => saveVersion(true)}
-              disabled={busy !== null || !hasArtifacts}
+              disabled={busy !== null || !hasArtifacts || !draftValid}
+              title={!draftValid ? "fix the rubric errors above first" : undefined}
             >
               {busy === "save_rescore" ? "Saving…" : `Save v${nextVersion} & re-score`}
             </button>

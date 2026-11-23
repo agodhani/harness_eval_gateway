@@ -115,4 +115,20 @@ describe("specFromRun", () => {
     assert.deepEqual(archived.task_inputs, { archive_id: "up-1" });
     assert.equal(specFromRun(run({ config: {} })).task_inputs, null);
   });
+
+  test("rubric_template + rubric_hint (PR23) ride the spec; absent stay null", () => {
+    const spec = specFromRun(
+      run({
+        config: {
+          rubric_template: "extraction-accuracy",
+          rubric_hint: "invoice field extraction",
+        },
+      }),
+    );
+    assert.equal(spec.rubric_template, "extraction-accuracy");
+    assert.equal(spec.rubric_hint, "invoice field extraction");
+    const plain = specFromRun(run({ config: {} }));
+    assert.equal(plain.rubric_template, null);
+    assert.equal(plain.rubric_hint, null);
+  });
 });
