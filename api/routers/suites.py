@@ -200,6 +200,7 @@ async def run_suite(
         harness_configs=body.harness_configs,
         evaluator_model=body.evaluator_model,
         budgets=body.budgets,
+        trials=body.trials,
     )
     _validate_harness_configs(probe)
     warnings = await modelcheck.validate_run_models(probe, settings=get_settings())
@@ -233,8 +234,9 @@ async def run_suite(
             harness_configs=configs,
             evaluator_model=body.evaluator_model,
             budgets=body.budgets,
+            trials=body.trials,
         )
-        run = _persist_run(session, rc)
+        run = _persist_run(session, rc, warnings)
         run.suite_ref = suite.slug
         run.suite_index = i
         run.suite_run_id = suite_run.id

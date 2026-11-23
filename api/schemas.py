@@ -998,11 +998,15 @@ class SuiteRunIn(BaseModel):
         Field(default=None, max_length=255)
     )
     budgets: BudgetsIn = Field(default_factory=BudgetsIn)
+    # PR27 parity — each suite task's matrix multiplies by trials the same
+    # way a normal submit does.
+    trials: int = Field(default=1, ge=1, le=8)
 
     @model_validator(mode="after")
     def _normalize_models(self) -> SuiteRunIn:
         """Same dedupe/blank-drop + matrix cap as ``RunCreate`` — each task
-        expands configs × models the same way a normal submit would."""
+        expands configs × models × trials the same way a normal submit
+        would."""
         if self.models is not None:
             seen = {self.model_name}
             cleaned: list[str] = []
@@ -1014,11 +1018,12 @@ class SuiteRunIn(BaseModel):
         model_count = 1 + len(self.models or [])
         pinned = sum(1 for hc in self.harness_configs if hc.model)
         cells = pinned + (len(self.harness_configs) - pinned) * model_count
-        if cells > MAX_MATRIX_CELLS:
+        sandboxes = cells * self.trials
+        if sandboxes > MAX_MATRIX_CELLS:
             raise ValueError(
-                f"run matrix would spawn {cells} sandboxes "
+                f"run matrix would spawn {sandboxes} sandboxes "
                 f"({len(self.harness_configs)} configs × "
-                f"{model_count} models); "
+                f"{model_count} models × {self.trials} trials); "
                 f"max is {MAX_MATRIX_CELLS}"
             )
         return self
