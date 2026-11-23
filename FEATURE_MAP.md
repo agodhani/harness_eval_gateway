@@ -1967,8 +1967,9 @@ rigged before it starts.
 - **Verify:**
   - Unit: `tests/unit/api/test_leaderboard.py` (10 tests — model/config
     ranking + sample sd, n vs sandboxes coverage, preset/date/min-trials
-    filters, newest-wins, empty scope) against per-test file-backed
-    SQLite (the shared :memory: engine leaks rows across tests).
+    filters, newest-wins, empty scope, since/until tz handling) against
+    per-test file-backed SQLite (the shared :memory: engine leaks rows
+    across tests).
   - Web: `lib/compareRuns.test.ts` (9 tests); eslint + `next build`
     clean (`/compare`, `/leaderboard` prerender).
   - Manual: score ≥2 runs → `/leaderboard` ranks models + config
@@ -2030,11 +2031,12 @@ rigged before it starts.
   `web/components/ExportButtons.tsx`, `web/app/share/[token]/`,
   `web/app/runs/[id]/{results,analysis}/`.
 - **Verify:**
-  - Unit: `tests/unit/api/test_export.py` (12 tests — JSON round-trip
+  - Unit: `tests/unit/api/test_export.py` (13 tests — JSON round-trip
     through `RunExport.model_validate`, events-lite projection, CSV
-    shape/BOM/empty-run header, 404/422, share mint/idempotent/revoke/
-    unknown-token 404, events_total bounds); migration tests cover the
-    new head + unique index + downgrade.
+    shape/BOM/empty-run header + legacy `harness` config key, 404/422,
+    share mint/idempotent/revoke/unknown-token 404, events_total
+    bounds); migration tests cover the new head + unique index +
+    downgrade.
   - Web: `api.test.ts` `runExportUrl` describe; eslint + `next build`
     clean (`/share/[token]` prerender).
   - Manual: results/analysis headers → `⬇ csv` opens in Sheets one row
