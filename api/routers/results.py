@@ -72,6 +72,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from api.config import get_settings
@@ -1858,6 +1859,18 @@ _EXPORT_CSV_FIELDS = [
 ]
 
 
+_CSV_FORMULA_CHARS = ("=", "+", "-", "@")
+
+
+def _csv_cell(value: Any) -> Any:
+    # String cells that Excel would parse as a formula get the standard
+    # quote prefix — the BOM targets Excel, and names/rationales are
+    # submitter- and judge-influenced text.
+    if isinstance(value, str) and value[:1] in _CSV_FORMULA_CHARS:
+        return "'" + value
+    return value
+
+
 def _export_csv(
     run_id: UUID, results: RunResults, analytics: RunAnalytics
 ) -> str:
@@ -1917,7 +1930,7 @@ def _export_csv(
         if sb.overall is not None:
             dim_rows.append(("overall", sb.overall))
         if not dim_rows:
-            writer.writerow([base[f] for f in _EXPORT_CSV_FIELDS])
+            writer.writerow([_csv_cell(base[f]) for f in _EXPORT_CSV_FIELDS])
             continue
         for dim, entry in dim_rows:
             row = dict(base)
@@ -1928,7 +1941,7 @@ def _export_csv(
                     "rationale": entry.rationale,
                 }
             )
-            writer.writerow([row[f] for f in _EXPORT_CSV_FIELDS])
+            writer.writerow([_csv_cell(row[f]) for f in _EXPORT_CSV_FIELDS])
     return "\ufeff" + buf.getvalue()
 
 
@@ -2008,7 +2021,15 @@ def create_share_link(run_id: UUID, session: DbSession) -> ShareLinkOut:
     run = _run_or_404(session, run_id)
     if run.share_token is None:
         run.share_token = secrets.token_urlsafe(16)
-        session.commit()
+        try:
+            session.commit()
+        except IntegrityError:
+            # A concurrent mint won the ix_runs_share_token race —
+            # converge on its token; the mint contract is idempotent.
+            session.rollback()
+            session.refresh(run)
+            if run.share_token is None:
+                raise
     return ShareLinkOut(
         run_id=run.id,
         token=run.share_token,
