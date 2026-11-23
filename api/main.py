@@ -22,11 +22,13 @@ from api.routers import (
     harnesses,
     health,
     models,
+    presets,
     preview,
     prices,
     results,
     runs,
     skillpacks,
+    suites,
     uploads,
 )
 from orchestrator import runner
@@ -64,6 +66,8 @@ def create_app() -> FastAPI:
     app.include_router(prices.router)
     app.include_router(preview.router)
     app.include_router(skillpacks.router)
+    app.include_router(presets.router)
+    app.include_router(suites.router)
     app.include_router(uploads.router)
     return app
 

@@ -234,23 +234,59 @@ heatmap, output browser.
 - **Verify:** a `prompt` × 3-models run completes with no docker
   containers started; scores land; cost/tokens meter normally.
 
-### PR26 — Benchmark suites + deterministic checkers
-- **Scope:** presets gain an optional `suite`: `cases: [{id, input,
-  expected?, checker}]` where checker ∈ `exact | regex | contains |
-  json_schema | numeric_tol | file_exists | exec_exit_zero` (agentic
-  cells get the file/exec checkers run inside `heg-exec`; prompt cells
-  get the output checkers run against `output.txt`). Suite runner is a
-  new `scoring/collectors` signal (`suite`): pass rate + per-case
-  results into `analysis.json`, `ANALYSIS.md`, a `suite_pass` score row
-  (0–10 scale), and a flat summary on the results API — same envelope
-  pattern as `generated_tests`.
-- **Touch:** `scoring/collectors.py` + new `scoring/suite.py`,
-  `api/schemas.py` (preset `suite`, `SuiteReport`), evaluator staging,
-  results UI column, `task_presets` seed files w/ example suites.
-- **Depends:** PR22 (suite lives on presets); soft ← PR23 (custom dim
-  `task_success` to fold pass rate into) + PR25 (prompt outputs).
-- **Verify:** a 5-case suite on a prompt-cell run yields per-case
-  pass/fail + mean in results without judge involvement.
+### PR26 — Benchmark suites + deterministic checkers ✅ shipped
+- **Scope (as shipped):** suites are vendored files —
+  `benchmark_suites/<slug>/suite.yaml` lists `tasks: [{id, preset_ref |
+  prompt, adapter?, checks: [{check, spec}]}]` (preset-ref tasks reuse
+  PR22's library; inline prompts cover freeform/prompt cells). The
+  checker set is `exact | contains | regex | json_schema | numeric_tol`
+  (output-oriented — prompt cells measure `output.txt` at the artifact
+  root) plus `file_exists | grep | py_test | output_grep`
+  (artifact/workspace-oriented; `py_test` = the card's `exec_exit_zero`
+  — candidate tests run inside the locked `heg-exec` container via
+  `ExecRunner`, never on the host).
+  - `POST /api/suites/{slug}/run` fans out one normal run per task
+    under a shared `suite_runs` batch row; `runs` carry
+    `suite_ref`/`suite_index`/`suite_run_id` provenance. Adapter-pinned
+    tasks with no matching harness config 422 before anything starts.
+  - Post-artifact/pre-judge, the lifecycle runs the task's declared
+    checks and persists append-only `checker_results` rows
+    (pass/fail/skipped/error + detail) — deterministic outcomes kept
+    strictly beside judge scores. A `suite` signal (pass rate +
+    per-check results) lands in `analysis.json`/`ANALYSIS.md`, a
+    `suite_pass` score row (0–10 scale) records the pass rate, and a
+    flat `suite` summary rides `SandboxResult` — same envelope pattern
+    as `generated_tests`.
+  - `GET /api/suite-runs/{id}` aggregates the batch task × cell:
+    per-sandbox `judge_overall` beside checker counts/pass rate, plus
+    pooled `check_pass_rate` + `mean_judge_overall`. `?suite=` filters
+    `GET /api/runs`; rescoring re-reads the current suite.yaml
+    (newest-wins on `checker_results.id`).
+  - Web: `/suites` browse, `/suites/[slug]` detail + minimal launcher,
+    `/suite-runs/[id]` batch matrix, a "Deterministic checks" card on
+    results (✓/✗/⊘/! per check + `suite_pass`), suite provenance on
+    run detail + runs list, nav link.
+  - Example suite `benchmark_suites/starter-regression/` covers a
+    container task (`preset_ref`, file/grep/py_test checks) and a
+    prompt-only task (`adapter: prompt`, output checkers).
+- **Touch (shipped):** `benchmark_suites/` (new dir + suite.yaml schema),
+  `api/suites.py` (vendored store: slug-safe, jailed paths, Pydantic
+  checks), `api/routers/suites.py` (new), `scoring/checkers.py` (new —
+  the `suite` signal's measurement layer), `scoring/{models,render}.py`
+  (signal surface), `orchestrator/lifecycle.py` (post-artifact pass),
+  `api/routers/{runs,results}.py`, `api/schemas.py`, `api/config.py`
+  (`BENCHMARK_SUITES_DIR`), `db/models.py` + migration
+  `e4f5a6b7c8d9` (`suite_runs`, `checker_results`, `runs.suite_*`),
+  `web/lib/api.ts`, `web/app/{suites,suite-runs}/`,
+  `web/app/runs/[id]/results/ResultsClient.tsx`, nav.
+- **Depends:** PR22 (preset_ref tasks + provenance snapshot pattern);
+  soft ← PR23 (custom dim `task_success` to fold pass rate into) +
+  PR25 (prompt outputs — output checkers already target the PR25
+  `output.txt` convention).
+- **Verify:** a multi-case prompt-cell task yields per-case
+  pass/fail + pass rate in results without judge involvement
+  (`checker_results` + flat `suite` summary are DB-derived); a
+  container task's `py_test` executes only inside `heg-exec`.
 
 ### PR27 — Repeats per cell + per-config model settings
 - **Scope:** statistical defensibility. `RunCreate.trials` (1–8, default

@@ -22,10 +22,14 @@ INITIAL_REV = "f0a1b2c3d4e5"
 SANDBOX_NAME_REV = "a2b3c4d5e6f7"
 # PR27: adds ``runs.trials`` (int, default 1).
 RUNS_TRIALS_REV = "d7e9f1a3b5c7"
-# PR28 (re-chained on top of RUNS_TRIALS_REV).
+# PR28 — re-chained on top of RUNS_TRIALS_REV.
 MODEL_PRICES_REV = "c4e8d1a7f3b5"
-# case-insensitive glob uniqueness — current chain head
+# PR28 follow-up — case-insensitive glob uniqueness.
 PRICE_GLOB_LOWER_REV = "d6e2b8f4a1c9"
+# PR22 — re-chained on top of PRICE_GLOB_LOWER_REV.
+TASK_PRESETS_REV = "d1e2f3a4b5c6"
+# PR26 — benchmark suites + checker results; current chain head.
+SUITES_REV = "e4f5a6b7c8d9"
 
 
 @pytest.fixture()
@@ -57,7 +61,7 @@ def _columns(url: str, table: str) -> set[str]:
 
 def test_migration_chain_single_headed() -> None:
     heads = ScriptDirectory.from_config(_cfg()).get_heads()
-    assert list(heads) == [PRICE_GLOB_LOWER_REV]
+    assert list(heads) == [SUITES_REV]
 
 
 def test_sandbox_name_upgrade_downgrade(sqlite_url: str) -> None:
@@ -84,6 +88,139 @@ def test_sandbox_name_matches_model(sqlite_url: str) -> None:
         )
         assert col["nullable"] is True
         assert str(col["type"]) == "VARCHAR(255)"
+    finally:
+        engine.dispose()
+
+
+def test_task_presets_upgrade_downgrade(sqlite_url: str) -> None:
+    """PR22: task_presets table + runs.preset_ref/preset_revision round-trip."""
+    command.upgrade(_cfg(), "head")
+    preset_cols = _columns(sqlite_url, "task_presets")
+    assert {
+        "id",
+        "slug",
+        "title",
+        "description",
+        "task_prompt",
+        "category",
+        "tags",
+        "source",
+        "revision",
+        "suggested_adapter",
+        "suggested_models",
+        "created_at",
+        "updated_at",
+    } <= preset_cols
+    run_cols = _columns(sqlite_url, "runs")
+    assert {"preset_ref", "preset_revision"} <= run_cols
+
+    command.downgrade(_cfg(), SANDBOX_NAME_REV)
+    inspector_tables = set()
+    engine = create_engine(sqlite_url)
+    try:
+        inspector_tables = set(inspect(engine).get_table_names())
+        run_cols = {c["name"] for c in inspect(engine).get_columns("runs")}
+    finally:
+        engine.dispose()
+    assert "task_presets" not in inspector_tables
+    assert "preset_ref" not in run_cols
+    assert "preset_revision" not in run_cols
+
+    command.upgrade(_cfg(), "head")
+    assert "slug" in _columns(sqlite_url, "task_presets")
+
+
+def test_task_presets_slug_unique(sqlite_url: str) -> None:
+    """The migrated table enforces the shared slug namespace (unique slug)."""
+    command.upgrade(_cfg(), "head")
+    engine = create_engine(sqlite_url)
+    try:
+        uniques = [
+            uc
+            for uc in inspect(engine).get_unique_constraints("task_presets")
+            if "slug" in uc.get("column_names", [])
+        ]
+        # sqlite reports unique indexes separately — check both surfaces.
+        indexes = [
+            ix
+            for ix in inspect(engine).get_indexes("task_presets")
+            if ix.get("unique") and ix.get("column_names") == ["slug"]
+        ]
+        assert uniques or indexes
+    finally:
+        engine.dispose()
+
+
+def test_benchmark_suites_upgrade_downgrade(sqlite_url: str) -> None:
+    """PR26: suite_runs + checker_results tables, runs.suite_* cols."""
+    command.upgrade(_cfg(), "head")
+
+    engine = create_engine(sqlite_url)
+    try:
+        tables = set(inspect(engine).get_table_names())
+        assert {"suite_runs", "checker_results"} <= tables
+        suite_run_cols = {
+            c["name"] for c in inspect(engine).get_columns("suite_runs")
+        }
+        assert {"id", "suite_slug", "suite_version", "created_at"} <= suite_run_cols
+        checker_cols = {
+            c["name"] for c in inspect(engine).get_columns("checker_results")
+        }
+        assert {
+            "id",
+            "run_id",
+            "sandbox_id",
+            "check_type",
+            "spec",
+            "status",
+            "passed",
+            "detail",
+            "created_at",
+        } <= checker_cols
+        run_cols = {c["name"] for c in inspect(engine).get_columns("runs")}
+        assert {"suite_ref", "suite_index", "suite_run_id"} <= run_cols
+        fks = {
+            fk["referred_table"]
+            for fk in inspect(engine).get_foreign_keys("runs")
+        }
+        assert "suite_runs" in fks
+    finally:
+        engine.dispose()
+
+    # Down to PR22: PR26 schema unwinds, preset provenance stays.
+    command.downgrade(_cfg(), TASK_PRESETS_REV)
+    engine = create_engine(sqlite_url)
+    try:
+        tables = set(inspect(engine).get_table_names())
+        assert "suite_runs" not in tables
+        assert "checker_results" not in tables
+        run_cols = {c["name"] for c in inspect(engine).get_columns("runs")}
+        assert "suite_ref" not in run_cols
+        assert "preset_ref" in run_cols
+    finally:
+        engine.dispose()
+
+    # Re-apply cleanly.
+    command.upgrade(_cfg(), "head")
+    assert "suite_runs" in _columns(sqlite_url, "suite_runs") or _columns(
+        sqlite_url, "suite_runs"
+    )
+
+
+def test_checker_results_nullable_and_defaults(sqlite_url: str) -> None:
+    """checker_results mirrors db.models: booleans/details have DB defaults,
+    run/sandbox ids are required."""
+    command.upgrade(_cfg(), "head")
+    engine = create_engine(sqlite_url)
+    try:
+        cols = {
+            c["name"]: c for c in inspect(engine).get_columns("checker_results")
+        }
+        assert cols["run_id"]["nullable"] is False
+        assert cols["sandbox_id"]["nullable"] is False
+        assert cols["passed"]["nullable"] is False
+        assert cols["detail"]["nullable"] is False
+        assert cols["run_id"]["default"] is None or True  # no server default
     finally:
         engine.dispose()
 

@@ -24,6 +24,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from api import modelcheck
+from api import presets as preset_store
 from api.config import get_settings
 from api.deps import get_db
 from api.schemas import (
@@ -34,7 +35,15 @@ from api.schemas import (
     RunSummary,
     SandboxOut,
 )
-from db.models import Artifact, Event, Rubric, Run, Sandbox, Score
+from db.models import (
+    Artifact,
+    CheckerResult,
+    Event,
+    Rubric,
+    Run,
+    Sandbox,
+    Score,
+)
 from orchestrator import adapters as orch_adapters
 from orchestrator import events as orch_events
 from orchestrator import pacing, provision, runner, state_machine
@@ -122,6 +131,11 @@ def _run_out(
             _queue_positions(session).get(run.id) if run.status == "queued" else None
         ),
         warnings=list(warnings or []),
+        preset_ref=run.preset_ref,
+        preset_revision=run.preset_revision,
+        suite_ref=run.suite_ref,
+        suite_index=run.suite_index,
+        suite_run_id=run.suite_run_id,
         sandboxes=[SandboxOut.model_validate(s) for s in _run_sandboxes(session, run.id)],
         rubric=RubricOut.model_validate(rubric) if rubric else None,
     )
@@ -194,24 +208,14 @@ def _validate_task_inputs(body: RunCreate) -> None:
 # ---------------------------------------------------------------------------
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
-async def create_run(body: RunCreate, session: DbSession) -> RunOut:
-    """Submit a run: persist the spec, kick off rubric drafting in background."""
-    _validate_harness_configs(body)
-    _validate_task_inputs(body)
-    # gt=0 accepts inf — a non-finite cap would silently never trip (and a
-    # field-level rejection serializes the echoed body into the 422 → 500).
-    if body.budgets.max_cost_usd is not None and not math.isfinite(
-        body.budgets.max_cost_usd
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="budgets.max_cost_usd must be a finite number",
-        )
-    # Best-effort provider-catalog check — warnings on absent models, a hard
-    # 422 on provider-reported tool-capability mismatches. Catalog fetch
-    # failures skip validation entirely (offline tolerance).
-    warnings = await modelcheck.validate_run_models(body, settings=get_settings())
+def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
+    """Build the run config, resolve the preset ref, insert the Run row.
+
+    Flush-only — the caller commits so multi-run batches (PR26 suite
+    fan-out) stay atomic. Returns the pending Run (``run.id`` is assigned
+    by the flush). ``warnings`` accumulates advisory notices (PR27
+    model_options drops) for the caller to echo back.
+    """
     # PR27: model_options keys the config's adapter doesn't expose are
     # stripped before persisting — the sandbox env/request only ever sees
     # honored knobs — and the drop is called out as a warning (never a 422:
@@ -272,14 +276,64 @@ async def create_run(body: RunCreate, session: DbSession) -> RunOut:
     config["same_model_eval"] = evaluator_model in set(
         run_models(config, body.model_name)
     )
+
+    # PR22 preset resolution — a preset_ref asserts the task came from the
+    # preset: the preset's body REPLACES the submitted task_prompt (stored
+    # verbatim, same comparison contract) and the resolved slug+revision are
+    # snapshotted as provenance. Unknown refs 422 like unknown adapters.
+    task_prompt = body.task_prompt
+    preset_ref: str | None = None
+    preset_revision: int | None = None
+    if body.preset_ref:
+        preset = preset_store.resolve(
+            session, get_settings().TASK_PRESETS_DIR, body.preset_ref
+        )
+        if preset is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"unknown preset {body.preset_ref!r} — "
+                    "GET /api/presets lists valid slugs"
+                ),
+            )
+        task_prompt = preset.task_prompt
+        preset_ref = preset.slug
+        preset_revision = preset.revision
+
     run = Run(
         status="submitted",
-        task_prompt=body.task_prompt,
+        task_prompt=task_prompt,
         model_name=body.model_name,
         trials=body.trials,
         config=config,
+        preset_ref=preset_ref,
+        preset_revision=preset_revision,
     )
     session.add(run)
+    session.flush()
+    return run
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_run(body: RunCreate, session: DbSession) -> RunOut:
+    """Submit a run: persist the spec, kick off rubric drafting in background."""
+    _validate_harness_configs(body)
+    _validate_task_inputs(body)
+    # gt=0 accepts inf — a non-finite cap would silently never trip (and a
+    # field-level rejection serializes the echoed body into the 422 → 500).
+    if body.budgets.max_cost_usd is not None and not math.isfinite(
+        body.budgets.max_cost_usd
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="budgets.max_cost_usd must be a finite number",
+        )
+    # Best-effort provider-catalog check — warnings on absent models, a hard
+    # 422 on provider-reported tool-capability mismatches. Catalog fetch
+    # failures skip validation entirely (offline tolerance).
+    warnings = await modelcheck.validate_run_models(body, settings=get_settings())
+
+    run = _persist_run(session, body, warnings)
     session.commit()
 
     runner.start_rubric_task(run.id)
@@ -290,13 +344,20 @@ async def create_run(body: RunCreate, session: DbSession) -> RunOut:
 async def list_runs(
     session: DbSession,
     run_status: Annotated[str | None, Query(alias="status")] = None,
+    preset: Annotated[str | None, Query()] = None,
+    suite: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[RunSummary]:
-    """Runs newest-first; ``?status=`` filters, ``limit``/``offset`` paginate."""
+    """Runs newest-first; ``?status=``/``?preset=``/``?suite=`` filters,
+    paginated."""
     stmt = select(Run).order_by(Run.created_at.desc()).limit(limit).offset(offset)
     if run_status:
         stmt = stmt.where(Run.status == run_status)
+    if preset:
+        stmt = stmt.where(Run.preset_ref == preset.strip().lower())
+    if suite:
+        stmt = stmt.where(Run.suite_ref == suite.strip().lower())
     runs = session.execute(stmt).scalars().all()
 
     run_ids = [r.id for r in runs]
@@ -326,6 +387,10 @@ async def list_runs(
             created_at=r.created_at,
             finished_at=r.finished_at,
             sandbox_count=counts.get(r.id, 0),
+            preset_ref=r.preset_ref,
+            suite_ref=r.suite_ref,
+            suite_index=r.suite_index,
+            suite_run_id=r.suite_run_id,
             queue_position=positions.get(r.id),
         )
         for r in runs
@@ -434,6 +499,9 @@ def _hard_delete_run(session: Session, run: Run) -> None:
     sandbox_ids = select(Sandbox.id).where(Sandbox.run_id == run.id)
     session.execute(delete(Score).where(Score.sandbox_id.in_(sandbox_ids)))
     session.execute(delete(Artifact).where(Artifact.sandbox_id.in_(sandbox_ids)))
+    session.execute(
+        delete(CheckerResult).where(CheckerResult.run_id == run.id)
+    )
     session.execute(delete(Event).where(Event.run_id == run.id))
     # Rubric.parent_id is a self-FK — a single DELETE of the run's rows
     # removes parent + child versions together.

@@ -1,0 +1,73 @@
+# Starter regression suite — the PR26 reference shape.
+#
+# One suite run = one run per task (POST /api/suites/starter-regression/run
+# with the usual model/harness_configs spec). Each task's `check:` block is
+# measured post-artifact by the deterministic checkers and lands as
+# checker_results rows + the `suite` signal beside the judge scores.
+#
+# Tasks demonstrate both task kinds and a container + prompt cell:
+# - preset_ref tasks resolve the vendored task preset at submit (same
+#   provenance as a normal preset run).
+# - prompt tasks carry an inline task prompt.
+# - `adapter:` pins restrict a task to harness configs selecting that
+#   adapter — `miniloop` for container cells, `prompt` for the PR25
+#   prompt-only cell (register `adapter: prompt` configs once PR25 is in;
+#   until then a run of this suite 422s on the pinned task — by design).
+id: starter-regression
+version: 2
+title: Starter regression suite
+description: >-
+  Three-task smoke suite: a container-cell file/grep/pytest check on the
+  wordle-html preset, plus prompt-cell output checks (regex, substring,
+  numeric tolerance, JSON schema) on inline extraction prompts.
+tasks:
+  - id: wordle-container
+    preset_ref: wordle-html
+    adapter: miniloop
+    check:
+      # file_exists — a path exists under the artifact workspace/ (or the
+      # artifact root itself).
+      file_exists: index.html
+      # grep — a regex must match inside that file.
+      grep:
+        path: index.html
+        pattern: '<html|<!DOCTYPE'
+      # py_test — vendored pytest dir (relative to this suite dir) run
+      # against the candidate workspace in the locked heg-exec container.
+      py_test: tests/wordle
+  - id: total-extractor
+    prompt: >-
+      Answer with exactly one line of text and nothing else:
+      `TOTAL: <number>` where <number> is the sum 17 + 25.
+    adapter: prompt
+    check:
+      # output_grep — a regex must match the prompt cell's output.txt
+      # (written at the artifact root; workspace output.txt is the
+      # fallback).
+      output_grep: 'TOTAL:\s*42'
+      # contains — literal substring in output.txt (no regex).
+      contains: 'TOTAL'
+      # numeric_tol — first number in output.txt within tolerance.
+      numeric_tol:
+        value: 42
+        tolerance: 0
+  - id: json-reporter
+    prompt: >-
+      Reply with a single JSON object and nothing else, of the form
+      {"answer": <integer>, "unit": "items"} where answer is 17 + 25.
+    adapter: prompt
+    check:
+      # json_schema — output.txt parses as JSON and validates against a
+      # documented subset of JSON Schema (type/required/properties/...
+      # see scoring.checkers.JSON_SCHEMA_KEYS).
+      json_schema:
+        type: object
+        required: [answer, unit]
+        properties:
+          answer: {type: integer, minimum: 0}
+          unit: {type: string}
+        additionalProperties: false
+      # exact — output.txt (trimmed) equals this text verbatim. A strict
+      # check — most models will fail this one; it's here to exercise the
+      # red path on the example suite.
+      exact: '{"answer": 42, "unit": "items"}'

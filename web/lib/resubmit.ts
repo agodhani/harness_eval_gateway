@@ -16,6 +16,12 @@ import type { Budgets, HarnessConfig, RunOut, TaskInputs } from "./api.ts";
 /** Everything the submit form needs to re-create a run's spec. */
 export interface ResubmitSpec {
   task_prompt: string;
+  /** PR22: preset slug the task_prompt resolved from (null for freeform
+   * prompts). Carried so resubmit re-attaches to the preset — the new run
+   * resolves the preset's CURRENT revision verbatim (an updated preset
+   * submits its updated body; the staged task_prompt is the "edit as
+   * custom copy" fallback if the user detaches it). */
+  preset_ref?: string | null;
   /** Participant models, primary first (row 1 → model_name). */
   models: string[];
   evaluator_model: string | null;
@@ -43,6 +49,7 @@ export function specFromRun(run: RunOut): ResubmitSpec {
   }
   return {
     task_prompt: run.task_prompt ?? "",
+    preset_ref: run.preset_ref ?? null,
     models: models.length ? models : [run.model_name].filter(Boolean),
     evaluator_model:
       (cfg.evaluator_model as string | null | undefined) ?? null,
@@ -88,8 +95,21 @@ export function consumeResubmit(): ResubmitSpec | null {
       !spec ||
       typeof spec !== "object" ||
       typeof spec.task_prompt !== "string" ||
+      (spec.preset_ref != null && typeof spec.preset_ref !== "string") ||
       !Array.isArray(spec.models) ||
-      !Array.isArray(spec.harness_configs)
+      !spec.models.every((m) => typeof m === "string") ||
+      (spec.evaluator_model != null &&
+        typeof spec.evaluator_model !== "string") ||
+      !Array.isArray(spec.harness_configs) ||
+      !spec.harness_configs.every(
+        (c) =>
+          c &&
+          typeof c === "object" &&
+          typeof c.adapter === "string" &&
+          Array.isArray(c.skill_packs),
+      ) ||
+      (spec.budgets != null &&
+        (typeof spec.budgets !== "object" || Array.isArray(spec.budgets)))
     ) {
       return null;
     }

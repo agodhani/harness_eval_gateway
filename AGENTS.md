@@ -33,6 +33,13 @@ adapters are added.
   harnesses + skill packs + evaluator model. `model_name` is the default
   participant model; `models` (normalized into `config.models`) selects the
   full participant set.
+- **Task preset (PR22)** — a reusable evaluation task. Vendored presets are
+  committed Markdown under `task_presets/<slug>.md` (frontmatter metadata +
+  body = the prompt); user presets are `task_presets` table rows. One shared
+  slug namespace; submitting `preset_ref` resolves the preset, replaces the
+  task prompt with the preset body verbatim, and snapshots
+  `runs.preset_ref` + `preset_revision`. Freeform prompts stay supported —
+  `task_prompt` is always the authoritative run text.
 - **Sandbox** — a Docker container running one harness instance on the task,
   with an identical clean initial repo/workspace as its siblings.
 - **Harness adapter** — per-harness plugin: knows how to install, configure,
@@ -326,6 +333,29 @@ pins it); `TESTGEN_MODEL`, `TESTGEN_SOURCE_BUDGET_BYTES` (24k),
 `TESTGEN_TIMEOUT_SECONDS` (960). `EXEC_TEST_TARGET` is the
 ExecRunner→runner env contract for the suite mount.
 
+PR26 (F25) adds a fourth measured signal, `suite`: runs fanned out from a
+vendored **benchmark suite** (`benchmark_suites/<slug>/suite.yaml` — tasks
+are preset refs or inline prompts, each optionally pinned to an adapter)
+get their declared **deterministic checkers** executed post-artifact and
+pre-judge by `scoring/checkers.py`. Output checkers (`exact`, `contains`,
+`regex`, `json_schema`, `numeric_tol`, `output_grep`) read bounded,
+jailed files under the artifact (prompt cells: `output.txt` at the
+artifact root); workspace checkers (`file_exists`, `grep`) resolve
+workspace-first; `py_test` runs the suite's vendored tests against the
+candidate workspace inside the locked `heg-exec` container via
+`ExecRunner` — candidate test code never executes on the host. Each
+outcome persists as an append-only `checker_results` row
+(pass/fail/skipped/error + detail — `skipped` = infra absent, `error` =
+checker misconfig/crash), plus `suite_checks.json` in the artifact, a
+`suite_checks` checkpoint/`test_execution` event, the `suite` signal in
+`analysis.json`/`ANALYSIS.md`, and a `suite_pass` Score row (pass rate
+×10 — the one deliberate fold into the score table). Results surfaces a
+flat `suite` summary + `checker_results` per sandbox (newest-wins per
+check spec); `GET /api/suite-runs/{id}` aggregates a batch task × cell
+with `judge_overall` beside checker roll-ups. Rescores re-read the
+current suite.yaml; checker outcomes stay complementary to — never
+merged into — judge rubric dimensions.
+
 Flow: auto-generated from task spec → HITL review/edit in UI → frozen →
 applied identically to all sandboxes. Generation is fault-tolerant —
 `RUBRIC_GEN_RETRIES` (default 2) covers transient upstream errors and
@@ -357,6 +387,11 @@ evaluator/     # rubric scoring agent
 scoring/       # objective signal collectors (static analysis + exec/coverage)
 skillpacks/    # vendored default packs: superpowers, mattpocock-skills, spec-kit
 skillpack_import/  # F11 GitHub import: codeload fetch, SKILL.md scan, pack store
+task_presets/  # vendored task presets (<slug>.md — frontmatter + prompt body)
+api/presets.py # preset store: vendored discovery + merged vendored/user resolve
+benchmark_suites/ # vendored benchmark suites (<slug>/suite.yaml + tests/)
+api/suites.py  # suite store: yaml parse, slug-safe resolve, jailed check paths
+scoring/checkers.py # deterministic suite checkers (output + workspace + py_test)
 web/           # Next.js app
 db/            # schema + Alembic migrations
 tests/         # unit / integration / e2e
@@ -393,6 +428,14 @@ or tests change.
 | F15 | Submit UX: live model picker + install, named harness configs |
 | F16 | Model-vs-model matrix: multi-model runs + per-model analytics |
 | F17 | Artifact thumbnails (headless screenshots via the preview stack) |
+| F18 | Prompt-only matrix cells (no-sandbox `prompt` adapter) |
+| F19 | Artifact file browser + side-by-side diff |
+| F20 | Trials per cell + per-config model options |
+| F21 | Budgets & pricing accuracy (`model_prices` glob rate table) |
+| F22 | Quality × cost/speed scatter + deterministic verdict card |
+| F23 | Task inputs (seeded workspace: repo_url or uploaded archive) |
+| F24 | Task preset library (vendored + user presets, preset_ref provenance) |
+| F25 | Benchmark suites + deterministic checkers (suite.yaml fan-out, objective checkers beside judge scores) |
 
 ## Post-MVP roadmap
 
@@ -406,6 +449,9 @@ or tests change.
 - ~~Automated test-suite generation as eval target~~ — **landed PR8**:
   `generated_tests` signal (LLM-written suite, exec via `test_target`,
   pass rate into the judge brief)
+- ~~Benchmark suites + deterministic checkers~~ — **landed PR26 (F25)**:
+  vendored `suite.yaml` fan-out + objective `checker_results` beside
+  judge scores (see Rubric §)
 - Higher-fidelity instrumentation via harness hooks/plugins
 - Gateway response caching / deterministic replay
 - Multi-host / K8s sandbox scaling
@@ -829,7 +875,7 @@ or tests change.
   "verdict" card under the chart is a pure template from
   `web/lib/scatterMatrix.ts` (`paretoFrontier`, `buildVerdict`,
   `verdictLines`), `node --test`-covered like `gridMatrix.ts`.
-- **Task inputs seed the workspace once per run (PR24)** — the seed is
+- **Task inputs seed the workspace once per run (PR24/F23)** — the seed is
   materialized per RUN (`data/seeds/<run_id>/`, atomic rename), not per
   sandbox: N cells cloning the same repo independently would waste the
   wall clock and could race remote ref movement — one fetch pins
@@ -844,11 +890,45 @@ or tests change.
   prompting disabled under `SEED_GIT_TIMEOUT_SECONDS`. Archive extraction
   never calls `extractall` — members are name-checked and byte-capped,
   and a post-materialization sweep drops symlinks resolving outside the
-  seed root. **Preset contract (feat/pr22-presets):** preset frontmatter
+  seed root. **Preset contract (PR22/F24):** preset frontmatter
   may carry `seed: {repo_url: <url>, ref: <sha>} | {upload: <upload_id>}`
   — it maps onto `task_inputs` when `preset_ref` resolves (`upload`
   translates to `archive_id`). Prompt cells have no workspace — a
   `task_inputs` seed simply doesn't reach them.
+- **Task presets (PR22/F24) mirror the skillpack resource model** — vendored
+  presets are committed `task_presets/<slug>.md` files (same stdlib
+  frontmatter parser as skillpacks — flow-style values like
+  `tags: [a, b]`, no YAML block lists), user presets are Postgres rows;
+  both share ONE slug namespace and create-collisions return the same
+  structured 409 `name_conflict` + `suggested_name`. Submit sends
+  `preset_ref` — the API resolves it, REPLACES `task_prompt` with the
+  preset body verbatim, and snapshots `runs.preset_ref` +
+  `preset_revision` (provenance + grouping axis; `task_prompt` stays the
+  authoritative run text — a preset edit never rewrites history; resubmit
+  re-resolves the CURRENT revision). Vendored presets are read-only at
+  runtime (PATCH/DELETE 409); user PATCH bumps `revision`. Slugs validate
+  before any filesystem touch — traversal (`../x`) is a 422, never a
+  path. `/presets` + `/presets/[slug]` expose browse/detail with run
+  history, per-model/per-config leaderboards, and a score trend — the
+  grouping axis later suites/leaderboard pages hang off.
+- **Benchmark suites (PR26/F25) are vendored files, not preset fields** —
+  the roadmap sketched `preset.suite.cases`; the shipped model is a
+  `benchmark_suites/<slug>/suite.yaml` task list (preset_ref XOR inline
+  prompt, optional `adapter` pin, `checks:` per task) because a suite
+  groups heterogeneous tasks, not parameterizations of one prompt.
+  `POST /api/suites/{slug}/run` fans out ONE normal run per task under a
+  shared `suite_runs` batch row (`runs.suite_ref`/`suite_index`/
+  `suite_run_id`) — the whole existing lifecycle (approval → provision →
+  monitor → snapshot → eval) stays authoritative; no second runner.
+  **Deterministic checkers are complementary evidence, never judge
+  input**: `scoring/checkers.py` measures pass/fail/skipped/error
+  post-artifact into append-only `checker_results` (autoincrement `id`
+  orders newest-wins merges; rescores append, never update). The only
+  deliberate fold into the score table is the explicit `suite_pass` row
+  (pass rate ×10) the card asked for. Candidate code still never
+  executes on the host — `py_test` runs inside locked `heg-exec`; a
+  missing Docker/image is `skipped`, not a failure. Paths are
+  suite-jailed and byte-capped; slugs validate before filesystem touch.
 
 ## Working conventions
 
@@ -911,6 +991,18 @@ or tests change.
   skills), `POST /api/skillpacks/import` (selection → `data/skillpacks/`;
   `mode` = `pack`|`merge`|`split`, collision → 409 `detail.suggested_name`),
   `DELETE /api/skillpacks/{name}` (imported only).
+- `GET /api/presets` (PR22) lists the merged task-preset library (vendored
+  `task_presets/` + user rows) with browse aggregates (`runs_count`,
+  `last_run_mean`); `GET /api/presets/{slug}` (+`/analytics` → runs,
+  per-model/per-config leaderboards, trend), `POST /api/presets/{slug}`
+  (create user preset — slug collision → 409 `name_conflict` +
+  `suggested_name`, same contract as skillpack import), `PATCH`/`DELETE`
+  (user presets only — vendored are filesystem resources; PATCH bumps
+  `revision`). `RunCreate.preset_ref` resolves the preset and REPLACES
+  `task_prompt` with its body verbatim; `runs.preset_ref` +
+  `preset_revision` snapshot the provenance, and `GET /api/runs?preset=`
+  filters. Slugs validate `^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$` BEFORE
+  any filesystem touch — vendored resolution is traversal-safe.
 - **Known issues (Phase 3 candidates):** event ingest has no retry/buffering —
   a sandbox emitting during an api restart loses early events; gateway emits
   best-effort. `heg-dev` static cred exists for dev only. Unauthenticated

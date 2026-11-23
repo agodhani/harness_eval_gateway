@@ -34,6 +34,7 @@ import {
   stageResubmit,
 } from "@/lib/resubmit";
 import RunConsoleLive from "@/components/RunConsoleLive";
+import { SavePresetDialog } from "@/components/SavePresetDialog";
 import {
   Badge,
   Card,
@@ -330,6 +331,8 @@ export default function RunDetailClient({ runId }: { runId: string }) {
   const [createWarnings, setCreateWarnings] = useState<string[]>([]);
   // cancel/delete in-flight state
   const [cancelling, setCancelling] = useState(false);
+  // PR22 — save this run's task prompt as a reusable preset.
+  const [savePresetOpen, setSavePresetOpen] = useState(false);
 
   const refresh = useCallback(
     async (silent = true) => {
@@ -654,11 +657,63 @@ export default function RunDetailClient({ runId }: { runId: string }) {
           </WarnNote>
         ) : null}
 
-        <Card title="Task">
+        <Card
+          title="Task"
+          actions={
+            run.preset_ref ? (
+              <Badge tone="outline" title="Task preset this prompt resolved from">
+                <Link href={`/presets/${run.preset_ref}`}>{run.preset_ref}</Link>
+                {run.preset_revision != null ? ` · rev ${run.preset_revision}` : ""}
+              </Badge>
+            ) : (
+              <button
+                type="button"
+                className="btn btn--sm btn--ghost"
+                onClick={() => setSavePresetOpen(true)}
+                title="Save this task prompt as a reusable preset"
+              >
+                save prompt as preset
+              </button>
+            )
+          }
+        >
           <p className="task-text">{run.task_prompt}</p>
           <dl className="kv" style={{ marginTop: "0.9rem" }}>
             <dt>Run ID</dt>
             <dd className="mono">{run.id}</dd>
+            {run.preset_ref ? (
+              <>
+                <dt>Preset</dt>
+                <dd className="mono">
+                  <Link href={`/presets/${run.preset_ref}`}>{run.preset_ref}</Link>
+                  {run.preset_revision != null ? (
+                    <span className="faint">
+                      {" "}· rev {run.preset_revision}
+                      {" "}(the prompt above is the snapshot taken at submit)
+                    </span>
+                  ) : null}
+                </dd>
+              </>
+            ) : null}
+            {run.suite_ref ? (
+              <>
+                <dt>Suite</dt>
+                <dd className="mono">
+                  <Link href={`/suites/${run.suite_ref}`}>{run.suite_ref}</Link>
+                  <span className="faint">
+                    {" "}· task #{run.suite_index ?? "?"}
+                  </span>
+                  {run.suite_run_id ? (
+                    <>
+                      {" "}·{" "}
+                      <Link href={`/suite-runs/${run.suite_run_id}`}>
+                        batch {run.suite_run_id.slice(0, 8)}
+                      </Link>
+                    </>
+                  ) : null}
+                </dd>
+              </>
+            ) : null}
             <dt>Created</dt>
             <dd className="mono">{formatTs(run.created_at)}</dd>
             <dt>Started</dt>
@@ -887,6 +942,18 @@ export default function RunDetailClient({ runId }: { runId: string }) {
           </WarnNote>
         ) : null}
       </div>
+
+      {savePresetOpen ? (
+        <SavePresetDialog
+          taskPrompt={run.task_prompt}
+          initialTitle={run.task_prompt.trim().split("\n")[0]?.slice(0, 80) ?? ""}
+          onClose={() => setSavePresetOpen(false)}
+          onSaved={(p) => {
+            setSavePresetOpen(false);
+            setNotice(`Saved as preset "${p.slug}" — see it under Presets.`);
+          }}
+        />
+      ) : null}
     </main>
   );
 }

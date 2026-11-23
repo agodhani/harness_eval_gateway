@@ -17,6 +17,7 @@
  */
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import Link from "next/link";
 import {
   ADAPTERS,
   ApiError,
@@ -24,6 +25,7 @@ import {
   DEFAULT_BUDGETS,
   getModels,
   listHarnesses,
+  listPresets,
   listSkillPacks,
   NO_SANDBOX_ADAPTERS,
   PROVIDERS,
@@ -38,20 +40,32 @@ import {
   type SkillPack,
   type SkillpackImportResult,
   type TaskInputs,
+  type TaskPreset,
   type UploadOut,
 } from "@/lib/api";
+import { truncate } from "@/lib/format";
 import { modelsPayload, participantModels } from "@/lib/modelRows";
 import {
   consumeResubmit,
   stageRunWarnings,
 } from "@/lib/resubmit";
 import { ComboInput } from "@/components/ComboInput";
-import { Badge, Card, ErrorNote, InfoNote, WarnNote } from "@/components/ui";
+import { SavePresetDialog } from "@/components/SavePresetDialog";
+import {
+  Badge,
+  Card,
+  EmptyState,
+  ErrorNote,
+  InfoNote,
+  Loading,
+  WarnNote,
+} from "@/components/ui";
 import { ImportSkillPackDialog } from "./ImportSkillPackDialog";
 
 // Offline fallback for the model pickers — the live list comes from
 // GET /api/models (gateway → upstream) when the backend is reachable.
 const MODEL_SUGGESTIONS = ["qwen3:8b", "qwen2.5-coder:3b", "qwen2.5-coder:7b"];
+const DEFAULT_ADAPTER = "miniloop";
 const MAX_CONFIGS = 8;
 // Mirrors api/schemas.py MAX_MATRIX_CELLS — configs × models sandbox cap.
 const MAX_MATRIX_CELLS = 32;
@@ -124,7 +138,7 @@ function blankConfig(): ConfigRow {
   return {
     key: nextKey++,
     name: "",
-    adapter: "miniloop",
+    adapter: DEFAULT_ADAPTER,
     skill_packs: [],
     system_prompt_extra: "",
     opts: { ...BLANK_OPTS },
@@ -139,6 +153,22 @@ export default function SubmitPage() {
   const router = useRouter();
 
   const [taskPrompt, setTaskPrompt] = useState("");
+  // PR22 task source: "custom" (freeform textarea — the original shape) or
+  // "preset" (a library entry's body; preset_ref rides on the submit and the
+  // server snapshots the resolved revision). taskPrompt stays live in both
+  // modes — it's the "edit as custom copy" target and the resubmit fallback.
+  const [taskMode, setTaskMode] = useState<"custom" | "preset">("custom");
+  // Selected preset slug. A slug absent from the loaded library is NOT
+  // auto-detached — `presetMissing` surfaces it and validation forces a
+  // re-pick (submitting it would 422 anyway); an unloaded library leaves
+  // it submittable (offline resubmit — the server resolves it).
+  const [presetSlug, setPresetSlug] = useState<string | null>(null);
+  const [presets, setPresets] = useState<TaskPreset[] | null>(null);
+  const [presetsFailed, setPresetsFailed] = useState(false);
+  const [presetQuery, setPresetQuery] = useState("");
+  const [presetCategory, setPresetCategory] = useState("");
+  const [presetNotice, setPresetNotice] = useState<string | null>(null);
+  const [savePresetOpen, setSavePresetOpen] = useState(false);
   // Participant-model rows — row 1 is the required primary (→ model_name);
   // extra rows are the PR14 additional models (→ models, deduped). Model
   // starts EMPTY: prefilling a provider-specific name (e.g. an ollama tag)
@@ -268,6 +298,13 @@ export default function SubmitPage() {
       const spec = consumeResubmit();
       if (!spec) return;
       setTaskPrompt(spec.task_prompt);
+      // PR22: a preset-backed run resubmits AS a preset run — the ref re-
+      // resolves the CURRENT revision server-side; the staged task_prompt
+      // remains the "edit as custom copy" fallback.
+      if (spec.preset_ref) {
+        selectPreset(spec.preset_ref);
+        setTaskMode("preset");
+      }
       setModelRows(
         spec.models.length
           ? spec.models.map((m) => ({
@@ -418,7 +455,127 @@ export default function SubmitPage() {
       });
   }, []);
 
+  // PR22 preset library — merged vendored + user presets. The
+  // ?preset=<slug> param (detail-page "run this preset" links) is explicit
+  // user intent applied on mount regardless of the fetch outcome — queued in
+  // a microtask so it lands after the resubmit effect's staged ref: the URL
+  // param wins. A slug absent from the loaded library isn't detached — the
+  // picker surfaces the mismatch and validation makes the user re-pick or
+  // switch to custom (a missing slug would 422 server-side anyway).
+  useEffect(() => {
+    let cancelled = false;
+    const qp = new URLSearchParams(window.location.search)
+      .get("preset")
+      ?.trim()
+      .toLowerCase();
+    void Promise.resolve().then(() => {
+      if (cancelled || !qp) return;
+      selectPreset(qp);
+      setTaskMode("preset");
+    });
+    listPresets()
+      .then((list) => {
+        if (cancelled) return;
+        setPresets((prev) => {
+          const fetched = new Set(list.map((p) => p.slug));
+          return [...list, ...(prev ?? []).filter((p) => !fetched.has(p.slug))];
+        });
+      })
+      .catch(() => {
+        /* API down — preset mode stays selectable but unverifiable;
+           a preset_ref slug still submits (server resolves it). */
+        if (!cancelled) setPresetsFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const packNames = useMemo(() => new Set(packs.map((p) => p.name)), [packs]);
+
+  // ------------------------------------------------------------------
+  // PR22 preset derived state
+  // ------------------------------------------------------------------
+
+  function selectPreset(slug: string | null) {
+    setPresetSlug(slug);
+    setPresetNotice(null);
+  }
+
+  const selectedPreset = useMemo(
+    () => (presets ?? []).find((p) => p.slug === presetSlug) ?? null,
+    [presets, presetSlug],
+  );
+  /** Slug set but absent from a LOADED library — the picker flags it and
+   * validation forces a re-pick (submitting it would 422 anyway). */
+  const presetMissing =
+    taskMode === "preset" &&
+    presetSlug !== null &&
+    presets !== null &&
+    selectedPreset === null;
+
+  const presetCategories = useMemo(
+    () =>
+      [...new Set((presets ?? []).map((p) => p.category).filter(Boolean))].sort(),
+    [presets],
+  );
+  const pq = presetQuery.trim().toLowerCase();
+  const filteredPresets = useMemo(
+    () =>
+      (presets ?? []).filter((p) => {
+        if (presetCategory && p.category !== presetCategory) return false;
+        if (!pq) return true;
+        return [p.title, p.slug, p.description, p.category, ...p.tags].some((h) =>
+          h.toLowerCase().includes(pq),
+        );
+      }),
+    [presets, presetCategory, pq],
+  );
+
+  /** One-click preset suggestions — fills EMPTY participant-model fields
+   * with suggested_models and applies suggested_adapter (when it's a known
+   * adapter) to configs still at the form default. Never overwrites a
+   * field the user already filled. */
+  function applyPresetSuggestions() {
+    const p = selectedPreset;
+    if (!p) return;
+    if (p.suggested_adapter && adapterNames.includes(p.suggested_adapter)) {
+      const a = p.suggested_adapter;
+      setConfigs((cs) =>
+        cs.map((c) =>
+          !c.adapter || c.adapter === DEFAULT_ADAPTER ? { ...c, adapter: a } : c,
+        ),
+      );
+    }
+    const sugg = p.suggested_models ?? [];
+    if (sugg.length > 0) {
+      setModelRows((rs) => {
+        const taken = new Set<string>();
+        for (const r of rs) {
+          const m = r.model.trim();
+          if (m) taken.add(m);
+        }
+        const fresh: string[] = [];
+        for (const s of sugg) {
+          const m = s.trim();
+          if (m && !taken.has(m)) {
+            taken.add(m);
+            fresh.push(m);
+          }
+        }
+        if (fresh.length === 0) return rs;
+        const out = [...rs];
+        let si = 0;
+        for (let i = 0; i < out.length && si < fresh.length; i++) {
+          if (!out[i].model.trim()) out[i] = { ...out[i], model: fresh[si++] };
+        }
+        while (si < fresh.length && out.length < MAX_MODEL_ROWS) {
+          out.push({ key: nextKey++, provider: defaultProvider, model: fresh[si++] });
+        }
+        return out;
+      });
+    }
+  }
 
   function onPackImported(result: SkillpackImportResult) {
     const key = importFor;
@@ -491,7 +648,13 @@ export default function SubmitPage() {
 
   const validation = useMemo(() => {
     const errs: Record<string, string> = {};
-    if (!taskPrompt.trim()) errs.task_prompt = "Task prompt is required.";
+    if (taskMode === "custom") {
+      if (!taskPrompt.trim()) errs.task_prompt = "Task prompt is required.";
+    } else if (!presetSlug) {
+      errs.task = "Pick a preset or switch to a custom prompt.";
+    } else if (presetMissing) {
+      errs.task = `Preset "${presetSlug}" isn't in the library — pick another or switch to a custom prompt.`;
+    }
     if (!primaryModel) errs.model_name = "Model name is required.";
     if (configs.length === 0) errs.configs = "At least one harness config is required.";
     configs.forEach((c, i) => {
@@ -559,7 +722,7 @@ export default function SubmitPage() {
     });
     return errs;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskPrompt, primaryModel, configs, budgets, adapterNames, packNames, sandboxCount, modelCount, trials, inputsMode, repoUrl, stagedUpload, uploading]);
+  }, [taskMode, taskPrompt, presetSlug, presetMissing, primaryModel, configs, budgets, adapterNames, packNames, sandboxCount, modelCount, trials, inputsMode, repoUrl, stagedUpload, uploading]);
 
   const isValid = Object.keys(validation).length === 0;
 
@@ -727,7 +890,16 @@ export default function SubmitPage() {
     setSubmitting(true);
     try {
       const run = await createRun({
-        task_prompt: taskPrompt.trim(),
+        // Preset mode sends the selected preset's body (the server replaces
+        // task_prompt with the preset verbatim anyway — it must just be
+        // non-empty for the schema); a slug staged offline falls back to the
+        // textarea's staged text. preset_ref carries the provenance.
+        task_prompt:
+          taskMode === "preset"
+            ? (selectedPreset?.task_prompt ?? taskPrompt).trim() ||
+              "(resolved server-side from preset)"
+            : taskPrompt.trim(),
+        preset_ref: taskMode === "preset" ? presetSlug : null,
         model_name,
         models,
         harness_configs,
@@ -772,28 +944,258 @@ export default function SubmitPage() {
       </div>
 
       <form onSubmit={onSubmit} className="form-grid" noValidate>
-        <Card title="Task">
-          <div className="field">
-            <label className="field__label" htmlFor="task_prompt">
-              Task prompt <span className="faint">(required)</span>
-            </label>
-            <textarea
-              id="task_prompt"
-              className="textarea"
-              rows={6}
-              placeholder='e.g. "Build a replica of the game 2048 in a single HTML file."'
-              value={taskPrompt}
-              onChange={(e) => setTaskPrompt(e.target.value)}
-              disabled={submitting}
-            />
-            {fieldErrors.task_prompt ? (
-              <span className="field__error">{fieldErrors.task_prompt}</span>
-            ) : (
-              <span className="field__hint">
-                {taskPrompt.trim().length}/100,000 chars — the rubric is generated from this.
-              </span>
-            )}
-          </div>
+        <Card
+          title="Task"
+          actions={
+            <div className="row" role="group" aria-label="Task source">
+              <button
+                type="button"
+                className={`filter-chip${taskMode === "custom" ? " is-active" : ""}`}
+                onClick={() => {
+                  setTaskMode("custom");
+                  setPresetNotice(null);
+                }}
+                disabled={submitting}
+              >
+                custom prompt
+              </button>
+              <button
+                type="button"
+                className={`filter-chip${taskMode === "preset" ? " is-active" : ""}`}
+                onClick={() => {
+                  setTaskMode("preset");
+                  setPresetNotice(null);
+                }}
+                disabled={submitting}
+              >
+                task preset
+              </button>
+            </div>
+          }
+        >
+          {presetNotice ? <InfoNote>{presetNotice}</InfoNote> : null}
+          {taskMode === "custom" ? (
+            <div className="field">
+              <label className="field__label" htmlFor="task_prompt">
+                Task prompt <span className="faint">(required)</span>
+              </label>
+              <textarea
+                id="task_prompt"
+                className="textarea"
+                rows={6}
+                placeholder='e.g. "Build a replica of the game 2048 in a single HTML file."'
+                value={taskPrompt}
+                onChange={(e) => setTaskPrompt(e.target.value)}
+                disabled={submitting}
+              />
+              {fieldErrors.task_prompt ? (
+                <span className="field__error">{fieldErrors.task_prompt}</span>
+              ) : (
+                <span className="field__hint">
+                  {taskPrompt.trim().length}/100,000 chars — the rubric is generated from this.
+                </span>
+              )}
+              <div className="row">
+                <button
+                  type="button"
+                  className="btn btn--sm"
+                  onClick={() => setSavePresetOpen(true)}
+                  disabled={submitting || !taskPrompt.trim()}
+                  title="Save this prompt to the preset library"
+                >
+                  save as preset
+                </button>
+                <span className="field__hint" style={{ alignSelf: "center" }}>
+                  …or{" "}
+                  <Link href="/presets">browse the preset library</Link> to run a
+                  saved task verbatim.
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div className="field">
+              <label className="field__label">
+                Task preset <span className="faint">(the body runs verbatim)</span>
+              </label>
+              {presets !== null && presets.length > 0 ? (
+                <>
+                  <input
+                    className="input"
+                    type="search"
+                    placeholder="Filter: title, slug, tag…"
+                    aria-label="Filter presets"
+                    value={presetQuery}
+                    onChange={(e) => setPresetQuery(e.target.value)}
+                    disabled={submitting}
+                    style={{ marginBottom: "0.4rem" }}
+                  />
+                  <div
+                    className="filter-bar"
+                    style={{ border: "none", padding: "0 0 0.4rem" }}
+                    role="group"
+                    aria-label="Filter by category"
+                  >
+                    <button
+                      type="button"
+                      className={`filter-chip${presetCategory === "" ? " is-active" : ""}`}
+                      onClick={() => setPresetCategory("")}
+                    >
+                      all
+                    </button>
+                    {presetCategories.map((c) => (
+                      <button
+                        key={c}
+                        type="button"
+                        className={`filter-chip${presetCategory === c ? " is-active" : ""}`}
+                        onClick={() =>
+                          setPresetCategory(presetCategory === c ? "" : c)
+                        }
+                      >
+                        {c}
+                      </button>
+                    ))}
+                  </div>
+                  {filteredPresets.length === 0 ? (
+                    <EmptyState>No presets match — adjust the filters.</EmptyState>
+                  ) : (
+                    <div
+                      className="preset-pick"
+                      role="listbox"
+                      aria-label="Task presets"
+                      aria-activedescendant={presetSlug ? `preset-${presetSlug}` : undefined}
+                    >
+                      {filteredPresets.map((p) => (
+                        <button
+                          type="button"
+                          key={p.slug}
+                          id={`preset-${p.slug}`}
+                          role="option"
+                          aria-selected={presetSlug === p.slug}
+                          className={`preset-item${presetSlug === p.slug ? " preset-item--active" : ""}`}
+                          onClick={() => selectPreset(p.slug)}
+                          disabled={submitting}
+                        >
+                          <span className="preset-item__head">
+                            <span className="preset-item__title">{p.title}</span>
+                            <Badge tone={p.source === "vendored" ? "violet" : "blue"}>
+                              {p.source}
+                            </Badge>
+                            {p.category ? <Badge tone="outline">{p.category}</Badge> : null}
+                          </span>
+                          {p.description ? (
+                            <span className="preset-item__desc">
+                              {truncate(p.description, 110)}
+                            </span>
+                          ) : null}
+                          <span className="preset-item__meta">
+                            <code>{p.slug}</code>
+                            {" · "}
+                            {p.runs_count} run{p.runs_count === 1 ? "" : "s"}
+                            {p.last_run_mean != null
+                              ? ` · last mean ${p.last_run_mean}`
+                              : ""}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </>
+              ) : presets === null ? (
+                presetsFailed ? (
+                  <WarnNote>
+                    Preset library unavailable — a preset staged via a ?preset=
+                    link or resubmit still submits (the server resolves the
+                    slug); otherwise switch to a custom prompt.
+                  </WarnNote>
+                ) : (
+                  <Loading label="Loading presets…" />
+                )
+              ) : (
+                <EmptyState>
+                  No presets in the library — switch to a custom prompt.
+                </EmptyState>
+              )}
+
+              {selectedPreset ? (
+                <div className="field" style={{ marginTop: "0.6rem" }}>
+                  <label className="field__label" htmlFor="preset_preview">
+                    Selected prompt{" "}
+                    <span className="faint">
+                      (read-only — rev {selectedPreset.revision}; runs snapshot this body)
+                    </span>
+                  </label>
+                  <textarea
+                    id="preset_preview"
+                    className="textarea"
+                    rows={6}
+                    readOnly
+                    value={selectedPreset.task_prompt}
+                  />
+                  <div className="row" style={{ justifyContent: "space-between" }}>
+                    <span className="field__hint" style={{ alignSelf: "center" }}>
+                      <Link href={`/presets/${selectedPreset.slug}`}>
+                        preset detail →
+                      </Link>
+                    </span>
+                    <button
+                      type="button"
+                      className="btn btn--sm"
+                      onClick={() => {
+                        setTaskPrompt(selectedPreset.task_prompt);
+                        selectPreset(null);
+                        setTaskMode("custom");
+                      }}
+                      disabled={submitting}
+                      title="Detach the ref and edit this prompt as a one-off"
+                    >
+                      edit as custom copy
+                    </button>
+                  </div>
+                  {selectedPreset.suggested_adapter ||
+                  selectedPreset.suggested_models.length ? (
+                    <InfoNote>
+                      This preset suggests{" "}
+                      {selectedPreset.suggested_adapter ? (
+                        <>
+                          adapter <code>{selectedPreset.suggested_adapter}</code>
+                        </>
+                      ) : null}
+                      {selectedPreset.suggested_adapter &&
+                      selectedPreset.suggested_models.length
+                        ? " and "
+                        : ""}
+                      {selectedPreset.suggested_models.length ? (
+                        <>
+                          model
+                          {selectedPreset.suggested_models.length > 1 ? "s" : ""}{" "}
+                          <code>{selectedPreset.suggested_models.join(", ")}</code>
+                        </>
+                      ) : null}
+                      .{" "}
+                      <button
+                        type="button"
+                        className="btn btn--sm btn--ghost"
+                        onClick={applyPresetSuggestions}
+                        disabled={submitting}
+                      >
+                        apply to empty fields
+                      </button>
+                    </InfoNote>
+                  ) : null}
+                </div>
+              ) : presetSlug ? (
+                <WarnNote>
+                  Preset <code>{presetSlug}</code>
+                  {presets !== null
+                    ? " isn't in the library — pick another or switch to a custom prompt."
+                    : " — the server resolves it at submit."}
+                </WarnNote>
+              ) : null}
+              {fieldErrors.task ? (
+                <span className="field__error">{fieldErrors.task}</span>
+              ) : null}
+            </div>
+          )}
 
           {/* PR24 — task inputs: seed every sandbox's workspace from a
               public repo or a staged archive before the agent starts. */}
@@ -1559,6 +1961,25 @@ export default function SubmitPage() {
           importedPacks={packs.filter((p) => p.source === "imported")}
           onClose={() => setImportFor(null)}
           onImported={onPackImported}
+        />
+      ) : null}
+
+      {savePresetOpen ? (
+        <SavePresetDialog
+          taskPrompt={taskPrompt}
+          initialTitle={taskPrompt.trim().split("\n")[0]?.slice(0, 80) ?? ""}
+          onClose={() => setSavePresetOpen(false)}
+          onSaved={(p) => {
+            setSavePresetOpen(false);
+            // Add the fresh preset to the loaded library and select it —
+            // the natural next step after saving.
+            setPresets((prev) =>
+              prev ? [...prev.filter((x) => x.slug !== p.slug), p] : [p],
+            );
+            selectPreset(p.slug);
+            setTaskMode("preset");
+            setPresetNotice(`Saved "${p.title}" — now selected as the task preset.`);
+          }}
         />
       ) : null}
     </main>

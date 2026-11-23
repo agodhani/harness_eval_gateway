@@ -58,8 +58,16 @@ from sqlalchemy.orm import Session
 
 from api.config import get_settings
 from api.deps import get_db
-from api.schemas import AnalysisReport, RubricOut
-from db.models import Artifact, Event, Rubric, Run, Sandbox, Score
+from api.schemas import AnalysisReport, CheckerResultOut, RubricOut
+from db.models import (
+    Artifact,
+    CheckerResult,
+    Event,
+    Rubric,
+    Run,
+    Sandbox,
+    Score,
+)
 from evaluator.scores import OVERALL_DIMENSION
 from orchestrator import events as orch_events
 from orchestrator import runner, state_machine
@@ -71,6 +79,7 @@ from sandbox.preview import (
     resolve_workspace_dir,
 )
 from sandbox.thumbnails import THUMB_FILENAME, THUMB_META_FILENAME
+from scoring.checkers import SUITE_PASS_DIMENSION
 from scoring.exec import exec_summary_dict
 from scoring.render import ANALYSIS_JSON_FILENAME
 
@@ -140,6 +149,23 @@ class GeneratedTestsSummary(BaseModel):
     coverage_percent: float | None = None
     timed_out: bool = False
     detail: str | None = None  # skip reason / error message
+
+
+class SuiteSummary(BaseModel):
+    """PR26 flat suite headline — the deterministic checker roll-up over
+    the sandbox's merged ``checker_results`` rows (newest-wins per check).
+    DB-sourced, so it lands even when no judge ever ran — the "per-case
+    pass/fail + mean without judge involvement" contract. ``pass_rate``
+    excludes skipped/error checks (not measured outcomes); null when
+    nothing measured. ``suite_pass`` mirrors the Score dimension ×10."""
+
+    total: int = 0
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    errors: int = 0
+    pass_rate: float | None = None
+    suite_pass: float | None = None  # the suite_pass Score value (0–10)
 
 
 class ArtifactRef(BaseModel):
@@ -223,6 +249,14 @@ class SandboxResult(BaseModel):
     # PR8: flat view of the ``generated_tests`` signal (LLM-written suite
     # executed against the submission) — None when no analysis exists.
     generated_tests: GeneratedTestsSummary | None = None
+    # PR26: deterministic checker outcomes for suite-task runs — pass /
+    # fail / skipped / error beside the judge scores. Newest-wins per
+    # (check_type, spec), mirroring the score merge; empty for non-suite
+    # runs and suites without ``check:`` blocks.
+    checker_results: list[CheckerResultOut] = Field(default_factory=list)
+    # PR26: flat roll-up of those rows — counts + pass rate (+ the
+    # ``suite_pass`` score value). None for non-suite runs.
+    suite: SuiteSummary | None = None
 
 
 class RubricVersionOut(BaseModel):
@@ -636,6 +670,43 @@ def get_run_results(
     for art in artifacts:
         artifacts_by_sandbox.setdefault(art.sandbox_id, []).append(art)
 
+    # PR26 checker results — newest-wins per (check_type, spec): the rows
+    # are append-only (a rescore re-measures and inserts), and the autoinc
+    # id is the durable insertion order, so the last row per key wins.
+    checker_rows = (
+        session.execute(
+            select(CheckerResult)
+            .where(CheckerResult.sandbox_id.in_(sandbox_ids))
+            .order_by(CheckerResult.id)
+        )
+        .scalars()
+        .all()
+        if sandbox_ids
+        else []
+    )
+    checker_by_sandbox: dict[UUID, dict[tuple[str, str], CheckerResult]] = {}
+    for cr in checker_rows:
+        key = (cr.check_type, json.dumps(cr.spec or {}, sort_keys=True))
+        checker_by_sandbox.setdefault(cr.sandbox_id, {})[key] = cr
+
+    # Flat suite roll-up per sandbox — the card's "per-case pass/fail +
+    # mean without judge involvement": computed from the DB rows, so it
+    # exists even when analysis.json/the judge never did.
+    suite_by_sandbox: dict[UUID, dict[str, Any]] = {}
+    for sid, merged in checker_by_sandbox.items():
+        rows = list(merged.values())
+        passed = sum(1 for r in rows if r.status == "pass")
+        failed = sum(1 for r in rows if r.status == "fail")
+        measured = passed + failed
+        suite_by_sandbox[sid] = {
+            "total": len(rows),
+            "passed": passed,
+            "failed": failed,
+            "skipped": sum(1 for r in rows if r.status == "skipped"),
+            "errors": sum(1 for r in rows if r.status == "error"),
+            "pass_rate": (passed / measured) if measured else None,
+        }
+
     # Eval-failure events — latest label per sandbox. Only surfaced on
     # sandboxes with NO Score rows: a retry that eventually produced scores
     # supersedes its earlier failed attempts.
@@ -684,6 +755,7 @@ def get_run_results(
         overall: DimensionScore | None = None
         rubric_id: UUID | None = None
         sb_rubric_version: int | None = None
+        suite_pass_score: float | None = None
         for sc in by_sandbox.get(sb.id, []):
             if sc.rubric_id is not None:
                 rubric_id = sc.rubric_id  # rows ordered asc -> newest wins
@@ -697,6 +769,9 @@ def get_run_results(
                 overall = entry
             else:
                 dimensions[sc.dimension] = entry
+                if sc.dimension == SUITE_PASS_DIMENSION:
+                    suite_pass_score = sc.score
+        suite_block = suite_by_sandbox.get(sb.id)
         results.append(
             SandboxResult(
                 sandbox_id=sb.id,
@@ -713,7 +788,14 @@ def get_run_results(
                 dimensions=dimensions,
                 overall=overall,
                 eval_error=(
-                    None if by_sandbox.get(sb.id) else eval_failures.get(sb.id)
+                    # A suite_pass row is a checker measurement, not a
+                    # judge verdict — it must not mask "judge failed".
+                    None
+                    if any(
+                        sc.dimension != SUITE_PASS_DIMENSION
+                        for sc in by_sandbox.get(sb.id, [])
+                    )
+                    else eval_failures.get(sb.id)
                 ),
                 artifacts=[
                     ArtifactRef(id=a.id, kind=a.kind, path=a.path)
@@ -733,6 +815,22 @@ def get_run_results(
                 analysis=analysis,
                 exec=_exec_summary(analysis),
                 generated_tests=_generated_tests_summary(analysis),
+                checker_results=[
+                    CheckerResultOut(
+                        check=cr.check_type,
+                        spec=cr.spec or {},
+                        status=cr.status,
+                        passed=bool(cr.passed),
+                        detail=cr.detail or "",
+                        created_at=cr.created_at,
+                    )
+                    for cr in checker_by_sandbox.get(sb.id, {}).values()
+                ],
+                suite=(
+                    SuiteSummary(**suite_block, suite_pass=suite_pass_score)
+                    if suite_block is not None
+                    else None
+                ),
             )
         )
 

@@ -2263,6 +2263,102 @@ a.chip:hover {
 }
 
 /* ==========================================================================
+   PR22 — task presets: submit picker, library browse + detail
+   ========================================================================== */
+
+/* Scrollable preset picker in the submit Task card (listbox semantics;
+   .skill-pick sibling but rows are buttons, not checkboxes). */
+.preset-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-height: 280px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  padding: 0.5rem;
+}
+.preset-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid transparent;
+  border-left: 2px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 0.82rem;
+  text-align: left;
+  cursor: pointer;
+}
+.preset-item:hover {
+  border-color: var(--border-strong);
+}
+.preset-item:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.preset-item--active {
+  border-color: var(--accent);
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.preset-item__head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+.preset-item__title {
+  color: var(--text);
+  font-weight: 500;
+}
+.preset-item__desc {
+  font-size: 0.76rem;
+  color: var(--text-faint);
+}
+.preset-item__meta {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  color: var(--text-faint);
+}
+
+/* KPI strip — preset detail aggregates. */
+.kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 0.6rem;
+}
+.kpi {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  padding: 0.55rem 0.7rem;
+}
+.kpi__label {
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.kpi__value {
+  font-family: var(--mono);
+  font-size: 1.15rem;
+  color: var(--text);
+  margin-top: 0.15rem;
+}
+.kpi__sub {
+  font-size: 0.7rem;
+  color: var(--text-faint);
+}
+
+/* ==========================================================================
    PR34 — artifact file browser + side-by-side diff modal
    ========================================================================== */
 

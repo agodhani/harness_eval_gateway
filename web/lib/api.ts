@@ -296,6 +296,12 @@ export interface TaskInputs {
 
 export interface RunCreate {
   task_prompt: string;
+  /** PR22: task-preset slug (GET /api/presets) — when set the server
+   * replaces task_prompt with the preset's body verbatim and snapshots
+   * the resolved slug + revision as provenance. Omit for freeform tasks;
+   * a divergent prompt must be sent WITHOUT the ref (the submit form's
+   * "edit as custom copy" drops it). */
+  preset_ref?: string | null;
   model_name: string;
   /** PR14: ADDITIONAL participant models — matrix expands to
    * harness_configs × ([model_name] + models). Omit for single-model. */
@@ -397,6 +403,16 @@ export interface RunOut {
   updated_at: string | null;
   started_at: string | null;
   finished_at: string | null;
+  /** PR22: preset slug + revision snapshot the task_prompt resolved from
+   * (null for freeform prompts). */
+  preset_ref?: string | null;
+  preset_revision?: number | null;
+  /** PR26: suite provenance on suite-fanned runs — the vendored suite
+   * slug, the task's 0-based index inside suite.yaml, and the shared
+   * suite_runs batch id (links to /suite-runs/{id}). */
+  suite_ref?: string | null;
+  suite_index?: number | null;
+  suite_run_id?: string | null;
   sandboxes: SandboxOut[];
   rubric: RubricOut | null;
 }
@@ -411,6 +427,13 @@ export interface RunSummary {
   created_at: string;
   finished_at: string | null;
   sandbox_count: number;
+  /** PR22: preset slug the task came from (null for freeform prompts) —
+   * drives the list's preset column/filter. */
+  preset_ref?: string | null;
+  /** PR26: suite slug + task index + batch id (null on non-suite runs). */
+  suite_ref?: string | null;
+  suite_index?: number | null;
+  suite_run_id?: string | null;
 }
 
 export interface EventOut {
@@ -514,6 +537,12 @@ export interface SandboxResult {
    * never spawns captures. `url` is api-relative (prefix API_BASE).
    */
   thumbnail?: ThumbRef | null;
+  /** PR26: deterministic suite checker outcomes (newest-wins per check) —
+   * pass/fail/skipped/error beside judge scores; empty for non-suite runs. */
+  checker_results?: CheckerResult[];
+  /** PR26: flat roll-up of checker_results — counts + pass rate + the
+   * suite_pass score value (0–10). Null for non-suite runs. */
+  suite?: SuiteSummary | null;
 }
 
 /** PR5: one rubric version as listed in results — drives the version
@@ -707,13 +736,17 @@ export async function uploadArchive(file: File): Promise<UploadOut> {
 
 export interface ListRunsOptions {
   status?: string;
+  /** PR22: restrict to runs submitted from this preset slug. */
+  preset?: string;
+  /** PR26: restrict to runs fanned out from this suite slug. */
+  suite?: string;
   limit?: number;
   offset?: number;
 }
 
 export function listRuns(opts: ListRunsOptions = {}): Promise<RunSummary[]> {
   return request<RunSummary[]>(
-    `/api/runs${qs({ status: opts.status, limit: opts.limit ?? 100, offset: opts.offset ?? 0 })}`,
+    `/api/runs${qs({ status: opts.status, preset: opts.preset, suite: opts.suite, limit: opts.limit ?? 100, offset: opts.offset ?? 0 })}`,
   );
 }
 
@@ -1621,6 +1654,348 @@ export function deleteRun(runId: string): Promise<RunDeleteOut> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// task presets (PR22 — vendored library + user-saved prompts)
+// ---------------------------------------------------------------------------
+
+/** One task preset — a vendored `task_presets/<slug>.md` file or a
+ * user-saved row. `source` distinguishes them and decides PATCH/DELETE
+ * (user only). The markdown body is the verbatim task prompt a preset
+ * submit runs. */
+export interface TaskPreset {
+  slug: string;
+  title: string;
+  description: string;
+  task_prompt: string;
+  category: string;
+  tags: string[];
+  source: "vendored" | "user" | string;
+  /** Bumps on every user-preset PATCH (vendored always 1) — the value
+   * runs.preset_revision snapshots at submit. */
+  revision: number;
+  suggested_adapter: string | null;
+  suggested_models: string[];
+  created_at: string | null;
+  updated_at: string | null;
+  /** Library browse aggregates — runs whose preset_ref matches + the
+   * newest scored run's mean overall (null when unscored/none). */
+  runs_count: number;
+  last_run_mean: number | null;
+}
+
+/** POST /api/presets/{slug} body — the slug lives in the path. */
+export interface PresetCreate {
+  title: string;
+  task_prompt: string;
+  description?: string;
+  category?: string;
+  tags?: string[];
+  suggested_adapter?: string | null;
+  suggested_models?: string[] | null;
+}
+
+/** PATCH /api/presets/{slug} — partial edit; bumps revision. */
+export type PresetUpdate = Partial<PresetCreate>;
+
+/** One run's row inside a preset's analytics. */
+export interface PresetRunPoint {
+  run_id: string;
+  status: string;
+  created_at: string | null;
+  finished_at: string | null;
+  sandbox_count: number;
+  /** Mean of the run's sandbox-level `overall` scores — null unscored. */
+  mean_overall_score: number | null;
+  scored_sandboxes: number;
+}
+
+/** One preset-leaderboard row — mean `overall` pooled over the bucket's
+ * scored cells. `key` = model name (model board) or config key (config
+ * board, e.g. "name:<cfg name>"); `runs` = distinct runs contributing. */
+export interface PresetLeaderboardEntry {
+  key: string;
+  label: string;
+  adapter: string | null;
+  name: string | null;
+  mean_overall_score: number;
+  n: number;
+  runs: number;
+}
+
+/** Score-over-time point for the preset trend chart — oldest first, one
+ * per run with ≥1 scored cell. */
+export interface PresetTrendPoint {
+  run_id: string;
+  created_at: string | null;
+  finished_at: string | null;
+  mean_overall_score: number;
+  scored_sandboxes: number;
+}
+
+/** GET /api/presets/{slug}/analytics — the preset detail page's data in
+ * one shot. */
+export interface PresetAnalytics {
+  preset: TaskPreset;
+  /** Newest-first — every run on the preset. */
+  runs: PresetRunPoint[];
+  by_model: PresetLeaderboardEntry[];
+  by_config: PresetLeaderboardEntry[];
+  /** Pooled mean `overall` over every scored cell (n = count); null
+   * when nothing on the preset has been scored. */
+  mean_overall_score: number | null;
+  n_scored: number;
+  trend: PresetTrendPoint[];
+}
+
+/** Structured 409 detail for preset-slug collisions (confirm-and-rename) —
+ * same contract shape as skillpack imports. */
+export interface PresetNameConflict {
+  kind: "name_conflict";
+  message: string;
+  name: string | null;
+  source: "vendored" | "user" | string | null;
+  suggested_name: string | null;
+}
+
+/** Extract the collision payload from a create-preset 409, if it is one. */
+export function presetConflictOf(err: unknown): PresetNameConflict | null {
+  if (err instanceof ApiError && err.status === 409) {
+    const d = err.rawDetail;
+    if (
+      d !== null &&
+      typeof d === "object" &&
+      (d as { kind?: unknown }).kind === "name_conflict"
+    ) {
+      return d as PresetNameConflict;
+    }
+  }
+  return null;
+}
+
+/** Client-side mirror of api/presets.py slugify — prefills the save-as
+ * slug from a title. */
+export function presetSlugify(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64)
+    .replace(/-+$/g, "");
+}
+
+export function listPresets(): Promise<TaskPreset[]> {
+  return request<TaskPreset[]>("/api/presets");
+}
+
+export function getPresetAnalytics(slug: string): Promise<PresetAnalytics> {
+  return request<PresetAnalytics>(
+    `/api/presets/${encodeURIComponent(slug)}/analytics`,
+  );
+}
+
+/** Save a task prompt as a user preset at `slug` — 409 carries a
+ * structured name_conflict (presetConflictOf) with a suggested_name. */
+export function createPreset(slug: string, body: PresetCreate): Promise<TaskPreset> {
+  return request<TaskPreset>(`/api/presets/${encodeURIComponent(slug)}`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function updatePreset(slug: string, body: PresetUpdate): Promise<TaskPreset> {
+  return request<TaskPreset>(`/api/presets/${encodeURIComponent(slug)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+export function deletePreset(slug: string): Promise<void> {
+  return request<void>(`/api/presets/${encodeURIComponent(slug)}`, {
+    method: "DELETE",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// PR26 — benchmark suites + deterministic checkers
+// ---------------------------------------------------------------------------
+
+/** One declared check on a suite task — `check` is the checker type
+ * (file_exists | grep | py_test | output_grep | exact | contains |
+ * json_schema | numeric_tol), `spec` its declared parameters. */
+export interface SuiteCheck {
+  check: string;
+  spec: Record<string, unknown>;
+}
+
+/** One suite.yaml task — preset_ref XOR prompt; `adapter` pins the task
+ * to harness configs selecting that adapter (null = all configs). */
+export interface SuiteTask {
+  index: number;
+  id: string;
+  preset_ref: string | null;
+  prompt: string | null;
+  adapter: string | null;
+  checks: SuiteCheck[];
+}
+
+/** A suite_runs batch — one fan-out of a suite. */
+export interface SuiteRunRef {
+  id: string;
+  suite_slug: string;
+  suite_version: number | null;
+  created_at: string;
+  run_count: number;
+}
+
+/** GET /api/suites row — vendored suite + browse aggregates. */
+export interface Suite {
+  slug: string;
+  version: number;
+  title: string;
+  description: string;
+  task_count: number;
+  checks_count: number;
+  suite_runs_count: number;
+}
+
+/** GET /api/suites/{slug} — suite + tasks + recent batches. */
+export interface SuiteDetail extends Suite {
+  tasks: SuiteTask[];
+  recent_runs: SuiteRunRef[];
+}
+
+/** POST /api/suites/{slug}/run body — the shared run spec every suite
+ * task fans out with (RunCreate minus the task text). */
+export interface SuiteRunIn {
+  model_name: string;
+  models?: string[] | null;
+  harness_configs: HarnessConfig[];
+  evaluator_model?: string | null;
+  budgets?: Budgets;
+  /** PR27 parity: each task's matrix multiplies by this many trials. */
+  trials?: number;
+}
+
+/** One run created by a suite fan-out. */
+export interface SuiteRunChild {
+  run_id: string;
+  suite_index: number;
+  task_id: string;
+  preset_ref: string | null;
+  status: string;
+}
+
+/** 201 response to POST /api/suites/{slug}/run. */
+export interface SuiteRunOut {
+  id: string;
+  suite_slug: string;
+  suite_version: number | null;
+  runs: SuiteRunChild[];
+  warnings: string[];
+}
+
+/** One deterministic checker outcome (checker_results row). */
+export interface CheckerResult {
+  check: string;
+  spec: Record<string, unknown>;
+  status: string; // pass | fail | skipped | error
+  passed: boolean;
+  detail: string;
+  created_at: string | null;
+}
+
+/** Flat suite roll-up on SandboxResult — the card's "per-case pass/fail +
+ * mean without judge involvement". pass_rate excludes skipped/error;
+ * suite_pass mirrors the suite_pass Score value (0–10). */
+export interface SuiteSummary {
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  errors: number;
+  pass_rate: number | null;
+  suite_pass: number | null;
+}
+
+/** Checker roll-up for one suite cell. */
+export interface SuiteCellChecks {
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  errors: number;
+  pass_rate: number | null;
+  checks: CheckerResult[];
+}
+
+/** One task × cell result — judge overall beside checker roll-up. */
+export interface SuiteCell {
+  sandbox_id: string;
+  name: string | null;
+  label: string;
+  model: string;
+  status: string;
+  terminal_reason: string | null;
+  judge_overall: number | null;
+  checks: SuiteCellChecks;
+}
+
+/** One suite task's run inside a batch. */
+export interface SuiteRunTask {
+  run_id: string;
+  suite_index: number;
+  task_id: string;
+  preset_ref: string | null;
+  status: string;
+  created_at: string | null;
+  finished_at: string | null;
+  cells: SuiteCell[];
+}
+
+/** Batch-level roll-up — pooled checker pass rate + mean judge overall. */
+export interface SuiteRunAggregate {
+  tasks: number;
+  cells: number;
+  checks_total: number;
+  checks_passed: number;
+  checks_failed: number;
+  checks_skipped: number;
+  checks_errors: number;
+  check_pass_rate: number | null;
+  cells_scored: number;
+  mean_judge_overall: number | null;
+}
+
+/** GET /api/suite-runs/{id} — task × cell aggregation + batch roll-up. */
+export interface SuiteRunResults {
+  id: string;
+  suite_slug: string;
+  suite_version: number | null;
+  created_at: string | null;
+  runs: SuiteRunTask[];
+  aggregate: SuiteRunAggregate;
+}
+
+export function listSuites(): Promise<Suite[]> {
+  return request<Suite[]>("/api/suites");
+}
+
+export function getSuite(slug: string): Promise<SuiteDetail> {
+  return request<SuiteDetail>(`/api/suites/${encodeURIComponent(slug)}`);
+}
+
+/** Launch the whole suite — one run per task (201). */
+export function runSuite(slug: string, body: SuiteRunIn): Promise<SuiteRunOut> {
+  return request<SuiteRunOut>(`/api/suites/${encodeURIComponent(slug)}/run`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function getSuiteRun(id: string): Promise<SuiteRunResults> {
+  return request<SuiteRunResults>(`/api/suite-runs/${encodeURIComponent(id)}`);
+}
 // ---------------------------------------------------------------------------
 // prices (PR28 — user-editable glob rate table layered over the static one)
 // ---------------------------------------------------------------------------
