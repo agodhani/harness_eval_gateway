@@ -13,7 +13,6 @@ from __future__ import annotations
 import csv
 import io
 import uuid
-from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
