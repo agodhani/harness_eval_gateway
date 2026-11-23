@@ -1508,6 +1508,47 @@ configurable per cell (e.g. temperature sweeps).
 - **Depends on:** PR21 (unpriced honesty this makes permanent), F3
   (creds/metering), F9 (analytics cost surface).
 
+### F22 — Quality × cost/speed scatter + auto summary (PR33) ✅
+
+- **What:** the analysis page gains a "Quality × cost | wall clock"
+  scatter card (full-width, after the score cards): one dot per
+  config × model matrix cell — the same `buildScoreGrid` fold as the
+  PR31 results grid, so trials mean into their cell. y = mean PR21
+  **weighted** total (never the judge's self-reported `overall`); x =
+  mean per-sandbox estimated cost (PR28 honest prices) or mean
+  wall-clock on the segmented toggle; color + marker shape = model
+  (first-seen order is stable); dot size = mean avg output tok/s
+  (smallest = unmeasured speed). Accent rings + a dashed connector mark
+  the **Pareto frontier** — the cells nothing beats on both axes at
+  once. Under the chart a deterministic **verdict** card (no LLM call)
+  names the best cell with the runner-up delta, the value pick (max
+  quality-per-$ or per-minute over the frontier), and the cheap/fast
+  alternative ("88% cheaper for −4").
+- **Honesty/sparse handling:** cells missing the active axis are
+  EXCLUDED and named in the legend — an unpriced cell never plots at
+  $0 (PR21 rule) — while scored-but-unclocked cells drop only on the
+  wall-clock toggle. Cells with no weighted score never become points;
+  `unscoredCells`/`excluded`/`partialCostCells` counts are disclosed in
+  the legend (a cell priced over only some members still plots, flagged).
+- **Where:** `web/lib/scatterMatrix.ts` — pure transform mirroring
+  `gridMatrix.ts` (`buildScatterPoints` folds `cellExtras` + tok/s
+  means, `axisValue`/`withAxis` resolve x, `paretoFrontier` =
+  non-dominated set x-asc, `buildVerdict` + `verdictLines` = the
+  template, `buildScatterData` bundles it all) +
+  `web/lib/scatterMatrix.test.ts` (hand-computed Pareto oracles, sparse
+  handling, determinism under shuffle); `web/app/runs/[id]/analysis/
+  QualityScatter.tsx` (recharts `ScatterChart` + custom tip/ring) wired
+  into `AnalysisClient.tsx` (shared specMap/dimensionKeys); `.verdict`
+  styles in `web/app/globals.css`.
+- **Verify:** `cd web && node --test lib/scatterMatrix.test.ts` (22
+  tests); manual: analysis page on a scored run → dots per cell, toggle
+  cost↔wall clock changes the frontier + verdict wording
+  (cheaper↔faster, pts/$↔pts/min); a run with an unpriced model lists
+  that cell under "excluded" rather than plotting it at $0.
+- **Depends on:** F16 (PR31 grid fold + weighted totals), F21 (PR28
+  honest prices), F9/F13 (analytics payload + analysis page), PR30
+  speed fields.
+
 ## Implementation sequence
 
 **Phase 0 — foundation (sequential):** F0 scaffold + base schema.

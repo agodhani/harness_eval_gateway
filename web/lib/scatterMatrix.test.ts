@@ -148,20 +148,20 @@ describe("buildScatterPoints", () => {
   });
 
   test("cells without a weighted score produce no point", () => {
-    const scored = sb({ score: 8, model: "m1" });
-    const unscored = sb({ score: null, model: "m1" });
-    const grid = buildScoreGrid(
-      [scored, unscored],
-      ["m1"],
-      DIM_KEYS,
-      SPEC,
-    );
     // different harness_config name → two cells, only one scored.
-    scored.harness_config = { adapter: "miniloop", name: "s" };
-    unscored.harness_config = { adapter: "miniloop", name: "u" };
-    const g2 = buildScoreGrid([scored, unscored], ["m1"], DIM_KEYS, SPEC);
-    assert.equal(grid.cells.length >= 1, true);
-    const pts = buildScatterPoints(g2.cells, undefined);
+    const scored = sb({
+      score: 8,
+      model: "m1",
+      harness_config: { adapter: "miniloop", name: "s" },
+    });
+    const unscored = sb({
+      score: null,
+      model: "m1",
+      harness_config: { adapter: "miniloop", name: "u" },
+    });
+    const grid = buildScoreGrid([scored, unscored], ["m1"], DIM_KEYS, SPEC);
+    assert.equal(grid.cells.length, 2);
+    const pts = buildScatterPoints(grid.cells, undefined);
     assert.equal(pts.length, 1);
     assert.equal(pts[0].rowLabel, "s");
   });
