@@ -72,7 +72,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, or_, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from api.config import get_settings
@@ -2018,18 +2017,14 @@ def create_share_link(run_id: UUID, session: DbSession) -> ShareLinkOut:
     ``secrets.token_urlsafe(16)`` = 128 bits of entropy — the token is the
     only credential the read-only share surface checks.
     """
-    run = _run_or_404(session, run_id)
+    run = session.get(Run, run_id, with_for_update=True)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="run not found"
+        )
     if run.share_token is None:
         run.share_token = secrets.token_urlsafe(16)
-        try:
-            session.commit()
-        except IntegrityError:
-            # A concurrent mint won the ix_runs_share_token race —
-            # converge on its token; the mint contract is idempotent.
-            session.rollback()
-            session.refresh(run)
-            if run.share_token is None:
-                raise
+    session.commit()
     return ShareLinkOut(
         run_id=run.id,
         token=run.share_token,
