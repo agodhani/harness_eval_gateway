@@ -129,6 +129,16 @@ describe("validateDraft", () => {
     assert.match(v.fieldErrors["dim.2"], /weight must be a number/);
   });
 
+  test("flags reserved score-field names", () => {
+    for (const name of ["Overall", "suite_pass", "total"]) {
+      const v = validateDraft({
+        ...BASE,
+        dimensions: [{ ...BASE.dimensions[0], name }],
+      });
+      assert.match(v.fieldErrors["dim.0"], /reserved score field/);
+    }
+  });
+
   test("flags criterion refs that resolve to undeclared dims", () => {
     const v = validateDraft({
       ...BASE,

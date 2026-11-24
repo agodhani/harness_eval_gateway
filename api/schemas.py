@@ -972,7 +972,7 @@ def _validate_suggested_rubric(v: dict[str, Any] | None) -> dict[str, Any] | Non
       (vendored file or user row) resolved as the generation basis.
     - ``{"hint": "<text>"}`` — a domain hint fed into the gen prompt.
     - ``{"dimensions": [...]}`` — an inline rubric fragment used as the
-      basis directly (may also carry summary/criteria keys).
+      basis directly (may also carry summary/title/criteria keys).
 
     Any combination of those keys is accepted; anything else 422s.
     """
@@ -995,6 +995,19 @@ def _validate_suggested_rubric(v: dict[str, Any] | None) -> dict[str, Any] | Non
         not isinstance(v.get("hint"), str) or not v["hint"].strip()
     ):
         raise ValueError("suggested_rubric.hint must be non-empty text")
+    # These strings reach the rubric-gen prompt verbatim (hint as the
+    # domain-hint line, summary/title inside the basis JSON), so they're
+    # capped like the item lists. ``hint`` shares ``RunCreate.rubric_hint``'s
+    # bound; ``title`` shares ``PresetCreate.title``'s.
+    for key, cap in (("hint", 2000), ("summary", 2000), ("title", 255)):
+        if key not in v:
+            continue
+        if not isinstance(v[key], str):
+            raise ValueError(f"suggested_rubric.{key} must be text")
+        if len(v[key]) > cap:
+            raise ValueError(
+                f"suggested_rubric.{key} allows at most {cap} chars"
+            )
     for key in ("dimensions", "criteria"):
         items = v.get(key)
         if items is None:

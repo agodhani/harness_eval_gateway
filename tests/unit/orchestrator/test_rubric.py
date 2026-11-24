@@ -186,6 +186,18 @@ def test_duplicate_dimension_rejected() -> None:
         parse_rubric_json(json.dumps(payload))
 
 
+def test_reserved_dimension_names_rejected() -> None:
+    """A dim named like a reserved score field would masquerade as the
+    ``overall`` headline row, the ``suite_pass`` checker pseudo-row, or a
+    flat-map key (``scores``/``summary``/``total``) the eval parser skips —
+    normalization rejects every casing."""
+    for name in ("overall", "Overall", "suite_pass", "total"):
+        payload = _valid_rubric_payload()
+        payload["dimensions"][0]["name"] = name
+        with pytest.raises(ValidationError, match="reserved score field"):
+            parse_rubric_json(json.dumps(payload))
+
+
 def test_criterion_dimension_normalized() -> None:
     """Criteria bind to dimensions by name — the reference soft-normalizes
     the same way dimension names do (``Accuracy`` → ``accuracy``)."""
