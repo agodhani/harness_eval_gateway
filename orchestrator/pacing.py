@@ -31,14 +31,27 @@ Two mechanisms:
    in the SAME run fast (one probe each): fresh per-config caps would let
    sustained pressure hold the run's single execution slot for N×cap.
 
+3. **Local-provider sandbox cap.** When EVERY participant model on a run
+   resolves to a local provider (``LOCAL_PROVIDERS`` — all of its cells
+   share the one host's model server), concurrently-active sandboxes are
+   capped at ``SANDBOX_MAX_CONCURRENT_LOCAL`` (default 2, 0/unset = off).
+   Cells past the cap are parked as ``Sandbox.status="queued"`` BEFORE
+   ``docker run`` and promote FIFO — oldest ``sandbox_queued`` checkpoint
+   first — when a sibling goes terminal
+   (:func:`claim_queued_sandbox`, driven by the lifecycle's paced
+   watcher). The spawn memory gate still applies at promotion.
+
 Pacing ``checkpoint`` events make the queue visible on the run timeline:
 ``run_queued`` / ``run_dequeued`` at run scope and ``spawn_mem_wait`` /
-``spawn_mem_release`` / ``spawn_mem_timeout`` at sandbox scope.
+``spawn_mem_release`` / ``spawn_mem_timeout`` at sandbox scope — plus
+``sandbox_queued`` / ``sandbox_dequeued`` for the local-run cap.
 """
 
 from __future__ import annotations
 
 import asyncio
+import fnmatch
+import json as _json
 import logging
 import os
 import re
@@ -53,10 +66,11 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from db.models import Event, Run
+from db.models import Event, Run, Sandbox
 
 from . import state_machine
 from .events import emit
+from .matrix import run_models
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +78,16 @@ log = logging.getLogger(__name__)
 ACTIVE_RUN_STATES: tuple[str, ...] = ("provisioning", "running", "evaluating")
 #: Statuses that block a new approval from starting immediately.
 BLOCKING_RUN_STATES: tuple[str, ...] = (*ACTIVE_RUN_STATES, "queued")
+
+#: Sandbox statuses that hold one local-pacing slot — the cell's container
+#: either exists or is being launched/torn down. ``queued`` cells hold no
+#: slot (that IS the queue) and terminal cells have released theirs.
+ACTIVE_SANDBOX_STATES: tuple[str, ...] = ("provisioning", "running", "terminating")
+
+#: Providers that share the one local model server — an all-local run's
+#: cells contend on the same host's Ollama, so their parallelism is
+#: throttled by ``SANDBOX_MAX_CONCURRENT_LOCAL``.
+LOCAL_PROVIDERS: frozenset[str] = frozenset({"ollama"})
 
 #: Cadence for re-emitting ``spawn_mem_wait`` while a spawn stays parked —
 #: often enough that the timeline shows the wait is live, sparse enough to
@@ -432,3 +456,166 @@ async def wait_for_headroom(
                 min_free / (1024 * 1024),
             )
         await asyncio.sleep(poll)
+
+
+# ---------------------------------------------------------------------------
+# local-provider sandbox cap (queue before docker run)
+# ---------------------------------------------------------------------------
+
+
+def _provider_routes(raw: str) -> dict[str, str]:
+    """Best-effort ``PROVIDER_ROUTES`` parse — invalid JSON degrades to
+    ``{}`` (mirror of ``api.modelcheck._provider_routes``, which mirrors
+    ``gateway.config.Settings.provider_routes``)."""
+    try:
+        parsed = _json.loads((raw or "").strip() or "{}")
+    except ValueError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(k): str(v) for k, v in parsed.items()}
+
+
+def provider_for_model(settings: Any, model: str) -> str:
+    """Which provider serves ``model`` — mirror of
+    ``api.modelcheck._provider_for_model`` (itself a mirror of
+    ``gateway.config.Settings.provider_for_model``): ``PROVIDER_ROUTES``
+    globs in declaration order, first match wins; local-name globs (no
+    ``/``) never swallow a ``vendor/model`` id; ``UPSTREAM_PROVIDER`` is
+    the fallback."""
+    lowered = str(model or "").lower()
+    namespaced = "/" in lowered
+    for glob, provider in _provider_routes(
+        getattr(settings, "PROVIDER_ROUTES", "") or ""
+    ).items():
+        pattern = glob.lower()
+        if namespaced and "/" not in pattern:
+            continue
+        if fnmatch.fnmatchcase(lowered, pattern):
+            return provider
+    return getattr(settings, "UPSTREAM_PROVIDER", "ollama") or "ollama"
+
+
+def run_is_local(settings: Any, run: Run) -> bool:
+    """True when EVERY participant model on the run routes to a local
+    provider (``LOCAL_PROVIDERS``). Participants = the run's model list
+    plus any per-config ``model`` pins (``matrix.run_models``) — one
+    remote cell means mixed contention and the cap does not apply."""
+    models = run_models(run.config, run.model_name)
+    return all(
+        provider_for_model(settings, m) in LOCAL_PROVIDERS for m in models
+    ) if models else False
+
+
+def local_sandbox_cap(settings: Any, run: Run) -> int:
+    """The concurrency cap for this run's sandboxes.
+
+    ``SANDBOX_MAX_CONCURRENT_LOCAL`` unset/≤0 disables pacing entirely.
+    Otherwise the cap applies ONLY when the run is all-local — a run
+    hitting hosted providers gets no benefit from throttling local
+    container startup (its cells aren't swapping one model server).
+    """
+    cap = int(getattr(settings, "SANDBOX_MAX_CONCURRENT_LOCAL", 0) or 0)
+    if cap <= 0:
+        return 0
+    return cap if run_is_local(settings, run) else 0
+
+
+def active_sandbox_count(
+    session_factory: sessionmaker[Session], run_id: uuid.UUID
+) -> int:
+    """Cells currently holding a pacing slot (provisioning/running/terminating)."""
+    with session_factory() as session:
+        return int(
+            session.scalar(
+                select(func.count(Sandbox.id)).where(
+                    Sandbox.run_id == run_id,
+                    Sandbox.status.in_(ACTIVE_SANDBOX_STATES),
+                )
+            )
+            or 0
+        )
+
+
+def queued_sandbox_count(
+    session_factory: sessionmaker[Session], run_id: uuid.UUID
+) -> int:
+    """Cells parked pre-``docker run`` on the local cap."""
+    with session_factory() as session:
+        return int(
+            session.scalar(
+                select(func.count(Sandbox.id)).where(
+                    Sandbox.run_id == run_id, Sandbox.status == "queued"
+                )
+            )
+            or 0
+        )
+
+
+def _oldest_queued_sandbox(
+    session: Session, run_id: uuid.UUID
+) -> tuple[Sandbox, datetime | None] | None:
+    """The first-parked queued cell: FIFO order = insertion order of its
+    ``sandbox_queued`` checkpoint (Event.id is monotonic per insert)."""
+    row = session.execute(
+        select(Sandbox, Event.ts)
+        .join(Event, Event.sandbox_id == Sandbox.id)
+        .where(
+            Sandbox.run_id == run_id,
+            Sandbox.status == "queued",
+            Event.type == "checkpoint",
+            Event.payload["stage"].as_string() == "sandbox_queued",
+        )
+        .order_by(Event.id)
+        .limit(1)
+    ).first()
+    return (row[0], row[1]) if row else None
+
+
+def claim_queued_sandbox(
+    session_factory: sessionmaker[Session],
+    run_id: uuid.UUID,
+    *,
+    cap: int,
+) -> uuid.UUID | None:
+    """Promote the oldest queued sandbox when a pacing slot is free.
+
+    The slot check and the ``queued → provisioning`` transition happen in
+    one committed session — the status flip IS the claim, so duplicate
+    calls can't promote the same cell. Returns the promoted sandbox id —
+    the caller then launches it (``provision.spawn_queued``, mem gate
+    included) and starts its monitor — ``None`` when the cap is still
+    full or the queue is empty.
+    """
+    with session_factory() as session:
+        active = session.scalar(
+            select(func.count(Sandbox.id)).where(
+                Sandbox.run_id == run_id,
+                Sandbox.status.in_(ACTIVE_SANDBOX_STATES),
+            )
+        )
+        if int(active or 0) >= cap:
+            return None
+        row = _oldest_queued_sandbox(session, run_id)
+        if row is None:
+            return None
+        sb, queued_ts = row
+        sid = sb.id
+        queued_seconds = None
+        ts = _aware(queued_ts)
+        if ts is not None:
+            queued_seconds = max(0.0, (_now() - ts).total_seconds())
+        state_machine.transition(session, sb, "provisioning")
+        emit(
+            session,
+            run_id=run_id,
+            sandbox_id=sid,
+            event_type="checkpoint",
+            payload={
+                "stage": "sandbox_dequeued",
+                "queued_seconds": queued_seconds,
+                "cap": cap,
+            },
+        )
+        session.commit()
+        return sid

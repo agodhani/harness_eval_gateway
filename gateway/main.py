@@ -159,6 +159,15 @@ def _sandbox_tokens_used(run_uuid: uuid.UUID, sandbox_uuid: uuid.UUID) -> int:
         return metering.tokens_used(session, run_uuid, sandbox_id=sandbox_uuid)
 
 
+def _budget_state(run_uuid: uuid.UUID, sandbox_uuid: uuid.UUID) -> dict[str, Any]:
+    """F30 budget-resilience state for one sandbox — summed ``extend_budget``
+    grants + already-emitted ``budget_warning`` limit kinds. Read fresh per
+    request so a control-plane extension takes effect on the NEXT call
+    without restarting the cell."""
+    with get_session_factory()() as session:
+        return metering.budget_state(session, run_uuid, sandbox_uuid)
+
+
 # Body params only Ollama understands — harnesses tuned for Ollama (miniloop's
 # `think`/`num_ctx`) emit them; hosted providers may 400 on unknown fields.
 _OLLAMA_ONLY_KEYS = ("num_ctx", "keep_alive", "think", "options")
@@ -675,9 +684,23 @@ async def _budget_gate(
     run_uuid = metering.uuid_or_none(claims.run_id)
     if run_uuid is None:
         return None
+    sandbox_uuid = metering.uuid_or_none(claims.sandbox_id)
+    # F30: extension store — ``budget_extended`` checkpoints sum onto BOTH
+    # ceilings this cred passes through, so POST .../extend_budget (or an
+    # auto_extend bump) widens the live gate without a restart.
+    bstate: dict[str, Any] = (
+        await asyncio.to_thread(_budget_state, run_uuid, sandbox_uuid)
+        if sandbox_uuid is not None
+        else {
+            "added_tokens": 0,
+            "added_cost_usd": 0.0,
+            "extensions": 0,
+            "warned": set(),
+        }
+    )
     used = await asyncio.to_thread(_tokens_used, run_uuid)
     estimate = metering.max_tokens_estimate(body)
-    limit = metering.token_budget(claims, settings)
+    limit = metering.token_budget(claims, settings) + int(bstate["added_tokens"])
     if used + estimate > limit:
         await metering.emit_error(
             claims,
@@ -709,12 +732,52 @@ async def _budget_gate(
             },
         )
 
+    # F30 headroom warning — once per (sandbox, limit kind) when recorded
+    # spend crosses ~80% of the effective cap. Checkpoint → the cell's
+    # timeline; the monitor can also auto_extend off it.
+    if (
+        sandbox_uuid is not None
+        and used >= metering.BUDGET_WARN_FRACTION * limit
+        and "run_tokens" not in bstate["warned"]
+    ):
+        await metering.emit_event(
+            claims,
+            source="gateway",
+            event_type="checkpoint",
+            payload={
+                "stage": "budget_warning",
+                "limit": "run_tokens",
+                "used_tokens": used,
+                "budget": limit,
+                "pct": round(used / limit, 3),
+                "remaining_tokens": limit - used,
+            },
+        )
+        bstate["warned"].add("run_tokens")
+
     sandbox_limit = metering.sandbox_token_budget(claims)
-    sandbox_uuid = metering.uuid_or_none(claims.sandbox_id)
     if sandbox_limit is None or sandbox_uuid is None:
         return None
+    sandbox_limit += int(bstate["added_tokens"])
     sb_used = await asyncio.to_thread(_sandbox_tokens_used, run_uuid, sandbox_uuid)
     if sb_used + estimate <= sandbox_limit:
+        if (
+            sb_used >= metering.BUDGET_WARN_FRACTION * sandbox_limit
+            and "sandbox_tokens" not in bstate["warned"]
+        ):
+            await metering.emit_event(
+                claims,
+                source="gateway",
+                event_type="checkpoint",
+                payload={
+                    "stage": "budget_warning",
+                    "limit": "sandbox_tokens",
+                    "used_tokens": sb_used,
+                    "budget": sandbox_limit,
+                    "pct": round(sb_used / sandbox_limit, 3),
+                    "remaining_tokens": sandbox_limit - sb_used,
+                },
+            )
         return None
     await metering.emit_error(
         claims,

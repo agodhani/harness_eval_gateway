@@ -139,6 +139,13 @@ class Settings(BaseSettings):
     # to a single probe, so sustained pressure can't hang a run for N×cap.
     SPAWN_MEM_POLL_SECONDS: float = 5.0
     SPAWN_MEM_WAIT_SECONDS: float = 3600.0
+    # Local-run sandbox cap: when EVERY participant model on a run resolves
+    # to a local provider (ollama), at most this many cells' containers are
+    # active at once — extra cells park as Sandbox.status="queued" before
+    # `docker run` and promote FIFO when siblings go terminal. 2 default:
+    # a small local model can't honestly serve N parallel agents anyway,
+    # and 2 keeps host RAM+contention sane. 0 disables.
+    SANDBOX_MAX_CONCURRENT_LOCAL: int = 2
 
     # --- Artifact preview (F12) ---
     # Static-preview container image (`python -m http.server`); shares the

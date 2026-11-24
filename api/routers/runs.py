@@ -33,6 +33,7 @@ from api.schemas import (
     RunDeleteOut,
     RunOut,
     RunSummary,
+    SandboxBudgetOut,
     SandboxOut,
 )
 from db.models import (
@@ -44,6 +45,7 @@ from db.models import (
     Sandbox,
     Score,
 )
+from gateway import metering
 from orchestrator import adapters as orch_adapters
 from orchestrator import events as orch_events
 from orchestrator import pacing, provision, runner, state_machine
@@ -111,10 +113,69 @@ def _queue_positions(session: Session) -> dict[uuid.UUID, int]:
     return {run_id: i + 1 for i, run_id in enumerate(rows)}
 
 
+def _sandbox_budget_map(
+    session: Session, run: Run, sandboxes: list[Sandbox]
+) -> dict[uuid.UUID, SandboxBudgetOut]:
+    """F30 — live per-cell budget summaries for the run detail payload.
+
+    Two grouped queries (usage + budget-state events) cover every cell —
+    no per-row fanout, so a 32-sandbox run stays cheap. ``None`` keys in
+    ``usage_by_sandbox`` are sandbox-less traffic (service/eval creds);
+    they still count toward the shared run ceiling, so they fold into
+    ``run_total``.
+    """
+    budgets = provision.budgets_for(run)
+    token_budget = budgets.get("token_budget")
+    sb_cap = budgets.get("sandbox_token_budget")
+    max_cost = budgets.get("max_cost_usd")
+    if not token_budget:
+        return {}
+    usage = metering.usage_by_sandbox(session, run.id)
+    states = metering.budget_states(session, run.id)
+    run_total = sum(usage.values())
+    out: dict[uuid.UUID, SandboxBudgetOut] = {}
+    for s in sandboxes:
+        st = states.get(s.id) or {
+            "added_tokens": 0,
+            "added_cost_usd": 0.0,
+            "warned": set(),
+        }
+        ext_tok = int(st["added_tokens"])
+        ext_cost = float(st["added_cost_usd"])
+        if sb_cap:
+            used = int(usage.get(s.id, 0))
+            limit = int(sb_cap) + ext_tok
+            scope = "sandbox"
+        else:
+            used = run_total
+            limit = int(token_budget) + ext_tok
+            scope = "run"
+        pct = used / limit if limit else 0.0
+        out[s.id] = SandboxBudgetOut(
+            used_tokens=used,
+            limit_tokens=limit,
+            scope=scope,
+            pct=round(pct, 3),
+            warning=bool(st["warned"])
+            or pct >= metering.BUDGET_WARN_FRACTION,
+            extended_tokens=ext_tok,
+            extended_cost_usd=ext_cost,
+            limit_cost_usd=(float(max_cost) + ext_cost) if max_cost else None,
+        )
+    return out
+
+
 def _run_out(
     session: Session, run: Run, *, warnings: list[str] | None = None
 ) -> RunOut:
     rubric = _latest_rubric(session, run.id)
+    sandboxes = _run_sandboxes(session, run.id)
+    budget_map = _sandbox_budget_map(session, run, sandboxes)
+    sandbox_outs: list[SandboxOut] = []
+    for s in sandboxes:
+        s_out = SandboxOut.model_validate(s)
+        s_out.budget = budget_map.get(s.id)
+        sandbox_outs.append(s_out)
     return RunOut(
         id=run.id,
         status=run.status,
@@ -130,6 +191,10 @@ def _run_out(
         queue_position=(
             _queue_positions(session).get(run.id) if run.status == "queued" else None
         ),
+        # F30: the local-provider container cap in effect — the UI uses it
+        # to label queued cells ("local pacing · max N").
+        sandbox_pacing_cap=pacing.local_sandbox_cap(get_settings(), run)
+        or None,
         warnings=list(warnings or []),
         preset_ref=run.preset_ref,
         preset_revision=run.preset_revision,
@@ -137,7 +202,7 @@ def _run_out(
         suite_index=run.suite_index,
         suite_run_id=run.suite_run_id,
         share_url=f"/share/{run.share_token}" if run.share_token else None,
-        sandboxes=[SandboxOut.model_validate(s) for s in _run_sandboxes(session, run.id)],
+        sandboxes=sandbox_outs,
         rubric=RubricOut.model_validate(rubric) if rubric else None,
     )
 

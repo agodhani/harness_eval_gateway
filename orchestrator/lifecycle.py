@@ -697,6 +697,81 @@ async def _evaluate_all(
 
 
 # ---------------------------------------------------------------------------
+# local-run pacing — capped watcher + FIFO promotion
+# ---------------------------------------------------------------------------
+
+
+async def _watch_cells_paced(
+    *,
+    session_factory: sessionmaker[Session],
+    runtime: SandboxRuntime,
+    settings: Any,
+    run: Run,
+    budgets: dict[str, Any],
+    seed: Any,
+    cap: int,
+    running_ids: list[uuid.UUID],
+) -> None:
+    """Monitor spawned cells and promote queued ones as slots free.
+
+    Task-set pacing: each task owns one cell — either ``watch_sandbox``
+    on an already-running sandbox or ``spawn_queued`` + ``watch_sandbox``
+    for a claimed cell. A task completes only after its cell is terminal
+    (or its launch failed), so a completion frees one pacing slot and the
+    oldest queued cell claims it via ``claim_queued_sandbox``. The claim
+    runs synchronously on the loop thread between ``asyncio.wait``s, so
+    FIFO order is deterministic (oldest ``sandbox_queued`` event first).
+    """
+
+    async def _launch_then_watch(sid: uuid.UUID) -> None:
+        spawned = await provision.spawn_queued(
+            session_factory=session_factory,
+            runtime=runtime,
+            run=run,
+            budgets=budgets,
+            sandbox_id=sid,
+            settings=settings,
+            seed=seed,
+        )
+        if spawned is not None:
+            await monitor.watch_sandbox(
+                session_factory=session_factory,
+                runtime=runtime,
+                settings=settings,
+                run_id=run.id,
+                sandbox_id=sid,
+                budgets=budgets,
+            )
+
+    watch: set[asyncio.Task[None]] = {
+        asyncio.create_task(
+            monitor.watch_sandbox(
+                session_factory=session_factory,
+                runtime=runtime,
+                settings=settings,
+                run_id=run.id,
+                sandbox_id=sid,
+                budgets=budgets,
+            )
+        )
+        for sid in running_ids
+    }
+    while True:
+        # Fill freed slots FIFO — each claim flips queued→provisioning
+        # (holding the slot) before its launch task starts.
+        while len(watch) < cap:
+            sid = pacing.claim_queued_sandbox(session_factory, run.id, cap=cap)
+            if sid is None:
+                break
+            watch.add(asyncio.create_task(_launch_then_watch(sid)))
+        if not watch:
+            return
+        _done, watch = await asyncio.wait(
+            watch, return_when=asyncio.FIRST_COMPLETED
+        )
+
+
+# ---------------------------------------------------------------------------
 # main entry
 # ---------------------------------------------------------------------------
 
@@ -793,14 +868,28 @@ async def _run_lifecycle(
             )
             return
 
+    # Local-run pacing: an all-local run caps CONCURRENTLY-ACTIVE sandboxes
+    # (SANDBOX_MAX_CONCURRENT_LOCAL, 0 = off). Cells past the cap park as
+    # status="queued" BEFORE docker run and promote FIFO when siblings go
+    # terminal — the paced watcher in step 2 drives the claims.
+    cap = pacing.local_sandbox_cap(settings, run)
     for hc in configs:
         if prompt_cell.is_prompt_config(hc):
+            # Prompt cells hold no pacing slot: they never spawn a
+            # container and finish inline before the monitor exists.
             await prompt_cell.run_prompt_cell(
                 session_factory=session_factory,
                 runtime=runtime,
                 run_id=run_id,
                 harness_config=hc,
                 settings=settings,
+            )
+        elif cap and pacing.active_sandbox_count(session_factory, run_id) >= cap:
+            provision.queue_sandbox(
+                session_factory,
+                run_id,
+                hc,
+                cap=cap,
             )
         else:
             await provision.spawn_one(
@@ -814,7 +903,8 @@ async def _run_lifecycle(
 
     running_ids = _running_sandbox_ids(session_factory, run_id)
     artifact_sandboxes = _sandboxes_with_artifacts(session_factory, run_id)
-    if not running_ids and not artifact_sandboxes:
+    queued_count = pacing.queued_sandbox_count(session_factory, run_id) if cap else 0
+    if not running_ids and not artifact_sandboxes and not queued_count:
         _set_run_status(
             session_factory,
             run_id,
@@ -840,21 +930,39 @@ async def _run_lifecycle(
     }
     if prompt_done:
         event_payload["prompt_cells"] = prompt_done
+    if queued_count:
+        event_payload["queued"] = queued_count
+        event_payload["sandbox_cap"] = cap
     _set_run_status(session_factory, run_id, "running", event_payload=event_payload)
     budgets = provision.budgets_for(run)
-    await asyncio.gather(
-        *(
-            monitor.watch_sandbox(
-                session_factory=session_factory,
-                runtime=runtime,
-                settings=settings,
-                run_id=run_id,
-                sandbox_id=sid,
-                budgets=budgets,
-            )
-            for sid in running_ids
+    if cap:
+        # Paced watcher: monitors run for spawned cells; each terminal
+        # sibling frees a pacing slot and the oldest queued cell claims it
+        # (provision.launch + monitor) until the queue drains.
+        await _watch_cells_paced(
+            session_factory=session_factory,
+            runtime=runtime,
+            settings=settings,
+            run=run,
+            budgets=budgets,
+            seed=seed,
+            cap=cap,
+            running_ids=running_ids,
         )
-    )
+    else:
+        await asyncio.gather(
+            *(
+                monitor.watch_sandbox(
+                    session_factory=session_factory,
+                    runtime=runtime,
+                    settings=settings,
+                    run_id=run_id,
+                    sandbox_id=sid,
+                    budgets=budgets,
+                )
+                for sid in running_ids
+            )
+        )
 
     # 3) evaluating.
     _set_run_status(
