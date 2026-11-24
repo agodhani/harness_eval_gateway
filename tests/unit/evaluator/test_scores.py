@@ -166,8 +166,10 @@ def test_parse_overall_synthesized_when_missing() -> None:
     parsed = parse_scores_json(json.dumps(payload))
     assert parsed.overall == 6.0
     assert parsed.warnings == [
-        "overall missing — computed from dimension scores "
-        "(scale-normalized to 0-10)"
+        (
+            "overall missing — computed from dimension scores "
+            "(scale-normalized to 0-10)"
+        )
     ]
 
 

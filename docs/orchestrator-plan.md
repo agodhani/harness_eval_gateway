@@ -10,7 +10,11 @@ them. Everything below maps to existing code.
 > check live in `api/schemas.py` / `orchestrator/matrix.py` (see
 > `FEATURE_MAP.md` F16). PR22 adds optional `RunCreate.preset_ref` and the
 > `/api/presets*` surface + `GET /api/runs?preset=` filter — see
-> `FEATURE_MAP.md` F18.
+> `FEATURE_MAP.md` F18. PR23 supersedes §2's validator and prompt sketch:
+> `RubricContent.dimensions` accepts 1–12 arbitrary normalized names (the
+> canonical four are now the code-task default + soft alias-fold targets,
+> not a requirement), and generation steers via `RunCreate.rubric_template`
+> /`rubric_hint` — see `FEATURE_MAP.md` F26.
 
 ## 0. Facts that constrain the design (verified in Phase-1 code)
 

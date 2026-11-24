@@ -1895,7 +1895,8 @@ rigged before it starts.
   `rubric_templates` DB rows for user-authored ones.
   `GET /api/rubric-templates` lists `{name, description, content,
   source}`; `GET /api/rubric-templates/{name}` gets one (vendored seeds
-  are validated through `RubricContent` at startup-access time).
+  re-validate through `RubricContent` on every read — a contract test
+  pins the committed files).
 - **Preset `suggested_rubric`:** `task_presets.suggested_rubric`
   (nullable JSONB) + vendored frontmatter — `{template: name}` |
   `{hint: text}` | inline `{dimensions: [...]}`. User presets PATCH it;
@@ -1941,7 +1942,11 @@ rigged before it starts.
   `rubric_template`/`rubric_hint` so resubmits regenerate the same
   basis.
 - **Where:** `orchestrator/rubric.py`, `evaluator/prompts.py`,
-  `evaluator/judge_direct.py`, `rubric_templates/`,
+  `evaluator/judge_direct.py`, `evaluator/scores.py` (judge-output
+  fold/reserved-name drop + scale-normalized synthesized `overall`),
+  `scoring/checkers.py` (single-sourced `RESERVED_DIMENSION_NAMES` +
+  `DIMENSION_ALIASES`/`fold_dimension_name` shared by authoring and
+  eval), `rubric_templates/`,
   `api/rubric_templates.py`, `api/routers/rubric_templates.py`,
   `api/config.py` (`RUBRIC_TEMPLATES_DIR`), `api/presets.py`,
   `api/routers/{presets,runs}.py`, `api/schemas.py`,

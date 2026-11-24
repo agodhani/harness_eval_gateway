@@ -989,7 +989,7 @@ def _validate_suggested_rubric(v: dict[str, Any] | None) -> dict[str, Any] | Non
     if v is None:
         return None
     if not isinstance(v, dict):
-        raise ValueError(
+        raise ValueError(  # noqa: TRY004 — ValueError maps to a 422 in a pydantic validator
             "suggested_rubric must be an object — "
             '{"template": name}, {"hint": text}, or {"dimensions": [...]}'
         )
@@ -1013,7 +1013,9 @@ def _validate_suggested_rubric(v: dict[str, Any] | None) -> dict[str, Any] | Non
         if key not in v:
             continue
         if not isinstance(v[key], str):
-            raise ValueError(f"suggested_rubric.{key} must be text")
+            raise ValueError(  # noqa: TRY004 — ValueError maps to a 422
+                f"suggested_rubric.{key} must be text"
+            )
         if len(v[key]) > cap:
             raise ValueError(
                 f"suggested_rubric.{key} allows at most {cap} chars"
@@ -1023,7 +1025,9 @@ def _validate_suggested_rubric(v: dict[str, Any] | None) -> dict[str, Any] | Non
         if items is None:
             continue
         if not isinstance(items, list):
-            raise ValueError(f"suggested_rubric.{key} must be a list")
+            raise ValueError(  # noqa: TRY004 — ValueError maps to a 422
+                f"suggested_rubric.{key} must be a list"
+            )
         if len(items) > 24:
             raise ValueError(
                 f"suggested_rubric.{key} allows at most 24 items"
