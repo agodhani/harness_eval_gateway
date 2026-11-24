@@ -10,6 +10,7 @@ from __future__ import annotations
 from orchestrator.matrix import (
     cell_key,
     expanded_configs,
+    judge_models,
     participant_models,
     run_models,
     sandbox_model,
@@ -247,3 +248,41 @@ def test_cell_key_groups_trials_of_one_cell() -> None:
     # different cells differ
     assert cell_key({**base, "model": "m2"}) != t1
     assert cell_key({**base, "adapter": "b"}) != t1
+
+
+# ---------------------------------------------------------------------------
+# judge_models — stored-config judge panel (PR29)
+# ---------------------------------------------------------------------------
+
+
+def test_judge_models_panel_round_trip() -> None:
+    cfg = {"evaluator_model": "judge-a",
+           "evaluator_models": ["judge-a", "judge-b", "judge-c"]}
+    assert judge_models(cfg, "participant") == ["judge-a", "judge-b", "judge-c"]
+
+
+def test_judge_models_no_panel_single_evaluator() -> None:
+    assert judge_models({"evaluator_model": "judge-a"}, "m") == ["judge-a"]
+    # config.evaluator_model blank/None → the run's primary model judges
+    # (the same default chain the evaluator resolves)
+    assert judge_models({"evaluator_model": "  "}, "m") == ["m"]
+    assert judge_models({}, "m") == ["m"]
+    assert judge_models(None, "m") == ["m"]
+
+
+def test_judge_models_panel_defensive_dedupe() -> None:
+    """A hand-edited config can't repeat a judge — stored configs bypass
+    the submit-side normalization that normally guarantees uniqueness."""
+    cfg = {"evaluator_models": ["judge-a", "judge-b", "judge-a", " "]}
+    assert judge_models(cfg, "m") == ["judge-a", "judge-b"]
+
+
+def test_judge_models_empty_panel_falls_back() -> None:
+    """evaluator_models present but all blank/non-str → single-judge
+    fallback, never an empty panel."""
+    assert judge_models({"evaluator_models": []}, "m") == ["m"]
+    assert judge_models(
+        {"evaluator_models": [" ", None], "evaluator_model": "j"}, "m"
+    ) == ["j"]
+    # non-list panel key is ignored entirely
+    assert judge_models({"evaluator_models": "judge-a"}, "m") == ["m"]

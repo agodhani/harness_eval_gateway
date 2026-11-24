@@ -251,3 +251,38 @@ async def test_multi_provider_routes_fetch_each_catalog(monkeypatch) -> None:
     warnings = await modelcheck.validate_run_models(body, settings=settings)
     assert sorted(fetched) == ["ollama", "openrouter"]
     assert any("openrouter" in w for w in warnings)
+
+
+async def test_no_tools_panel_judge_422s_with_panel_label(monkeypatch) -> None:
+    """PR29 — every panel judge runs its own miniloop eval sandbox: a
+    no-tools model ANYWHERE in evaluator_models is a hard 422, labelled
+    by its panel slot so the user knows which judge to swap."""
+    _patch_fetch(
+        monkeypatch,
+        {
+            "qwen3:8b": frozenset({"tools"}),
+            "judge-a": frozenset({"tools"}),
+            "weak-judge": frozenset({"completion"}),
+        },
+    )
+    body = _body(
+        evaluator_model="judge-a",
+        evaluator_models=["judge-b", "weak-judge"],
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        await modelcheck.validate_run_models(body, settings=_settings())
+    assert excinfo.value.status_code == 422
+    assert "evaluator_models[2] 'weak-judge'" in excinfo.value.detail
+
+
+async def test_panel_judges_all_presence_checked(monkeypatch) -> None:
+    """Absent-panel-member warnings name the panel slot, not just the
+    generic evaluator_model label."""
+    _patch_fetch(monkeypatch, {"qwen3:8b": frozenset({"tools"})})
+    body = _body(evaluator_models=["ghost-b", "ghost-c"])
+    warnings = await modelcheck.validate_run_models(body, settings=_settings())
+    # schema normalization folds evaluator_model in as panel head, so the
+    # list entries check under their panel slots [1]/[2]
+    assert any("evaluator_models[1] 'ghost-b'" in w for w in warnings)
+    assert any("evaluator_models[2] 'ghost-c'" in w for w in warnings)
+    assert any("evaluator_model 'eval-model'" in w for w in warnings)

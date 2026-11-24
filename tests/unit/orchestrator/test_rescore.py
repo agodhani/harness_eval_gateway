@@ -985,3 +985,55 @@ async def test_rescore_promotes_even_when_pass_raises(
 
     assert calls == [queued.id]
     assert _run(session_factory, queued.id).status == "done"
+
+
+# ---------------------------------------------------------------------------
+# PR29 — judge panel
+# ---------------------------------------------------------------------------
+
+
+async def test_rescore_default_reruns_panel(
+    session_factory, settings, artifact_root
+) -> None:
+    """A plain rescore (no model override) re-judges with the FULL panel —
+    every judge re-scores the artifact, not just the primary."""
+    cfg = run_config()
+    cfg["evaluator_models"] = ["judge-a", "judge-b"]
+    run = make_run(session_factory, status="done", config=cfg)
+    _rubric(session_factory, run.id, version=1)
+    _artifact_sandbox(session_factory, artifact_root, run.id)
+
+    calls: list = []
+    await rescore_run(
+        run.id,
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+
+    assert [c["model"] for c in calls] == ["judge-a", "judge-b"]
+
+
+async def test_rescore_model_override_single_judge(
+    session_factory, settings, artifact_root
+) -> None:
+    """model= override on a panel run re-judges with THAT judge only — the
+    panel is the default, not a floor on every rescore."""
+    cfg = run_config()
+    cfg["evaluator_models"] = ["judge-a", "judge-b"]
+    run = make_run(session_factory, status="done", config=cfg)
+    _rubric(session_factory, run.id, version=1)
+    _artifact_sandbox(session_factory, artifact_root, run.id)
+
+    calls: list = []
+    await rescore_run(
+        run.id,
+        session_factory=session_factory,
+        runtime=FakeRuntime(artifact_root=artifact_root),
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+        model="other-judge",
+    )
+
+    assert [c["model"] for c in calls] == ["other-judge"]

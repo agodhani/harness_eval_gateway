@@ -920,3 +920,130 @@ async def test_lifecycle_prompt_only_run_skips_seed(
     assert len(requests) == 1
     with session_factory() as s:
         assert s.get(type(run), run.id).status == "done"
+
+
+# ---------------------------------------------------------------------------
+# PR29 — judge panel
+# ---------------------------------------------------------------------------
+
+
+async def test_lifecycle_judge_panel_scores_every_artifact(
+    session_factory, settings, artifact_root, monkeypatch
+) -> None:
+    """PR29 — config.evaluator_models = [j1, j2]: every judge evaluates
+    every artifact on its own eval cred, tagged by model."""
+    cfg = run_config()
+    cfg["evaluator_models"] = ["judge-a", "judge-b"]
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+    settings.EVAL_SCORE_RETRIES = 0
+
+    fake = FakeRuntime(artifact_root=artifact_root, default_logs=RESULT_DONE)
+    calls: list = []
+    evaluator = _score_writing_evaluator(calls)
+
+    # mint_cred is re-entered per judge — its token payload has no judge
+    # claim (run+sandbox+iat+exp+max_tokens only), so two mints in the same
+    # second are byte-identical. "Own cred per judge" = a FRESH MINT inside
+    # the judge loop (TTL + budget restart for every judge), which this
+    # call count asserts.
+    mints: list = []
+    import orchestrator.lifecycle as lc
+
+    orig_mint = lc.mint_cred
+
+    def recording_mint(**kwargs):
+        mints.append(kwargs)
+        return orig_mint(**kwargs)
+
+    monkeypatch.setattr(lc, "mint_cred", recording_mint)
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=evaluator,
+    )
+
+    # 1 sandbox × 2 judges — panel order preserved, one fresh mint each
+    assert [c["model"] for c in calls] == ["judge-a", "judge-b"]
+    assert len(mints) == 2
+    with session_factory() as s:
+        assert s.get(type(run), run.id).status == "done"
+        rows = s.execute(select(Score)).scalars().all()
+        assert len(rows) == 2 * len(DIMS)
+
+
+async def test_lifecycle_judge_panel_failure_isolation(
+    session_factory, settings, artifact_root
+) -> None:
+    """Judge A's hard failure can't zero judge B's scores or skip its pass —
+    the per-judge eval_failed marker names the failed judge."""
+    cfg = run_config()
+    cfg["evaluator_models"] = ["judge-a", "judge-b"]
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+    settings.EVAL_SCORE_RETRIES = 0
+
+    fake = FakeRuntime(artifact_root=artifact_root, default_logs=RESULT_DONE)
+    calls: list = []
+
+    async def judge_b_only(**kwargs):
+        calls.append(kwargs)
+        if kwargs["model"] == "judge-a":
+            raise RuntimeError("judge-a exploded")
+        with kwargs["session_factory"]() as s:
+            s.add(
+                Score(
+                    sandbox_id=kwargs["sandbox_id"],
+                    rubric_id=kwargs["rubric_id"],
+                    dimension="d",
+                    score=8.0,
+                    rationale="ok",
+                    judge_model="judge-b",
+                )
+            )
+            s.commit()
+        return []
+
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=judge_b_only,
+    )
+
+    assert [c["model"] for c in calls] == ["judge-a", "judge-b"]
+    with session_factory() as s:
+        # judge-b's scores still landed → run completes done
+        assert s.get(type(run), run.id).status == "done"
+        evs = s.execute(select(Event).where(Event.run_id == run.id)).scalars().all()
+        failed = [
+            e for e in evs
+            if e.type == "error" and e.payload.get("phase") == "eval_failed"
+        ]
+        assert len(failed) == 1
+        assert failed[0].payload["judge_model"] == "judge-a"
+
+
+async def test_lifecycle_no_panel_single_judge_compat(
+    session_factory, settings, artifact_root
+) -> None:
+    """No evaluator_models → the single evaluator_model judges once —
+    the pre-PR29 shape end to end."""
+    cfg = run_config()
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+    settings.EVAL_SCORE_RETRIES = 0
+
+    fake = FakeRuntime(artifact_root=artifact_root, default_logs=RESULT_DONE)
+    calls: list = []
+    await run_lifecycle(
+        run.id,
+        session_factory=session_factory,
+        runtime=fake,
+        settings=settings,
+        evaluator_fn=_score_writing_evaluator(calls),
+    )
+    assert [c["model"] for c in calls] == ["eval-model"]
