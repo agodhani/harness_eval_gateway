@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from scoring.checkers import SUITE_PASS_DIMENSION
+
 #: Filename the eval agent must write at the workspace root.
 SCORES_FILENAME = "scores.json"
 
@@ -293,6 +295,14 @@ def _synthesized_overall(
 #: different scale than the per-dimension 0-10 scores.
 _FLAT_MAP_SKIP_KEYS = frozenset({"scores", "overall", "summary", "total"})
 
+#: Folded names a judge-emitted entry can never persist under — the
+#: eval-side mirror of the rubric author's ``RESERVED_DIMENSION_NAMES``
+#: (orchestrator/rubric.py): ``overall``/``suite_pass`` are pseudo-rows the
+#: pipeline itself writes, ``scores``/``summary``/``total`` are document
+#: fields. A judge entry under one of these would masquerade as the
+#: headline or checker row, or land as a phantom dimension column.
+_RESERVED_SCORE_NAMES = _FLAT_MAP_SKIP_KEYS | {SUITE_PASS_DIMENSION}
+
 
 def _flat_scores_entries(obj: dict[str, Any]) -> list[dict[str, Any]]:
     """Normalize a flat ``{dimension: number}`` mapping into entry dicts.
@@ -353,12 +363,22 @@ def parse_scores_json(
                 f"scores[{i}] has no usable 'dimension' — dropped"
             )
             continue
+        folded = _fold_dimension_name(dim)
+        if folded in _RESERVED_SCORE_NAMES:
+            parsed.warnings.append(
+                f"scores[{i}] ({dim!r}) names a reserved score field — dropped"
+            )
+            continue
         score = _as_float(item.get("score"))
         if score is None:
             parsed.warnings.append(
                 f"scores[{i}] ({dim!r}) has non-numeric 'score' — dropped"
             )
             continue
+        if dimension_scales and folded in dimension_scales:
+            # Variant spellings of a declared dimension persist under the
+            # declared (already-normalized) name, not the judge's casing.
+            dim = folded
         rationale = item.get("rationale")
         if not isinstance(rationale, str):
             rationale = ""

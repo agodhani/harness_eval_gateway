@@ -703,6 +703,23 @@ def test_create_and_patch_suggested_rubric(api) -> None:
     assert resp.json()["suggested_rubric"] is None
 
 
+def test_suggested_rubric_basis_serialized_size_cap(api) -> None:
+    """Item values inside the inline basis are bounded too — the fragment
+    is carried verbatim into ``config.rubric_basis`` and JSON-dumped into
+    the rubric-gen prompt, so oversized content 422s at the boundary."""
+    resp = api.client.post(
+        "/api/presets/huge-basis",
+        json={
+            "title": "Huge",
+            "task_prompt": "x",
+            "suggested_rubric": {
+                "dimensions": [{"name": "d", "description": "y" * 40_000}]
+            },
+        },
+    )
+    assert resp.status_code == 422
+
+
 def test_submit_preset_suggested_rubric_fills_template(api, presets_dir: Path) -> None:
     """A preset's ``suggested_rubric`` supplies the run's rubric_template
     ONLY when the submit didn't name one — explicit always wins."""

@@ -6,6 +6,7 @@ docs). Run-spec schemas (F1) and results schemas (F8) land with their routers.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from datetime import datetime
@@ -962,6 +963,15 @@ class RunTrends(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+#: Serialized-size cap on the inline rubric basis a preset's
+#: ``suggested_rubric`` can declare — ``_persist_run`` carries the
+#: ``summary``/``title``/``dimensions``/``criteria`` fragment verbatim into
+#: ``config.rubric_basis``, which ``_user_prompt`` JSON-dumps into the
+#: rubric-gen message. Vendored templates run ~2KB; this bound stays far
+#: past a legitimate basis and far under ``task_prompt``'s 100K.
+_SUGGESTED_RUBRIC_BASIS_MAX_CHARS = 32_000
+
+
 def _validate_suggested_rubric(v: dict[str, Any] | None) -> dict[str, Any] | None:
     """Shared shape check for a preset's ``suggested_rubric`` (PR23).
 
@@ -1020,6 +1030,17 @@ def _validate_suggested_rubric(v: dict[str, Any] | None) -> dict[str, Any] | Non
             )
         if not all(isinstance(item, dict) for item in items):
             raise ValueError(f"suggested_rubric.{key} items must be objects")
+    basis = {
+        k: v[k] for k in ("summary", "title", "dimensions", "criteria") if k in v
+    }
+    if basis and (
+        len(json.dumps(basis, ensure_ascii=False, default=str))
+        > _SUGGESTED_RUBRIC_BASIS_MAX_CHARS
+    ):
+        raise ValueError(
+            "suggested_rubric basis exceeds "
+            f"{_SUGGESTED_RUBRIC_BASIS_MAX_CHARS} serialized chars"
+        )
     if not v.get("template") and not v.get("hint") and not v.get("dimensions"):
         raise ValueError(
             "suggested_rubric must declare template, hint, or dimensions"

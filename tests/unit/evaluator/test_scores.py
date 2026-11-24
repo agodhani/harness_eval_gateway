@@ -360,3 +360,70 @@ def test_parse_literal_eval_rejects_scalars() -> None:
         parse_scores_json("'just a quoted string'")
     with pytest.raises(ScoresFileError):
         parse_scores_json("(1, 2, 3)")
+
+
+# ---------------------------------------------------------------------------
+# reserved score-namespace + declared-dimension folding (PR23)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_drops_reserved_dimension_names() -> None:
+    """A judge entry under a reserved score field must never persist —
+    ``suite_pass``/``overall`` are pipeline-written pseudo-rows and
+    ``scores``/``summary``/``total`` are document fields."""
+    payload = {
+        "scores": [
+            {"dimension": "suite_pass", "score": 10},
+            {"dimension": "Overall", "score": 9},
+            {"dimension": "total", "score": 40},
+            {"dimension": "code_quality", "score": 7},
+        ]
+    }
+    parsed = parse_scores_json(json.dumps(payload))
+    assert [e.dimension for e in parsed.entries] == ["code_quality"]
+    assert sum("reserved score field" in w for w in parsed.warnings) == 3
+
+
+def test_parse_flat_map_drops_suite_pass() -> None:
+    """The flat-map form reaches the same reserved check — a ``suite_pass``
+    key is not a per-dimension score."""
+    parsed = parse_scores_json(json.dumps({"suite_pass": 10, "code_quality": 7}))
+    assert {e.dimension: e.score for e in parsed.entries} == {"code_quality": 7.0}
+
+
+def test_parse_all_reserved_entries_raises() -> None:
+    with pytest.raises(ScoresFileError):
+        parse_scores_json(
+            json.dumps({"scores": [{"dimension": "suite_pass", "score": 10}]})
+        )
+
+
+def test_parse_folds_judge_spelling_onto_declared_dimension() -> None:
+    """A judge's 'Accuracy' for a rubric declaring ``accuracy`` persists
+    under the declared (normalized) spelling, not verbatim."""
+    payload = {"scores": [{"dimension": "Accuracy", "score": 8}]}
+    scales = {"accuracy": (0.0, 10.0, 1.0)}
+    parsed = parse_scores_json(json.dumps(payload), dimension_scales=scales)
+    assert [e.dimension for e in parsed.entries] == ["accuracy"]
+
+
+def test_parse_folded_duplicate_last_wins() -> None:
+    """Case variants of one declared dimension dedup after folding."""
+    payload = {
+        "scores": [
+            {"dimension": "Accuracy", "score": 3},
+            {"dimension": "accuracy", "score": 9},
+        ]
+    }
+    scales = {"accuracy": (0.0, 10.0, 1.0)}
+    parsed = parse_scores_json(json.dumps(payload), dimension_scales=scales)
+    assert [(e.dimension, e.score) for e in parsed.entries] == [("accuracy", 9.0)]
+    assert any("duplicate" in w for w in parsed.warnings)
+
+
+def test_parse_unknown_spelling_passes_through() -> None:
+    """A folded name matching no declared dimension keeps verbatim spelling."""
+    payload = {"scores": [{"dimension": "Some Custom Axis", "score": 6}]}
+    scales = {"accuracy": (0.0, 10.0, 1.0)}
+    parsed = parse_scores_json(json.dumps(payload), dimension_scales=scales)
+    assert [e.dimension for e in parsed.entries] == ["Some Custom Axis"]
