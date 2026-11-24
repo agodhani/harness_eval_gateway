@@ -350,6 +350,39 @@ class TaskInputsIn(BaseModel):
         return self
 
 
+def _normalize_evaluator_panel(
+    evaluator_model: str | None, evaluator_models: list[str] | None
+) -> list[str] | None:
+    """PR29 — normalize the judge-panel spec shared by ``RunCreate`` /
+    ``SuiteRunIn``: dedupe/blank-drop ``evaluator_models`` preserving
+    order, then fold ``evaluator_model`` in as panel head — the single
+    field names the PRIMARY judge and ``config.evaluator_model`` persists
+    panel[0] so back-compat readers (rescore defaults, same_model_eval)
+    stay truthful. ``None`` when no panel was submitted (single-judge
+    runs keep the pre-PR29 config shape)."""
+    if evaluator_models is None:
+        return None
+    seen: set[str] = set()
+    panel: list[str] = []
+    for m in evaluator_models:
+        if m and m not in seen:
+            seen.add(m)
+            panel.append(m)
+    if not panel:
+        return None
+    if evaluator_model:
+        if evaluator_model in panel:
+            panel.remove(evaluator_model)
+        panel.insert(0, evaluator_model)
+        if len(panel) > 3:
+            raise ValueError(
+                "evaluator_model + evaluator_models would make a "
+                f"{len(panel)}-judge panel; max is 3 — drop "
+                "evaluator_model or shorten the list"
+            )
+    return panel
+
+
 class RunCreate(BaseModel):
     """POST /api/runs body — one evaluation submission."""
 
@@ -383,6 +416,16 @@ class RunCreate(BaseModel):
     evaluator_model: Annotated[str, StringConstraints(strip_whitespace=True)] | None = (
         Field(default=None, max_length=255)
     )
+    # PR29 — judge panel: an ordered list of 1–3 evaluator models, each
+    # scoring every artifact (results cells then carry the judge mean +
+    # spread). Extends ``evaluator_model`` — the single field keeps
+    # naming the panel's primary judge (folded to panel head when both
+    # are submitted). Omitted → single-judge run on
+    # evaluator_model/model_name, the pre-PR29 shape.
+    evaluator_models: (
+        list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]]
+        | None
+    ) = Field(default=None, max_length=3)
     budgets: BudgetsIn = Field(default_factory=BudgetsIn)
     # PR24 — seed every sandbox workspace from a repo or uploaded archive.
     # None = the historical empty-workspace behavior.
@@ -426,6 +469,9 @@ class RunCreate(BaseModel):
                     seen.add(m)
                     cleaned.append(m)
             self.models = cleaned or None
+        self.evaluator_models = _normalize_evaluator_panel(
+            self.evaluator_model, self.evaluator_models
+        )
         model_count = 1 + len(self.models or [])
         pinned = sum(1 for hc in self.harness_configs if hc.model)
         cells = pinned + (len(self.harness_configs) - pinned) * model_count
@@ -1329,6 +1375,12 @@ class SuiteRunIn(BaseModel):
     evaluator_model: Annotated[str, StringConstraints(strip_whitespace=True)] | None = (
         Field(default=None, max_length=255)
     )
+    # PR29 parity — optional 1–3 judge panel every suite task evaluates
+    # with (same ``_normalize_evaluator_panel`` fold as RunCreate).
+    evaluator_models: (
+        list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]]
+        | None
+    ) = Field(default=None, max_length=3)
     budgets: BudgetsIn = Field(default_factory=BudgetsIn)
     # PR27 parity — each suite task's matrix multiplies by trials the same
     # way a normal submit does.
@@ -1347,6 +1399,9 @@ class SuiteRunIn(BaseModel):
                     seen.add(m)
                     cleaned.append(m)
             self.models = cleaned or None
+        self.evaluator_models = _normalize_evaluator_panel(
+            self.evaluator_model, self.evaluator_models
+        )
         model_count = 1 + len(self.models or [])
         pinned = sum(1 for hc in self.harness_configs if hc.model)
         cells = pinned + (len(self.harness_configs) - pinned) * model_count

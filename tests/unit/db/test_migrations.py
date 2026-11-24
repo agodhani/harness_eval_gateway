@@ -467,7 +467,7 @@ def test_judge_panel_upgrade_downgrade(sqlite_url: str) -> None:
 
 def test_pairwise_votes_roundtrip(sqlite_url: str) -> None:
     """A migrated DB accepts + reads back a vote row (ORM matches schema)."""
-    from datetime import datetime, timezone
+    from datetime import UTC, datetime
 
     from db.models import PairwiseVote, Run, Sandbox
     from db.session import make_engine, make_session_factory
@@ -484,8 +484,8 @@ def test_pairwise_votes_roundtrip(sqlite_url: str) -> None:
             run = Run(
                 task_prompt="t",
                 model_name="m",
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
             )
             s.add(run)
             s.flush()
