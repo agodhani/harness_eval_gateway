@@ -32,9 +32,12 @@ export interface ResubmitSpec {
    * server-side under data/uploads). */
   task_inputs?: TaskInputs | null;
   /** PR23: the run's resolved rubric template name + domain hint ride
-   * along so a resubmit regenerates with the same basis (an inline
-   * `rubric_basis` isn't resubmittable — a preset-attached resubmit
-   * re-resolves the CURRENT suggested_rubric like preset_ref semantics). */
+   * along as explicit submit values, so a preset-attached resubmit
+   * regenerates with the ORIGINALLY-resolved basis — frozen rather than
+   * re-resolved from the preset's CURRENT suggested_rubric (config can't
+   * distinguish an explicit pick from a suggestion-derived value). Only
+   * the never-persisted inline `rubric_basis` re-resolves like preset_ref
+   * semantics — it isn't carried. */
   rubric_template?: string | null;
   rubric_hint?: string | null;
   /** PR27: repeats per matrix cell (undefined = the form's default 1). */

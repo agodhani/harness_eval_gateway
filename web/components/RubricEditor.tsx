@@ -97,11 +97,12 @@ export default function RubricEditor({
       if (!v || typeof v !== "object" || Array.isArray(v)) {
         throw new Error("rubric content must be a JSON object");
       }
-      const check = validateDraft(draftFromContent(v as RubricContent));
+      const projected = draftFromContent(v as RubricContent);
+      const check = validateDraft(projected);
       const issues = [...check.errors, ...Object.values(check.fieldErrors)];
       setRawError(null);
       setRawIssues(issues);
-      onChange(v as RubricContent, {
+      onChange(buildRubricContent(projected, v as RubricContent), {
         valid: issues.length === 0,
         errors: issues,
       });
