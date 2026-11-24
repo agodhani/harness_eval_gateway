@@ -2011,9 +2011,16 @@ rigged before it starts.
 - **Share links (stretch, shipped):** `runs.share_token` (nullable
   unique str, migration `c5f9a2b8d4e7` chained on `e4f5a6b7c8d9`).
   `POST /api/runs/{id}/share` mints `secrets.token_urlsafe(16)`
-  idempotently → `{token, url: "/share/{token}"}`; `DELETE` revokes
-  (idempotent). `GET /api/share/{token}` → `ShareOut` (spec + `RunResults`
-  + bounded events-lite) — unknown and revoked tokens 404 identically.
+  idempotently → `{token, url: "/share/{token}"}` (the mint claims the
+  slot with a conditional UPDATE so concurrent POSTs return the winner's
+  token on every dialect); `DELETE` revokes (idempotent).
+  `GET /api/share/{token}` → `ShareOut` (spec + `RunResults` + bounded
+  events-lite) — unknown and revoked tokens 404 identically. Unlike the
+  export, the share bundle scrubs control-plane filesystem references:
+  `artifact_path`/`artifacts`/`thumbnail`, the
+  `previewable`/`preview_type`/`preview_candidates` probe fields, the
+  analysis `workspace` path, and the `_SHARE_FS_KEYS` event-payload +
+  signal-metric keys are all stripped before serving.
   `RunOut.share_url` advertises the minted path on run detail. The token
   is the only credential the share surface checks — the app ships
   unauthenticated, so this is PR19's extension point, not a security
@@ -2036,8 +2043,8 @@ rigged before it starts.
   - Unit: `tests/unit/api/test_export.py` (14 tests — JSON round-trip
     through `RunExport.model_validate`, events-lite projection, CSV
     shape/BOM/empty-run header + legacy `harness` config key, 404/422,
-    share mint/idempotent/revoke/unknown-token 404, events_total
-    bounds); migration tests cover the new head + unique index +
+    share mint/idempotent/revoke/unknown-token 404 + fs-ref scrub,
+    events_total bounds); migration tests cover the new head + unique index +
     downgrade.
   - Web: `api.test.ts` `runExportUrl` describe; eslint + `next build`
     clean (`/share/[token]` prerender).
