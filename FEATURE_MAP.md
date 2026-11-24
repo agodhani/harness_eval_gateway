@@ -2005,7 +2005,9 @@ rigged before it starts.
     phase analytics (turns, tokens in/out/cache/total, wall clock, est.
     cost) repeat per row — sheets pivot on them. Dimensions sort
     alphabetically (deterministic across sibling runs); a UTF-8 BOM keeps
-    Excel on UTF-8.
+    Excel on UTF-8, and string cells opening with a formula trigger
+    (`= + - @`, tab, CR) get a `'` prefix so submitter/judge text can't
+    land as a live Excel formula.
 - **Share links (stretch, shipped):** `runs.share_token` (nullable
   unique str, migration `c5f9a2b8d4e7` chained on `e4f5a6b7c8d9`).
   `POST /api/runs/{id}/share` mints `secrets.token_urlsafe(16)`

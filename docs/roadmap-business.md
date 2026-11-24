@@ -382,6 +382,9 @@ heatmap, output browser.
   weighted rubric.
 
 ### PR32 — Cross-run compare + leaderboards ✅ shipped
+- **Landed as F27:** `/api/analytics/leaderboard` + `/compare` +
+  `/leaderboard` + the preset-embedded board all shipped. Details:
+  `FEATURE_MAP.md` F27.
 - **Scope:**
   - `/compare?runs=id1,id2` — two runs side by side: spec diff
     (models/configs/budgets/rubric version), score matrices,
