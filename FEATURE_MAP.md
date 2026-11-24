@@ -407,8 +407,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   clamped to the eval-attempt deadline),
   `TESTGEN_MAX_TOKENS_RETRY` (8192) — retries cover empty content,
   zero-runnable-file output, and timeouts. A scores doc missing
-  `overall` gets it synthesized as the mean of dimension scores +
-  warning (`parse_scores_json`).
+  `overall` gets it synthesized from the dimension scores
+  (scale-normalized to 0-10) + warning (`parse_scores_json`).
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
   `prompts.py`, `judge_direct.py` — direct-completion fallback,
   `testgen.py` — PR8 suite generation + exec orchestration),

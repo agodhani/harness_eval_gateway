@@ -151,7 +151,7 @@ def test_parse_overall_non_numeric_ignored() -> None:
     # non-numeric overall is ignored, then synthesized from the entries
     assert parsed.overall == 5.0
     assert any("not numeric" in w for w in parsed.warnings)
-    assert any("computed as mean" in w for w in parsed.warnings)
+    assert any("computed from dimension scores" in w for w in parsed.warnings)
 
 
 def test_parse_overall_synthesized_when_missing() -> None:
@@ -166,7 +166,8 @@ def test_parse_overall_synthesized_when_missing() -> None:
     parsed = parse_scores_json(json.dumps(payload))
     assert parsed.overall == 6.0
     assert parsed.warnings == [
-        "overall missing — computed as mean of dimension scores"
+        "overall missing — computed from dimension scores "
+        "(scale-normalized to 0-10)"
     ]
 
 
@@ -174,7 +175,7 @@ def test_parse_genuine_overall_not_flagged() -> None:
     """A real `overall` is used verbatim — no synthesis warning."""
     parsed = parse_scores_json(json.dumps(GOOD))
     assert parsed.overall == 7.2
-    assert not any("computed as mean" in w for w in parsed.warnings)
+    assert not any("computed from dimension scores" in w for w in parsed.warnings)
 
 
 def test_parse_overall_synthesis_rounds_to_one_decimal() -> None:
@@ -259,7 +260,7 @@ def test_parse_salvages_bare_array_plus_truncated_object() -> None:
     # trailing object was truncated -> genuine overall lost; the mean of
     # the salvaged entries is synthesized instead (flagged in warnings)
     assert parsed.overall == 10.0
-    assert any("computed as mean" in w for w in parsed.warnings)
+    assert any("computed from dimension scores" in w for w in parsed.warnings)
 
 
 def test_parse_salvages_bare_array_plus_complete_object() -> None:

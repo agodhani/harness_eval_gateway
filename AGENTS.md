@@ -131,7 +131,8 @@ adapters are added.
    generation call once at raised caps on empty/timed-out/zero-file output
    (`TESTGEN_MAX_TOKENS_RETRY`, up to 2× `TESTGEN_TIMEOUT_SECONDS` clamped
    to the eval-attempt deadline); a scores doc
-   missing `overall` gets it synthesized as the dimension mean + a warning.
+   missing `overall` gets it synthesized from the dimension scores
+   (scale-normalized to 0-10) + a warning.
 7. **Artifact store** — `./data/artifacts/<run_id>/<sandbox_id>/` — repo
    tarballs, transcripts, event exports.
 

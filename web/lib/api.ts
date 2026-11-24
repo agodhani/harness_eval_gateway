@@ -1999,12 +1999,6 @@ export function listRubricTemplates(): Promise<RubricTemplate[]> {
   return request<RubricTemplate[]>("/api/rubric-templates");
 }
 
-export function getRubricTemplate(name: string): Promise<RubricTemplate> {
-  return request<RubricTemplate>(
-    `/api/rubric-templates/${encodeURIComponent(name)}`,
-  );
-}
-
 // ---------------------------------------------------------------------------
 // PR26 — benchmark suites + deterministic checkers
 // ---------------------------------------------------------------------------

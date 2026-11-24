@@ -276,10 +276,3 @@ def resolve(session: Session, vendored_root: str | Path, name: str) -> Template 
         return vendored
     row = get_user(session, name)
     return user_to_template(row) if row is not None else None
-
-
-def taken_names(session: Session, vendored_root: str | Path) -> set[str]:
-    """Every name in use — vendored files plus user rows."""
-    names = {t.name for t in list_vendored(vendored_root)}
-    names.update(session.execute(select(RubricTemplate.name)).scalars().all())
-    return names

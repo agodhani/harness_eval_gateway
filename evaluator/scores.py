@@ -385,11 +385,13 @@ def parse_scores_json(
     if parsed.overall is None:
         # A judge that scored every dimension but omitted `overall` must not
         # leave the field null — the results matrix reads it as the headline
-        # score. Synthesize the dimension mean and flag it as derived so the
-        # eval_scored event's warnings show where the number came from.
+        # score. Synthesize it from the dimension scores and flag it as
+        # derived so the eval_scored event's warnings show where the number
+        # came from.
         parsed.overall = _synthesized_overall(parsed.entries, dimension_scales)
         parsed.warnings.append(
-            "overall missing — computed as mean of dimension scores"
+            "overall missing — computed from dimension scores "
+            "(scale-normalized to 0-10)"
         )
 
     summary = obj.get("summary")
