@@ -1872,8 +1872,10 @@ rigged before it starts.
   canonical coding axes. `RubricContent.dimensions` accepts **1–12
   arbitrary dimensions** — names soft-normalize to snake_case and fold
   through the canonical alias map (a *soft* normalizer, never a
-  validator); duplicates after normalization are the one structural
-  rejection. Each dimension keeps its own `title`/`description`/
+  validator); names normalizing to empty or past 128 chars, reserved
+  score-namespace names (`overall`/`suite_pass`/`scores`/`summary`/
+  `total`), and duplicates after normalization are rejected. Each
+  dimension keeps its own `title`/`description`/
   `weight`/`min_score`/`max_score`, so non-10-point scales persist and
   score correctly. `scores.dimension` stays keyed by dimension name —
   an `accuracy`/`tone`/`compliance` rubric drafts, freezes, evaluates,
@@ -1914,8 +1916,8 @@ rigged before it starts.
   report whatever signals they can measure; the judge brief — not the
   collector — decides applicability.
 - **DB:** migration `f6a7b8c9d0e1_rubric_templates.py` (revises
-  `c5f9a2b8d4e7`) — `rubric_templates` table (name PK, description,
-  JSONB content, source, timestamps) +
+  `c5f9a2b8d4e7`) — `rubric_templates` table (`id` Uuid PK, `name`
+  unique-indexed, description, JSONB content, source, timestamps) +
   `task_presets.suggested_rubric`.
 - **API:** `RunCreate.rubric_template`/`rubric_hint` (nullable);
   `RubricTemplateOut`; `Preset*` schemas carry `suggested_rubric`;

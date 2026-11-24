@@ -185,8 +185,9 @@ class RubricContent(BaseModel):
 
     ``extra="allow"`` keeps LLM-added top-level fields. ``dimensions``
     accepts 1–12 entries (PR23): each name soft-normalizes (snake_case +
-    canonical aliases) and the normalized set must be unique — duplicates
-    after normalization are the one structural rejection.
+    canonical aliases); names normalizing to empty or past
+    ``MAX_DIMENSION_NAME``, reserved score fields, and duplicates after
+    normalization are rejected.
     """
 
     model_config = ConfigDict(extra="allow")

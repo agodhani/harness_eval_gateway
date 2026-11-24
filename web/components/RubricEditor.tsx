@@ -107,20 +107,21 @@ export default function RubricEditor({
   function toForm() {
     // Re-derive the form from the last valid raw parse; invalid raw keeps
     // the prior draft so a half-typed JSON blob can't destroy form edits.
+    let next = draft;
     try {
       const v: unknown = JSON.parse(raw);
       if (v && typeof v === "object" && !Array.isArray(v)) {
-        const next = draftFromContent(v as RubricContent);
-        setDraft(next);
-        const check = validateDraft(next);
-        onChange(buildRubricContent(next, content), {
-          valid: check.errors.length === 0 && Object.keys(check.fieldErrors).length === 0,
-          errors: check.errors,
-        });
+        next = draftFromContent(v as RubricContent);
       }
     } catch {
       /* stay on the previous draft */
     }
+    setDraft(next);
+    const check = validateDraft(next);
+    onChange(buildRubricContent(next, content), {
+      valid: check.errors.length === 0 && Object.keys(check.fieldErrors).length === 0,
+      errors: check.errors,
+    });
     setMode("form");
   }
 

@@ -327,8 +327,10 @@ MVP dimensions: functional requirements, acceptance criteria, code
 implementation quality, cyclomatic complexity. Since PR23 (F26) those four
 are only the **code-task default** — `RubricContent.dimensions` accepts
 1–12 arbitrary dimensions (names soft-normalize to snake_case + a small
-canonical-alias map; duplicates after normalization are the one structural
-rejection), so non-coding rubrics (extraction accuracy, tone, compliance,
+canonical-alias map; rejected only on names normalizing to empty or past
+128 chars, reserved score-namespace names, or duplicates after
+normalization), so non-coding rubrics (extraction accuracy, tone,
+compliance,
 …) generate, freeze, score, and render with no code axes at all.
 Generation can be steered: `RunCreate.rubric_hint` (fallback: preset
 category) feeds a domain line into the gen prompt, and a **rubric
@@ -1082,9 +1084,11 @@ or tests change.
   `RubricContent` now takes 1–12 arbitrary dims; the canonical names
   remain as (a) the `code-default` template's set, (b) alias-fold
   targets for common LLM re-phrasings, and (c) the results table's
-  sort anchor (canonical-first, then alpha). Dedup after normalization
-  is the ONLY structural rejection — a 3-dim rubric is valid, not an
-  error. Generation steering resolves strictly: explicit
+  sort anchor (canonical-first, then alpha). Structural rejections:
+  names that normalize to empty or past 128 chars, reserved
+  score-namespace names (`overall`, `suite_pass`, `scores`, `summary`,
+  `total`), and duplicates after normalization — a 3-dim rubric is
+  valid, not an error. Generation steering resolves strictly: explicit
   `rubric_template` → preset `suggested_rubric` → freeform task text,
   with `rubric_hint` → preset `category` → none for the domain line;
   all three land on `run.config` so `draft_rubric` resolves them at

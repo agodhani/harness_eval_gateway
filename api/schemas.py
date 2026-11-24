@@ -995,8 +995,18 @@ def _validate_suggested_rubric(v: dict[str, Any] | None) -> dict[str, Any] | Non
         not isinstance(v.get("hint"), str) or not v["hint"].strip()
     ):
         raise ValueError("suggested_rubric.hint must be non-empty text")
-    if "dimensions" in v and not isinstance(v.get("dimensions"), list):
-        raise ValueError("suggested_rubric.dimensions must be a list")
+    for key in ("dimensions", "criteria"):
+        items = v.get(key)
+        if items is None:
+            continue
+        if not isinstance(items, list):
+            raise ValueError(f"suggested_rubric.{key} must be a list")
+        if len(items) > 24:
+            raise ValueError(
+                f"suggested_rubric.{key} allows at most 24 items"
+            )
+        if not all(isinstance(item, dict) for item in items):
+            raise ValueError(f"suggested_rubric.{key} items must be objects")
     if not v.get("template") and not v.get("hint") and not v.get("dimensions"):
         raise ValueError(
             "suggested_rubric must declare template, hint, or dimensions"

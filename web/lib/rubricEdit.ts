@@ -7,8 +7,9 @@
  * `orchestrator/rubric.py` so client-side errors match what the API would
  * report:
  *
- *   - 1–12 dimensions; every `name` soft-normalizes to snake_case and the
- *     normalized set must be unique (the one structural rejection);
+ *   - 1–12 dimensions; every `name` soft-normalizes to snake_case —
+ *     reject names normalizing to empty or >128 chars, reserved score
+ *     names, and duplicates in the normalized set;
  *   - canonical aliases fold onto the four canonical spellings exactly like
  *     the backend's `_DIMENSION_ALIASES` — a soft normalizer, never a
  *     requirement;

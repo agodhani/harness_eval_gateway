@@ -180,7 +180,7 @@ def test_dimension_count_bounds() -> None:
 
 def test_duplicate_dimension_rejected() -> None:
     payload = _valid_rubric_payload()
-    # Two dims normalize to the same name -> the one structural rejection.
+    # Two dims normalize to the same name -> a structural rejection.
     payload["dimensions"][1]["name"] = "functional_requirements"
     with pytest.raises(ValidationError, match="duplicate dimensions"):
         parse_rubric_json(json.dumps(payload))
