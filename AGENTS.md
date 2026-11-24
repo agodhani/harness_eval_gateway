@@ -167,6 +167,19 @@ adapters are added.
    by `SPAWN_MEM_WAIT_SECONDS` — expiry fails that one sandbox and makes
    the remaining configs fail fast (one probe each), so sustained pressure
    can't hold the run's slot for N×cap.
+   **Local-run sandbox pacing (F30):** when EVERY participant model
+   resolves to a local provider (ollama — `pacing.provider_for_model`
+   mirrors the gateway's `PROVIDER_ROUTES`/`UPSTREAM_PROVIDER` routing),
+   at most `SANDBOX_MAX_CONCURRENT_LOCAL` (default 2, 0 disables) cells'
+   containers are active at once. Cells past the cap insert as
+   `Sandbox.status="queued"` BEFORE `docker run` (`sandbox_queued`
+   checkpoint, FIFO `ahead` position) and promote `queued → provisioning`
+   via `pacing.claim_queued_sandbox` as siblings go terminal —
+   `lifecycle._watch_cells_paced` runs the claim between `asyncio.wait`
+   completions so order is deterministic. The launch then runs the same
+   pipeline (pack staging, mem gate, cred, `docker run`) — the cap is a
+   container-slot count, not a call-rate limit: a small local model can't
+   honestly serve N parallel agents anyway. Prompt cells hold no slot.
 4. **Execute** — agent loops; all model calls via gateway; adapter streams
    normalized events; UI shows live timeline.
 5. **Terminate** — each sandbox reaches a terminal state (below); workspace
@@ -196,6 +209,19 @@ verdict (PR28) — the terminate checkpoint's `payload.limit` says which:
 (per-cell ceiling, cred `sandbox_max_tokens` metered against the cell's
 own usage + monitor backstop), `cost` (`max_cost_usd` vs the cell's
 estimated spend at the layered price table — priced models only).
+
+**Budget resilience (F30):** caps are live-widenable, not one-shot.
+`POST /api/sandboxes/{id}/extend_budget` appends a `budget_extended`
+checkpoint; the gateway's `_budget_gate` and the monitor's poll sum those
+rows into the cred's effective ceilings (token grants widen BOTH the run
+and per-sandbox limits the cred passes through; cost grants widen
+`max_cost_usd`) — a control-plane bump takes effect on the next
+call/poll, no restart. When spend crosses ~80% of the effective cap,
+`budget_warning` checkpoints emit once per (sandbox, limit kind) — the
+gateway on the request path, the monitor poll as backstop — and surface
+in the UI as a "near cap" badge with an extend affordance.
+`budgets.auto_extend` (submit checkbox) makes the monitor grant +50%
+once on the first warning (`via="auto"`).
 
 Provisional defaults (confirm with user): 60 min wall clock, $2 spend cap,
 stuck-loop = 3 consecutive identical tool calls.
@@ -1007,6 +1033,31 @@ or tests change.
   `/dashboard` reuses the PR32 leaderboard for its top-5 boards and
   polls only while the lane is busy. `web/lib/dashboard.ts` holds the
   pure chart transforms (node-tested).
+- **F30 — local-run sandbox pacing reuses the run-queue pattern, one
+  level down**: `"queued"` is a real SANDBOX status (rows persist —
+  sweeps/UI see parked cells; `ACTIVE_SANDBOX_STATES` =
+  provisioning/running/terminating explicitly excludes it), applied ONLY
+  when every participant model resolves local (`pacing.LOCAL_PROVIDERS`
+  = ollama — provider routing is mirrored in `pacing.provider_for_model`
+  rather than imported, since gateway settings differ from api
+  settings). The cap is a concurrent-CONTAINER count driven by
+  `lifecycle._watch_cells_paced` — claims run on the loop thread between
+  `asyncio.wait` completions so FIFO order is deterministic, and a
+  failed spawn never eats a slot (only active states count). A queued
+  cell's launch re-runs the full spawn pipeline (`provision._launch` —
+  staging/mem gate/cred/docker) — pacing wraps, it doesn't shortcut.
+  `queue_sandbox`/`claim_queued_sandbox`/`spawn_queued` mirror
+  `place_run`/`claim_next_queued` semantics.
+- **F30 — budget extensions are events, not columns**: no migration —
+  `extend_budget`/`auto_extend` grants are append-only `budget_extended`
+  checkpoints summed per read (`metering.budget_state`/`budget_states`),
+  so a control-plane bump is live on the gateway's next request and the
+  monitor's next poll without restarting the cell, and the timeline
+  shows the grant. `budget_warning` checkpoints (once per sandbox+limit,
+  ~80% of the EFFECTIVE cap) dedup the same way — read-then-emit on both
+  the gateway request path and the monitor backstop. The default run
+  budget moved 200k → 500k (`BudgetsIn`/`DEFAULT_RUN_TOKEN_BUDGET`
+  aligned) — budgets stop runaways, not honest work.
 
 ## Working conventions
 
