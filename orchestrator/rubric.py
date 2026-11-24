@@ -42,7 +42,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -56,7 +55,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from db.models import Rubric, Run
 from gateway.creds import mint_cred
 from gateway.metering import tokens_used
-from scoring.checkers import SUITE_PASS_DIMENSION
+from scoring.checkers import RESERVED_DIMENSION_NAMES, fold_dimension_name
 
 from . import state_machine
 from .events import emit
@@ -86,49 +85,10 @@ MAX_DIMENSIONS = 12
 #: judge-emitted names, so a longer rubric name would silently lose its score.
 MAX_DIMENSION_NAME = 128
 
-#: Normalized names a dimension can never take: ``overall`` and
-#: ``suite_pass`` are reserved pseudo-rows in ``scores.dimension`` (the
-#: results payload routes them to the headline / deterministic-checker
-#: slots), and ``scores``/``summary``/``total`` are the eval parser's
-#: flat-map exclusions — a real dimension under one of these names loses
-#: its score or masquerades as another field.
-RESERVED_DIMENSION_NAMES = frozenset(
-    {"overall", "scores", "summary", "total", SUITE_PASS_DIMENSION}
-)
-
-# LLM-friendly aliases normalized onto the canonical names before validation.
-# SOFT normalization only — arbitrary dimension names pass through untouched;
-# the aliases just fold common LLM re-phrasings onto the canonical spellings.
-_DIMENSION_ALIASES = {
-    "functional": "functional_requirements",
-    "functional_req": "functional_requirements",
-    "functional_reqs": "functional_requirements",
-    "requirements": "functional_requirements",
-    "acceptance": "acceptance_criteria",
-    "acceptance_tests": "acceptance_criteria",
-    "code": "code_quality",
-    "implementation": "code_quality",
-    "implementation_quality": "code_quality",
-    "code_implementation": "code_quality",
-    "code_implementation_quality": "code_quality",
-    "quality": "code_quality",
-    "complexity": "cyclomatic_complexity",
-    "cyclomatic": "cyclomatic_complexity",
-}
-
-_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
-
-
-def _normalize_dimension_name(name: str) -> str:
-    """``"Code Implementation Quality!!"`` → ``code_implementation_quality``."""
-    return _NON_ALNUM_RE.sub("_", name.strip().lower()).strip("_")
-
-
-def _canonical_dimension(name: str) -> str:
-    norm = _normalize_dimension_name(name)
-    if norm in CANONICAL_DIMENSIONS:
-        return norm
-    return _DIMENSION_ALIASES.get(norm, norm)
+#: Reserved score-namespace names (``orchestrator.rubric`` authoring guard)
+#: and the LLM-phrasing alias map + shared fold live in
+#: ``scoring.checkers`` — ``evaluator.scores`` applies the same contract to
+#: judge output, so both sides import the one definition.
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +129,7 @@ def _normalized_dimension_name(value: str) -> str:
     Raises ``ValueError`` when nothing usable remains — a name made purely
     of punctuation would key scores under ``""``.
     """
-    normalized = _canonical_dimension(value)
+    normalized = fold_dimension_name(value)
     if not normalized:
         raise ValueError(f"dimension name {value!r} normalizes to empty")
     if len(normalized) > MAX_DIMENSION_NAME:
@@ -219,7 +179,7 @@ class RubricContent(BaseModel):
             # way so "Accuracy" binds a dim normalized to ``accuracy``. An
             # unusable reference (punctuation only) is evidence text, not
             # structure — keep it verbatim rather than rejecting the rubric.
-            if _canonical_dimension(criterion.dimension):
+            if fold_dimension_name(criterion.dimension):
                 criterion.dimension = _normalized_dimension_name(
                     criterion.dimension
                 )

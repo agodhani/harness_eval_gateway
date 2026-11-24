@@ -407,6 +407,28 @@ def test_parse_folds_judge_spelling_onto_declared_dimension() -> None:
     assert [e.dimension for e in parsed.entries] == ["accuracy"]
 
 
+def test_parse_folds_alias_spelling_onto_declared_dimension() -> None:
+    """A judge's alias spelling (``functional``, ``complexity``) for a
+    rubric declaring the canonical name persists under the declared name —
+    the same fold the authoring side applies, so the declared dimension
+    reads scored instead of a phantom column appearing."""
+    payload = {
+        "scores": [
+            {"dimension": "functional", "score": 8},
+            {"dimension": "complexity", "score": 6},
+        ]
+    }
+    scales = {
+        "functional_requirements": (0.0, 10.0, 1.0),
+        "cyclomatic_complexity": (0.0, 10.0, 1.0),
+    }
+    parsed = parse_scores_json(json.dumps(payload), dimension_scales=scales)
+    assert {e.dimension: e.score for e in parsed.entries} == {
+        "functional_requirements": 8.0,
+        "cyclomatic_complexity": 6.0,
+    }
+
+
 def test_parse_folded_duplicate_last_wins() -> None:
     """Case variants of one declared dimension dedup after folding."""
     payload = {

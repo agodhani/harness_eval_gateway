@@ -11,8 +11,8 @@
  *     reject names normalizing to empty or >128 chars, reserved score
  *     names, and duplicates in the normalized set;
  *   - canonical aliases fold onto the four canonical spellings exactly like
- *     the backend's `_DIMENSION_ALIASES` — a soft normalizer, never a
- *     requirement;
+ *     the backend's `DIMENSION_ALIASES` (`scoring/checkers.py`) — a soft
+ *     normalizer, never a requirement;
  *   - criterion `dimension` refs normalize the same way; a ref that doesn't
  *     resolve to a declared dimension is flagged (backend leaves it to the
  *     judge but a typo'd ref is nearly always an authoring bug).
@@ -67,7 +67,7 @@ export const RESERVED_DIMENSION_NAMES = new Set([
   "total",
 ]);
 
-/** Backend `_DIMENSION_ALIASES` — fold LLM re-phrasings onto canonical. */
+/** Backend `DIMENSION_ALIASES` — fold LLM re-phrasings onto canonical. */
 const DIMENSION_ALIASES: Record<string, string> = {
   functional: "functional_requirements",
   functional_req: "functional_requirements",
@@ -88,7 +88,7 @@ const DIMENSION_ALIASES: Record<string, string> = {
 const NON_ALNUM = /[^a-z0-9]+/g;
 
 /** ``"Code Implementation Quality!!"`` → ``code_implementation_quality``
- * (backend `_normalize_dimension_name`). */
+ * (the snake_case fold inside backend `fold_dimension_name`). */
 export function normalizeDimensionName(name: string): string {
   return name
     .trim()
@@ -97,7 +97,7 @@ export function normalizeDimensionName(name: string): string {
     .replace(/^_+|_+$/g, "");
 }
 
-/** snake_case + alias fold — backend `_canonical_dimension`. Returns "" for
+/** snake_case + alias fold — backend `fold_dimension_name`. Returns "" for
  * names made of nothing usable (punctuation only). */
 export function canonicalDimension(name: string): string {
   const norm = normalizeDimensionName(name);

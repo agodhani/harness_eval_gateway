@@ -37,7 +37,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from scoring.checkers import SUITE_PASS_DIMENSION
+from scoring.checkers import (
+    RESERVED_DIMENSION_NAMES,
+    SUITE_PASS_DIMENSION,
+    fold_dimension_name,
+)
 
 #: Filename the eval agent must write at the workspace root.
 SCORES_FILENAME = "scores.json"
@@ -79,8 +83,10 @@ class ParsedScores:
     ``entries`` are the valid per-dimension scores (invalid entries are
     dropped and described in ``warnings``). ``overall``/``summary`` come from
     the top-level fields when present and valid; when ``overall`` is missing
-    or unusable but entries exist, it is synthesized as the mean of the
-    dimension scores (flagged in ``warnings``) so the results surface never
+    or unusable but entries exist, it is synthesized from the dimension
+    scores — the weighted mean of each score's normalized position on its
+    declared scale (a plain mean when no scales are known), clamped to the
+    0-10 headline and flagged in ``warnings`` — so the results surface never
     shows a silent null.
     """
 
@@ -214,15 +220,6 @@ def _clean_dimension(value: Any) -> str | None:
     return dim[:MAX_DIMENSION_LEN]
 
 
-_DIM_NAME_FOLD_RE = re.compile(r"[^a-z0-9]+")
-
-
-def _fold_dimension_name(name: str) -> str:
-    """snake_case fold matching the rubric's dimension-name normalization —
-    judge-emitted names fold the same way for scale lookup."""
-    return _DIM_NAME_FOLD_RE.sub("_", name.strip().lower()).strip("_")
-
-
 def rubric_dimension_scales(
     rubric: dict[str, Any] | None,
 ) -> dict[str, tuple[float, float, float]]:
@@ -248,7 +245,7 @@ def rubric_dimension_scales(
         lo = _as_float(dim.get("min_score"))
         hi = _as_float(dim.get("max_score"))
         weight = _as_float(dim.get("weight"))
-        out[_fold_dimension_name(name)] = (
+        out[fold_dimension_name(name)] = (
             lo if lo is not None else 0.0,
             hi if hi is not None else 10.0,
             weight if weight is not None else 1.0,
@@ -275,7 +272,7 @@ def _synthesized_overall(
     weighted = 0.0
     total_weight = 0.0
     for entry in entries:
-        spec = scales.get(_fold_dimension_name(entry.dimension))
+        spec = scales.get(fold_dimension_name(entry.dimension))
         lo, hi, weight = spec if spec is not None else (0.0, 10.0, 1.0)
         if not math.isfinite(weight) or weight < 0:
             weight = 1.0
@@ -291,17 +288,12 @@ def _synthesized_overall(
 
 
 #: Keys excluded when a flat ``{dimension: score}`` dict is normalized —
-#: ``overall``/``summary`` are schema fields, ``total`` is a sum on a
-#: different scale than the per-dimension 0-10 scores.
-_FLAT_MAP_SKIP_KEYS = frozenset({"scores", "overall", "summary", "total"})
-
-#: Folded names a judge-emitted entry can never persist under — the
-#: eval-side mirror of the rubric author's ``RESERVED_DIMENSION_NAMES``
-#: (orchestrator/rubric.py): ``overall``/``suite_pass`` are pseudo-rows the
-#: pipeline itself writes, ``scores``/``summary``/``total`` are document
-#: fields. A judge entry under one of these would masquerade as the
-#: headline or checker row, or land as a phantom dimension column.
-_RESERVED_SCORE_NAMES = _FLAT_MAP_SKIP_KEYS | {SUITE_PASS_DIMENSION}
+#: the document fields among ``RESERVED_DIMENSION_NAMES``
+#: (``overall``/``summary`` are schema fields, ``total`` is a sum on a
+#: different scale, ``scores`` is the list form). ``suite_pass`` is left
+#: out so a flat ``suite_pass`` key reaches the reserved-name drop below
+#: (with a warning) rather than silently vanishing here.
+_FLAT_MAP_SKIP_KEYS = RESERVED_DIMENSION_NAMES - {SUITE_PASS_DIMENSION}
 
 
 def _flat_scores_entries(obj: dict[str, Any]) -> list[dict[str, Any]]:
@@ -363,8 +355,8 @@ def parse_scores_json(
                 f"scores[{i}] has no usable 'dimension' — dropped"
             )
             continue
-        folded = _fold_dimension_name(dim)
-        if folded in _RESERVED_SCORE_NAMES:
+        folded = fold_dimension_name(dim)
+        if folded in RESERVED_DIMENSION_NAMES:
             parsed.warnings.append(
                 f"scores[{i}] ({dim!r}) names a reserved score field — dropped"
             )
@@ -376,8 +368,9 @@ def parse_scores_json(
             )
             continue
         if dimension_scales and folded in dimension_scales:
-            # Variant spellings of a declared dimension persist under the
-            # declared (already-normalized) name, not the judge's casing.
+            # Variant/alias spellings of a declared dimension persist
+            # under the declared (already-normalized) name, not the
+            # judge's casing.
             dim = folded
         rationale = item.get("rationale")
         if not isinstance(rationale, str):
