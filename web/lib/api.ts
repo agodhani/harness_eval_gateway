@@ -1345,7 +1345,10 @@ export interface ShareRun {
   trials: number;
   config: RunConfig;
   preset_ref: string | null;
+  preset_revision: number | null;
   suite_ref: string | null;
+  suite_index: number | null;
+  suite_run_id: string | null;
   created_at: string | null;
   started_at: string | null;
   finished_at: string | null;

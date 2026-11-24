@@ -72,6 +72,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, or_, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from api.config import get_settings
@@ -1725,9 +1726,10 @@ class ShareOut(BaseModel):
     """``GET /api/share/{token}`` — the read-only share bundle.
 
     Spec + score matrix + the bounded events-lite index — everything the
-    ``/share/{token}`` page renders. Artifact paths inside ``results`` are
-    the control-plane's local FS references (the share view simply doesn't
-    expose artifact download/browse).
+    ``/share/{token}`` page renders. Control-plane filesystem references
+    (``artifact_path``, ``artifacts``, the analysis ``workspace`` path)
+    are stripped from ``results`` — the share view exposes neither
+    artifact download nor browse.
     """
 
     run: RunSpecOut
@@ -2017,7 +2019,9 @@ def create_share_link(run_id: UUID, session: DbSession) -> ShareLinkOut:
     ``secrets.token_urlsafe(16)`` = 128 bits of entropy — the token is the
     only credential the read-only share surface checks. The mint claims the
     slot with a conditional UPDATE — stays idempotent under concurrent
-    POSTs on every dialect (``FOR UPDATE`` locks are a no-op on SQLite).
+    POSTs on every dialect (``FOR UPDATE`` locks are a no-op on SQLite;
+    a SHARED-lock upgrade stall rolls back and re-reads the winner's
+    token).
     """
     run = session.get(Run, run_id)
     if run is None:
@@ -2028,11 +2032,17 @@ def create_share_link(run_id: UUID, session: DbSession) -> ShareLinkOut:
     if token is None:
         for _ in range(2):
             candidate = secrets.token_urlsafe(16)
-            if session.execute(
-                update(Run)
-                .where(Run.id == run_id, Run.share_token.is_(None))
-                .values(share_token=candidate)
-            ).rowcount:
+            try:
+                claimed = session.execute(
+                    update(Run)
+                    .where(Run.id == run_id, Run.share_token.is_(None))
+                    .values(share_token=candidate)
+                ).rowcount
+                session.commit()
+            except OperationalError:
+                session.rollback()
+                claimed = 0
+            if claimed:
                 token = candidate
                 break
             token = session.execute(
@@ -2047,7 +2057,7 @@ def create_share_link(run_id: UUID, session: DbSession) -> ShareLinkOut:
             )
     session.commit()
     return ShareLinkOut(
-        run_id=run.id,
+        run_id=run_id,
         token=token,
         url=f"/share/{token}",
     )
@@ -2058,8 +2068,17 @@ def delete_share_link(run_id: UUID, session: DbSession) -> None:
     """Revoke the share link — the token stops resolving immediately."""
     run = _run_or_404(session, run_id)
     if run.share_token is not None:
-        run.share_token = None
-        session.commit()
+        try:
+            run.share_token = None
+            session.commit()
+        except OperationalError:
+            # Same SQLite SHARED-lock upgrade stall as the mint — drop the
+            # read lock and apply the write in a fresh transaction.
+            session.rollback()
+            session.execute(
+                update(Run).where(Run.id == run_id).values(share_token=None)
+            )
+            session.commit()
 
 
 @router.get("/api/share/{token}", response_model=ShareOut)
@@ -2080,9 +2099,15 @@ def get_shared_run(token: str, session: DbSession) -> ShareOut:
     events, events_total = _event_lite_rows(
         session, run.id, cap=_EXPORT_EVENT_CAP
     )
+    results = get_run_results(run.id, session)
+    for sb in results.sandboxes:
+        sb.artifact_path = None
+        sb.artifacts = []
+        if sb.analysis is not None:
+            sb.analysis.workspace = ""
     return ShareOut(
         run=_run_spec_out(run),
-        results=get_run_results(run.id, session),
+        results=results,
         events=events,
         events_total=events_total,
         events_truncated=events_total > len(events),
