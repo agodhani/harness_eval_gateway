@@ -13,7 +13,9 @@
  *
  * Rows reuse {@link EventRow} — identical `.tl-*` markup and per-type
  * colors to the merged stream. Presentational only: all state (lanes,
- * expansion, filters) lives in TimelineClient.
+ * expansion, filters, clock mode) lives in TimelineClient. `timeLabelOf`
+ * (F31) supplies the per-event time label — relative mode returns each
+ * cell's own t+0 offset; undefined keeps absolute wall clock.
  */
 import { shortId } from "@/lib/format";
 import type { EventOut } from "@/lib/api";
@@ -41,6 +43,7 @@ export default function SplitTimeline({
   onPickLane,
   names,
   displaySourceOf,
+  timeLabelOf,
 }: {
   rows: SplitRow[];
   lanes: LaneSelection;
@@ -59,6 +62,9 @@ export default function SplitTimeline({
   /** Judge-phase re-tagging (lib/evalPhase.ts) — same source labels the
    * merged stream shows. */
   displaySourceOf?: (ev: EventOut) => string;
+  /** F31 — relative-mode time label per event (own cell's t+0 offset);
+   * undefined in absolute mode → EventRow renders the wall clock. */
+  timeLabelOf?: (ev: EventOut) => string | undefined;
 }) {
   const stripById = new Map(strips.map((s) => [s.sandboxId, s]));
   return (
@@ -106,6 +112,7 @@ export default function SplitTimeline({
               onToggle={onToggle}
               sandboxName={ev.sandbox_id ? names?.get(ev.sandbox_id) : undefined}
               displaySource={displaySourceOf?.(ev)}
+              timeLabel={timeLabelOf?.(ev)}
             />
           );
         }
@@ -119,6 +126,7 @@ export default function SplitTimeline({
                   onToggle={onToggle}
                   showSandbox={false}
                   displaySource={displaySourceOf?.(row.left)}
+                  timeLabel={timeLabelOf?.(row.left)}
                 />
               ) : null}
             </div>
@@ -130,6 +138,7 @@ export default function SplitTimeline({
                   onToggle={onToggle}
                   showSandbox={false}
                   displaySource={displaySourceOf?.(row.right)}
+                  timeLabel={timeLabelOf?.(row.right)}
                 />
               ) : null}
             </div>
