@@ -2033,7 +2033,7 @@ rigged before it starts.
   `web/components/ExportButtons.tsx`, `web/app/share/[token]/`,
   `web/app/runs/[id]/{results,analysis}/`.
 - **Verify:**
-  - Unit: `tests/unit/api/test_export.py` (13 tests — JSON round-trip
+  - Unit: `tests/unit/api/test_export.py` (14 tests — JSON round-trip
     through `RunExport.model_validate`, events-lite projection, CSV
     shape/BOM/empty-run header + legacy `harness` config key, 404/422,
     share mint/idempotent/revoke/unknown-token 404, events_total

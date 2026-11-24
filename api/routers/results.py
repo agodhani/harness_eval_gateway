@@ -1727,9 +1727,11 @@ class ShareOut(BaseModel):
 
     Spec + score matrix + the bounded events-lite index — everything the
     ``/share/{token}`` page renders. Control-plane filesystem references
-    (``artifact_path``, ``artifacts``, the analysis ``workspace`` path,
-    the ``_SHARE_FS_KEYS`` payload/metric keys) are stripped — the share
-    view exposes neither artifact download nor browse.
+    (``artifact_path``, ``artifacts``, ``thumbnail``, the
+    ``previewable``/``preview_type``/``preview_candidates`` probe fields,
+    the analysis ``workspace`` path, the ``_SHARE_FS_KEYS`` payload/metric
+    keys) are stripped — the share view exposes neither artifact download
+    nor browse.
     """
 
     run: RunSpecOut
@@ -2023,9 +2025,10 @@ def export_run(
 
 #: Stored payload/metric keys that carry control-plane filesystem paths —
 #: dropped from the share bundle's events and analysis signal metrics
-#: (``sb.artifact_path``/``artifacts``/analysis ``workspace`` are scrubbed
-#: field-by-field in ``get_shared_run``; the authenticated export keeps
-#: everything verbatim).
+#: (``sb.artifact_path``/``artifacts``/``thumbnail``/the preview probe
+#: fields/analysis ``workspace`` are scrubbed field-by-field in
+#: ``get_shared_run``; the authenticated export keeps everything
+#: verbatim).
 _SHARE_FS_KEYS = frozenset(
     {
         "artifact_path",
@@ -2128,6 +2131,10 @@ def get_shared_run(token: str, session: DbSession) -> ShareOut:
     for sb in results.sandboxes:
         sb.artifact_path = None
         sb.artifacts = []
+        sb.thumbnail = None
+        sb.previewable = False
+        sb.preview_type = None
+        sb.preview_candidates = []
         if sb.analysis is not None:
             sb.analysis.workspace = ""
             for sig in sb.analysis.signals:

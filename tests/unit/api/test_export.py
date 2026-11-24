@@ -417,6 +417,22 @@ def test_share_strips_fs_refs(
     art_dir = tmp_path / "run" / "sb"
     art_dir.mkdir(parents=True)
     host = str(art_dir)
+    # a previewable workspace + a captured thumbnail — the share bundle
+    # must carry neither the fetch URL nor the browse affordances
+    (art_dir / "workspace").mkdir()
+    (art_dir / "workspace" / "index.html").write_text(
+        "<html><body>2048</body></html>"
+    )
+    (art_dir / "thumbnail.png").write_bytes(b"\x89PNG")
+    (art_dir / "thumbnail.json").write_text(
+        json.dumps(
+            {
+                "captured_at": "2026-01-01T00:00:00",
+                "type": "static",
+                "entry": "index.html",
+            }
+        )
+    )
     (art_dir / "analysis.json").write_text(
         json.dumps(
             {
@@ -489,6 +505,10 @@ def test_share_strips_fs_refs(
     )
     assert sb1["artifact_path"] is None
     assert sb1["artifacts"] == []
+    assert sb1["thumbnail"] is None
+    assert sb1["previewable"] is False
+    assert sb1["preview_type"] is None
+    assert sb1["preview_candidates"] == []
     assert sb1["analysis"]["workspace"] == ""
     metrics = sb1["analysis"]["signals"][0]["metrics"]
     assert "tests_dir" not in metrics
@@ -524,6 +544,9 @@ def test_share_strips_fs_refs(
         if x["sandbox_id"] == str(scored_run["sb1"])
     )
     assert x_sb1["artifact_path"] == host
+    assert x_sb1["thumbnail"]["url"].endswith("/thumbnail")
+    assert x_sb1["previewable"] is True
+    assert x_sb1["preview_candidates"][0]["entry"] == "index.html"
     assert (
         x_sb1["analysis"]["signals"][0]["metrics"]["tests_dir"]
         == str(art_dir / "generated_tests")
