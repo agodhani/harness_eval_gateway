@@ -244,11 +244,14 @@ def test_create_run_defaults(api) -> None:
     assert cfg["harness_configs"][0]["skill_packs"] == []
     assert cfg["budgets"] == {
         "max_iters": 50,
-        "token_budget": 200_000,
+        # F30: bumped 200k → 500k (matches DEFAULT_RUN_TOKEN_BUDGET).
+        "token_budget": 500_000,
         "wall_clock_seconds": 3600,
         # PR28: optional per-sandbox caps default unset (no per-cell limit).
         "sandbox_token_budget": None,
         "max_cost_usd": None,
+        # F30: auto-extension opt-in — off unless the submit asks for it.
+        "auto_extend": False,
     }
     # evaluator defaults to participant model -> same_model_eval flag
     assert cfg["evaluator_model"] == "qwen3:8b"

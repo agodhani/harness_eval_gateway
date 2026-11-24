@@ -122,8 +122,10 @@ class GatewaySettings(BaseSettings):
     GATEWAY_CRED_SECRET: str = "dev-secret-change-me"
 
     # Fallback per-run token budget when the credential carries no max_tokens
-    # claim. A cred's own max_tokens overrides this.
-    DEFAULT_RUN_TOKEN_BUDGET: int = 200_000
+    # claim. A cred's own max_tokens overrides this. F30: bumped 200k → 500k —
+    # a real agentic task burns past 200k on retries; the cap exists to stop
+    # runaways, not starve honest work (matches BudgetsIn.token_budget).
+    DEFAULT_RUN_TOKEN_BUDGET: int = 500_000
 
     # Whole-request timeout for the upstream httpx clients (connect+read
     # bound per attempt). Congested local providers queue calls
