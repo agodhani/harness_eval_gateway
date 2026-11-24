@@ -105,30 +105,43 @@ export function canonicalDimension(name: string): string {
 }
 
 const num = (v: unknown): string =>
-  typeof v === "number" && Number.isFinite(v) ? String(v) : "";
+  typeof v === "number" && Number.isFinite(v)
+    ? String(v)
+    : typeof v === "string"
+      ? v
+      : "";
 
-/** Frozen JSON → form rows. Missing lists become empty; numeric fields
- * become strings; unknown extra keys are preserved by `buildRubricContent`
- * via the `content` it merges over (extras ride along untouched). */
+const str = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/** Frozen JSON → form rows. Missing/non-list lists become empty; numeric
+ * fields become strings; unknown extra keys are preserved by
+ * `buildRubricContent` via the `content` it merges over (extras ride along
+ * untouched). Total over arbitrary JSON — raw-mode input lands here. */
 export function draftFromContent(content: RubricContent | null | undefined): RubricDraft {
-  const dims = content?.dimensions ?? [];
-  const crits = content?.criteria ?? [];
+  const dims = Array.isArray(content?.dimensions) ? content.dimensions : [];
+  const crits = Array.isArray(content?.criteria) ? content.criteria : [];
   return {
-    summary: typeof content?.summary === "string" ? content.summary : "",
-    dimensions: dims.map((d) => ({
-      name: d.name ?? "",
-      title: d.title ?? "",
-      description: d.description ?? "",
-      weight: d.weight == null ? "" : num(d.weight),
-      min_score: d.min_score == null ? "" : num(d.min_score),
-      max_score: d.max_score == null ? "" : num(d.max_score),
-    })),
-    criteria: crits.map((c) => ({
-      id: c.id ?? "",
-      text: c.text ?? "",
-      dimension: c.dimension ?? "",
-      weight: c.weight == null ? "" : num(c.weight),
-    })),
+    summary: str(content?.summary),
+    dimensions: dims.map((d) => {
+      const dim = (d ?? {}) as RubricDimension;
+      return {
+        name: str(dim.name),
+        title: str(dim.title),
+        description: str(dim.description),
+        weight: dim.weight == null ? "" : num(dim.weight),
+        min_score: dim.min_score == null ? "" : num(dim.min_score),
+        max_score: dim.max_score == null ? "" : num(dim.max_score),
+      };
+    }),
+    criteria: crits.map((c) => {
+      const crit = (c ?? {}) as RubricCriterion;
+      return {
+        id: str(crit.id),
+        text: str(crit.text),
+        dimension: str(crit.dimension),
+        weight: crit.weight == null ? "" : num(crit.weight),
+      };
+    }),
   };
 }
 

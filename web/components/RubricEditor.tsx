@@ -12,7 +12,7 @@
  *
  * Controlled: the parent owns the `content` working copy; every edit calls
  * `onChange(content, meta)` where `meta.valid` reports whether the current
- * state could save (form-validation or JSON-parse outcome) — parents wire
+ * state could save (form or raw-JSON validation outcome) — parents wire
  * that into their save-button `disabled`. Remount via `key=` when the base
  * rubric changes so the internal draft re-derives.
  */
@@ -50,6 +50,7 @@ export default function RubricEditor({
   const [draft, setDraft] = useState<RubricDraft>(() => draftFromContent(content));
   const [raw, setRaw] = useState("");
   const [rawError, setRawError] = useState<string | null>(null);
+  const [rawIssues, setRawIssues] = useState<string[]>([]);
 
   const validation = useMemo(() => validateDraft(draft), [draft]);
   const dimNames = useMemo(
@@ -85,6 +86,7 @@ export default function RubricEditor({
     // toggle — the raw editor starts from the current working copy.
     setRaw(JSON.stringify(buildRubricContent(draft, content), null, 2));
     setRawError(null);
+    setRawIssues([]);
     setMode("json");
   }
 
@@ -95,11 +97,18 @@ export default function RubricEditor({
       if (!v || typeof v !== "object" || Array.isArray(v)) {
         throw new Error("rubric content must be a JSON object");
       }
+      const check = validateDraft(draftFromContent(v as RubricContent));
+      const issues = [...check.errors, ...Object.values(check.fieldErrors)];
       setRawError(null);
-      onChange(v as RubricContent, { valid: true, errors: [] });
+      setRawIssues(issues);
+      onChange(v as RubricContent, {
+        valid: issues.length === 0,
+        errors: issues,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setRawError(msg);
+      setRawIssues([]);
       onChange(content, { valid: false, errors: [msg] });
     }
   }
@@ -155,6 +164,13 @@ export default function RubricEditor({
             spellCheck={false}
           />
           {rawError ? <p className="field__error">Invalid JSON: {rawError}</p> : null}
+          {rawIssues.length > 0 ? (
+            <ul className="field__error" style={{ margin: 0, paddingLeft: "1.2rem" }}>
+              {rawIssues.map((e, i) => (
+                <li key={i}>{e}</li>
+              ))}
+            </ul>
+          ) : null}
         </div>
       ) : (
         <div className="stack">

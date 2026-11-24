@@ -1392,7 +1392,7 @@ export default function SubmitPage() {
               value={rubricHint}
               onChange={(e) => setRubricHint(e.target.value)}
               disabled={submitting}
-              maxLength={255}
+              maxLength={2000}
             />
             <span className="field__hint">
               {rubricHint.trim() === "" &&
