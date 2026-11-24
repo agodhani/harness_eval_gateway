@@ -80,6 +80,10 @@ CANONICAL_DIMENSIONS = (
 #: ``RubricContent.dimensions`` count bounds (PR23).
 MIN_DIMENSIONS = 1
 MAX_DIMENSIONS = 12
+#: ``RubricDimension.name`` bound (normalized form) — the name keys
+#: ``scores.dimension`` (String(128)) and the eval parser truncates longer
+#: judge-emitted names, so a longer rubric name would silently lose its score.
+MAX_DIMENSION_NAME = 128
 
 # LLM-friendly aliases normalized onto the canonical names before validation.
 # SOFT normalization only — arbitrary dimension names pass through untouched;
@@ -157,6 +161,11 @@ def _normalized_dimension_name(value: str) -> str:
     normalized = _canonical_dimension(value)
     if not normalized:
         raise ValueError(f"dimension name {value!r} normalizes to empty")
+    if len(normalized) > MAX_DIMENSION_NAME:
+        raise ValueError(
+            f"dimension name {value!r} normalizes to {len(normalized)} chars "
+            f"(max {MAX_DIMENSION_NAME})"
+        )
     return normalized
 
 

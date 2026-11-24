@@ -384,10 +384,10 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
         Path(__file__).resolve().parents[2] / "rubric_templates"
     )
     if rubric_template is not None:
-        if (
-            template_store.resolve(session, templates_dir, rubric_template)
-            is None
-        ):
+        resolved_template = template_store.resolve(
+            session, templates_dir, rubric_template
+        )
+        if resolved_template is None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
@@ -395,16 +395,19 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
                     "GET /api/rubric-templates lists valid names"
                 ),
             )
+        rubric_template = resolved_template.name
     elif preset is not None:
         suggested = preset.suggested_rubric or {}
         suggested_template = str(suggested.get("template") or "").strip()
         if suggested_template:
-            if (
-                template_store.resolve(session, templates_dir, suggested_template)
-                is not None
-            ):
-                rubric_template = suggested_template
-        elif isinstance(suggested.get("dimensions"), list):
+            resolved_template = template_store.resolve(
+                session, templates_dir, suggested_template
+            )
+            if resolved_template is not None:
+                rubric_template = resolved_template.name
+        if rubric_template is None and isinstance(
+            suggested.get("dimensions"), list
+        ):
             # Inline rubric fragment — carried verbatim as the basis.
             rubric_basis = {
                 k: suggested[k]

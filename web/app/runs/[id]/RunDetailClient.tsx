@@ -35,6 +35,7 @@ import {
   specFromRun,
   stageResubmit,
 } from "@/lib/resubmit";
+import { draftFromContent, validateDraft } from "@/lib/rubricEdit";
 import RunConsoleLive from "@/components/RunConsoleLive";
 import RubricEditor from "@/components/RubricEditor";
 import { SavePresetDialog } from "@/components/SavePresetDialog";
@@ -511,8 +512,12 @@ export default function RunDetailClient({ runId }: { runId: string }) {
 
   function startEdit() {
     if (!rubric) return;
-    setDraftContent(rubric.content ?? {});
-    setDraftValid(true);
+    const content = rubric.content ?? {};
+    setDraftContent(content);
+    const v = validateDraft(draftFromContent(content));
+    setDraftValid(
+      v.errors.length === 0 && Object.keys(v.fieldErrors).length === 0,
+    );
     setRubricError(null);
     setEditing(true);
   }

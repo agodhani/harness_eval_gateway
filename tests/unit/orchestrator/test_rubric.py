@@ -789,7 +789,8 @@ async def test_draft_rubric_template_basis(session_factory) -> None:
     user_msg = messages[1]["content"]
     assert "extraction_accuracy" in user_msg  # template dims are the basis
     assert "field_coverage" in user_msg
-    assert "field_coverage" not in user_msg.split("Task prompt")[0]
+    assert "Rubric template" in user_msg
+    assert user_msg.index("Rubric template") < user_msg.index("field_coverage")
     system_msg = messages[0]["content"]
     assert "rubric template" in system_msg.lower()
 

@@ -107,6 +107,7 @@ from evaluator.scores import (
     ParsedScores,
     ScoresFileError,
     load_scores_file,
+    rubric_dimension_scales,
 )
 from evaluator.testgen import GENERATED_TESTS_DIRNAME, generate_tests_signal
 from sandbox.runtime import DEFAULT_IMAGE, SandboxRuntime
@@ -980,7 +981,11 @@ async def evaluate_sandbox(
     scores_path = eval_ws / SCORES_FILENAME
     mode = "agentic"
     try:
-        parsed = await asyncio.to_thread(load_scores_file, scores_path)
+        parsed = await asyncio.to_thread(
+            load_scores_file,
+            scores_path,
+            dimension_scales=rubric_dimension_scales(rubric),
+        )
     except ScoresFileError as exc:
         reason = "scores_missing" if not scores_path.exists() else "scores_invalid"
         # Direct-judge fallback: the tool loop failed at OUTPUT, not

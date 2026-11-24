@@ -110,6 +110,9 @@ export function consumeResubmit(): ResubmitSpec | null {
       !spec.models.every((m) => typeof m === "string") ||
       (spec.evaluator_model != null &&
         typeof spec.evaluator_model !== "string") ||
+      (spec.rubric_template != null &&
+        typeof spec.rubric_template !== "string") ||
+      (spec.rubric_hint != null && typeof spec.rubric_hint !== "string") ||
       !Array.isArray(spec.harness_configs) ||
       !spec.harness_configs.every(
         (c) =>

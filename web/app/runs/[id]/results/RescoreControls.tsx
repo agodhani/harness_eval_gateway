@@ -26,6 +26,7 @@ import {
   type RunResults,
 } from "@/lib/api";
 import RubricEditor from "@/components/RubricEditor";
+import { draftFromContent, validateDraft } from "@/lib/rubricEdit";
 import { ErrorNote, InfoNote } from "@/components/ui";
 
 function errMsg(err: unknown, fallback: string): string {
@@ -90,8 +91,12 @@ export default function RescoreControls({
     }
     setBaseRubricId(base.id);
     setBaseLabel(`v${base.version}`);
-    setDraftContent(base.content ?? {});
-    setDraftValid(true);
+    const content = base.content ?? {};
+    setDraftContent(content);
+    const v = validateDraft(draftFromContent(content));
+    setDraftValid(
+      v.errors.length === 0 && Object.keys(v.fieldErrors).length === 0,
+    );
     setEditing(true);
   }
 

@@ -212,6 +212,78 @@ def _clean_dimension(value: Any) -> str | None:
     return dim[:MAX_DIMENSION_LEN]
 
 
+_DIM_NAME_FOLD_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _fold_dimension_name(name: str) -> str:
+    """snake_case fold matching the rubric's dimension-name normalization —
+    judge-emitted names fold the same way for scale lookup."""
+    return _DIM_NAME_FOLD_RE.sub("_", name.strip().lower()).strip("_")
+
+
+def rubric_dimension_scales(
+    rubric: dict[str, Any] | None,
+) -> dict[str, tuple[float, float, float]]:
+    """``{dimension: (min_score, max_score, weight)}`` from a frozen rubric.
+
+    Feeds the synthesized-overall fallback: a judge score is normalized
+    onto the 0-10 headline scale via its dimension's declared range.
+    Dimensions with missing/non-numeric scale fields take the 0-10 /
+    weight-1 defaults the generation schema declares.
+    """
+    out: dict[str, tuple[float, float, float]] = {}
+    if not isinstance(rubric, dict):
+        return out
+    dims = rubric.get("dimensions")
+    if not isinstance(dims, list):
+        return out
+    for dim in dims:
+        if not isinstance(dim, dict):
+            continue
+        name = dim.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        lo = _as_float(dim.get("min_score"))
+        hi = _as_float(dim.get("max_score"))
+        weight = _as_float(dim.get("weight"))
+        out[_fold_dimension_name(name)] = (
+            lo if lo is not None else 0.0,
+            hi if hi is not None else 10.0,
+            weight if weight is not None else 1.0,
+        )
+    return out
+
+
+def _synthesized_overall(
+    entries: list[ScoreEntry],
+    scales: dict[str, tuple[float, float, float]] | None,
+) -> float:
+    """Fallback ``overall`` — always on the 0-10 headline scale.
+
+    With rubric scales each entry contributes its normalized position on
+    the declared dimension range, weighted; an entry whose dimension has
+    no usable scale (unknown name, degenerate min >= max) counts at its
+    raw score — the historical plain mean when no scales are passed.
+    """
+    if not scales:
+        return round(sum(e.score for e in entries) / len(entries), 1)
+    weighted = 0.0
+    total_weight = 0.0
+    for entry in entries:
+        spec = scales.get(_fold_dimension_name(entry.dimension))
+        lo, hi, weight = spec if spec is not None else (0.0, 10.0, 1.0)
+        if not math.isfinite(weight) or weight < 0:
+            weight = 1.0
+        if math.isfinite(lo) and math.isfinite(hi) and hi > lo:
+            weighted += weight * (entry.score - lo) / (hi - lo)
+        else:
+            weighted += weight * entry.score / 10.0
+        total_weight += weight
+    if total_weight <= 0:
+        return round(sum(e.score for e in entries) / len(entries), 1)
+    return round(10.0 * weighted / total_weight, 1)
+
+
 #: Keys excluded when a flat ``{dimension: score}`` dict is normalized —
 #: ``overall``/``summary`` are schema fields, ``total`` is a sum on a
 #: different scale than the per-dimension 0-10 scores.
@@ -232,14 +304,20 @@ def _flat_scores_entries(obj: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def parse_scores_json(text: str) -> ParsedScores:
+def parse_scores_json(
+    text: str,
+    *,
+    dimension_scales: dict[str, tuple[float, float, float]] | None = None,
+) -> ParsedScores:
     """Parse scores.json content into :class:`ParsedScores`.
 
     Raises :class:`ScoresFileError` when the document is not a JSON object,
     lacks a ``scores`` list, or yields zero valid entries. A missing or
-    non-numeric ``overall`` is synthesized as the mean of the valid entries
-    (with a warning) — a null headline score is never emitted for a usable
-    document.
+    non-numeric ``overall`` is synthesized from the valid entries (with a
+    warning) — a null headline score is never emitted for a usable
+    document. ``dimension_scales`` (see :func:`rubric_dimension_scales`)
+    gives each dimension's declared scale so the synthesized ``overall``
+    stays a 0-10 score on custom-scale rubrics.
     """
     obj = _loads_lenient(text)
     if obj is None:
@@ -305,10 +383,7 @@ def parse_scores_json(text: str) -> ParsedScores:
         # leave the field null — the results matrix reads it as the headline
         # score. Synthesize the dimension mean and flag it as derived so the
         # eval_scored event's warnings show where the number came from.
-        parsed.overall = round(
-            sum(entry.score for entry in parsed.entries) / len(parsed.entries),
-            1,
-        )
+        parsed.overall = _synthesized_overall(parsed.entries, dimension_scales)
         parsed.warnings.append(
             "overall missing — computed as mean of dimension scores"
         )
@@ -319,7 +394,11 @@ def parse_scores_json(text: str) -> ParsedScores:
     return parsed
 
 
-def load_scores_file(path: Path) -> ParsedScores:
+def load_scores_file(
+    path: Path,
+    *,
+    dimension_scales: dict[str, tuple[float, float, float]] | None = None,
+) -> ParsedScores:
     """Read + parse ``path``; raises :class:`ScoresFileError` on any failure.
 
     ``path`` must be a regular file — the eval workspace is writable by the
@@ -336,4 +415,6 @@ def load_scores_file(path: Path) -> ParsedScores:
         raise ScoresFileError(f"cannot read {path}: {exc}") from exc
     if len(raw) > SCORES_FILE_MAX_BYTES:
         raise ScoresFileError(f"{path} exceeds {SCORES_FILE_MAX_BYTES} bytes")
-    return parse_scores_json(raw.decode("utf-8", errors="replace"))
+    return parse_scores_json(
+        raw.decode("utf-8", errors="replace"), dimension_scales=dimension_scales
+    )

@@ -197,11 +197,41 @@ def get_vendored(root: str | Path, name: str) -> Template | None:
 # ---------------------------------------------------------------------------
 
 
-def user_to_template(row: RubricTemplate) -> Template:
+def user_to_template(row: RubricTemplate) -> Template | None:
+    """Row → normalized template; ``None`` for non-conforming rows.
+
+    User rows land out of band — a ``name`` that isn't already canonical
+    can never resolve (``get_user`` compares the canonical query verbatim)
+    and ``content`` that isn't RubricContent-shaped can never produce a
+    rubric. Both skip with a warning rather than list an unusable entry
+    or blow up the merged listing.
+    """
+    try:
+        name = validate_name(row.name)
+    except TemplateError:
+        name = ""
+    if name != row.name:
+        log.warning(
+            "skipping rubric template row %r: name is not canonical", row.name
+        )
+        return None
+    content = row.content
+    if not isinstance(content, dict):
+        log.warning(
+            "skipping rubric template %s: content is not an object", name
+        )
+        return None
+    try:
+        content = RubricContent.model_validate(content).model_dump(mode="json")
+    except ValueError:
+        log.warning(
+            "skipping rubric template %s: content fails rubric validation", name
+        )
+        return None
     return Template(
-        name=row.name,
+        name=name,
         description=row.description or "",
-        content=dict(row.content or {}),
+        content=content,
         source=row.source or "user",
         created_at=row.created_at,
     )
@@ -222,7 +252,7 @@ def list_user(session: Session) -> list[Template]:
         .scalars()
         .all()
     )
-    return [user_to_template(r) for r in rows]
+    return [t for r in rows if (t := user_to_template(r)) is not None]
 
 
 def list_all(session: Session, vendored_root: str | Path) -> list[Template]:

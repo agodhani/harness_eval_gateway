@@ -341,7 +341,7 @@ export interface RunConfig {
    * (explicit or from the preset's suggested_rubric), an inline basis
    * fragment, and/or the domain hint fed to the generator. */
   rubric_template?: string;
-  rubric_basis?: RubricContent | { dimensions?: unknown[] } | unknown;
+  rubric_basis?: unknown;
   rubric_hint?: string;
   /** PR27: repeats per matrix cell persisted at submit. */
   trials?: number;

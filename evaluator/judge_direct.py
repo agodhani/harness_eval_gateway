@@ -53,6 +53,7 @@ from evaluator.scores import (
     ParsedScores,
     ScoresFileError,
     parse_scores_json,
+    rubric_dimension_scales,
 )
 from evaluator.testgen import (
     GENERATED_TESTS_DIRNAME,
@@ -444,6 +445,8 @@ async def judge_direct(
             await client.aclose()
 
     try:
-        return parse_scores_json(raw)
+        return parse_scores_json(
+            raw, dimension_scales=rubric_dimension_scales(rubric)
+        )
     except ScoresFileError as exc:
         raise DirectJudgeError(f"direct judge output unusable: {exc}") from exc

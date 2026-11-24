@@ -979,7 +979,7 @@ def _validate_suggested_rubric(v: dict[str, Any] | None) -> dict[str, Any] | Non
     if v is None:
         return None
     if not isinstance(v, dict):
-        raise TypeError(
+        raise ValueError(
             "suggested_rubric must be an object — "
             '{"template": name}, {"hint": text}, or {"dimensions": [...]}'
         )
@@ -987,9 +987,13 @@ def _validate_suggested_rubric(v: dict[str, Any] | None) -> dict[str, Any] | Non
     unknown = sorted(set(v) - allowed)
     if unknown:
         raise ValueError(f"suggested_rubric: unknown keys {unknown}")
-    if "template" in v and not str(v.get("template") or "").strip():
+    if "template" in v and (
+        not isinstance(v.get("template"), str) or not v["template"].strip()
+    ):
         raise ValueError("suggested_rubric.template must be a non-empty name")
-    if "hint" in v and not str(v.get("hint") or "").strip():
+    if "hint" in v and (
+        not isinstance(v.get("hint"), str) or not v["hint"].strip()
+    ):
         raise ValueError("suggested_rubric.hint must be non-empty text")
     if "dimensions" in v and not isinstance(v.get("dimensions"), list):
         raise ValueError("suggested_rubric.dimensions must be a list")
