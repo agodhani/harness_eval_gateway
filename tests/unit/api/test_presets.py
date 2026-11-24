@@ -647,27 +647,21 @@ def test_vendored_suggested_rubrics_resolve() -> None:
     template that actually resolves in the merged library — a committed
     typo would silently never apply, so the contract test pins it."""
     from api import rubric_templates as template_store
-    from db.models import RubricTemplate  # noqa: F401 — tables exist on Base
 
-    engine_preset_templates = {}
-    with make_session_factory(
-        __import__("db.session", fromlist=["make_engine"]).make_engine(
-            "sqlite:///:memory:"
+    preset_templates = {}
+    for p in preset_store.list_vendored(VENDORED_DIR):
+        if not p.suggested_rubric:
+            continue
+        name = p.suggested_rubric.get("template")
+        assert name, f"{p.slug}: suggested_rubric without template"
+        preset_templates[p.slug] = name
+        tpl = template_store.get_vendored(REPO_ROOT / "rubric_templates", name)
+        assert tpl is not None, (
+            f"{p.slug}: suggested_rubric template {name!r} not vendored"
         )
-    )():
-        for p in preset_store.list_vendored(VENDORED_DIR):
-            if not p.suggested_rubric:
-                continue
-            name = p.suggested_rubric.get("template")
-            assert name, f"{p.slug}: suggested_rubric without template"
-            engine_preset_templates[p.slug] = name
-            tpl = template_store.get_vendored(REPO_ROOT / "rubric_templates", name)
-            assert tpl is not None, (
-                f"{p.slug}: suggested_rubric template {name!r} not vendored"
-            )
     # the non-code presets picked their domain templates
-    assert engine_preset_templates.get("extraction-classification") == "extraction-accuracy"
-    assert engine_preset_templates.get("support-reply") == "support-tone-compliance"
+    assert preset_templates.get("extraction-classification") == "extraction-accuracy"
+    assert preset_templates.get("support-reply") == "support-tone-compliance"
 
 
 def test_create_and_patch_suggested_rubric(api) -> None:

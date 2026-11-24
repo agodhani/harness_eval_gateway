@@ -56,6 +56,16 @@ export const MAX_DIMENSIONS = 12;
 /** `scores.dimension` is String(128) — keep names under the column bound. */
 export const MAX_DIMENSION_NAME = 128;
 
+/** Reserved `scores.dimension` pseudo-rows + flat-map keys the eval parser
+ * owns — the backend rejects real dimensions under these names. */
+export const RESERVED_DIMENSION_NAMES = new Set([
+  "overall",
+  "suite_pass",
+  "scores",
+  "summary",
+  "total",
+]);
+
 /** Backend `_DIMENSION_ALIASES` — fold LLM re-phrasings onto canonical. */
 const DIMENSION_ALIASES: Record<string, string> = {
   functional: "functional_requirements",
@@ -179,6 +189,8 @@ export function validateDraft(draft: RubricDraft): DraftValidation & {
       fieldErrors[key] = "name is required";
     } else if (!canon) {
       fieldErrors[key] = `"${d.name}" has no letters/digits — nothing to score under`;
+    } else if (RESERVED_DIMENSION_NAMES.has(canon)) {
+      fieldErrors[key] = `"${canon}" is a reserved score field — pick another name`;
     } else if (canon.length > MAX_DIMENSION_NAME) {
       fieldErrors[key] = `normalized name is ${canon.length} chars (max ${MAX_DIMENSION_NAME})`;
     }

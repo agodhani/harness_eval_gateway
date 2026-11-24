@@ -56,6 +56,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from db.models import Rubric, Run
 from gateway.creds import mint_cred
 from gateway.metering import tokens_used
+from scoring.checkers import SUITE_PASS_DIMENSION
 
 from . import state_machine
 from .events import emit
@@ -84,6 +85,16 @@ MAX_DIMENSIONS = 12
 #: ``scores.dimension`` (String(128)) and the eval parser truncates longer
 #: judge-emitted names, so a longer rubric name would silently lose its score.
 MAX_DIMENSION_NAME = 128
+
+#: Normalized names a dimension can never take: ``overall`` and
+#: ``suite_pass`` are reserved pseudo-rows in ``scores.dimension`` (the
+#: results payload routes them to the headline / deterministic-checker
+#: slots), and ``scores``/``summary``/``total`` are the eval parser's
+#: flat-map exclusions — a real dimension under one of these names loses
+#: its score or masquerades as another field.
+RESERVED_DIMENSION_NAMES = frozenset(
+    {"overall", "scores", "summary", "total", SUITE_PASS_DIMENSION}
+)
 
 # LLM-friendly aliases normalized onto the canonical names before validation.
 # SOFT normalization only — arbitrary dimension names pass through untouched;
@@ -192,6 +203,10 @@ class RubricContent(BaseModel):
         seen: list[str] = []
         for dim in self.dimensions:
             canonical = _normalized_dimension_name(dim.name)
+            if canonical in RESERVED_DIMENSION_NAMES:
+                raise ValueError(
+                    f"dimension name {canonical!r} is a reserved score field"
+                )
             dim.name = canonical
             seen.append(canonical)
         names = set(seen)
@@ -203,9 +218,10 @@ class RubricContent(BaseModel):
             # way so "Accuracy" binds a dim normalized to ``accuracy``. An
             # unusable reference (punctuation only) is evidence text, not
             # structure — keep it verbatim rather than rejecting the rubric.
-            normalized = _canonical_dimension(criterion.dimension)
-            if normalized:
-                criterion.dimension = normalized
+            if _canonical_dimension(criterion.dimension):
+                criterion.dimension = _normalized_dimension_name(
+                    criterion.dimension
+                )
         return self
 
 

@@ -263,10 +263,13 @@ def _synthesized_overall(
     With rubric scales each entry contributes its normalized position on
     the declared dimension range, weighted; an entry whose dimension has
     no usable scale (unknown name, degenerate min >= max) counts at its
-    raw score — the historical plain mean when no scales are passed.
+    raw score — the historical plain mean when no scales are passed. An
+    off-scale judge score is clamped to the dimension range so it can't
+    push the headline outside 0-10.
     """
+    mean = round(min(10.0, max(0.0, sum(e.score for e in entries) / len(entries))), 1)
     if not scales:
-        return round(sum(e.score for e in entries) / len(entries), 1)
+        return mean
     weighted = 0.0
     total_weight = 0.0
     for entry in entries:
@@ -275,12 +278,13 @@ def _synthesized_overall(
         if not math.isfinite(weight) or weight < 0:
             weight = 1.0
         if math.isfinite(lo) and math.isfinite(hi) and hi > lo:
-            weighted += weight * (entry.score - lo) / (hi - lo)
+            pos = (entry.score - lo) / (hi - lo)
         else:
-            weighted += weight * entry.score / 10.0
+            pos = entry.score / 10.0
+        weighted += weight * min(1.0, max(0.0, pos))
         total_weight += weight
     if total_weight <= 0:
-        return round(sum(e.score for e in entries) / len(entries), 1)
+        return mean
     return round(10.0 * weighted / total_weight, 1)
 
 
