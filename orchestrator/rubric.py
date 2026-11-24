@@ -253,8 +253,8 @@ def _normalize_rubric_dict(data: dict[str, Any]) -> dict[str, Any]:
     """Lenient pre-validation coercions on the parsed rubric dict.
 
     Only shape-preserving fixes for observed small-model quirks — the
-    structural contract (exactly the four canonical dimensions) is still
-    enforced by :class:`RubricContent` validation:
+    structural contract (1–12 dimensions, unique after normalization) is
+    still enforced by :class:`RubricContent` validation:
 
     - ``generated_by`` emitted as a scalar (live: the string
       ``"rubric_generator"``) wraps as ``{"source": <value>}``; a null
@@ -262,9 +262,6 @@ def _normalize_rubric_dict(data: dict[str, Any]) -> dict[str, Any]:
     - ``dimensions[]``/``criteria[]`` ``weight``/``min_score``/
       ``max_score`` arriving as numeric strings coerce to float; genuinely
       non-numeric values pass through untouched for validation to reject.
-
-    The one structural contract — 1–12 dimensions, unique after
-    normalization — is enforced by :class:`RubricContent` validation.
     """
     if "generated_by" in data:
         generated_by = data["generated_by"]
