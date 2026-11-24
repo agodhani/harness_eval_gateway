@@ -438,6 +438,8 @@ task_presets/  # vendored task presets (<slug>.md — frontmatter + prompt body)
 api/presets.py # preset store: vendored discovery + merged vendored/user resolve
 benchmark_suites/ # vendored benchmark suites (<slug>/suite.yaml + tests/)
 api/suites.py  # suite store: yaml parse, slug-safe resolve, jailed check paths
+rubric_templates/ # vendored rubric templates (<name>.json, F26)
+api/rubric_templates.py # merged template store: vendored + user rows
 scoring/checkers.py # deterministic suite checkers (output + workspace + py_test)
 web/           # Next.js app
 db/            # schema + Alembic migrations

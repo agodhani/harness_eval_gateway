@@ -6,7 +6,7 @@ freeform prompt. Two sources share ONE slug namespace:
 - **vendored** — ``task_presets/<slug>.md`` at the repo root: a YAML-ish
   frontmatter block (``slug`` — which must equal the filename stem —
   ``title``, ``description``, ``category``, ``tags``, optional
-  ``suggested_adapter``/``suggested_models``)
+  ``suggested_adapter``/``suggested_models``/``suggested_rubric``)
   followed by a markdown body that IS the task prompt. Committed + baked
   into the api image like ``skillpacks/``.
 - **user** — ``task_presets`` table rows created via
