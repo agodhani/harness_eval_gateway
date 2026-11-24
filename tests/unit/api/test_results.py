@@ -129,13 +129,30 @@ def test_run_results_shape(client: TestClient, scored_run) -> None:
     assert sb1["model"] == "qwen3:8b"  # PR14: no config model → run default
     assert sb1["harness_config"]["skill_packs"] == ["superpowers"]
     assert sb1["rubric_id"] == str(scored_run["rubric_id"])
-    assert sb1["dimensions"]["functional_requirements"] == {
-        "score": 8.0, "rationale": "game loop works"
-    }
+    fr = sb1["dimensions"]["functional_requirements"]
+    assert fr["score"] == 8.0
+    assert fr["rationale"] == "game loop works"
+    # PR29 provenance fields — single-judge legacy rows merge to a
+    # one-judge cell whose judge_model resolves to the primary judge.
+    assert fr["source"] == "llm"
+    assert fr["judge_count"] == 1
+    assert fr["spread"] is None
+    assert fr["judges"] == [
+        {
+            "judge_model": "qwen3:8b",
+            "score": 8.0,
+            "rationale": "game loop works",
+            "source": "llm",
+        }
+    ]
     assert sb1["dimensions"]["code_quality"]["score"] == 6.0
     # overall pseudo-dimension surfaced separately, not inside dimensions
     assert "overall" not in sb1["dimensions"]
-    assert sb1["overall"] == {"score": 7.0, "rationale": "solid attempt"}
+    assert sb1["overall"]["score"] == 7.0
+    assert sb1["overall"]["rationale"] == "solid attempt"
+    assert sb1["overall"]["source"] == "llm"
+    assert body["evaluator_models"] == ["qwen3:8b"]
+    assert body["votes"] is None
 
     sb2 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"]))
     assert sb2["dimensions"] == {}
@@ -1375,9 +1392,9 @@ def test_results_same_second_passes_newest_inserted_wins(
         x for x in body["sandboxes"]
         if x["sandbox_id"] == str(scored_run["sb1"])
     )
-    assert sb1["dimensions"]["functional_requirements"] == {
-        "score": 3.0, "rationale": "v1 rescore pass"
-    }
+    dim = sb1["dimensions"]["functional_requirements"]
+    assert dim["score"] == 3.0
+    assert dim["rationale"] == "v1 rescore pass"
     assert sb1["rubric_version"] == 1
 
 

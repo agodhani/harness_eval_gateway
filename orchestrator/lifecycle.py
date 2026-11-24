@@ -43,7 +43,7 @@ from scoring import checkers
 
 from . import monitor, pacing, prompt_cell, provision, state_machine
 from .events import emit
-from .matrix import expanded_configs
+from .matrix import expanded_configs, judge_models
 
 log = logging.getLogger(__name__)
 
@@ -376,6 +376,10 @@ def _suite_pass_score_row(
             f"{roll['passed']}/{roll['measured']} deterministic suite "
             f"checks passed"
         ),
+        # PR29 provenance — deterministic measurement, not a judge: it
+        # lands in its own merge bucket and carries no model.
+        source="checker",
+        judge_model=None,
     )
 
 
@@ -551,7 +555,16 @@ async def _evaluate_all(
             )
             return
 
-    evaluator_model = model or (run.config or {}).get("evaluator_model") or run.model_name
+    # PR29 — judge panel: an explicit ``model`` override (re-score)
+    # re-judges with that ONE judge; otherwise the run's panel
+    # (config.evaluator_models — evaluator_model is panel[0]) each scores
+    # every artifact independently, on its own cred. model_name is the
+    # final fallback so a panel can never be empty on a well-formed run.
+    judges = (
+        [model]
+        if model
+        else (judge_models(run.config, run.model_name) or [run.model_name])
+    )
     timeout = float(settings.EVAL_TIMEOUT_SECONDS)
 
     sandboxes = _sandboxes_with_artifacts(session_factory, run.id, sandbox_ids)
@@ -595,7 +608,7 @@ async def _evaluate_all(
             ),
             "transcript_path": artifact_dir / "transcript.log",
             "terminal_reason": sb.terminal_reason,
-            "model": evaluator_model,
+            "model": "",  # set per judge inside the panel loop below
             "gateway_base_url": settings.GATEWAY_URL,
             "session_factory": session_factory,
             "timeout_seconds": timeout,
@@ -609,43 +622,99 @@ async def _evaluate_all(
             # reasoning before scores.json; the 4096 default truncates.
             "judge_max_tokens": int(settings.EVAL_JUDGE_MAX_TOKENS),
         }
-        # Baseline BEFORE the first attempt: a re-score can target an
-        # already-judged sandbox, so "any Score rows" ≠ "this pass scored".
-        # Retry progress is measured by the DELTA — otherwise a flaky empty
-        # re-score would satisfy the check on stale rows and never retry.
-        baseline = _sandbox_score_count(session_factory, sb.id)
-        attempts = 0
-        for attempt in range(1, retries + 2):
-            attempts = attempt
-            try:
-                # Fresh cred per attempt: a single cred's TTL can't span N
-                # sequential evals. max_tokens = tokens already spent +
-                # EVAL_TOKEN_BUDGET so the judge keeps its own allowance
-                # instead of 429ing on participant spend.
-                kwargs["gateway_cred"] = mint_cred(
-                    run_id=run.id,
-                    sandbox_id=sb.id,
-                    secret=settings.GATEWAY_CRED_SECRET,
-                    ttl_seconds=int(settings.EVAL_TIMEOUT_SECONDS) + 600,
-                    max_tokens=_run_tokens_used(session_factory, run.id)
-                    + int(settings.EVAL_TOKEN_BUDGET),
-                )
-                # Error-feedback retry: the previous attempt's
-                # eval_scores_failed detail lands in the retry's
-                # EVAL_PROMPT.md (prior_error) — a blind respawn with the
-                # same prompt flakes identically. Queried fresh per attempt
-                # so a second retry sees the latest failure.
-                kwargs["prior_error"] = (
-                    _last_eval_scores_error(session_factory, sb.id)
-                    if attempt > 1
-                    else None
-                )
-                await asyncio.wait_for(
-                    evaluator_fn(**kwargs),
-                    timeout=timeout + _EVAL_TIMEOUT_MARGIN_SECONDS,
-                )
-            except Exception as exc:  # noqa: BLE001 — per-sandbox isolation
-                log.warning("evaluation failed for sandbox %s: %s", sb.id, exc)
+        # One judge at a time (sequential — the eval sandbox id + staged
+        # workspace are per-sandbox, not per-judge). Each judge gets its
+        # own cred + retry budget; one judge's failure mustn't zero the
+        # others' scores, so baselines and failure markers are per judge.
+        for judge in judges:
+            kwargs["model"] = judge
+            # Baseline BEFORE the first attempt: a re-score can target an
+            # already-judged sandbox, so "any Score rows" ≠ "this pass
+            # scored". Retry progress is measured by the DELTA — otherwise
+            # a flaky empty re-score would satisfy the check on stale rows
+            # and never retry. Re-snapshotted PER JUDGE on the total count
+            # (not judge-scoped): judge A's rows can't satisfy judge B's
+            # delta, and unstamped/legacy rows still count as output.
+            baseline = _sandbox_score_count(session_factory, sb.id)
+            attempts = 0
+            for attempt in range(1, retries + 2):
+                attempts = attempt
+                try:
+                    # Fresh cred per attempt: a single cred's TTL can't
+                    # span N sequential evals — and a panel never shares
+                    # one cred across judges (PR29). max_tokens = tokens
+                    # already spent + EVAL_TOKEN_BUDGET so the judge keeps
+                    # its own allowance instead of 429ing on participant
+                    # spend.
+                    kwargs["gateway_cred"] = mint_cred(
+                        run_id=run.id,
+                        sandbox_id=sb.id,
+                        secret=settings.GATEWAY_CRED_SECRET,
+                        ttl_seconds=int(settings.EVAL_TIMEOUT_SECONDS) + 600,
+                        max_tokens=_run_tokens_used(session_factory, run.id)
+                        + int(settings.EVAL_TOKEN_BUDGET),
+                    )
+                    # Error-feedback retry: the previous attempt's
+                    # eval_scores_failed detail lands in the retry's
+                    # EVAL_PROMPT.md (prior_error) — a blind respawn with the
+                    # same prompt flakes identically. Queried fresh per attempt
+                    # so a second retry sees the latest failure.
+                    kwargs["prior_error"] = (
+                        _last_eval_scores_error(session_factory, sb.id)
+                        if attempt > 1
+                        else None
+                    )
+                    await asyncio.wait_for(
+                        evaluator_fn(**kwargs),
+                        timeout=timeout + _EVAL_TIMEOUT_MARGIN_SECONDS,
+                    )
+                except Exception as exc:  # noqa: BLE001 — per-sandbox isolation
+                    log.warning(
+                        "evaluation failed for sandbox %s (judge %s): %s",
+                        sb.id,
+                        judge,
+                        exc,
+                    )
+                    _emit_run_event(
+                        session_factory,
+                        run.id,
+                        sandbox_id=sb.id,
+                        event_type="error",
+                        payload={
+                            "stage": "evaluation",
+                            "judge_model": judge,
+                            "message": f"{type(exc).__name__}: {exc}",
+                        },
+                    )
+                    break  # infra failure is deterministic — don't retry
+                if _sandbox_score_count(session_factory, sb.id) > baseline:
+                    break  # this pass produced scores — done with this judge
+                if attempt <= retries:
+                    # Judge ran but produced no usable scores.json — the
+                    # observed failure mode of small local judge models
+                    # (malformed JSON, stuck-loop wander). Bounded re-spawn,
+                    # event-visible.
+                    _emit_run_event(
+                        session_factory,
+                        run.id,
+                        sandbox_id=sb.id,
+                        event_type="checkpoint",
+                        payload={
+                            "stage": "eval_retry",
+                            "judge_model": judge,
+                            "attempt": attempt + 1,
+                            "reason": "no scores produced",
+                        },
+                    )
+            if _sandbox_score_count(session_factory, sb.id) == baseline:
+                # THIS judge produced nothing across its attempts — the
+                # per-judge eval-failure marker (PR29: judge A scoring
+                # must not mask judge B's total failure, so the check is
+                # "no delta for this judge", not "no rows at all").
+                # Per-attempt failures leave their own error events, but
+                # nothing else distinguishes "gave up" from "retry pending"
+                # on the timeline, and the results API derives its
+                # per-sandbox eval_error from these.
                 _emit_run_event(
                     session_factory,
                     run.id,
@@ -653,47 +722,15 @@ async def _evaluate_all(
                     event_type="error",
                     payload={
                         "stage": "evaluation",
-                        "message": f"{type(exc).__name__}: {exc}",
+                        "phase": "eval_failed",
+                        "judge_model": judge,
+                        "message": (
+                            f"judge {judge} produced no usable scores after "
+                            f"{attempts} attempt(s)"
+                        ),
+                        "attempts": attempts,
                     },
                 )
-                break  # infra failure is deterministic — don't retry
-            if _sandbox_score_count(session_factory, sb.id) > baseline:
-                break  # this pass produced scores — done with this sandbox
-            if attempt <= retries:
-                # Judge ran but produced no usable scores.json — the observed
-                # failure mode of small local judge models (malformed JSON,
-                # stuck-loop wander). Bounded re-spawn, event-visible.
-                _emit_run_event(
-                    session_factory,
-                    run.id,
-                    sandbox_id=sb.id,
-                    event_type="checkpoint",
-                    payload={
-                        "stage": "eval_retry",
-                        "attempt": attempt + 1,
-                        "reason": "no scores produced",
-                    },
-                )
-        if _sandbox_score_count(session_factory, sb.id) == 0:
-            # Final per-sandbox eval-failure marker — per-attempt failures
-            # leave their own error events, but nothing else distinguishes
-            # "gave up" from "retry pending" on the timeline, and the
-            # results API derives its per-sandbox eval_error from these.
-            _emit_run_event(
-                session_factory,
-                run.id,
-                sandbox_id=sb.id,
-                event_type="error",
-                payload={
-                    "stage": "evaluation",
-                    "phase": "eval_failed",
-                    "message": (
-                        "judge produced no usable scores after "
-                        f"{attempts} attempt(s)"
-                    ),
-                    "attempts": attempts,
-                },
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -1262,7 +1299,13 @@ async def _rescore_run(
     if run is None:
         return
 
-    evaluator_model = model or (run.config or {}).get("evaluator_model") or run.model_name
+    # PR29 — an explicit ``model`` re-judges with that one judge;
+    # otherwise a rescore re-runs the run's whole panel.
+    rescore_judges = (
+        [model]
+        if model
+        else (judge_models(run.config, run.model_name) or [run.model_name])
+    )
     _enter_evaluating(
         session_factory,
         run_id,
@@ -1270,7 +1313,8 @@ async def _rescore_run(
             "stage": "rescore_started",
             "rubric_id": str(rubric.id),
             "rubric_version": rubric.version,
-            "model": evaluator_model,
+            "model": rescore_judges[0],
+            "judge_models": rescore_judges,
             "sandbox_ids": (
                 [str(s) for s in sorted(sandbox_ids)] if sandbox_ids else "all"
             ),
