@@ -116,6 +116,29 @@ describe("specFromRun", () => {
     assert.equal(specFromRun(run({ config: {} })).task_inputs, null);
   });
 
+  test("judge panel (PR29): extras restore from persisted panel head-tail", () => {
+    const spec = specFromRun(
+      run({
+        config: {
+          evaluator_model: "qwen2.5-coder:7b",
+          evaluator_models: ["qwen2.5-coder:7b", "gpt-4o-mini", "judge-c"],
+        },
+      }),
+    );
+    // config.evaluator_models is the FULL panel (head = evaluator_model);
+    // the spec only models the extras — panel[0] already restored via
+    // evaluator_model.
+    assert.equal(spec.evaluator_model, "qwen2.5-coder:7b");
+    assert.deepEqual(spec.evaluator_models, ["gpt-4o-mini", "judge-c"]);
+  });
+
+  test("no panel (PR29): evaluator_models stays null — legacy single judge", () => {
+    const spec = specFromRun(
+      run({ config: { evaluator_model: "qwen2.5-coder:7b" } }),
+    );
+    assert.equal(spec.evaluator_models, null);
+  });
+
   test("rubric_template + rubric_hint (PR23) ride the spec; absent stay null", () => {
     const spec = specFromRun(
       run({

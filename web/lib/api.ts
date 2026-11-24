@@ -316,6 +316,11 @@ export interface RunCreate {
   models?: string[] | null;
   harness_configs: HarnessConfig[];
   evaluator_model?: string | null;
+  /** PR29: ADDITIONAL judge models — the run's judge panel becomes
+   * [evaluator_model] + evaluator_models (1–3 total, deduped). Each judge
+   * scores every artifact independently; results merge to the panel mean
+   * + spread. Omit for the classic single judge. */
+  evaluator_models?: string[] | null;
   budgets?: Budgets;
   task_inputs?: TaskInputs | null;
   /** PR23: rubric-generation steering — `rubric_template` names a template
@@ -334,6 +339,9 @@ export interface RunConfig {
   /** PR14: effective participant-model set persisted at submit. */
   models?: string[];
   evaluator_model?: string | null;
+  /** PR29: persisted judge panel (evaluator_model folded to panel[0]) —
+   * absent on single-judge runs, which keep the legacy shape. */
+  evaluator_models?: string[];
   budgets?: Budgets;
   same_model_eval?: boolean;
   task_inputs?: TaskInputs | null;
@@ -491,9 +499,34 @@ export interface EventOut {
   payload: Record<string, unknown>;
 }
 
+/** PR29 — one judge's newest verdict on a dimension (panel merge). */
+export interface JudgeScore {
+  /** Model stamped on the score row — null for checker rows (suite_pass)
+   * and never model-authored entries. */
+  judge_model: string | null;
+  score: number;
+  rationale: string;
+  /** "llm" (judge pass) | "checker" (deterministic measurement). */
+  source: string;
+}
+
 export interface DimensionScore {
   score: number;
   rationale: string;
+  /** PR29 — where the displayed number came from: "llm" = per-judge
+   * newest-score mean across the panel; "human" = a POST
+   * /api/sandboxes/{id}/scores override row, which wins the pair
+   * outright; "checker" = deterministic suite_pass measurement. */
+  source?: string;
+  /** Free-text context on human overrides (why the score moved). */
+  note?: string | null;
+  /** Per-judge newest verdicts feeding the mean — rendered in the cell
+   * tooltip + the "judges said X" line under a human override. */
+  judges?: JudgeScore[];
+  /** max − min across contributing judges; null below 2 judges — the UI
+   * badges disagreement above its threshold (>2 pts). */
+  spread?: number | null;
+  judge_count?: number;
 }
 
 /** PR6 — objective scoring signals (scoring/ AnalysisReport).
@@ -614,6 +647,12 @@ export interface RunResults {
   selected_rubric_version?: number | null;
   /** PR5: every rubric version + score counts for the selector. */
   rubric_versions?: RubricVersionOut[];
+  /** PR29: the run's judge panel — panel[0] is the primary judge
+   * NULL-judge score rows resolve into. Single-judge runs report a
+   * one-element panel. */
+  evaluator_models?: string[];
+  /** PR29: blind A/B roll-up — null until the first vote lands. */
+  votes?: VotesSummary | null;
   sandboxes: SandboxResult[];
 }
 
@@ -626,6 +665,11 @@ export interface ScoreOut {
   dimension: string;
   score: number;
   rationale: string;
+  /** PR29 provenance — judge model for llm rows (null pre-panel);
+   * the row's author class (llm | human | checker); human context. */
+  judge_model?: string | null;
+  source?: string;
+  note?: string | null;
   created_at: string;
 }
 
@@ -2055,6 +2099,9 @@ export interface SuiteRunIn {
   models?: string[] | null;
   harness_configs: HarnessConfig[];
   evaluator_model?: string | null;
+  /** PR29: judge panel extras — every suite task's run scores against
+   * [evaluator_model] + evaluator_models. */
+  evaluator_models?: string[] | null;
   budgets?: Budgets;
   /** PR27 parity: each task's matrix multiplies by this many trials. */
   trials?: number;
@@ -2511,5 +2558,151 @@ export function getAnalyticsSummary(
       recent: opts.recent,
       price_model: opts.priceModel,
     })}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// PR29 — judge quality: human overrides + blind A/B pairwise review
+// ---------------------------------------------------------------------------
+
+/** POST /api/sandboxes/{id}/scores body — a human override verdict on one
+ * dimension. The stored row (source="human") wins the newest-wins merge
+ * for its (sandbox, dimension) pair regardless of what judge rows exist;
+ * `note` carries the "why" for the results cell. */
+export interface HumanScoreIn {
+  dimension: string;
+  score: number;
+  rationale?: string;
+  note?: string | null;
+}
+
+export function postHumanScore(
+  sandboxId: string,
+  body: HumanScoreIn,
+): Promise<ScoreOut> {
+  return request<ScoreOut>(
+    `/api/sandboxes/${encodeURIComponent(sandboxId)}/scores`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+/** One sandbox's blind-A/B tally. `win_rate` counts decided votes only
+ * (wins / (wins+losses) — ties excluded); null when undecided. */
+export interface VoteStats {
+  wins: number;
+  losses: number;
+  ties: number;
+  win_rate: number | null;
+}
+
+/** Blind A/B roll-up on RunResults.votes — `total` is the merged vote
+ * count (newest per unordered pair+dim wins); `compared`/`agreed`/
+ * `agreement_rate` measure judge-vs-human agreement over votes where
+ * both sides carry a judge mean on the voted dimension. */
+export interface VotesSummary {
+  total: number;
+  by_sandbox: Record<string, VoteStats>;
+  compared: number;
+  agreed: number;
+  agreement_rate: number | null;
+}
+
+/** POST /api/runs/{id}/pair body — optionally pin which two
+ * artifact-bearing sandboxes face off; omitted → server picks at random. */
+export interface PairCreateIn {
+  sandbox_ids?: string[] | null;
+}
+
+/** One anonymized side of a pair session — label + file listing only
+ * (no sandbox ids, model or config names; that's the blind contract). */
+export interface PairSideOut {
+  label: string; // "A" | "B"
+  /** "workspace" | "artifact" (prompt-cell: output.txt only). */
+  root: string;
+  entries: FileEntry[];
+  truncated: boolean;
+}
+
+/** 201 response to POST /api/runs/{id}/pair — pair_id is the only handle
+ * the reviewer (and the vote endpoint) needs. `dimensions` = the rubric
+ * dimension names + "overall" — the vote menu. */
+export interface PairOut {
+  pair_id: string;
+  run_id: string;
+  dimensions: string[];
+  sides: PairSideOut[];
+}
+
+/** Anonymized read of one pair-side file — `side` is the A/B label. */
+export interface PairFileOut {
+  pair_id: string;
+  side: string;
+  path: string;
+  size: number;
+  truncated: boolean;
+  binary: boolean;
+  text: string | null;
+}
+
+/** POST /api/runs/{id}/pair/{pair_id}/vote body — winner is the A/B label
+ * (or "tie"); the stored row resolves it to sandbox ids server-side. */
+export interface PairVoteIn {
+  dimension: string;
+  winner: string; // "A" | "B" | "tie"
+  note?: string | null;
+}
+
+/** One recorded blind-A/B vote — real sandbox ids, revealed post-vote. */
+export interface PairwiseVoteOut {
+  id: number;
+  run_id: string;
+  left_sandbox: string;
+  right_sandbox: string;
+  dimension: string;
+  winner: string; // left | right | tie — left := the sandbox behind "A"
+  note: string;
+  created_at: string;
+}
+
+/** Open a blind A/B pair session (201). */
+export function createPair(
+  runId: string,
+  sandboxIds?: string[],
+): Promise<PairOut> {
+  const body: PairCreateIn = sandboxIds ? { sandbox_ids: sandboxIds } : {};
+  return request<PairOut>(`/api/runs/${encodeURIComponent(runId)}/pair`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Read one file inside a pair side — 404s on expired sessions. */
+export function getPairFile(
+  runId: string,
+  pairId: string,
+  side: string,
+  path: string,
+): Promise<PairFileOut> {
+  return request<PairFileOut>(
+    `/api/runs/${encodeURIComponent(runId)}/pair/${encodeURIComponent(pairId)}/files/${encodeURIComponent(side)}/${fileUrlPath(path)}`,
+  );
+}
+
+/** Record the reviewer's verdict (201). */
+export function postPairVote(
+  runId: string,
+  pairId: string,
+  body: PairVoteIn,
+): Promise<PairwiseVoteOut> {
+  return request<PairwiseVoteOut>(
+    `/api/runs/${encodeURIComponent(runId)}/pair/${encodeURIComponent(pairId)}/vote`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+/** Every recorded pairwise vote for the run, newest first. */
+export function listPairVotes(runId: string): Promise<PairwiseVoteOut[]> {
+  return request<PairwiseVoteOut[]>(
+    `/api/runs/${encodeURIComponent(runId)}/votes`,
   );
 }

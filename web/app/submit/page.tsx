@@ -73,6 +73,9 @@ const MAX_CONFIGS = 8;
 const MAX_MATRIX_CELLS = 32;
 // RunCreate.models caps at 8 extras → at most 1 primary + 8 extra rows.
 const MAX_MODEL_ROWS = 9;
+/** PR29: judge panel — primary judge (evaluator_model) + up to 2 extra
+ * judge rows (evaluator_models); the server folds them to a 1–3 panel. */
+const MAX_EXTRA_JUDGES = 2;
 
 /** PR27 per-config model-sampling knobs — form state stays stringly-typed
  * (empty = unset) and serializes to numbers/null in the payload. */
@@ -192,6 +195,10 @@ export default function SubmitPage() {
   const [evalRow, setEvalRow] = useState<ModelRow>(() =>
     blankModelRow("ollama"),
   );
+  // PR29: additional judge rows (evaluator_models) — each scores every
+  // artifact independently on its own eval cred; results merge to the
+  // panel mean + spread.
+  const [evalExtras, setEvalExtras] = useState<ModelRow[]>([]);
   // Gateway's resolved default provider — learned from the no-param mount
   // fetch; new rows + unpicked selects track it.
   const [defaultProvider, setDefaultProvider] = useState("ollama");
@@ -288,6 +295,9 @@ export default function SubmitPage() {
           rs.map((row) => (row.picked ? row : { ...row, provider })),
         );
         setEvalRow((e) => (e.picked ? e : { ...e, provider }));
+        setEvalExtras((rs) =>
+          rs.map((r) => (r.picked ? r : { ...r, provider })),
+        );
       })
       .catch(() => {
         /* offline fallback: static MODEL_SUGGESTIONS */
@@ -329,6 +339,13 @@ export default function SubmitPage() {
         provider: "ollama",
         model: spec.evaluator_model ?? "",
       });
+      // PR29: the spec's panel extras restore as additional judge rows
+      // (panel[0] = evaluator_model already restored above).
+      setEvalExtras(
+        (spec.evaluator_models ?? [])
+          .slice(0, MAX_EXTRA_JUDGES)
+          .map((m) => ({ key: nextKey++, provider: "ollama", model: m })),
+      );
       setConfigs(
         spec.harness_configs.length
           ? spec.harness_configs.map((c) => ({
@@ -645,10 +662,18 @@ export default function SubmitPage() {
   const sandboxCount = configs.length * Math.max(modelCount, 1) * trials;
 
   const effectiveEvaluator = evalRow.model.trim() || primaryModel;
-  // PR14: flagged when the judge equals ANY participant model —
-  // non-independent judging for that matrix cell.
-  const sameModelEval =
-    effectiveEvaluator !== "" && participants.includes(effectiveEvaluator);
+  // PR29: the effective judge panel — primary judge + filled extras.
+  const judgePanel = useMemo(
+    () => [
+      effectiveEvaluator,
+      ...evalExtras.map((r) => r.model.trim()).filter(Boolean),
+    ].filter(Boolean),
+    [effectiveEvaluator, evalExtras],
+  );
+  // PR14 + PR29: flagged when ANY judge on the panel equals a participant
+  // model — non-independent judging for that matrix cell.
+  const judgeOverlap = participants.filter((m) => judgePanel.includes(m));
+  const sameModelEval = judgeOverlap.length > 0;
 
   const canAddConfig = configs.length < MAX_CONFIGS;
   // Row cap: 8 extras max (RunCreate.models bound) AND adding one more
@@ -666,7 +691,8 @@ export default function SubmitPage() {
   // (or an unkeyed/unreachable ollama) hides it.
   const ollamaInUse =
     modelRows.some((r) => r.provider === "ollama") ||
-    evalRow.provider === "ollama";
+    evalRow.provider === "ollama" ||
+    evalExtras.some((r) => r.provider === "ollama");
   const pullVisible = ollamaInUse && (catalogs.ollama?.pullSupported ?? false);
 
   const validation = useMemo(() => {
@@ -767,6 +793,21 @@ export default function SubmitPage() {
   function pickEvalProvider(provider: string) {
     setEvalRow((e) => ({ ...e, provider, picked: true }));
     ensureCatalog(provider);
+  }
+
+  function updateEvalExtra(key: number, patch: Partial<ModelRow>) {
+    setEvalExtras((rs) =>
+      rs.map((r) => (r.key === key ? { ...r, ...patch } : r)),
+    );
+  }
+
+  function addEvalExtra() {
+    if (evalExtras.length >= MAX_EXTRA_JUDGES) return;
+    setEvalExtras((rs) => [...rs, blankModelRow(defaultProvider)]);
+  }
+
+  function removeEvalExtra(key: number) {
+    setEvalExtras((rs) => rs.filter((r) => r.key !== key));
   }
 
   function addModelRow() {
@@ -927,6 +968,12 @@ export default function SubmitPage() {
         models,
         harness_configs,
         evaluator_model: evalRow.model.trim() || null,
+        // PR29: additional judges — the server folds evaluator_model in as
+        // panel head; empty extras → null (single-judge legacy shape).
+        evaluator_models:
+          evalExtras.map((r) => r.model.trim()).filter(Boolean).length
+            ? evalExtras.map((r) => r.model.trim()).filter(Boolean)
+            : null,
         budgets,
         task_inputs: taskInputsPayload() ?? null,
         // PR23: empty strings → null (unset) — the server then falls back
@@ -1582,21 +1629,81 @@ export default function SubmitPage() {
                 mono
               />
             </div>
+            {/* PR29 — judge panel: up to 2 extra judges each re-scoring
+                every artifact; results merge to the panel mean + spread. */}
+            {evalExtras.map((row, i) => (
+              <div className="model-row" key={row.key}>
+                <span className="model-row__label">judge {i + 2}</span>
+                <select
+                  className="select"
+                  aria-label={`judge ${i + 2} provider`}
+                  title="Which upstream's catalog to browse — informational only"
+                  value={row.provider}
+                  onChange={(e) =>
+                    updateEvalExtra(row.key, {
+                      provider: e.target.value,
+                      picked: true,
+                    })
+                  }
+                  disabled={submitting}
+                >
+                  {PROVIDERS.map((p) => (
+                    <option key={p} value={p}>
+                      {p}
+                    </option>
+                  ))}
+                </select>
+                <ComboInput
+                  id={`evaluator_judge_${i + 2}`}
+                  value={row.model}
+                  onChange={(v) => updateEvalExtra(row.key, { model: v })}
+                  suggestions={suggestionsFor(row.provider)}
+                  placeholder="additional judge model"
+                  disabled={submitting}
+                  mono
+                />
+                <button
+                  type="button"
+                  className="btn btn--sm"
+                  aria-label={`Remove judge ${i + 2}`}
+                  title="Remove this judge from the panel"
+                  onClick={() => removeEvalExtra(row.key)}
+                  disabled={submitting}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+            {evalExtras.length < MAX_EXTRA_JUDGES ? (
+              <div className="model-row">
+                <button
+                  type="button"
+                  className="btn btn--sm"
+                  onClick={addEvalExtra}
+                  disabled={submitting}
+                  title="Add another judge — every panel judge re-scores every artifact; results merge to the mean with a disagreement spread"
+                >
+                  + add judge{evalExtras.length ? ` (${evalExtras.length + 2}/3)` : " panel"}
+                </button>
+              </div>
+            ) : null}
             {sameModelEval ? (
               <InfoNote>
-                Evaluator uses the <strong>same model</strong> as a participant
-                {effectiveEvaluator ? (
+                Judge panel uses a <strong>participant model</strong>
+                {judgeOverlap.length ? (
                   <>
                     {" "}
-                    (<code>{effectiveEvaluator}</code>)
+                    (<code>{judgeOverlap.join(", ")}</code>)
                   </>
                 ) : null}{" "}
-                — scores may not be fully independent. This is allowed; the
-                results page flags it.
+                — those scores may not be fully independent. This is allowed;
+                the results page flags it.
               </InfoNote>
             ) : (
               <span className="field__hint">
-                Leave empty to reuse the primary participant model.
+                Leave empty to reuse the primary participant model. A panel
+                of 2–3 judges merges scores to a mean with a disagreement
+                spread on the results matrix.
               </span>
             )}
           </div>
