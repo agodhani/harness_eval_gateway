@@ -436,6 +436,7 @@ or tests change.
 | F23 | Task inputs (seeded workspace: repo_url or uploaded archive) |
 | F24 | Task preset library (vendored + user presets, preset_ref provenance) |
 | F25 | Benchmark suites + deterministic checkers (suite.yaml fan-out, objective checkers beside judge scores) |
+| F31 | Timeline compare-mode clock (absolute|relative toggle, per-cell t+0 re-basing) |
 
 ## Post-MVP roadmap
 
