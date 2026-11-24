@@ -32,8 +32,10 @@ TASK_PRESETS_REV = "d1e2f3a4b5c6"
 SUITES_REV = "e4f5a6b7c8d9"
 # PR35 — runs.share_token (export + share links).
 SHARE_TOKEN_REV = "c5f9a2b8d4e7"
-# PR23 — rubric_templates + task_presets.suggested_rubric; current chain head.
+# PR23 — rubric_templates + task_presets.suggested_rubric.
 RUBRIC_TEMPLATES_REV = "f6a7b8c9d0e1"
+# PR29 — scores judge provenance + pairwise_votes; current chain head.
+JUDGE_PANEL_REV = "c7a9e1b3d5f2"
 
 
 @pytest.fixture()
@@ -65,7 +67,7 @@ def _columns(url: str, table: str) -> set[str]:
 
 def test_migration_chain_single_headed() -> None:
     heads = ScriptDirectory.from_config(_cfg()).get_heads()
-    assert list(heads) == [RUBRIC_TEMPLATES_REV]
+    assert list(heads) == [JUDGE_PANEL_REV]
 
 
 def test_sandbox_name_upgrade_downgrade(sqlite_url: str) -> None:
@@ -408,6 +410,107 @@ def test_rubric_templates_roundtrip(sqlite_url: str) -> None:
             assert tpl.source == "user"
             preset = s.query(TaskPreset).filter_by(slug="mig-preset").one()
             assert preset.suggested_rubric == {"template": "mig-template"}
+    finally:
+        engine.dispose()
+
+
+def test_judge_panel_upgrade_downgrade(sqlite_url: str) -> None:
+    """PR29: scores.judge_model/source/note + pairwise_votes land at head
+    and unwind cleanly below ``f6a7b8c9d0e1``."""
+    command.upgrade(_cfg(), "head")
+    engine = create_engine(sqlite_url)
+    try:
+        score_cols = {
+            c["name"]: c for c in inspect(engine).get_columns("scores")
+        }
+        assert {"judge_model", "source", "note"} <= set(score_cols)
+        assert score_cols["judge_model"]["nullable"] is True
+        assert score_cols["note"]["nullable"] is True
+        assert score_cols["source"]["nullable"] is False
+        vote_cols = {
+            c["name"] for c in inspect(engine).get_columns("pairwise_votes")
+        }
+        assert {
+            "id",
+            "run_id",
+            "left_sandbox",
+            "right_sandbox",
+            "dimension",
+            "winner",
+            "note",
+            "created_at",
+        } <= vote_cols
+        vote_fks = {
+            fk["referred_table"]
+            for fk in inspect(engine).get_foreign_keys("pairwise_votes")
+        }
+        assert {"runs", "sandboxes"} <= vote_fks
+    finally:
+        engine.dispose()
+
+    command.downgrade(_cfg(), RUBRIC_TEMPLATES_REV)
+    engine = create_engine(sqlite_url)
+    try:
+        assert "pairwise_votes" not in inspect(engine).get_table_names()
+        score_cols = {c["name"] for c in inspect(engine).get_columns("scores")}
+        assert "judge_model" not in score_cols
+        assert "source" not in score_cols
+        assert "note" not in score_cols
+        # the prior schema survives the unwind
+        assert "rubric_templates" in inspect(engine).get_table_names()
+    finally:
+        engine.dispose()
+
+    command.upgrade(_cfg(), "head")
+    assert "judge_model" in _columns(sqlite_url, "scores")
+
+
+def test_pairwise_votes_roundtrip(sqlite_url: str) -> None:
+    """A migrated DB accepts + reads back a vote row (ORM matches schema)."""
+    from datetime import datetime, timezone
+
+    from db.models import PairwiseVote, Run, Sandbox
+    from db.session import make_engine, make_session_factory
+
+    command.upgrade(_cfg(), "head")
+    engine = make_engine(sqlite_url)
+    sf = make_session_factory(engine)
+    try:
+        with sf() as s:
+            # runs.created_at/updated_at carry a literal ``now()`` server
+            # default from the initial migration — sqlite can't evaluate
+            # it, so supply timestamps explicitly (pre-existing schema
+            # quirk, not PR29's).
+            run = Run(
+                task_prompt="t",
+                model_name="m",
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+            s.add(run)
+            s.flush()
+            left = Sandbox(run_id=run.id)
+            right = Sandbox(run_id=run.id)
+            s.add_all([left, right])
+            s.flush()
+            s.add(
+                PairwiseVote(
+                    run_id=run.id,
+                    left_sandbox=left.id,
+                    right_sandbox=right.id,
+                    dimension="overall",
+                    winner="left",
+                    note="clearly better",
+                )
+            )
+            s.commit()
+        with sf() as s:
+            vote = (
+                s.query(PairwiseVote).filter_by(run_id=run.id).one()
+            )
+            assert vote.winner == "left"
+            assert vote.note == "clearly better"
+            assert vote.created_at is not None
     finally:
         engine.dispose()
 

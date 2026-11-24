@@ -207,6 +207,19 @@ class Score(Base):
     dimension: Mapped[str] = mapped_column(String(128))
     score: Mapped[float] = mapped_column(Float)
     rationale: Mapped[str] = mapped_column(Text, default="")
+    # PR29 — the evaluator model that authored an ``llm`` row, stamped at
+    # insert time so a multi-judge panel keeps per-judge rows attributable
+    # (NULL predates the panel; the merge treats NULL as the run's primary
+    # evaluator model). Human/checker rows carry no model provenance.
+    judge_model: Mapped[str | None] = mapped_column(String(255))
+    # llm (judge pass) | human (POST /api/sandboxes/{id}/scores override —
+    # wins the newest-wins merge for its pair regardless of order) |
+    # checker (deterministic suite_pass rows — no model authored them).
+    source: Mapped[str] = mapped_column(
+        String(16), default="llm", server_default="llm"
+    )
+    # Optional free-text context on human overrides (why the score moved).
+    note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     sandbox: Mapped[Sandbox] = relationship(back_populates="scores")
@@ -342,6 +355,46 @@ class CheckerResult(Base):
     )
 
     sandbox: Mapped[Sandbox] = relationship(back_populates="checker_results")
+
+
+class PairwiseVote(Base):
+    """PR29 — one blind A/B verdict on a pair of sandbox artifacts.
+
+    A pair session anonymizes two artifact-bearing sandboxes as labels
+    A/B (randomized order); the reviewer picks a winner per dimension
+    without seeing which config/model produced which artifact.
+    ``left_sandbox`` stores the REAL sandbox id behind label "A" — the
+    anonymization lives in the pair session, not the row. ``winner`` is
+    ``left`` | ``right`` | ``tie`` (a tied dimension is a verdict too —
+    it counts in summaries but not in win/loss rates). Votes feed the
+    results-page win-rate summary + judge-vs-human agreement stat; they
+    never replace judge scores.
+    """
+
+    __tablename__ = "pairwise_votes"
+
+    # Autoincrement pk like events.id / checker_results.id — the durable
+    # insertion order newest-wins vote merging keys on.
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("runs.id"), index=True)
+    left_sandbox: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("sandboxes.id"), index=True
+    )
+    right_sandbox: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("sandboxes.id"), index=True
+    )
+    dimension: Mapped[str] = mapped_column(String(128))
+    # left | right | tie — left is always the sandbox that wore label "A"
+    # in the pair session this vote resolved through.
+    winner: Mapped[str] = mapped_column(String(8))
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class ModelPriceRow(Base):
