@@ -1727,9 +1727,9 @@ class ShareOut(BaseModel):
 
     Spec + score matrix + the bounded events-lite index — everything the
     ``/share/{token}`` page renders. Control-plane filesystem references
-    (``artifact_path``, ``artifacts``, the analysis ``workspace`` path)
-    are stripped from ``results`` — the share view exposes neither
-    artifact download nor browse.
+    (``artifact_path``, ``artifacts``, the analysis ``workspace`` path,
+    the ``_SHARE_FS_KEYS`` payload/metric keys) are stripped — the share
+    view exposes neither artifact download nor browse.
     """
 
     run: RunSpecOut
@@ -1739,14 +1739,20 @@ class ShareOut(BaseModel):
     events_truncated: bool = False
 
 
-def _event_lite_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _event_lite_payload(
+    payload: dict[str, Any], *, drop: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     """Project a stored event payload to a bounded summary row.
 
     Top-level scalar fields pass through (strings capped); ``usage``
     keeps its scalar members; every other nested dict/list is dropped.
+    ``drop`` omits named keys outright (the share bundle's FS-ref keys —
+    the authenticated export projects verbatim).
     """
     out: dict[str, Any] = {}
     for key, value in payload.items():
+        if key in drop:
+            continue
         if value is None or isinstance(value, bool | int | float):
             out[key] = value
         elif isinstance(value, str):
@@ -1765,7 +1771,11 @@ def _event_lite_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _event_lite_rows(
-    session: Session, run_id: UUID, *, cap: int
+    session: Session,
+    run_id: UUID,
+    *,
+    cap: int,
+    drop: frozenset[str] = frozenset(),
 ) -> tuple[list[EventLiteOut], int]:
     """Events-lite rows for a run (oldest → newest) + the run's true total.
 
@@ -1795,7 +1805,7 @@ def _event_lite_rows(
                 seq=ev.seq,
                 source=ev.source,
                 type=ev.type,
-                payload=_event_lite_payload(ev.payload or {}),
+                payload=_event_lite_payload(ev.payload or {}, drop=drop),
             )
             for ev in rows
         ],
@@ -2011,6 +2021,21 @@ def export_run(
 # share links (PR35 stretch — the read-only /share/{token} surface)
 # ---------------------------------------------------------------------------
 
+#: Stored payload/metric keys that carry control-plane filesystem paths —
+#: dropped from the share bundle's events and analysis signal metrics
+#: (``sb.artifact_path``/``artifacts``/analysis ``workspace`` are scrubbed
+#: field-by-field in ``get_shared_run``; the authenticated export keeps
+#: everything verbatim).
+_SHARE_FS_KEYS = frozenset(
+    {
+        "artifact_path",
+        "eval_workspace",
+        "analysis_path",
+        "scores_path",
+        "tests_dir",
+    }
+)
+
 
 @router.post("/api/runs/{run_id}/share", response_model=ShareLinkOut)
 def create_share_link(run_id: UUID, session: DbSession) -> ShareLinkOut:
@@ -2097,7 +2122,7 @@ def get_shared_run(token: str, session: DbSession) -> ShareOut:
             status_code=status.HTTP_404_NOT_FOUND, detail="share link not found"
         )
     events, events_total = _event_lite_rows(
-        session, run.id, cap=_EXPORT_EVENT_CAP
+        session, run.id, cap=_EXPORT_EVENT_CAP, drop=_SHARE_FS_KEYS
     )
     results = get_run_results(run.id, session)
     for sb in results.sandboxes:
@@ -2105,6 +2130,9 @@ def get_shared_run(token: str, session: DbSession) -> ShareOut:
         sb.artifacts = []
         if sb.analysis is not None:
             sb.analysis.workspace = ""
+            for sig in sb.analysis.signals:
+                for key in _SHARE_FS_KEYS:
+                    sig.metrics.pop(key, None)
     return ShareOut(
         run=_run_spec_out(run),
         results=results,

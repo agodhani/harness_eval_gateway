@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import uuid
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
 from api.deps import get_session_factory
+from api.routers import results as results_router
 from api.routers.results import RunExport, ShareOut
 from db.models import Base, Event, Rubric, Run, Sandbox, Score
 
@@ -393,3 +397,134 @@ def test_share_events_bounded(client, scored_run, session_factory) -> None:
     shell = [e for e in out.events if e.type == "shell_command"]
     assert shell[0].payload["command"] == "echo 0"
     assert shell[0].payload["exit_code"] == 0
+
+
+def test_share_strips_fs_refs(
+    client, scored_run, session_factory, tmp_path: Path, monkeypatch
+) -> None:
+    """The share bundle carries no control-plane filesystem references —
+    not in results fields, analysis signal metrics, or event payloads —
+    while the authenticated export keeps the same rows verbatim."""
+    monkeypatch.setattr(
+        results_router,
+        "get_settings",
+        lambda: SimpleNamespace(
+            ARTIFACT_ROOT=tmp_path, PREVIEW_SCAN_TTL_SECONDS=0
+        ),
+    )
+    results_router.reset_scan_cache()
+
+    art_dir = tmp_path / "run" / "sb"
+    art_dir.mkdir(parents=True)
+    host = str(art_dir)
+    (art_dir / "analysis.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "workspace": str(tmp_path / "ws"),
+                "signals": [
+                    {
+                        "name": "generated_tests",
+                        "status": "ok",
+                        "metrics": {
+                            "tests_dir": str(art_dir / "generated_tests"),
+                            "pass_rate": 0.5,
+                        },
+                    }
+                ],
+            }
+        )
+    )
+    s = session_factory()
+    try:
+        sb = s.get(Sandbox, scored_run["sb1"])
+        sb.artifact_path = host
+        s.add_all(
+            [
+                # the sandbox_finalized checkpoint shape monitor/prompt_cell emit
+                Event(
+                    run_id=scored_run["run_id"],
+                    sandbox_id=scored_run["sb1"],
+                    source="orchestrator",
+                    type="checkpoint",
+                    payload={
+                        "stage": "sandbox_finalized",
+                        "terminal_reason": "agent_done",
+                        "artifact_path": host,
+                    },
+                ),
+                # the eval_started / eval_scored checkpoint shape the
+                # evaluator emits
+                Event(
+                    run_id=scored_run["run_id"],
+                    sandbox_id=scored_run["sb1"],
+                    source="evaluator",
+                    type="checkpoint",
+                    payload={
+                        "phase": "eval_started",
+                        "eval_workspace": host,
+                        "analysis_path": host,
+                        "scores_path": host,
+                    },
+                ),
+            ]
+        )
+        s.commit()
+    finally:
+        s.close()
+
+    client.post(f"/api/runs/{scored_run['run_id']}/share")
+    token = client.get(f"/api/runs/{scored_run['run_id']}").json()[
+        "share_url"
+    ].rsplit("/", 1)[-1]
+    shared = client.get(f"/api/share/{token}")
+    assert shared.status_code == 200
+    assert host not in shared.text
+
+    body = shared.json()
+    sb1 = next(
+        x
+        for x in body["results"]["sandboxes"]
+        if x["sandbox_id"] == str(scored_run["sb1"])
+    )
+    assert sb1["artifact_path"] is None
+    assert sb1["artifacts"] == []
+    assert sb1["analysis"]["workspace"] == ""
+    metrics = sb1["analysis"]["signals"][0]["metrics"]
+    assert "tests_dir" not in metrics
+    assert metrics["pass_rate"] == 0.5
+
+    by_stage = {e["payload"].get("stage"): e for e in body["events"]}
+    fin = by_stage["sandbox_finalized"]["payload"]
+    assert fin["terminal_reason"] == "agent_done"
+    for ev in body["events"]:
+        for key in (
+            "artifact_path",
+            "eval_workspace",
+            "analysis_path",
+            "scores_path",
+        ):
+            assert key not in ev["payload"]
+
+    # the authenticated export keeps the same rows verbatim
+    export = client.get(f"/api/runs/{scored_run['run_id']}/export").json()
+    x_fin = next(
+        e
+        for e in export["events"]
+        if e["payload"].get("stage") == "sandbox_finalized"
+    )
+    assert x_fin["payload"]["artifact_path"] == host
+    x_ev = next(
+        e for e in export["events"] if e["payload"].get("phase") == "eval_started"
+    )
+    assert x_ev["payload"]["eval_workspace"] == host
+    x_sb1 = next(
+        x
+        for x in export["results"]["sandboxes"]
+        if x["sandbox_id"] == str(scored_run["sb1"])
+    )
+    assert x_sb1["artifact_path"] == host
+    assert (
+        x_sb1["analysis"]["signals"][0]["metrics"]["tests_dir"]
+        == str(art_dir / "generated_tests")
+    )
