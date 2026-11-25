@@ -45,13 +45,20 @@ score, cost) for the most recent runs — powers the analysis page's trend
 chart. ``?price_model=`` reprices every point uniformly; omitted, each point
 is costed at its run's per-cell model rates — any unlisted cell model makes
 the point's cost unpriced (null), never a fallback rate (PR21).
+
+PR32 cross-run leaderboard: ``GET /api/analytics/leaderboard`` pools the
+newest-wins ``overall`` Score per sandbox across every run in scope into
+two rankings — by participant model and by harness-config family
+(``_family_key``: adapter + sorted skill-pack set) — with preset /
+date-range / min-trials run-axis filters. Powers ``/leaderboard`` and the
+preset-filtered embed on ``/presets/[slug]``.
 """
 
 from __future__ import annotations
 
 import math
 import statistics
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -70,6 +77,8 @@ from api.schemas import (
     CellAnalytics,
     EvaluatorActivity,
     LatencyStats,
+    Leaderboard,
+    LeaderboardEntry,
     ModelAnalytics,
     RunAnalytics,
     RunTrendPoint,
@@ -862,4 +871,184 @@ def get_run_trends(
         price_model=explicit_key,
         price_table=book.table(),
         points=points,
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR32 — cross-run leaderboard (GET /api/analytics/leaderboard)
+# ---------------------------------------------------------------------------
+
+
+def _family_key(harness_config: dict) -> tuple[str, str, str]:
+    """(group key, label, adapter) for the config-family leaderboard.
+
+    The family axis the PR32 card fixes: adapter + skill-pack set.
+    ``model`` is deliberately excluded (the model board owns that axis),
+    and so are PR1 config ``name``s and ``system_prompt_extra`` — a family
+    is meant to pool the same harness *shape* across runs, not to reshard
+    per-run tweaks. Named members still surface their shared name on the
+    entry when the whole family agrees on one.
+    """
+    hc = harness_config or {}
+    adapter = str(hc.get("adapter") or hc.get("harness") or "?")
+    packs = sorted(str(p) for p in hc.get("skill_packs") or [])
+    key = f"family:{adapter}|{','.join(packs)}"
+    label = " · ".join([adapter, *packs])
+    return key, label, adapter
+
+
+def _leaderboard_board(raw: dict[str, dict], *, config: bool) -> list[LeaderboardEntry]:
+    """Bucket map → ranked entries: mean ± sample sd (n−1, null under 2
+    scored cells — a lone score has no spread to report)."""
+    entries = [
+        LeaderboardEntry(
+            key=key,
+            label=bucket.get("label") or key,
+            adapter=bucket.get("adapter") if config else None,
+            name=(
+                next(iter(bucket["names"]))
+                if config and len(bucket.get("names") or ()) == 1
+                else None
+            ),
+            mean_overall_score=round(
+                sum(bucket["scores"]) / len(bucket["scores"]), 2
+            ),
+            sd_overall_score=(
+                round(statistics.stdev(bucket["scores"]), 3)
+                if len(bucket["scores"]) >= 2
+                else None
+            ),
+            n=len(bucket["scores"]),
+            runs=len(bucket["runs"]),
+            sandboxes=bucket["sandboxes"],
+        )
+        for key, bucket in raw.items()
+        if bucket["scores"]  # unscored buckets have nothing to rank
+    ]
+    # Best first; deterministic ties (more evidence, then key) — same rule
+    # as the preset leaderboard so boards read consistently.
+    entries.sort(key=lambda e: (-e.mean_overall_score, -e.n, e.key))
+    return entries
+
+
+@router.get("/api/analytics/leaderboard", response_model=Leaderboard)
+def get_leaderboard(
+    session: DbSession,
+    preset: Annotated[str | None, Query(max_length=64)] = None,
+    since: Annotated[datetime | None, Query()] = None,
+    until: Annotated[datetime | None, Query()] = None,
+    min_trials: Annotated[int, Query(ge=1)] = 1,
+) -> Leaderboard:
+    """Global rankings across every scored sandbox in scope.
+
+    Buckets: participant model (``sandbox_model`` — a per-config ``model``
+    pin wins over the run's ``model_name``, same as run analytics) and
+    harness-config family (adapter + pack set, ``_family_key``). A
+    sandbox's score is its LATEST ``overall`` row (asc order → newest
+    wins, the results/trends merge rule) so rescored cells count once.
+
+    Filters: ``preset`` pins ``runs.preset_ref``; ``since``/``until`` are
+    inclusive bounds on ``runs.created_at`` (naive values read as UTC);
+    ``min_trials`` keeps only runs submitted with ``trials >= N`` — the
+    repeat-per-cell axis (``harness_config.trial_index`` members share
+    their cell's family/model the same as single-shot cells).
+    """
+    # A date-only input parses naive — read it as UTC so the bound
+    # compares and binds honestly against the timestamptz column on every
+    # backend (a naive/aware ``>`` would itself raise TypeError).
+    if since is not None and since.tzinfo is None:
+        since = since.replace(tzinfo=UTC)
+    if until is not None and until.tzinfo is None:
+        until = until.replace(tzinfo=UTC)
+    if since is not None and until is not None and since > until:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="since must be <= until",
+        )
+
+    stmt = select(Run).order_by(Run.created_at.desc(), Run.id)
+    if preset:
+        stmt = stmt.where(Run.preset_ref == preset)
+    if since is not None:
+        stmt = stmt.where(Run.created_at >= since)
+    if until is not None:
+        stmt = stmt.where(Run.created_at <= until)
+    if min_trials > 1:
+        stmt = stmt.where(Run.trials >= min_trials)
+    runs = session.execute(stmt).scalars().all()
+    run_by_id = {r.id: r for r in runs}
+
+    sandboxes = (
+        session.execute(
+            select(Sandbox).where(Sandbox.run_id.in_(list(run_by_id)))
+        )
+        .scalars()
+        .all()
+        if run_by_id
+        else []
+    )
+
+    latest: dict[UUID, float] = {}
+    if sandboxes:
+        rows = session.execute(
+            select(Score.sandbox_id, Score.score)
+            .where(
+                Score.sandbox_id.in_([sb.id for sb in sandboxes]),
+                Score.dimension == OVERALL_DIMENSION,
+            )
+            .order_by(
+                Score.created_at.asc(),
+                Score.seq.asc().nulls_first(),
+                Score.id.asc(),
+            )
+        ).all()
+        for sid, sc in rows:
+            latest[sid] = sc  # ordered asc → newest wins
+
+    by_model: dict[str, dict] = {}
+    by_family: dict[str, dict] = {}
+    for sb in sandboxes:
+        run = run_by_id[sb.run_id]
+        hc = sb.harness_config or {}
+        score = latest.get(sb.id)
+
+        model = sandbox_model(hc, run.model_name)
+        mb = by_model.setdefault(
+            model, {"scores": [], "runs": set(), "sandboxes": 0}
+        )
+        mb["sandboxes"] += 1
+        if score is not None:
+            mb["scores"].append(score)
+            mb["runs"].add(sb.run_id)
+
+        fkey, flabel, adapter = _family_key(hc)
+        fb = by_family.setdefault(
+            fkey,
+            {
+                "label": flabel,
+                "adapter": adapter,
+                "scores": [],
+                "runs": set(),
+                "sandboxes": 0,
+                "names": set(),
+            },
+        )
+        fb["sandboxes"] += 1
+        name = str(hc.get("name") or "").strip()
+        if name:
+            fb["names"].add(name)
+        if score is not None:
+            fb["scores"].append(score)
+            fb["runs"].add(sb.run_id)
+
+    return Leaderboard(
+        preset=preset,
+        since=since,
+        until=until,
+        min_trials=min_trials,
+        runs_count=len(runs),
+        sandboxes_count=len(sandboxes),
+        n_scored=len(latest),
+        by_model=_leaderboard_board(by_model, config=False),
+        by_config=_leaderboard_board(by_family, config=True),
     )

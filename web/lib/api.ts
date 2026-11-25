@@ -2158,3 +2158,71 @@ export function getSandboxFileDiff(
 export function sandboxFileDownloadUrl(sandboxId: string, path: string): string {
   return `${API_BASE}${sandboxFilesPath(sandboxId)}/${fileUrlPath(path)}?download=1`;
 }
+
+// ---------------------------------------------------------------------------
+// cross-run leaderboard (PR32 — GET /api/analytics/leaderboard)
+// ---------------------------------------------------------------------------
+
+/** One leaderboard row — mean `overall` pooled over the bucket's scored
+ * sandbox cells across every run in scope. `key` = participant model
+ * (model board) or the config-family key `family:<adapter>|<packs>`
+ * (config board); `sd` is the sample sd (n−1), null under two scored
+ * cells — a lone score has no spread to report; `sandboxes` counts every
+ * cell in the bucket (scored + unscored) so "4 of 6 scored" stays honest. */
+export interface LeaderboardEntry {
+  key: string;
+  label: string;
+  /** Config board only: the family's adapter. */
+  adapter: string | null;
+  /** Config board only: shared PR1 config name (null when members
+   * disagree or none carry one). */
+  name: string | null;
+  mean_overall_score: number;
+  sd_overall_score: number | null;
+  /** Scored sandbox cells contributing to the mean. */
+  n: number;
+  /** Distinct runs contributing a scored cell. */
+  runs: number;
+  /** Every cell in the bucket — compare against `n` for coverage. */
+  sandboxes: number;
+}
+
+/** GET /api/analytics/leaderboard — rankings + filter echo + scope totals. */
+export interface Leaderboard {
+  preset: string | null;
+  since: string | null;
+  until: string | null;
+  min_trials: number;
+  /** Runs in scope (any status, scored or not). */
+  runs_count: number;
+  /** Sandbox cells in scope. */
+  sandboxes_count: number;
+  /** Cells carrying a latest `overall` score. */
+  n_scored: number;
+  by_model: LeaderboardEntry[];
+  by_config: LeaderboardEntry[];
+}
+
+/** Leaderboard query filters — `since`/`until` are ISO date or datetime
+ * strings (inclusive bounds on runs.created_at; date-only parses as UTC
+ * midnight server-side). `minTrials` keeps runs submitted with
+ * `trials >= N` (PR27 repeat-per-cell axis). */
+export interface LeaderboardFilters {
+  preset?: string;
+  since?: string;
+  until?: string;
+  minTrials?: number;
+}
+
+export function getLeaderboard(
+  filters: LeaderboardFilters = {},
+): Promise<Leaderboard> {
+  return request<Leaderboard>(
+    `/api/analytics/leaderboard${qs({
+      preset: filters.preset,
+      since: filters.since,
+      until: filters.until,
+      min_trials: filters.minTrials && filters.minTrials > 1 ? filters.minTrials : undefined,
+    })}`,
+  );
+}

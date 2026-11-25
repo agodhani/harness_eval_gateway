@@ -16,6 +16,8 @@ const LINKS = [
   { href: "/presets", label: "Presets" },
   { href: "/suites", label: "Suites" },
   { href: "/runs", label: "Runs" },
+  { href: "/compare", label: "Compare" },
+  { href: "/leaderboard", label: "Leaderboard" },
 ] as const;
 
 function HeaderNav() {

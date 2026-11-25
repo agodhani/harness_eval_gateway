@@ -437,6 +437,7 @@ or tests change.
 | F24 | Task preset library (vendored + user presets, preset_ref provenance) |
 | F25 | Benchmark suites + deterministic checkers (suite.yaml fan-out, objective checkers beside judge scores) |
 | F31 | Timeline compare-mode clock (absolute|relative toggle, per-cell t+0 re-basing) |
+| F27 | Cross-run compare + leaderboards (global model/config-family rankings, run-vs-run diff) |
 
 ## Post-MVP roadmap
 
@@ -944,6 +945,24 @@ or tests change.
   gained an `.evc-ev__t` time column + a footer stat (absolute:
   `start HH:MM:SS`; relative: elapsed to the lane's latest event —
   `Date.now()` is barred by the render-purity lint).
+- **Leaderboards rank sandbox CELLS, not runs (PR32/F27)** —
+  `GET /api/analytics/leaderboard` pools the newest-wins `overall`
+  Score per sandbox (mean ± sample sd over n scored cells + distinct
+  runs) into two boards: participant model and config FAMILY
+  (`family:<adapter>|<sorted packs>` — model pins, names, and trial
+  markers stripped so one family aggregates across submissions; `name`/
+  `label` surface only when every member agrees). Filters are run-axis:
+  `preset` (runs.preset_ref), `since`/`until` (inclusive created_at
+  bounds — naive inputs parse as UTC), `min_trials` (runs.trials ≥ N,
+  the submitted repeat count — not raw score count). Unscored cells
+  are excluded, never zeroed; `sandboxes` vs `n` keeps coverage honest.
+  `/compare?runs=idA,idB` fetches detail+results+analytics per run
+  client-side (no new endpoint): spec-diff rows, the same
+  `buildScoreGrid` score matrices as the results page, participant-vs-
+  evaluator-split analytics deltas, and the terminal-reason mix.
+  `web/lib/compareRuns.ts` holds the pure transforms; the shared
+  `LeaderboardBoards` renders on /leaderboard and embedded, preset-
+  filtered, on /presets/[slug].
 
 ## Working conventions
 
