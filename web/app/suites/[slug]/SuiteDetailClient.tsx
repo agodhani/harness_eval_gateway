@@ -55,7 +55,13 @@ function checkLabel(c: SuiteCheck): string {
   }
 }
 
-function RunLauncher({ slug }: { slug: string }) {
+function RunLauncher({
+  slug,
+  pinnedAdapters,
+}: {
+  slug: string;
+  pinnedAdapters: string[];
+}) {
   const router = useRouter();
   const [model, setModel] = useState("");
   const [adapters, setAdapters] = useState<string[]>([]);
@@ -72,7 +78,10 @@ function RunLauncher({ slug }: { slug: string }) {
         if (cancelled) return;
         const names = hs.map((h) => h.name).filter(Boolean);
         setAdapters(names);
-        if (names.length && picked.size === 0) setPicked(new Set([names[0]]));
+        if (names.length && picked.size === 0) {
+          const pinned = pinnedAdapters.filter((n) => names.includes(n));
+          setPicked(new Set(pinned.length ? pinned : [names[0]]));
+        }
       } catch {
         /* harness list down — the picker stays empty, launcher explains */
       }
@@ -102,6 +111,8 @@ function RunLauncher({ slug }: { slug: string }) {
       setError(
         err instanceof ApiError ? err.detail : "Suite launch failed.",
       );
+    } finally {
+      // Reset even on success: the router restores this page on "back".
       setSubmitting(false);
     }
   }
@@ -243,7 +254,14 @@ export default function SuiteDetailClient({ slug }: { slug: string }) {
       {error ? <ErrorNote>{error}</ErrorNote> : null}
 
       <div className="stack">
-        <RunLauncher slug={suite.slug} />
+        <RunLauncher
+          slug={suite.slug}
+          pinnedAdapters={[
+            ...new Set(
+              suite.tasks.flatMap((t) => (t.adapter ? [t.adapter] : [])),
+            ),
+          ]}
+        />
 
         <Card title={`Tasks (${suite.tasks.length})`}>
           <div className="table-wrap">

@@ -153,7 +153,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Verify:**
   - Unit: `tests/unit/orchestrator/` (`test_state_machine.py`,
     `test_lifecycle.py`, `test_monitor.py`, `test_provision.py`,
-    `test_rubric.py`, `test_pacing.py`), queue E2E + cancel/delete in
+    `test_rubric.py`, `test_rubric_failure_message.py`, `test_pacing.py`),
+    queue E2E + cancel/delete in
     `tests/unit/api/test_runs.py` (`test_approve_queues_behind_active_run`,
     `test_delete_queued_run_releases_slot`, `test_delete_inflight_run_409`,
     `test_delete_done_run_hard_deletes`)
