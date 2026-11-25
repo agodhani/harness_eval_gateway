@@ -136,6 +136,7 @@ def _run_out(
         suite_ref=run.suite_ref,
         suite_index=run.suite_index,
         suite_run_id=run.suite_run_id,
+        share_url=f"/share/{run.share_token}" if run.share_token else None,
         sandboxes=[SandboxOut.model_validate(s) for s in _run_sandboxes(session, run.id)],
         rubric=RubricOut.model_validate(rubric) if rubric else None,
     )

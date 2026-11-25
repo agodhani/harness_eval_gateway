@@ -61,6 +61,7 @@ import {
   statusTone,
   WarnNote,
 } from "@/components/ui";
+import ExportButtons from "@/components/ExportButtons";
 import AnalyticsSection from "./AnalyticsSection";
 import FileBrowser from "./FileBrowser";
 import GridView from "./GridView";
@@ -854,8 +855,8 @@ export default function ResultsClient({ runId }: { runId: string }) {
             {run?.task_prompt ? <> · {run.task_prompt.slice(0, 80)}{run.task_prompt.length > 80 ? "…" : ""}</> : null}
           </p>
         </div>
-        {run && isTerminal(status) ? (
-          <div className="row">
+        <div className="row" style={{ gap: "0.4rem", flexWrap: "wrap" }}>
+          {run && isTerminal(status) ? (
             <button
               type="button"
               className="btn btn--sm"
@@ -864,8 +865,16 @@ export default function ResultsClient({ runId }: { runId: string }) {
             >
               ↻ Resubmit
             </button>
-          </div>
-        ) : null}
+          ) : null}
+          {/* PR35 — export downloads (json/csv) + share-link mint/revoke.
+           * `key` remounts per run — the minted-link state is run-scoped
+           * (this client survives /runs/A → /runs/B nav unmounted). */}
+          <ExportButtons
+            key={runId}
+            runId={runId}
+            shareUrl={run?.share_url ?? null}
+          />
+        </div>
       </div>
 
       <div className="stack">

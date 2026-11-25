@@ -382,6 +382,9 @@ heatmap, output browser.
   weighted rubric.
 
 ### PR32 — Cross-run compare + leaderboards ✅ shipped
+- **Landed as F27:** `/api/analytics/leaderboard` + `/compare` +
+  `/leaderboard` + the preset-embedded board all shipped. Details:
+  `FEATURE_MAP.md` F27.
 - **Scope:**
   - `/compare?runs=id1,id2` — two runs side by side: spec diff
     (models/configs/budgets/rubric version), score matrices,
@@ -428,7 +431,11 @@ heatmap, output browser.
 - **Verify:** browse a 2048 artifact, open `index.html`; diff two
   sandboxes' `index.html` shows unified diff; path traversal 404s.
 
-### PR35 — Export + share
+### PR35 — Export + share ✅ shipped
+- **Landed as F28:** export endpoint + flattened CSV + the stretch —
+  `runs.share_token` capability links and the read-only `/share/{token}`
+  view all shipped. Details: `FEATURE_MAP.md` F28. PR19 keeps auth +
+  templates.
 - **Scope:** `GET /api/runs/{id}/export?fmt=json|csv` — full run bundle:
   spec, rubric, score matrix (+versions), analytics, events-lite
   (summary rows, not full payloads); CSV = flattened per-cell rows.

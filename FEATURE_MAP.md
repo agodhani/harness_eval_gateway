@@ -39,6 +39,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F24 | Task preset library (vendored md + user presets, preset_ref on runs, /presets browse + detail) | ✅ | `task_presets/`, `api/presets.py`, `api/routers/presets.py`, `api/routers/runs.py` (preset_ref), `db/models.py` (`TaskPreset`, `Run.preset_*`), `web/app/presets/`, `web/components/SavePresetDialog.tsx`, `web/app/submit/page.tsx` | `tests/unit/api/test_presets.py`, `tests/unit/db/test_migrations.py`, `web/lib/resubmit.test.ts` |
 | F25 | Benchmark suites + deterministic checkers (vendored suite.yaml fan-out, objective pass/fail beside judge scores, batch aggregation) | ✅ | `benchmark_suites/`, `api/suites.py`, `api/routers/suites.py`, `scoring/checkers.py`, `db/models.py` (`SuiteRun`, `CheckerResult`, `Run.suite_*`), `orchestrator/lifecycle.py`, `web/app/suites/`, `web/app/suite-runs/` | `tests/unit/api/test_suites.py`, `tests/unit/scoring/test_checkers.py`, `tests/unit/orchestrator/test_lifecycle_suites.py`, `tests/unit/evaluator/test_suite_signal.py`, `tests/unit/db/test_migrations.py` |
 | F27 | Cross-run compare + leaderboards (global model + config-family rankings w/ filters, `/compare` two-run diff, preset-embedded board) | ✅ | `api/routers/analytics.py` (`GET /api/analytics/leaderboard`), `api/schemas.py` (`Leaderboard`/`LeaderboardEntry`), `web/app/leaderboard/`, `web/app/compare/`, `web/components/LeaderboardBoards.tsx`, `web/lib/compareRuns.ts`, `web/lib/api.ts`, `web/app/presets/[slug]/PresetDetailClient.tsx` | `tests/unit/api/test_leaderboard.py`, `web/lib/compareRuns.test.ts` |
+| F28 | Run export + share links (`?fmt=json|csv` bundle — spec, rubrics, matrix, analytics, events-lite; `runs.share_token` + read-only `/share/{token}` results+timeline view) | ✅ | `api/routers/results.py` (`/export`, `/share` mint/revoke + `GET /api/share/{token}`), `db/models.py` (`Run.share_token`), `db/migrations/versions/c5f9a2b8d4e7_runs_share_token.py`, `web/lib/api.ts`, `web/components/ExportButtons.tsx`, `web/app/share/[token]/` | `tests/unit/api/test_export.py`, `tests/unit/db/test_migrations.py`, `web/lib/api.test.ts` |
 | F29 | Dashboard home (`/dashboard`: summary aggregate — KPI strip, weekly spend + runs charts, terminal-mix donut, queue lane, top-5 boards, recent runs) | ✅ | `api/routers/analytics.py` (`GET /api/analytics/summary`), `api/schemas.py` (`DashboardSummary`/`DashboardTotals`/`DashboardWeekPoint`/`DashboardQueue*`/`DashboardTerminalSlice`/`DashboardRecentRun`), `web/app/dashboard/`, `web/lib/dashboard.ts`, `web/lib/api.ts`, `web/components/SiteHeader.tsx`, `web/components/landing/Hero.tsx` | `tests/unit/api/test_summary.py`, `web/lib/dashboard.test.ts` |
 | F31 | Timeline compare-mode clock toggle (absolute wall clock vs per-cell relative t+0 — progress-rate comparison across staggered starts) | ✅ | `web/lib/timelineModes.ts`, `web/app/runs/[id]/timeline/{TimelineClient,EventRow,SplitTimeline}.tsx`, `web/components/RunConsoleLive.tsx`, `web/app/globals.css` (`.evc-ev__t`) | `web/lib/timelineModes.test.ts` |
 
@@ -1966,8 +1967,9 @@ rigged before it starts.
 - **Verify:**
   - Unit: `tests/unit/api/test_leaderboard.py` (10 tests — model/config
     ranking + sample sd, n vs sandboxes coverage, preset/date/min-trials
-    filters, newest-wins, empty scope) against per-test file-backed
-    SQLite (the shared :memory: engine leaks rows across tests).
+    filters, newest-wins, empty scope, since/until tz handling) against
+    per-test file-backed SQLite (the shared :memory: engine leaks rows
+    across tests).
   - Web: `lib/compareRuns.test.ts` (9 tests); eslint + `next build`
     clean (`/compare`, `/leaderboard` prerender).
   - Manual: score ≥2 runs → `/leaderboard` ranks models + config
@@ -1976,6 +1978,81 @@ rigged before it starts.
 - **Depends on:** F8/F9 (results + analytics shapes it reuses), F20
   (trials axis for min_trials), F24 (preset_ref filter), F22 (mean±sd
   + pricing-honesty conventions), F25 (suite provenance on the diff).
+
+### F28 — Run export + share links (PR35) ✅
+
+- **`GET /api/runs/{id}/export?fmt=json|csv`** (`api/routers/results.py`)
+  — the full run bundle as a download (`Content-Disposition: attachment`,
+  `heg-run-<uuid>.{json,csv}`):
+  - `fmt=json` → `RunExport` (`format: "heg-run-export"`,
+    `format_version: 1`): `spec` (`RunSpecOut` — task, models, trials,
+    verbatim config, preset/suite provenance, lifecycle stamps), `rubrics`
+    (EVERY version incl. content — score provenance needs it), `results`
+    (the `RunResults` payload the results page reads), `analytics` (the
+    `RunAnalytics` payload the analysis page reads — both computed by
+    calling the same handlers the UI uses, never re-derived), and
+    `events` — **events-lite** rows (`EventLiteOut`): the stored payload
+    projected to top-level scalar fields (strings capped at 300 chars) +
+    the small `usage` token dict verbatim; message bodies/tool args/diffs
+    dropped — a summary index, not a transcript. Bounded at 50k rows with
+    `events_total`/`events_truncated` reporting the true stream length.
+  - `fmt=csv` → the flattened sheet: **one row per sandbox × score
+    dimension** (`dimension`/`score`/`rationale`), the judge `overall`
+    emitted as a last dimension row per sandbox, and one empty-dimension
+    row per unscored sandbox so the sheet covers the whole matrix.
+    Per-sandbox fields (name/adapter/model/cell/trial/status/terminal/
+    `empty_workspace`/`eval_error`/`rubric_version`) plus participant-
+    phase analytics (turns, tokens in/out/cache/total, wall clock, est.
+    cost) repeat per row — sheets pivot on them. Dimensions sort
+    alphabetically (deterministic across sibling runs); a UTF-8 BOM keeps
+    Excel on UTF-8, and string cells opening with a formula trigger
+    (`= + - @`, tab, CR) get a `'` prefix so submitter/judge text can't
+    land as a live Excel formula.
+- **Share links (stretch, shipped):** `runs.share_token` (nullable
+  unique str, migration `c5f9a2b8d4e7` chained on `e4f5a6b7c8d9`).
+  `POST /api/runs/{id}/share` mints `secrets.token_urlsafe(16)`
+  idempotently → `{token, url: "/share/{token}"}` (the mint claims the
+  slot with a conditional UPDATE so concurrent POSTs return the winner's
+  token on every dialect); `DELETE` revokes (idempotent).
+  `GET /api/share/{token}` → `ShareOut` (spec + `RunResults` + bounded
+  events-lite) — unknown and revoked tokens 404 identically. Unlike the
+  export, the share bundle scrubs control-plane filesystem references:
+  `artifact_path`/`artifacts`/`thumbnail`, the
+  `previewable`/`preview_type`/`preview_candidates` probe fields, the
+  analysis `workspace` path, and the `_SHARE_FS_KEYS` event-payload +
+  signal-metric keys are all stripped before serving.
+  `RunOut.share_url` advertises the minted path on run detail. The token
+  is the only credential the share surface checks — the app ships
+  unauthenticated, so this is PR19's extension point, not a security
+  boundary today.
+- **Web:** `web/components/ExportButtons.tsx` on the results + analysis
+  page headers — `⬇ json`/`⬇ csv` anchor downloads (attachment-served,
+  same idiom as `artifactDownloadUrl`) and a `🔗 share` button that mints,
+  copies the absolute link, then offers open/copy/revoke chips.
+  `web/app/share/[token]/` renders the read-only view: spec header +
+  score matrix (same `.matrix` idiom, rationale inline) + the events-lite
+  index reusing the timeline's `EventRow`/`summarizeEvent` (expanding a
+  row shows the bounded projection), render-capped at 500 rows.
+- **Where:** `api/routers/results.py`, `api/schemas.py` (`RunOut.share_url`),
+  `api/routers/runs.py` (`_run_out`), `db/models.py`,
+  `db/migrations/versions/c5f9a2b8d4e7_runs_share_token.py`,
+  `tests/unit/api/test_export.py`, `web/lib/api.ts` + `.test.ts`,
+  `web/components/ExportButtons.tsx`, `web/app/share/[token]/`,
+  `web/app/runs/[id]/{results,analysis}/`.
+- **Verify:**
+  - Unit: `tests/unit/api/test_export.py` (14 tests — JSON round-trip
+    through `RunExport.model_validate`, events-lite projection, CSV
+    shape/BOM/empty-run header + legacy `harness` config key, 404/422,
+    share mint/idempotent/revoke/unknown-token 404 + fs-ref scrub,
+    events_total bounds); migration tests cover the new head + unique index +
+    downgrade.
+  - Web: `api.test.ts` `runExportUrl` describe; eslint + `next build`
+    clean (`/share/[token]` prerender).
+  - Manual: results/analysis headers → `⬇ csv` opens in Sheets one row
+    per sandbox×dimension; `⬇ json` is a self-contained bundle;
+    `🔗 share` copies a link opening the read-only view.
+- **Depends on:** F8/F9 (results + analytics payloads the bundle reuses),
+  F6 (events schema the lite projection mirrors).
 
 ### F29 — Dashboard home (PR36) ✅
 

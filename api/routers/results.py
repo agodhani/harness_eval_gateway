@@ -35,30 +35,55 @@ PR34 adds the artifact file browser + side-by-side diff:
   resolution is jailed to the browse root — traversal attempts 404 exactly
   like the artifact-download path.
 
+PR35 adds run export + share links (F28):
+
+- ``GET /api/runs/{run_id}/export?fmt=json|csv`` — the full run bundle as a
+  download: submitted spec, every rubric version (content included), the
+  score matrix (:class:`RunResults`, same payload the results page reads),
+  the analytics rollup (:class:`RunAnalytics`), and events-lite — summary
+  event rows with payloads projected to scalar fields, NOT full bodies.
+  ``fmt=csv`` instead flattens to one row per sandbox × score dimension
+  (see :func:`_export_csv` for the column doctrine).
+- ``POST /api/runs/{run_id}/share`` / ``DELETE .../share`` — mint / revoke
+  the run's ``share_token`` (unguessable; idempotent mint).
+- ``GET /api/share/{token}`` — the read-only share bundle the
+  ``/share/{token}`` page renders: spec + score matrix + events-lite.
+  No auth beyond the token itself (the app ships unauthenticated — this
+  is the PR19 extension point, not a security boundary).
+
 Pydantic models live here (not api/schemas.py) per Phase-2 ownership split.
 """
 
 from __future__ import annotations
 
+import csv
 import difflib
 import io
 import json
 import os
+import secrets
 import zipfile
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from api.config import get_settings
 from api.deps import get_db
-from api.schemas import AnalysisReport, CheckerResultOut, RubricOut
+from api.routers.analytics import get_run_analytics
+from api.schemas import (
+    AnalysisReport,
+    CheckerResultOut,
+    RubricOut,
+    RunAnalytics,
+)
 from db.models import (
     Artifact,
     CheckerResult,
@@ -1595,4 +1620,530 @@ def get_sandbox_file(
         truncated=truncated,
         binary=text is None,
         text=text,
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR35 (F28) — run export + share links
+# ---------------------------------------------------------------------------
+
+#: Max events embedded in an export bundle / share view. A run's stream is
+#: almost always far smaller (hundreds–low thousands); the bound keeps a
+#: pathological run's JSON bounded and is reported via
+#: ``events_total``/``events_truncated`` so consumers can tell.
+_EXPORT_EVENT_CAP = 50_000
+
+#: Scalar projection caps for events-lite rows: strings truncate at this
+#: many chars; nested objects are dropped EXCEPT ``usage`` (the small
+#: metered token block analytics + the timeline summary read — keeping it
+#: verbatim costs nothing and preserves the per-call accounting).
+_LITE_STRING_CAP = 300
+_LITE_KEEP_NESTED = frozenset({"usage"})
+
+
+class EventLiteOut(BaseModel):
+    """Events-lite row — an :class:`db.models.Event` minus its heavy payload.
+
+    ``payload`` is the stored payload projected to its top-level SCALAR
+    fields (str/int/float/bool/None; strings capped at
+    ``_LITE_STRING_CAP``), plus the small ``usage`` token dict verbatim.
+    Message bodies, tool args, diffs, and other nested content are dropped
+    — the export stays a summary index, not a transcript. The field set
+    matches :class:`api.schemas.EventOut` so timeline consumers
+    (``summarizeEvent``) read it unchanged.
+    """
+
+    id: int
+    run_id: UUID
+    sandbox_id: UUID | None
+    ts: datetime
+    seq: int | None
+    source: str
+    type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunSpecOut(BaseModel):
+    """The run's submitted spec + lifecycle stamps — the spec block shared
+    by the JSON export (``RunExport.spec``) and the share view
+    (``ShareOut.run``). ``config`` is the verbatim submitted config
+    (harness_configs, models, budgets, task_inputs, ...)."""
+
+    id: UUID
+    status: str
+    task_prompt: str
+    model_name: str
+    # The full participant-model set ([model_name] + config extras + any
+    # per-config pins) — same expansion the results payload reports.
+    models: list[str] = Field(default_factory=list)
+    evaluator_model: str | None = None
+    same_model_eval: bool | None = None
+    trials: int = 1
+    config: dict[str, Any] = Field(default_factory=dict)
+    preset_ref: str | None = None
+    preset_revision: int | None = None
+    suite_ref: str | None = None
+    suite_index: int | None = None
+    suite_run_id: UUID | None = None
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class RunExport(BaseModel):
+    """``GET /api/runs/{id}/export?fmt=json`` — the full run bundle.
+
+    Self-contained snapshot: the submitted spec, every rubric version
+    (content included — score provenance is meaningless without it), the
+    score matrix exactly as ``GET .../results`` serves it, the analytics
+    rollup exactly as ``GET .../analytics`` serves it, and the events-lite
+    index. ``format``/``format_version`` tag the schema for re-import
+    validation (``RunExport.model_validate`` round-trips the payload).
+    """
+
+    format: Literal["heg-run-export"] = "heg-run-export"
+    format_version: int = 1
+    exported_at: datetime
+    spec: RunSpecOut
+    rubrics: list[RubricOut] = Field(default_factory=list)
+    results: RunResults
+    analytics: RunAnalytics
+    events_total: int = 0
+    events_truncated: bool = False
+    events: list[EventLiteOut] = Field(default_factory=list)
+
+
+class ShareLinkOut(BaseModel):
+    """``POST /api/runs/{id}/share`` — the minted (or existing) link."""
+
+    run_id: UUID
+    token: str
+    # API-relative path the web app serves the read-only view at.
+    url: str
+
+
+class ShareOut(BaseModel):
+    """``GET /api/share/{token}`` — the read-only share bundle.
+
+    Spec + score matrix + the bounded events-lite index — everything the
+    ``/share/{token}`` page renders. Control-plane filesystem references
+    (``artifact_path``, ``artifacts``, ``thumbnail``, the
+    ``previewable``/``preview_type``/``preview_candidates`` probe fields,
+    the analysis ``workspace`` path, the ``_SHARE_FS_KEYS`` payload/metric
+    keys) are stripped — the share view exposes neither artifact download
+    nor browse.
+    """
+
+    run: RunSpecOut
+    results: RunResults
+    events: list[EventLiteOut] = Field(default_factory=list)
+    events_total: int = 0
+    events_truncated: bool = False
+
+
+def _event_lite_payload(
+    payload: dict[str, Any], *, drop: frozenset[str] = frozenset()
+) -> dict[str, Any]:
+    """Project a stored event payload to a bounded summary row.
+
+    Top-level scalar fields pass through (strings capped); ``usage``
+    keeps its scalar members; every other nested dict/list is dropped.
+    ``drop`` omits named keys outright (the share bundle's FS-ref keys —
+    the authenticated export projects verbatim).
+    """
+    out: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in drop:
+            continue
+        if value is None or isinstance(value, bool | int | float):
+            out[key] = value
+        elif isinstance(value, str):
+            out[key] = (
+                value
+                if len(value) <= _LITE_STRING_CAP
+                else value[:_LITE_STRING_CAP] + "…"
+            )
+        elif key in _LITE_KEEP_NESTED and isinstance(value, dict):
+            out[key] = {
+                k: v
+                for k, v in value.items()
+                if v is None or isinstance(v, bool | int | float | str)
+            }
+    return out
+
+
+def _event_lite_rows(
+    session: Session,
+    run_id: UUID,
+    *,
+    cap: int,
+    drop: frozenset[str] = frozenset(),
+) -> tuple[list[EventLiteOut], int]:
+    """Events-lite rows for a run (oldest → newest) + the run's true total.
+
+    Only the first ``cap`` rows are returned; ``total`` counts the whole
+    stream so callers can flag ``events_truncated``.
+    """
+    total = session.execute(
+        select(func.count(Event.id)).where(Event.run_id == run_id)
+    ).scalar_one()
+    rows = (
+        session.execute(
+            select(Event)
+            .where(Event.run_id == run_id)
+            .order_by(Event.id)
+            .limit(cap)
+        )
+        .scalars()
+        .all()
+    )
+    return (
+        [
+            EventLiteOut(
+                id=ev.id,
+                run_id=ev.run_id,
+                sandbox_id=ev.sandbox_id,
+                ts=ev.ts,
+                seq=ev.seq,
+                source=ev.source,
+                type=ev.type,
+                payload=_event_lite_payload(ev.payload or {}, drop=drop),
+            )
+            for ev in rows
+        ],
+        int(total),
+    )
+
+
+def _run_spec_out(run: Run) -> RunSpecOut:
+    cfg = run.config or {}
+    return RunSpecOut(
+        id=run.id,
+        status=run.status,
+        task_prompt=run.task_prompt,
+        model_name=run.model_name,
+        models=run_models(cfg, run.model_name),
+        evaluator_model=cfg.get("evaluator_model"),
+        same_model_eval=cfg.get("same_model_eval"),
+        trials=getattr(run, "trials", None) or cfg.get("trials") or 1,
+        config=cfg,
+        preset_ref=run.preset_ref,
+        preset_revision=run.preset_revision,
+        suite_ref=run.suite_ref,
+        suite_index=run.suite_index,
+        suite_run_id=run.suite_run_id,
+        created_at=run.created_at,
+        started_at=run.started_at,
+        finished_at=run.finished_at,
+    )
+
+
+#: CSV flattening doctrine (the card's "one row per sandbox×dimension"):
+#: every score row of the matrix becomes a sheet row carrying the score +
+#: rationale; the judge's ``overall`` pseudo-dimension is emitted as a
+#: regular dimension row (last per sandbox, mirroring the matrix's top
+#: row); a sandbox with NO scores still contributes one row with empty
+#: dimension/score so the sheet covers the whole matrix. Per-sandbox
+#: fields (config label, status, participant-phase analytics) repeat per
+#: row — sheets pivot on them freely; there's no separate analytics sheet.
+_EXPORT_CSV_FIELDS = [
+    "run_id",
+    "sandbox_id",
+    "sandbox_name",
+    "adapter",
+    "model",
+    "cell",
+    "trial_index",
+    "status",
+    "terminal_reason",
+    "empty_workspace",
+    "eval_error",
+    "rubric_version",
+    "dimension",
+    "score",
+    "rationale",
+    "llm_turns",
+    "tokens_input",
+    "tokens_output",
+    "tokens_cache_read",
+    "tokens_total",
+    "wall_clock_seconds",
+    "estimated_cost_usd",
+]
+
+
+_CSV_FORMULA_CHARS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(value: Any) -> Any:
+    # String cells that Excel would parse as a formula get the standard
+    # quote prefix — the BOM targets Excel, and names/rationales are
+    # submitter- and judge-influenced text.
+    if isinstance(value, str) and value[:1] in _CSV_FORMULA_CHARS:
+        return "'" + value
+    return value
+
+
+def _export_csv(
+    run_id: UUID, results: RunResults, analytics: RunAnalytics
+) -> str:
+    """Render the score matrix + per-sandbox analytics as CSV.
+
+    The ``\\ufeff`` BOM prefix keeps Excel's auto-detect on UTF-8 —
+    rationales can carry non-ASCII text.
+    """
+    metrics = {sa.sandbox_id: sa for sa in analytics.sandboxes}
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(_EXPORT_CSV_FIELDS)
+    for sb in results.sandboxes:
+        sa = metrics.get(sb.sandbox_id)
+        hc = sb.harness_config or {}
+        base: dict[str, Any] = {
+            "run_id": str(run_id),
+            "sandbox_id": str(sb.sandbox_id),
+            "sandbox_name": sb.name or "",
+            "adapter": hc.get("adapter") or hc.get("harness") or "",
+            "model": sb.model,
+            # The analytics cell key (config × model group) — lets a sheet
+            # pivot trials of one cell; empty only when analytics lacks
+            # the sandbox (shouldn't happen — both walk the same rows).
+            "cell": sa.cell if sa is not None else "",
+            "trial_index": sb.trial_index if sb.trial_index is not None else "",
+            "status": sb.status,
+            "terminal_reason": sb.terminal_reason or "",
+            "empty_workspace": "1" if sb.empty_workspace else "0",
+            "eval_error": sb.eval_error or "",
+            "rubric_version": (
+                sb.rubric_version if sb.rubric_version is not None else ""
+            ),
+            "llm_turns": sa.llm_turns if sa is not None else "",
+            "tokens_input": sa.tokens.input if sa is not None else "",
+            "tokens_output": sa.tokens.output if sa is not None else "",
+            "tokens_cache_read": sa.tokens.cache_read if sa is not None else "",
+            "tokens_total": sa.tokens.total if sa is not None else "",
+            "wall_clock_seconds": (
+                sa.wall_clock_seconds if sa is not None else ""
+            ),
+            "estimated_cost_usd": (
+                sa.estimated_cost_usd if sa is not None else ""
+            ),
+            # Score columns — per-dimension rows overwrite these; the
+            # score-less fallback row ships them empty.
+            "dimension": "",
+            "score": "",
+            "rationale": "",
+        }
+        # dimension order: alphabetical, then overall last — deterministic
+        # across runs so exports of sibling runs align row-for-row.
+        dim_rows = [
+            (dim, entry)
+            for dim, entry in sorted(sb.dimensions.items())
+        ]
+        if sb.overall is not None:
+            dim_rows.append(("overall", sb.overall))
+        if not dim_rows:
+            writer.writerow([_csv_cell(base[f]) for f in _EXPORT_CSV_FIELDS])
+            continue
+        for dim, entry in dim_rows:
+            row = dict(base)
+            row.update(
+                {
+                    "dimension": dim,
+                    "score": entry.score,
+                    "rationale": entry.rationale,
+                }
+            )
+            writer.writerow([_csv_cell(row[f]) for f in _EXPORT_CSV_FIELDS])
+    return "\ufeff" + buf.getvalue()
+
+
+def _run_or_404(session: Session, run_id: UUID) -> Run:
+    run = session.get(Run, run_id)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
+    return run
+
+
+@router.get("/api/runs/{run_id}/export")
+def export_run(
+    run_id: UUID,
+    session: DbSession,
+    fmt: Literal["json", "csv"] = "json",
+) -> Response:
+    """PR35 — the full run bundle as a download.
+
+    ``fmt=json`` (default) → :class:`RunExport` (spec, rubrics, score
+    matrix, analytics, events-lite). ``fmt=csv`` → the flattened sheet:
+    one row per sandbox × score dimension (see :func:`_export_csv`).
+    """
+    run = _run_or_404(session, run_id)
+    results = get_run_results(run_id, session)
+    analytics = get_run_analytics(run_id, session)
+
+    if fmt == "csv":
+        body = _export_csv(run_id, results, analytics)
+        return Response(
+            content=body.encode("utf-8"),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="heg-run-{run_id}.csv"'
+                )
+            },
+        )
+
+    events, events_total = _event_lite_rows(
+        session, run_id, cap=_EXPORT_EVENT_CAP
+    )
+    bundle = RunExport(
+        exported_at=datetime.now(UTC),
+        spec=_run_spec_out(run),
+        rubrics=[
+            RubricOut.model_validate(r) for r in _rubric_rows(session, run_id)
+        ],
+        results=results,
+        analytics=analytics,
+        events_total=events_total,
+        events_truncated=events_total > len(events),
+        events=events,
+    )
+    return Response(
+        content=bundle.model_dump_json(),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="heg-run-{run_id}.json"'
+            )
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# share links (PR35 stretch — the read-only /share/{token} surface)
+# ---------------------------------------------------------------------------
+
+#: Stored payload/metric keys that carry control-plane filesystem paths —
+#: dropped from the share bundle's events and analysis signal metrics
+#: (``sb.artifact_path``/``artifacts``/``thumbnail``/the preview probe
+#: fields/analysis ``workspace`` are scrubbed field-by-field in
+#: ``get_shared_run``; the authenticated export keeps everything
+#: verbatim).
+_SHARE_FS_KEYS = frozenset(
+    {
+        "artifact_path",
+        "eval_workspace",
+        "analysis_path",
+        "scores_path",
+        "tests_dir",
+    }
+)
+
+
+@router.post("/api/runs/{run_id}/share", response_model=ShareLinkOut)
+def create_share_link(run_id: UUID, session: DbSession) -> ShareLinkOut:
+    """Mint (or return) the run's share token — idempotent.
+
+    ``secrets.token_urlsafe(16)`` = 128 bits of entropy — the token is the
+    only credential the read-only share surface checks. The mint claims the
+    slot with a conditional UPDATE — stays idempotent under concurrent
+    POSTs on every dialect (``FOR UPDATE`` locks are a no-op on SQLite;
+    a SHARED-lock upgrade stall rolls back and re-reads the winner's
+    token).
+    """
+    run = session.get(Run, run_id)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="run not found"
+        )
+    token = run.share_token
+    if token is None:
+        for _ in range(2):
+            candidate = secrets.token_urlsafe(16)
+            try:
+                claimed = session.execute(
+                    update(Run)
+                    .where(Run.id == run_id, Run.share_token.is_(None))
+                    .values(share_token=candidate)
+                ).rowcount
+                session.commit()
+            except OperationalError:
+                session.rollback()
+                claimed = 0
+            if claimed:
+                token = candidate
+                break
+            token = session.execute(
+                select(Run.share_token).where(Run.id == run_id)
+            ).scalar_one_or_none()
+            if token is not None:
+                break
+        if token is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="share link contention",
+            )
+    session.commit()
+    return ShareLinkOut(
+        run_id=run_id,
+        token=token,
+        url=f"/share/{token}",
+    )
+
+
+@router.delete("/api/runs/{run_id}/share", status_code=status.HTTP_204_NO_CONTENT)
+def delete_share_link(run_id: UUID, session: DbSession) -> None:
+    """Revoke the share link — the token stops resolving immediately."""
+    run = _run_or_404(session, run_id)
+    if run.share_token is not None:
+        try:
+            run.share_token = None
+            session.commit()
+        except OperationalError:
+            # Same SQLite SHARED-lock upgrade stall as the mint — drop the
+            # read lock and apply the write in a fresh transaction.
+            session.rollback()
+            session.execute(
+                update(Run).where(Run.id == run_id).values(share_token=None)
+            )
+            session.commit()
+
+
+@router.get("/api/share/{token}", response_model=ShareOut)
+def get_shared_run(token: str, session: DbSession) -> ShareOut:
+    """The read-only bundle behind a share link — spec, score matrix, and
+    the bounded events-lite index.
+
+    Unknown/revoked tokens 404 identically — a revoked link's prior
+    existence is not disclosed.
+    """
+    run = session.execute(
+        select(Run).where(Run.share_token == token)
+    ).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="share link not found"
+        )
+    events, events_total = _event_lite_rows(
+        session, run.id, cap=_EXPORT_EVENT_CAP, drop=_SHARE_FS_KEYS
+    )
+    results = get_run_results(run.id, session)
+    for sb in results.sandboxes:
+        sb.artifact_path = None
+        sb.artifacts = []
+        sb.thumbnail = None
+        sb.previewable = False
+        sb.preview_type = None
+        sb.preview_candidates = []
+        if sb.analysis is not None:
+            sb.analysis.workspace = ""
+            for sig in sb.analysis.signals:
+                for key in _SHARE_FS_KEYS:
+                    sig.metrics.pop(key, None)
+    return ShareOut(
+        run=_run_spec_out(run),
+        results=results,
+        events=events,
+        events_total=events_total,
+        events_truncated=events_total > len(events),
     )

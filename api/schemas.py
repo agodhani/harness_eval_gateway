@@ -476,6 +476,9 @@ class RunOut(BaseModel):
     # 1-based position among ``queued`` runs (approval/queue-entry order) —
     # set only while the run is parked; null in every other status.
     queue_position: int | None = None
+    # PR35: the run's read-only share view path (``/share/{token}``) when a
+    # link has been minted — null until POST /api/runs/{id}/share runs.
+    share_url: str | None = None
     # Submit-time advisory warnings from the model-catalog check (e.g.
     # "model not in provider catalog") — populated on POST /api/runs only;
     # empty on reads (warnings are advisory, not persisted state).

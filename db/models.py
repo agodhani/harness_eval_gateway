@@ -77,6 +77,10 @@ class Run(Base):
     suite_run_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("suite_runs.id"), index=True
     )
+    # PR35 share links — an unguessable token enabling the read-only
+    # ``/share/{token}`` view (results + events-lite). NULL = not shared;
+    # minted by POST /api/runs/{id}/share, revoked by DELETE.
+    share_token: Mapped[str | None] = mapped_column(String(64), unique=True)
 
     sandboxes: Mapped[list[Sandbox]] = relationship(back_populates="run")
     rubrics: Mapped[list[Rubric]] = relationship(back_populates="run")

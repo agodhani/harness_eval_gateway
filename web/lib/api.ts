@@ -413,6 +413,9 @@ export interface RunOut {
   suite_ref?: string | null;
   suite_index?: number | null;
   suite_run_id?: string | null;
+  /** PR35: the run's read-only share view path (`/share/{token}`) once a
+   * link has been minted via POST /api/runs/{id}/share — null until then. */
+  share_url?: string | null;
   sandboxes: SandboxOut[];
   rubric: RubricOut | null;
 }
@@ -1308,6 +1311,77 @@ export function getSandboxScores(sandboxId: string): Promise<ScoreOut[]> {
 
 export function artifactDownloadUrl(artifactId: string): string {
   return `${API_BASE}/api/artifacts/${encodeURIComponent(artifactId)}/download`;
+}
+
+// ---------------------------------------------------------------------------
+// export + share (PR35 / F28)
+// ---------------------------------------------------------------------------
+
+export type RunExportFormat = "json" | "csv";
+
+/** `GET /api/runs/{id}/export` — the full run bundle (json) or the
+ * flattened per-cell sheet (csv). Served as an attachment, so plain
+ * `<a href>` download works like artifactDownloadUrl. */
+export function runExportUrl(runId: string, fmt: RunExportFormat): string {
+  return `${API_BASE}/api/runs/${encodeURIComponent(runId)}/export?fmt=${fmt}`;
+}
+
+/** The minted share link — `url` is the app-relative `/share/{token}` path. */
+export interface ShareLink {
+  run_id: string;
+  token: string;
+  url: string;
+}
+
+/** The run's spec + lifecycle stamps, as embedded in the share bundle. */
+export interface ShareRun {
+  id: string;
+  status: string;
+  task_prompt: string;
+  model_name: string;
+  models: string[];
+  evaluator_model: string | null;
+  same_model_eval: boolean | null;
+  trials: number;
+  config: RunConfig;
+  preset_ref: string | null;
+  preset_revision: number | null;
+  suite_ref: string | null;
+  suite_index: number | null;
+  suite_run_id: string | null;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+/** `GET /api/share/{token}` — the read-only bundle the /share/{token} page
+ * renders. `events` are events-lite rows (payload = scalar projection,
+ * never a transcript); `events_total`/`events_truncated` report the cap. */
+export interface ShareBundle {
+  run: ShareRun;
+  results: RunResults;
+  events: EventOut[];
+  events_total: number;
+  events_truncated: boolean;
+}
+
+/** Mint (or return) the run's share link — idempotent. */
+export function shareRun(runId: string): Promise<ShareLink> {
+  return request<ShareLink>(`/api/runs/${encodeURIComponent(runId)}/share`, {
+    method: "POST",
+  });
+}
+
+/** Revoke the share link — the token stops resolving immediately. */
+export function unshareRun(runId: string): Promise<void> {
+  return request<void>(`/api/runs/${encodeURIComponent(runId)}/share`, {
+    method: "DELETE",
+  });
+}
+
+/** Fetch a share bundle by token. 404 = unknown or revoked link. */
+export function getShareBundle(token: string): Promise<ShareBundle> {
+  return request<ShareBundle>(`/api/share/${encodeURIComponent(token)}`);
 }
 
 // ---------------------------------------------------------------------------

@@ -28,8 +28,10 @@ MODEL_PRICES_REV = "c4e8d1a7f3b5"
 PRICE_GLOB_LOWER_REV = "d6e2b8f4a1c9"
 # PR22 — re-chained on top of PRICE_GLOB_LOWER_REV.
 TASK_PRESETS_REV = "d1e2f3a4b5c6"
-# PR26 — benchmark suites + checker results; current chain head.
+# PR26 — benchmark suites + checker results.
 SUITES_REV = "e4f5a6b7c8d9"
+# PR35 — runs.share_token (export + share links); current chain head.
+SHARE_TOKEN_REV = "c5f9a2b8d4e7"
 
 
 @pytest.fixture()
@@ -61,7 +63,7 @@ def _columns(url: str, table: str) -> set[str]:
 
 def test_migration_chain_single_headed() -> None:
     heads = ScriptDirectory.from_config(_cfg()).get_heads()
-    assert list(heads) == [SUITES_REV]
+    assert list(heads) == [SHARE_TOKEN_REV]
 
 
 def test_sandbox_name_upgrade_downgrade(sqlite_url: str) -> None:
@@ -344,5 +346,58 @@ def test_model_prices_lower_glob_unique(sqlite_url: str) -> None:
             s.add(ModelPriceRow(model_glob="MIG-LOWER-*", source="user"))
             with pytest.raises(IntegrityError):
                 s.commit()
+    finally:
+        engine.dispose()
+
+
+def test_runs_share_token_upgrade_downgrade(sqlite_url: str) -> None:
+    """PR35: ``runs.share_token`` lands at head and drops below the suites rev."""
+    command.upgrade(_cfg(), "head")
+    assert "share_token" in _columns(sqlite_url, "runs")
+
+    command.downgrade(_cfg(), SUITES_REV)
+    assert "share_token" not in _columns(sqlite_url, "runs")
+
+    command.upgrade(_cfg(), "head")
+    assert "share_token" in _columns(sqlite_url, "runs")
+
+
+def test_runs_share_token_unique(sqlite_url: str) -> None:
+    """The migrated unique index refuses a duplicate share token."""
+    from datetime import UTC, datetime
+
+    from sqlalchemy.exc import IntegrityError
+
+    from db.models import Run
+    from db.session import make_engine, make_session_factory
+
+    command.upgrade(_cfg(), "head")
+    engine = make_engine(sqlite_url)
+    sf = make_session_factory(engine)
+    try:
+        # The migrated DDL keeps ``DEFAULT now()`` (Postgres spelling) on
+        # created_at/updated_at — sqlite can't evaluate it, so stamp the
+        # timestamps explicitly.
+        def _run(prompt: str, token: str | None) -> Run:
+            return Run(
+                task_prompt=prompt,
+                model_name="m",
+                share_token=token,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+
+        with sf() as s:
+            s.add(_run("a", "tok"))
+            s.commit()
+        with sf() as s:
+            s.add(_run("b", "tok"))
+            with pytest.raises(IntegrityError):
+                s.commit()
+        # NULLs coexist — most runs are never shared.
+        with sf() as s:
+            s.add(_run("c", None))
+            s.commit()
+            assert s.query(Run).filter_by(share_token=None).count() >= 1
     finally:
         engine.dispose()
