@@ -130,6 +130,30 @@ def expanded_configs(
     return out
 
 
+def judge_models(config: Mapping[str, Any] | None, model_name: str) -> list[str]:
+    """Effective judge panel of a stored run config (PR29).
+
+    ``config.evaluator_models`` (ordered 1–3 panel, ``evaluator_model``
+    already folded in as panel head) when the run spec carried one;
+    otherwise the single ``config.evaluator_model`` falling back to the
+    run's primary ``model_name`` — the same default chain the evaluator
+    resolves. Always returns ≥1 entry for a well-formed run; panel order
+    is stable (panel[0] is the primary judge).
+    """
+    cfg = config or {}
+    panel = cfg.get("evaluator_models")
+    if isinstance(panel, list):
+        out: list[str] = []
+        for m in panel:
+            s = _clean(m)
+            if s and s not in out:
+                out.append(s)
+        if out:
+            return out
+    single = _clean(cfg.get("evaluator_model")) or _clean(model_name)
+    return [single] if single else []
+
+
 def sandbox_model(harness_config: Mapping[str, Any] | None, default_model: str) -> str:
     """The participant model one sandbox runs: its config's ``model`` cell
     (PR14 multi-model matrix) else the run's primary ``model_name``."""

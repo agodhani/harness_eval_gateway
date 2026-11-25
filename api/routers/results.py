@@ -60,17 +60,27 @@ import csv
 import difflib
 import io
 import json
+import math
 import os
+import random
 import secrets
+import time
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal
-from uuid import UUID
+from typing import Annotated, Any, Literal, NamedTuple
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    field_validator,
+)
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -88,6 +98,7 @@ from db.models import (
     Artifact,
     CheckerResult,
     Event,
+    PairwiseVote,
     Rubric,
     Run,
     Sandbox,
@@ -95,8 +106,13 @@ from db.models import (
 )
 from evaluator.scores import OVERALL_DIMENSION
 from orchestrator import events as orch_events
-from orchestrator import runner, state_machine
-from orchestrator.matrix import run_models, sandbox_model, trial_index
+from orchestrator import prompt_cell, runner, state_machine
+from orchestrator.matrix import (
+    judge_models,
+    run_models,
+    sandbox_model,
+    trial_index,
+)
 from orchestrator.rubric import RubricContent, create_rubric_version
 from sandbox.preview import (
     ScanCache,
@@ -128,9 +144,39 @@ def reset_scan_cache() -> None:
 # ---------------------------------------------------------------------------
 
 
+class JudgeScore(BaseModel):
+    """One judge's newest verdict on a dimension (PR29 panel).
+
+    ``judge_model`` is the model stamped on the score row — ``None`` for
+    checker rows (``suite_pass``) and pre-panel rows whose author resolves
+    to the run's primary judge at merge time (the resolved name is
+    reported, so ``None`` here truly means "not model-authored").
+    """
+
+    judge_model: str | None = None
+    score: float
+    rationale: str = ""
+    source: str = "llm"  # llm | checker
+
+
 class DimensionScore(BaseModel):
     score: float
     rationale: str = ""
+    # PR29 — where the displayed number came from: "llm" = per-judge
+    # newest-score MEAN across the panel; "human" = a POST
+    # /api/sandboxes/{id}/scores override row, which wins the pair
+    # outright; "checker" = deterministic suite_pass measurement.
+    source: str = "llm"
+    # Free-text context on human overrides (why the score moved).
+    note: str | None = None
+    # Per-judge newest verdicts feeding the mean (empty only for a human
+    # cell that no judge row exists beside) — the UI renders these in the
+    # cell tooltip + the "judges said X" line under a human override.
+    judges: list[JudgeScore] = Field(default_factory=list)
+    # max − min across the contributing judges; ``None`` below 2 judges.
+    # The UI badges disagreement above its threshold (>2 pts).
+    spread: float | None = None
+    judge_count: int = 0
 
 
 class ExecSummary(BaseModel):
@@ -347,6 +393,9 @@ class RunResults(BaseModel):
     # re-deriving the matrix.
     models: list[str] = Field(default_factory=list)
     evaluator_model: str | None = None
+    # PR29 — the full judge panel ([evaluator_model] on single-judge
+    # runs — always ≥1 for a well-formed run); evaluator_model = panel[0].
+    evaluator_models: list[str] = Field(default_factory=list)
     same_model_eval: bool | None = None
     # PR24: the task-input seed spec echoed from run.config (a repo_url+ref
     # or an upload archive_id), or None for unseeded runs. The per-cell
@@ -361,6 +410,9 @@ class RunResults(BaseModel):
     # Every rubric version of the run + score counts — drives the UI's
     # version selector without a second request.
     rubric_versions: list[RubricVersionOut] = Field(default_factory=list)
+    # PR29 — blind A/B roll-up over pairwise_votes: per-sandbox win rate +
+    # judge-vs-human agreement. None until the run has votes.
+    votes: VotesSummary | None = None
     sandboxes: list[SandboxResult] = Field(default_factory=list)
 
 
@@ -375,6 +427,153 @@ class ScoreOut(BaseModel):
     dimension: str
     score: float
     rationale: str
+    # PR29 provenance — judge model for llm rows (NULL pre-panel); the
+    # row's author class (llm | human | checker); human override context.
+    judge_model: str | None = None
+    source: str = "llm"
+    note: str | None = None
+    created_at: datetime
+
+
+class HumanScoreIn(BaseModel):
+    """POST /api/sandboxes/{id}/scores body — a human override verdict on
+    one dimension (PR29).
+
+    The row lands with ``source="human"`` + ``seq`` above the sandbox's
+    current max, so it wins the newest-wins merge for its (sandbox,
+    dimension) pair regardless of what judge rows exist. Rubric
+    provenance stamps the run's latest approved rubric — "the judging
+    context the human was correcting" — while the merge keeps the row
+    visible in every ``?rubric_version=`` view (the correction is
+    version-agnostic).
+    """
+
+    dimension: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
+        min_length=1, max_length=128
+    )
+    score: float
+    rationale: str = Field(default="", max_length=10_000)
+    note: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, max_length=2000
+    )
+
+    @field_validator("score")
+    @classmethod
+    def _finite_score(cls, v: float) -> float:
+        # Scale is rubric-defined (0–10 MVP, arbitrary in PR23 rubrics) —
+        # only require a finite real number.
+        if not math.isfinite(v):
+            raise ValueError("score must be finite")
+        return v
+
+
+class VoteStats(BaseModel):
+    """One sandbox's blind-A/B tally (PR29). ``win_rate`` counts decided
+    votes only (wins / (wins+losses) — ties excluded); ``None`` when the
+    sandbox has no decided votes yet."""
+
+    wins: int = 0
+    losses: int = 0
+    ties: int = 0
+    win_rate: float | None = None
+
+
+class VotesSummary(BaseModel):
+    """Blind A/B roll-up for the results page (PR29).
+
+    ``total`` = merged vote count (newest vote per (unordered pair,
+    dimension) wins — a re-vote on the same pair/dim replaces rather than
+    double-counts). ``by_sandbox`` keys on sandbox id. ``compared`` /
+    ``agreed`` / ``agreement_rate`` measure judge-vs-human agreement: of
+    the votes where BOTH sides carry a judge mean on the voted dimension,
+    how often the judge's ranking matches the human's pick.
+    """
+
+    total: int = 0
+    by_sandbox: dict[str, VoteStats] = Field(default_factory=dict)
+    compared: int = 0
+    agreed: int = 0
+    agreement_rate: float | None = None
+
+
+class PairCreateIn(BaseModel):
+    """POST /api/runs/{id}/pair body — optionally pin which two sandboxes
+    face off (both must be artifact-bearing members of the run). Omitted
+    → the server picks two at random."""
+
+    sandbox_ids: list[UUID] | None = Field(default=None, min_length=2, max_length=2)
+
+
+class PairSideOut(BaseModel):
+    """One anonymized side of a pair session. ``root`` mirrors the file
+    browser's browse-root kind ("workspace" | "artifact") — under
+    anonymization the artifact root exposes ONLY ``output.txt`` (prompt
+    submissions), never meta.json/transcript/analysis.
+    """
+
+    label: str  # "A" | "B"
+    root: str
+    entries: list[FileEntry] = Field(default_factory=list)
+    truncated: bool = False
+
+
+class PairOut(BaseModel):
+    """201 response to POST /api/runs/{id}/pair — an anonymized A/B view.
+
+    Deliberately carries NO sandbox ids/config/model names: the pair_id
+    is the only handle the reviewer (and the vote endpoint) needs.
+    """
+
+    pair_id: str
+    run_id: UUID
+    # Rubric dimension names + "overall" — the reviewer's vote menu.
+    dimensions: list[str] = Field(default_factory=list)
+    sides: list[PairSideOut] = Field(default_factory=list)
+
+
+class PairFileOut(BaseModel):
+    """Anonymized read of one pair-side file — ``side`` is the label from
+    the pair session, never the sandbox id."""
+
+    pair_id: str
+    side: str
+    path: str
+    size: int
+    truncated: bool = False
+    binary: bool = False
+    text: str | None = None
+
+
+class PairVoteIn(BaseModel):
+    """POST /api/runs/{id}/pair/{pair_id}/vote body — the reviewer picks
+    a side per dimension. ``winner`` is the A/B label (or "tie"); the
+    stored row resolves it to left/right sandbox ids server-side."""
+
+    dimension: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
+        min_length=1, max_length=128
+    )
+    winner: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
+        min_length=1, max_length=8
+    )
+    note: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, max_length=2000
+    )
+
+
+class PairwiseVoteOut(BaseModel):
+    """One recorded blind-A/B vote. Returning the REAL sandbox ids is
+    deliberate — the reveal happens post-vote, and the results summary
+    needs them for per-sandbox win rates."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    run_id: UUID
+    left_sandbox: UUID
+    right_sandbox: UUID
+    dimension: str
+    winner: str  # left | right | tie — left := the sandbox behind "A"
+    note: str
     created_at: datetime
 
 
@@ -588,6 +787,147 @@ def _latest_approved_rubric(session: Session, run_id: UUID) -> Rubric | None:
     ).scalar_one_or_none()
 
 
+def _score_bucket(sc: Score, primary_judge: str | None) -> tuple[str, str | None]:
+    """Merge-bucket identity of one score row (PR29).
+
+    The newest-wins merge now keys on (source, judge) instead of the
+    dimension alone — a judge panel writes one row per judge per
+    dimension and the cell merges to their MEAN, so each judge's newest
+    row must survive:
+
+    - ``human`` overrides share ONE bucket regardless of author — the
+      newest human post wins the pair outright.
+    - ``checker`` rows (deterministic ``suite_pass``) are their own
+      bucket — no model authored them.
+    - ``llm`` rows bucket by ``judge_model``; a NULL judge (pre-PR29 or
+      unstamped rows) resolves to the run's primary judge — the only
+      model that could have written them — so they merge into the
+      primary's bucket rather than a phantom "unknown" judge.
+    """
+    if sc.source == "human":
+        return ("human", None)
+    if sc.source == "checker":
+        return ("checker", None)
+    return ("llm", sc.judge_model or primary_judge)
+
+
+def _dimension_entry(
+    buckets: dict[tuple[str, str | None], Score],
+    *,
+    newest: Score,
+) -> DimensionScore:
+    """Fold one dimension's per-bucket newest rows into the cell value.
+
+    ``newest`` is the dimension's latest row overall — its rationale is
+    the headline rationale for non-human merges (the most recent
+    contributing verdict, matching pre-PR29 last-wins display semantics).
+    A human bucket wins the pair outright (its score/rationale/note
+    display) but the judges' verdicts stay attached for the "what judges
+    said" tooltip + vote-agreement stat.
+    """
+    human = buckets.get(("human", None))
+    winners = sorted(
+        ((k, w) for k, w in buckets.items() if k[0] != "human"),
+        key=lambda kw: (kw[0][1] or "", kw[0][0]),
+    )
+    judges = [
+        JudgeScore(
+            # The bucket key already carries the resolved judge name —
+            # NULL judge_model on an llm row folded to the primary judge
+            # at bucket time; only checker rows truly report None.
+            judge_model=(k[1] if k[0] == "llm" else None),
+            score=w.score,
+            rationale=w.rationale or "",
+            source=w.source or "llm",
+        )
+        for k, w in winners
+    ]
+    spread = (
+        round(
+            max(w.score for _, w in winners)
+            - min(w.score for _, w in winners),
+            2,
+        )
+        if len(winners) >= 2
+        else None
+    )
+    if human is not None:
+        return DimensionScore(
+            score=human.score,
+            rationale=human.rationale or "",
+            source="human",
+            note=human.note,
+            judges=judges,
+            spread=spread,
+            judge_count=len(winners),
+        )
+    mean = sum(w.score for _, w in winners) / len(winners)
+    return DimensionScore(
+        score=round(mean, 2),
+        rationale=newest.rationale or "",
+        source=(
+            "checker"
+            if all(w.source == "checker" for _, w in winners)
+            else "llm"
+        ),
+        judges=judges,
+        spread=spread,
+        judge_count=len(winners),
+    )
+
+
+class _MergedScores(NamedTuple):
+    """One sandbox's merged score state for the results matrix."""
+
+    dimensions: dict[str, DimensionScore]
+    overall: DimensionScore | None
+    suite_pass: float | None
+    # dim → mean across LLM judges (human overrides excluded — the
+    # judge-vs-human agreement stat needs the JUDGE number even on
+    # overridden cells).
+    judge_means: dict[str, float]
+
+
+def _merge_dimensions(
+    rows: list[Score], *, primary_judge: str | None
+) -> _MergedScores:
+    """Newest-wins-per-bucket merge of one sandbox's score rows.
+
+    ``rows`` arrive ordered newest-last (created_at, seq, rubric_version,
+    id — the durable insertion order). Per dimension, the last row per
+    (source, judge) bucket survives; the cell then resolves as human >
+    judge-mean (see ``_dimension_entry``).
+    """
+    dims: dict[str, dict[tuple[str, str | None], Score]] = {}
+    newest_of: dict[str, Score] = {}
+    for sc in rows:
+        dims.setdefault(sc.dimension, {})[_score_bucket(sc, primary_judge)] = sc
+        # Every row overwrites its own bucket, so the dimension's last
+        # row is always one of the surviving winners.
+        newest_of[sc.dimension] = sc
+    dimensions: dict[str, DimensionScore] = {}
+    overall: DimensionScore | None = None
+    suite_pass: float | None = None
+    judge_means: dict[str, float] = {}
+    for dim, buckets in dims.items():
+        entry = _dimension_entry(buckets, newest=newest_of[dim])
+        llm_scores = [j.score for j in entry.judges if j.source == "llm"]
+        if llm_scores:
+            judge_means[dim] = sum(llm_scores) / len(llm_scores)
+        if dim == OVERALL_DIMENSION:
+            overall = entry
+        else:
+            dimensions[dim] = entry
+            if dim == SUITE_PASS_DIMENSION:
+                suite_pass = entry.score
+    return _MergedScores(
+        dimensions=dimensions,
+        overall=overall,
+        suite_pass=suite_pass,
+        judge_means=judge_means,
+    )
+
+
 @router.get("/api/runs/{run_id}/rubrics", response_model=list[RubricVersionOut])
 def list_rubric_versions(run_id: UUID, session: DbSession) -> list[RubricVersionOut]:
     """All rubric versions (newest first) + per-version score counts."""
@@ -662,12 +1002,16 @@ def get_run_results(
     if rubric_version is not None:
         # Strict provenance filter — also catches rows whose rubric_id maps
         # to this version but whose denormalized rubric_version was never
-        # stamped (pre-backfill/manual inserts).
+        # stamped (pre-backfill/manual inserts). PR29: human overrides are
+        # version-AGNOSTIC corrections — they stay visible in every
+        # pinned-version view (the human's adjustment to a cell stands
+        # regardless of which rubric version produced the judge scores).
         matching_ids = [rid for rid, ver in version_of.items() if ver == rubric_version]
         score_stmt = score_stmt.where(
             or_(
                 Score.rubric_version == rubric_version,
                 Score.rubric_id.in_(matching_ids),
+                Score.source == "human",
             )
         )
     scores = (
@@ -762,6 +1106,12 @@ def get_run_results(
 
     jail = _artifact_jail()
     scan_ttl = get_settings().PREVIEW_SCAN_TTL_SECONDS
+    cfg = run.config or {}
+    # PR29 — the run's judge panel; panel[0] is the primary judge NULL
+    # judge_model rows resolve into (pre-panel rows were authored by it).
+    panel = judge_models(cfg, run.model_name)
+    primary_judge = panel[0] if panel else None
+    judge_means_by_sandbox: dict[UUID, dict[str, float]] = {}
     results: list[SandboxResult] = []
     for sb in sandboxes:
         # F12: FS probe so the UI only offers Preview when the snapshot
@@ -776,12 +1126,10 @@ def get_run_results(
         )
         plan = scan.plan if scan is not None else None
         analysis = _load_analysis(jail, sb)
-        dimensions: dict[str, DimensionScore] = {}
-        overall: DimensionScore | None = None
         rubric_id: UUID | None = None
         sb_rubric_version: int | None = None
-        suite_pass_score: float | None = None
-        for sc in by_sandbox.get(sb.id, []):
+        sb_scores = by_sandbox.get(sb.id, [])
+        for sc in sb_scores:
             if sc.rubric_id is not None:
                 rubric_id = sc.rubric_id  # rows ordered asc -> newest wins
             row_version = sc.rubric_version or (
@@ -789,13 +1137,11 @@ def get_run_results(
             )
             if row_version is not None:
                 sb_rubric_version = row_version
-            entry = DimensionScore(score=sc.score, rationale=sc.rationale or "")
-            if sc.dimension == OVERALL_DIMENSION:
-                overall = entry
-            else:
-                dimensions[sc.dimension] = entry
-                if sc.dimension == SUITE_PASS_DIMENSION:
-                    suite_pass_score = sc.score
+        # PR29 — per-(source,judge) buckets: human wins its pair; llm
+        # buckets merge to the panel mean + spread.
+        merged = _merge_dimensions(sb_scores, primary_judge=primary_judge)
+        judge_means_by_sandbox[sb.id] = merged.judge_means
+        suite_pass_score = merged.suite_pass
         suite_block = suite_by_sandbox.get(sb.id)
         results.append(
             SandboxResult(
@@ -810,15 +1156,15 @@ def get_run_results(
                 artifact_path=sb.artifact_path,
                 rubric_id=rubric_id,
                 rubric_version=sb_rubric_version,
-                dimensions=dimensions,
-                overall=overall,
+                dimensions=merged.dimensions,
+                overall=merged.overall,
                 eval_error=(
                     # A suite_pass row is a checker measurement, not a
                     # judge verdict — it must not mask "judge failed".
                     None
                     if any(
                         sc.dimension != SUITE_PASS_DIMENSION
-                        for sc in by_sandbox.get(sb.id, [])
+                        for sc in sb_scores
                     )
                     else eval_failures.get(sb.id)
                 ),
@@ -859,7 +1205,6 @@ def get_run_results(
             )
         )
 
-    cfg = run.config or {}
     counts = _score_counts_by_rubric(session, run_id)
     return RunResults(
         run_id=run.id,
@@ -868,6 +1213,7 @@ def get_run_results(
         trials=getattr(run, "trials", None) or cfg.get("trials") or 1,
         models=run_models(cfg, run.model_name),
         evaluator_model=cfg.get("evaluator_model"),
+        evaluator_models=panel,
         same_model_eval=cfg.get("same_model_eval"),
         task_inputs=cfg.get("task_inputs") or None,
         selected_rubric_version=rubric_version,
@@ -882,6 +1228,7 @@ def get_run_results(
             )
             for r in rubrics
         ],
+        votes=_votes_summary(session, run_id, judge_means_by_sandbox),
         sandboxes=results,
     )
 
@@ -1019,6 +1366,9 @@ def _prepare_rescore(
             "rubric_id": str(rubric.id),
             "rubric_version": rubric.version,
             "model": model or (run.config or {}).get("evaluator_model") or run.model_name,
+            "judge_models": (
+                [model] if model else judge_models(run.config, run.model_name)
+            ),
             "sandbox_ids": (
                 [str(s) for s in sandbox_ids] if sandbox_ids is not None else "all"
             ),
@@ -2147,3 +2497,500 @@ def get_shared_run(token: str, session: DbSession) -> ShareOut:
         events_total=events_total,
         events_truncated=events_total > len(events),
     )
+
+# ---------------------------------------------------------------------------
+# PR29 — human score override + blind A/B pairwise review
+# ---------------------------------------------------------------------------
+
+
+def _votes_summary(
+    session: Session,
+    run_id: UUID,
+    judge_means_by_sandbox: dict[UUID, dict[str, float]],
+) -> VotesSummary | None:
+    """Pairwise-vote roll-up for the results page.
+
+    Votes merge newest-wins per (unordered sandbox pair, dimension) — a
+    re-vote on the same matchup replaces the earlier pick — then
+    aggregate per sandbox (wins/losses/ties; win_rate counts decided
+    votes) plus the judge-vs-human agreement rate over votes where BOTH
+    sides carry a judge mean on the voted dimension (``agreement_rate``
+    is None until at least one vote is comparable).
+    """
+    rows = (
+        session.execute(
+            select(PairwiseVote)
+            .where(PairwiseVote.run_id == run_id)
+            .order_by(PairwiseVote.id)
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return None
+    latest: dict[tuple[tuple[UUID, UUID], str], PairwiseVote] = {}
+    for v in rows:
+        key = (
+            tuple(sorted((v.left_sandbox, v.right_sandbox), key=str)),
+            v.dimension,
+        )
+        latest[key] = v
+
+    stats: dict[UUID, VoteStats] = {}
+    compared = 0
+    agreed = 0
+    for v in latest.values():
+        if v.winner == "tie":
+            stats.setdefault(v.left_sandbox, VoteStats()).ties += 1
+            stats.setdefault(v.right_sandbox, VoteStats()).ties += 1
+        elif v.winner == "left":
+            stats.setdefault(v.left_sandbox, VoteStats()).wins += 1
+            stats.setdefault(v.right_sandbox, VoteStats()).losses += 1
+        elif v.winner == "right":
+            stats.setdefault(v.right_sandbox, VoteStats()).wins += 1
+            stats.setdefault(v.left_sandbox, VoteStats()).losses += 1
+        left_mean = (judge_means_by_sandbox.get(v.left_sandbox) or {}).get(
+            v.dimension
+        )
+        right_mean = (judge_means_by_sandbox.get(v.right_sandbox) or {}).get(
+            v.dimension
+        )
+        if left_mean is None or right_mean is None:
+            continue
+        compared += 1
+        judge_winner = (
+            "left"
+            if left_mean > right_mean
+            else "right"
+            if right_mean > left_mean
+            else "tie"
+        )
+        if judge_winner == v.winner:
+            agreed += 1
+    for st in stats.values():
+        decided = st.wins + st.losses
+        st.win_rate = st.wins / decided if decided else None
+    return VotesSummary(
+        total=len(latest),
+        by_sandbox={str(sid): st for sid, st in stats.items()},
+        compared=compared,
+        agreed=agreed,
+        agreement_rate=(agreed / compared) if compared else None,
+    )
+
+
+@router.post(
+    "/api/sandboxes/{sandbox_id}/scores",
+    status_code=status.HTTP_201_CREATED,
+    response_model=ScoreOut,
+)
+def post_human_score(
+    sandbox_id: UUID, body: HumanScoreIn, session: DbSession
+) -> ScoreOut:
+    """PR29 — human override: a ``source="human"`` score row.
+
+    The row stamps ``seq`` above the sandbox's current max (the durable
+    newest-wins tiebreak) and carries the run's latest approved rubric as
+    provenance; the results merge then lets it WIN its (dimension,
+    sandbox) pair outright — judges' verdicts stay attached underneath.
+    A ``human_score`` checkpoint lands in the same transaction for
+    auditability.
+    """
+    sandbox = session.get(Sandbox, sandbox_id)
+    if sandbox is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="sandbox not found"
+        )
+    rubric = _latest_approved_rubric(session, sandbox.run_id)
+    next_seq = (
+        session.scalar(
+            select(func.max(Score.seq)).where(Score.sandbox_id == sandbox_id)
+        )
+        or 0
+    ) + 1
+    row = Score(
+        sandbox_id=sandbox_id,
+        rubric_id=rubric.id if rubric is not None else None,
+        rubric_version=rubric.version if rubric is not None else None,
+        seq=next_seq,
+        dimension=body.dimension,
+        score=body.score,
+        rationale=body.rationale or "",
+        source="human",
+        judge_model=None,
+        note=body.note,
+    )
+    session.add(row)
+    orch_events.emit(
+        session,
+        run_id=sandbox.run_id,
+        sandbox_id=sandbox_id,
+        event_type="checkpoint",
+        payload={
+            "stage": "human_score",
+            "dimension": body.dimension,
+            "score": body.score,
+            "rubric_version": rubric.version if rubric is not None else None,
+        },
+    )
+    session.commit()
+    session.refresh(row)
+    return ScoreOut.model_validate(row)
+
+
+#: Live blind-A/B pair sessions (pair_id → record). In-memory is
+#: deliberate: the anonymized mapping is presentation state, not data —
+#: a restart just expires open sessions (the reviewer requests a fresh
+#: pair); recorded votes persist in ``pairwise_votes``. TTL-bounded and
+#: size-capped so sessions can't accumulate.
+_PAIR_TTL_SECONDS = 2 * 60 * 60
+_PAIR_MAX_SESSIONS = 256
+
+
+class _PairSession(NamedTuple):
+    run_id: UUID
+    # The sandbox behind label "A" — recorded as ``left_sandbox`` on the
+    # vote rows. Right = label "B". The anonymization is presentation
+    # only; votes resolve to real ids here, not in the payload.
+    left: UUID
+    right: UUID
+    created: float
+
+
+_PAIR_SESSIONS: dict[str, _PairSession] = {}
+
+
+def reset_pair_sessions() -> None:
+    """Test hook — drop every live pair session."""
+    _PAIR_SESSIONS.clear()
+
+
+def _pair_get(pair_id: str) -> _PairSession | None:
+    sess = _PAIR_SESSIONS.get(pair_id)
+    if sess is None:
+        return None
+    if time.monotonic() - sess.created > _PAIR_TTL_SECONDS:
+        _PAIR_SESSIONS.pop(pair_id, None)
+        return None
+    return sess
+
+
+def _pair_put(record: _PairSession) -> str:
+    """Register a pair session → opaque pair_id. Expired sessions are
+    reaped first; the cap then evicts the oldest live sessions."""
+    now = time.monotonic()
+    for pid, sess in list(_PAIR_SESSIONS.items()):
+        if now - sess.created > _PAIR_TTL_SECONDS:
+            _PAIR_SESSIONS.pop(pid, None)
+    while len(_PAIR_SESSIONS) >= _PAIR_MAX_SESSIONS:
+        oldest = min(_PAIR_SESSIONS.items(), key=lambda kv: kv[1].created)[0]
+        _PAIR_SESSIONS.pop(oldest, None)
+    pair_id = uuid4().hex
+    _PAIR_SESSIONS[pair_id] = record
+    return pair_id
+
+
+def _pair_side_root(jail: Path, sandbox: Sandbox) -> tuple[Path, str] | None:
+    """The anonymized browse root for one pair side — same jail rules as
+    the file browser. ``workspace/`` when the snapshot exists; else the
+    artifact dir, where only ``output.txt`` is ever exposed (prompt-cell
+    submissions — meta.json/transcript/analysis never surface)."""
+    ws = resolve_workspace_dir(
+        jail=jail,
+        run_id=str(sandbox.run_id),
+        sandbox_id=str(sandbox.id),
+        artifact_path=sandbox.artifact_path,
+    )
+    if ws is not None:
+        return ws, "workspace"
+    art = resolve_artifact_dir(
+        jail=jail,
+        run_id=str(sandbox.run_id),
+        sandbox_id=str(sandbox.id),
+        artifact_path=sandbox.artifact_path,
+    )
+    if art is not None:
+        return art, "artifact"
+    return None
+
+
+def _pair_side(jail: Path, sandbox: Sandbox, label: str) -> PairSideOut:
+    """One side's anonymized file listing.
+
+    Anonymization contract (PR29): the reviewer sees the CANDIDATE'S own
+    files — the workspace tree, or exactly ``output.txt`` for
+    workspace-less prompt submissions. Harness/evaluator byproducts
+    (meta.json, transcript.log, analysis.json, suite_checks.json,
+    generated_tests/, score dumps) never appear — they carry
+    sandbox/model provenance that would un-blind the pair.
+    """
+    resolved = _pair_side_root(jail, sandbox)
+    if resolved is None:
+        return PairSideOut(label=label, root="artifact", entries=[])
+    root, kind = resolved
+    if kind == "artifact":
+        out_file = root / prompt_cell.OUTPUT_FILENAME
+        entries: list[FileEntry] = []
+        try:
+            if out_file.is_file() and not out_file.is_symlink():
+                entries.append(
+                    FileEntry(
+                        path=prompt_cell.OUTPUT_FILENAME,
+                        kind="file",
+                        size=out_file.stat().st_size,
+                    )
+                )
+        except OSError:
+            pass
+        return PairSideOut(label=label, root="artifact", entries=entries)
+    entries, truncated = _list_root_entries(root)
+    return PairSideOut(
+        label=label, root=kind, entries=entries, truncated=truncated
+    )
+
+
+def _pair_dimensions(session: Session, run_id: UUID) -> list[str]:
+    """The vote menu for a pair — the approved rubric's dimension names +
+    ``overall`` (the reviewer may still post other names — the vote row
+    accepts any non-empty dimension)."""
+    rubric = _latest_approved_rubric(session, run_id)
+    names: list[str] = []
+    if rubric is not None:
+        for d in (rubric.content or {}).get("dimensions") or []:
+            if isinstance(d, dict) and d.get("name"):
+                names.append(str(d["name"]))
+    names.append(OVERALL_DIMENSION)
+    return names
+
+
+@router.post(
+    "/api/runs/{run_id}/pair",
+    status_code=status.HTTP_201_CREATED,
+    response_model=PairOut,
+)
+def create_pair(
+    run_id: UUID,
+    session: DbSession,
+    body: PairCreateIn | None = None,
+) -> PairOut:
+    """PR29 — open a blind A/B pair session.
+
+    Picks two artifact-bearing sandboxes (``sandbox_ids`` may pin a
+    specific matchup for testing/focused review), assigns them labels
+    A/B in randomized order, and returns each side's anonymized file
+    listing. The response deliberately carries NO sandbox ids, model or
+    config names — ``pair_id`` is the only handle the reviewer (and the
+    vote endpoint) needs.
+    """
+    run = session.get(Run, run_id)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="run not found"
+        )
+    candidates = (
+        session.execute(
+            select(Sandbox)
+            .where(
+                Sandbox.run_id == run_id,
+                Sandbox.artifact_path.is_not(None),
+            )
+            .order_by(Sandbox.started_at.asc().nulls_last(), Sandbox.id)
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {sb.id: sb for sb in candidates}
+    if body is not None and body.sandbox_ids:
+        picked: list[Sandbox] = []
+        for sid in body.sandbox_ids:
+            if sid not in by_id:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=(
+                        f"sandbox {sid} is not an artifact-bearing member "
+                        "of this run"
+                    ),
+                )
+            picked.append(by_id[sid])
+        if picked[0].id == picked[1].id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="pair requires two distinct sandboxes",
+            )
+    else:
+        if len(candidates) < 2:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="run has fewer than two artifact-bearing sandboxes",
+            )
+        picked = list(random.sample(list(candidates), 2))
+
+    left, right = picked[0], picked[1]
+    if random.random() < 0.5:  # A/B order is blinded, not request order
+        left, right = right, left
+    pair_id = _pair_put(
+        _PairSession(
+            run_id=run_id,
+            left=left.id,
+            right=right.id,
+            created=time.monotonic(),
+        )
+    )
+    jail = _artifact_jail()
+    return PairOut(
+        pair_id=pair_id,
+        run_id=run_id,
+        dimensions=_pair_dimensions(session, run_id),
+        sides=[
+            _pair_side(jail, left, "A"),
+            _pair_side(jail, right, "B"),
+        ],
+    )
+
+
+def _pair_side_sandbox(
+    pair: _PairSession, side: str, session: Session
+) -> Sandbox:
+    label = side.upper()
+    if label == "A":
+        sid = pair.left
+    elif label == "B":
+        sid = pair.right
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="unknown pair side"
+        )
+    sb = session.get(Sandbox, sid)
+    if sb is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="pair artifact gone"
+        )
+    return sb
+
+
+@router.get(
+    "/api/runs/{run_id}/pair/{pair_id}/files/{side}/{path:path}",
+    response_model=PairFileOut,
+)
+def get_pair_file(
+    run_id: UUID,
+    pair_id: str,
+    side: str,
+    path: str,
+    session: DbSession,
+) -> PairFileOut:
+    """Read one file inside a pair side — anonymized (the side label
+    resolves to its sandbox server-side; nothing identifying returns).
+
+    For artifact-root sides (prompt cells) only ``output.txt`` resolves —
+    the rest of the artifact dir stays hidden, same contract as the
+    pair's file listing.
+    """
+    pair = _pair_get(pair_id)
+    if pair is None or pair.run_id != run_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="pair session not found or expired — POST a new pair",
+        )
+    sandbox = _pair_side_sandbox(pair, side, session)
+    resolved = _pair_side_root(_artifact_jail(), sandbox)
+    if resolved is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="pair side has no browsable artifact",
+        )
+    root, kind = resolved
+    if kind == "artifact" and path.strip("/") != prompt_cell.OUTPUT_FILENAME:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+        )
+    found = _resolve_in_root(root, path)
+    if found is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+        )
+    file_path, rel_posix = found
+    text, truncated, size = _read_text_capped(file_path)
+    return PairFileOut(
+        pair_id=pair_id,
+        side=side.upper(),
+        path=rel_posix,
+        size=size,
+        truncated=truncated,
+        binary=text is None,
+        text=text,
+    )
+
+
+@router.post(
+    "/api/runs/{run_id}/pair/{pair_id}/vote",
+    status_code=status.HTTP_201_CREATED,
+    response_model=PairwiseVoteOut,
+)
+def post_pair_vote(
+    run_id: UUID,
+    pair_id: str,
+    body: PairVoteIn,
+    session: DbSession,
+) -> PairwiseVoteOut:
+    """Record the reviewer's verdict — ``winner`` is an A/B label or
+    ``tie``; the stored row resolves the pair session's real sandbox ids
+    (``left_sandbox`` := the sandbox behind "A")."""
+    pair = _pair_get(pair_id)
+    if pair is None or pair.run_id != run_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="pair session not found or expired — POST a new pair",
+        )
+    winner = body.winner.lower()
+    if winner not in ("a", "b", "tie"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="winner must be 'A', 'B' or 'tie'",
+        )
+    stored = {"a": "left", "b": "right", "tie": "tie"}[winner]
+    row = PairwiseVote(
+        run_id=run_id,
+        left_sandbox=pair.left,
+        right_sandbox=pair.right,
+        dimension=body.dimension,
+        winner=stored,
+        note=body.note or "",
+    )
+    session.add(row)
+    orch_events.emit(
+        session,
+        run_id=run_id,
+        event_type="checkpoint",
+        payload={
+            "stage": "pairwise_vote",
+            "dimension": body.dimension,
+            "winner": stored,
+        },
+    )
+    session.commit()
+    session.refresh(row)
+    return PairwiseVoteOut.model_validate(row)
+
+
+@router.get(
+    "/api/runs/{run_id}/votes",
+    response_model=list[PairwiseVoteOut],
+)
+def list_pair_votes(run_id: UUID, session: DbSession) -> list[PairwiseVoteOut]:
+    """Every recorded pairwise vote for the run, newest first — the raw
+    rows behind ``RunResults.votes`` (the merge/summary view)."""
+    if session.get(Run, run_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="run not found"
+        )
+    rows = (
+        session.execute(
+            select(PairwiseVote)
+            .where(PairwiseVote.run_id == run_id)
+            .order_by(PairwiseVote.id.desc())
+        )
+        .scalars()
+        .all()
+    )
+    return [PairwiseVoteOut.model_validate(v) for v in rows]

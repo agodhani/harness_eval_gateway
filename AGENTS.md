@@ -485,10 +485,12 @@ or tests change.
 | F23 | Task inputs (seeded workspace: repo_url or uploaded archive) |
 | F24 | Task preset library (vendored + user presets, preset_ref provenance) |
 | F25 | Benchmark suites + deterministic checkers (suite.yaml fan-out, objective checkers beside judge scores) |
+| F26 | Custom rubric dimensions + rubric templates (arbitrary dims, template basis + domain hint) |
 | F31 | Timeline compare-mode clock (absolute|relative toggle, per-cell t+0 re-basing) |
 | F27 | Cross-run compare + leaderboards (global model/config-family rankings, run-vs-run diff) |
 | F28 | Run export + share links (`/export?fmt=json|csv` bundle; `/share/{token}` read-only view) |
 | F29 | Dashboard home (/dashboard summary aggregate — KPIs, weekly spend/runs, queue lane, top-5 boards) |
+| F32 | Judge quality: panel scoring + human override + blind A/B votes |
 
 ## Post-MVP roadmap
 
@@ -1104,6 +1106,29 @@ or tests change.
   fabricating or dropping rows. Frontend editing is the shared
   `RubricEditor` (structured form, raw JSON behind a toggle); raw-JSON
   textareas are gone from both edit sites.
+- **Judge quality is panel + human + blind vote, not one verdict
+  (PR29/F32)** — `RunCreate.evaluator_models` (1–3, deduped,
+  `evaluator_model` folds to panel head) runs every judge through the
+  full eval loop per artifact: own cred, own baseline copy, failure
+  isolated. Score rows stamp `judge_model`/`source`
+  (`evaluator`|`checker`|`human`)/`note`; the results merge buckets by
+  source — a `source="human"` row (`POST /api/sandboxes/{id}/scores`)
+  wins its cell outright and survives every `?rubric_version=` view,
+  else the cell is the judge MEAN with `spread` = max−min over ≥2
+  judge buckets + a per-judge breakdown. `suite_pass` rows stamp
+  `source="checker"`. Blind A/B is deliberately anonymized:
+  `POST /api/runs/{id}/pair` returns A/B sides carrying file listings
+  only (workspace tree; prompt cells expose `output.txt` only —
+  `meta.json`/`transcript`/analysis and sandbox/model identities never
+  surface pre-vote), pair sessions are in-memory with a 2h TTL
+  (restart/expiry → "post a new pair"), and the vote POST resolves to
+  real ids in its response. `RunResults.votes` merges newest-wins per
+  (unordered pair, dimension) into W/L/T + win rate plus
+  judge-vs-human agreement on comparable votes. Frontend: submit's
+  evaluator row grows up to 2 extra judge rows (extras-only payload —
+  the server re-folds the head); results gains `human`/`checker`/`±N`
+  badges, an inline human-score editor per cell, the `VotesCard`
+  roll-up, and the `PairReview` blind A/B card.
 
 ## Working conventions
 

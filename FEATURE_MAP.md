@@ -44,6 +44,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F29 | Dashboard home (`/dashboard`: summary aggregate — KPI strip, weekly spend + runs charts, terminal-mix donut, queue lane, top-5 boards, recent runs) | ✅ | `api/routers/analytics.py` (`GET /api/analytics/summary`), `api/schemas.py` (`DashboardSummary`/`DashboardTotals`/`DashboardWeekPoint`/`DashboardQueue*`/`DashboardTerminalSlice`/`DashboardRecentRun`), `web/app/dashboard/`, `web/lib/dashboard.ts`, `web/lib/api.ts`, `web/components/SiteHeader.tsx`, `web/components/landing/Hero.tsx` | `tests/unit/api/test_summary.py`, `web/lib/dashboard.test.ts` |
 | F30 | Local-run sandbox pacing + budget resilience (queued sandbox status for all-local runs, live `extend_budget`/auto_extend via append-only events, ~80% budget warnings, 500k default budget) | ✅ | `orchestrator/pacing.py` (`local_sandbox_cap`, `claim_queued_sandbox`), `orchestrator/provision.py` (`queue_sandbox`, `spawn_queued`, `_launch`), `orchestrator/lifecycle.py` (`_watch_cells_paced`), `gateway/metering.py` (`budget_state*`, `usage_by_sandbox`), `gateway/main.py` (`_budget_gate`), `orchestrator/monitor.py`, `api/routers/sandboxes.py`, `api/routers/runs.py` (`sandbox_pacing_cap`, per-cell `budget`), `web/app/runs/[id]/RunDetailClient.tsx` | `tests/unit/orchestrator/test_sandbox_pacing.py`, `test_monitor.py` (F30 section), `tests/unit/gateway/test_proxy.py` (F30 section), `tests/unit/api/test_sandboxes.py` |
 | F31 | Timeline compare-mode clock toggle (absolute wall clock vs per-cell relative t+0 — progress-rate comparison across staggered starts) | ✅ | `web/lib/timelineModes.ts`, `web/app/runs/[id]/timeline/{TimelineClient,EventRow,SplitTimeline}.tsx`, `web/components/RunConsoleLive.tsx`, `web/app/globals.css` (`.evc-ev__t`) | `web/lib/timelineModes.test.ts` |
+| F32 | Judge quality: panel scoring + human override + blind A/B votes (`evaluator_models` 1–3 judge panel, per-judge score rows merged to mean+spread, human-score override winning its cell, anonymized pair sessions + dimension votes feeding win/loss + judge-agreement roll-ups) | ✅ | `api/schemas.py`, `api/routers/{runs,results}.py`, `api/modelcheck.py`, `orchestrator/lifecycle.py`, `evaluator/evaluate.py`, `db/models.py` (`Score.judge_model/source/note`, `PairwiseVote`) + migration `c7a9e1b3d5f2`, `web/lib/{api,resubmit}.ts`, `web/app/submit/page.tsx`, `web/app/runs/[id]/results/{ResultsClient,PairReview}.tsx` | `tests/unit/api/test_runs.py`, `test_results.py`, `test_modelcheck.py`, `tests/unit/orchestrator/test_lifecycle.py`, `test_rescore.py`, `tests/unit/evaluator/test_evaluate.py`, `tests/unit/db/test_migrations.py`, `web/lib/resubmit.test.ts` |
 
 ## Feature details
 
@@ -2325,6 +2326,77 @@ gain headroom (or warn) instead of dying at a hard cap.
 - **Depends on:** F2 (orchestrator + monitor), F3 (gateway budget gate
   + cred claims), PR15 (run-pacing pattern this mirrors), F21 (per-cell
   budgets this extends), F8 (run detail surface).
+
+### F32 — Judge quality: panel scoring + human override + blind A/B votes (PR29) ✅
+
+- **What:** three trust layers on top of the single LLM judge.
+  **Panel:** `RunCreate.evaluator_models` (1–3 entries, deduped
+  order-preserving, `evaluator_model` folds in as panel head) runs every
+  judge through the full eval loop per artifact — own minted cred, own
+  baseline workspace copy, failure isolation (one judge's failure doesn't
+  mask the others' scores). Score rows carry `judge_model` + `source`
+  (`evaluator`/`checker`/`human`) + `note`; `eval_scored`/
+  `eval_scores_failed` payloads name the judge. The results merge
+  buckets a (dimension, sandbox) cell by source: a **human row wins
+  outright**, else the cell is the judge **mean** with `spread` =
+  max−min when ≥2 judge buckets differ, `judge_count`, and the per-judge
+  `judges[]` list attached for the expand-row breakdown. `evaluator_models`
+  on `RunResults` names the resolved panel (index 0 = the primary judge
+  the legacy NULL-`judge_model` rows fold into); a rescore with `model=`
+  re-judges under that one judge, without it re-runs the whole panel.
+  **Human override:** `POST /api/sandboxes/{id}/scores` writes a
+  `source="human"` row (seq above the sandbox max, `note` = why the
+  override) that wins its cell outright, survives every
+  `?rubric_version=` view, and emits a `human_score` checkpoint.
+  **Blind A/B:** `POST /api/runs/{id}/pair` picks two artifact-bearing
+  sandboxes (random or `sandbox_ids`-pinned) and returns anonymized A/B
+  sides — file listings only (`workspace/` tree; artifact-root prompt
+  cells expose `output.txt` only; `meta.json`/`transcript`/analysis
+  never surface, no sandbox ids/model names). `GET .../files/{side}/
+  {path}` reads a capped text file (session TTL 2h, in-memory — expiry
+  404s with "post a new pair"). `POST .../vote` records a per-dimension
+  winner (`A`/`B`/`tie`) and the response reveals the real ids;
+  `GET /api/runs/{id}/votes` lists newest-first and
+  `RunResults.votes` rolls up W/L/T + win rate per sandbox plus
+  judge-vs-human agreement (newest-wins per unordered pair+dim).
+- **Where:** `api/schemas.py` (`evaluator_models`, `HumanScoreIn`,
+  `PairCreateIn`/`PairOut`, `PairVoteIn`/`PairwiseVoteOut`,
+  `VotesSummary`, `JudgeScore`/`spread`/`judge_count`/`source`/`note` on
+  results shapes), `api/routers/runs.py` (panel normalize + persist,
+  `same_model_eval` across the panel), `api/modelcheck.py` (all judges
+  validated), `api/routers/results.py` (merge buckets, human-score POST,
+  pair sessions/files/vote/list + `votes` roll-up), `orchestrator/
+  lifecycle.py` (per-judge eval loop; `suite_pass` rows stamp
+  `source="checker"`), `evaluator/evaluate.py` (judge_model/source on
+  rows + event payloads), `db/models.py` + migration `c7a9e1b3d5f2`
+  (`scores.judge_model/source/note`, `pairwise_votes`), `web/lib/api.ts`
+  (types + fns), `web/lib/resubmit.ts` (panel extras round-trip),
+  `web/app/submit/page.tsx` (up-to-3 judge rows, panel-aware
+  same-model warning), `web/app/runs/[id]/results/ResultsClient.tsx`
+  (human/checker badges, ±spread badge, per-judge breakdown, inline
+  human-score editor, `VotesCard`), `PairReview.tsx` (blind A/B card:
+  two anonymized file panes → per-dimension vote → post-vote reveal).
+- **Verify:**
+  - Unit: `test_runs.py` (panel normalize/dedupe/cap, config shape);
+    `test_results.py` (mean+spread merge, human-wins, rubric_version
+    keep, pair/votes endpoints, roll-up); `test_modelcheck.py` (every
+    judge checked); `test_lifecycle.py` (per-judge pass order, cred
+    minting, failure isolation, `suite_pass` source); `test_rescore.py`
+    (panel re-run vs `model=` override); `test_evaluate.py`
+    (judge_model/source stamps); `test_migrations.py` (new head).
+  - Web: `lib/resubmit.test.ts` (panel head/extras round-trip);
+    `eslint` + `next build` clean.
+  - Manual: submit a run with 2–3 judges → per-judge `eval_scored`
+    checkpoints → results cells show `±spread` on disagreement → ✎ a
+    cell to a human score → `human` badge + judges still listed under
+    it → "new blind pair" → browse A/B → vote → ids reveal + Human
+    votes card updates.
+- **Depends on:** F26 (arbitrary dimension names make per-dimension
+  votes meaningful), F7/F14 (eval loop + rescore), F19 (jailed file
+  reads the pair file endpoint reuses). **Feeds:** the last trust-gap
+  before multi-domain evals — panel disagreement flags suspect cells,
+  human override fixes them in place, blind votes give a judge-quality
+  signal independent of the judge.
 
 ## Implementation sequence
 

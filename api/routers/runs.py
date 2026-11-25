@@ -41,6 +41,7 @@ from db.models import (
     Artifact,
     CheckerResult,
     Event,
+    PairwiseVote,
     Rubric,
     Run,
     Sandbox,
@@ -50,7 +51,7 @@ from gateway import metering
 from orchestrator import adapters as orch_adapters
 from orchestrator import events as orch_events
 from orchestrator import pacing, provision, runner, state_machine
-from orchestrator.matrix import participant_models, run_models
+from orchestrator.matrix import judge_models, participant_models, run_models
 from orchestrator.rubric import RubricContent
 from sandbox import seeds
 from skillpack_import.store import imported_root
@@ -95,11 +96,12 @@ def _run_sandboxes(session: Session, run_id: uuid.UUID) -> list[Sandbox]:
 
 
 def _same_model_eval(run: Run) -> bool:
-    """True when the judge model equals ANY participant model — non-independent
-    judging for that cell (PR14: participants are a set, not just model_name;
-    per-config ``model`` pins count too — ``run_models``)."""
-    evaluator = (run.config or {}).get("evaluator_model") or run.model_name
-    return evaluator in set(run_models(run.config, run.model_name))
+    """True when ANY judge model equals a participant model — non-independent
+    judging for that cell (PR29: the flag aggregates across the judge
+    panel; PR14: participants are a set, not just model_name — per-config
+    ``model`` pins count too — ``run_models``)."""
+    participants = set(run_models(run.config, run.model_name))
+    return bool(set(judge_models(run.config, run.model_name)) & participants)
 
 
 def _queue_positions(session: Session) -> dict[uuid.UUID, int]:
@@ -314,7 +316,15 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
             entry.pop("model_options", None)
         configs_in.append(entry)
 
-    evaluator_model = body.evaluator_model or body.model_name
+    # PR29 — judge panel: ``evaluator_models`` (already normalized with
+    # evaluator_model folded to panel head) when the spec carried one;
+    # else the single evaluator_model/model_name fallback. panel[0] is
+    # the primary judge and fills ``evaluator_model`` for back-compat
+    # readers (rescore defaults, results field).
+    evaluator_models = list(body.evaluator_models) if body.evaluator_models else [
+        body.evaluator_model or body.model_name
+    ]
+    evaluator_model = evaluator_models[0]
     # PR14: persist the run's model list ([model_name] + deduped extras) so
     # lifecycle/results/analytics can expand the matrix without re-parsing
     # the raw request. Per-config ``model`` pins stay inside each config
@@ -324,6 +334,13 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
         "harness_configs": configs_in,
         "models": models,
         "evaluator_model": evaluator_model,
+        # The ordered judge panel — only persisted when the spec actually
+        # carried one, so legacy/single-judge runs keep their config shape.
+        **(
+            {"evaluator_models": evaluator_models}
+            if body.evaluator_models is not None
+            else {}
+        ),
         "budgets": body.budgets.model_dump(),
         # PR24: the seed spec — only present on seeded runs (unseeded keeps
         # the legacy config shape). Provisioning materializes it once and
@@ -340,8 +357,10 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
     }
     # Judge == any participant model flags non-independent scoring; pins
     # count as participants even when outside the run's model list.
-    config["same_model_eval"] = evaluator_model in set(
-        run_models(config, body.model_name)
+    # PR29: ANY panel member counts — a 3-judge panel where one judge is
+    # a participant is still non-independent.
+    config["same_model_eval"] = bool(
+        set(evaluator_models) & set(run_models(config, body.model_name))
     )
 
     # PR22 preset resolution — a preset_ref asserts the task came from the
@@ -626,6 +645,7 @@ def _hard_delete_run(session: Session, run: Run) -> None:
     sandbox_ids = select(Sandbox.id).where(Sandbox.run_id == run.id)
     session.execute(delete(Score).where(Score.sandbox_id.in_(sandbox_ids)))
     session.execute(delete(Artifact).where(Artifact.sandbox_id.in_(sandbox_ids)))
+    session.execute(delete(PairwiseVote).where(PairwiseVote.run_id == run.id))
     session.execute(
         delete(CheckerResult).where(CheckerResult.run_id == run.id)
     )

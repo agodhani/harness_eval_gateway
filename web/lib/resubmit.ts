@@ -25,6 +25,9 @@ export interface ResubmitSpec {
   /** Participant models, primary first (row 1 → model_name). */
   models: string[];
   evaluator_model: string | null;
+  /** PR29: judge-panel extras beyond the primary judge (config's stored
+   * evaluator_models minus panel[0] = evaluator_model). */
+  evaluator_models?: string[] | null;
   harness_configs: HarnessConfig[];
   budgets: Budgets | null;
   /** PR24: the run's seed spec — repo seeds restore fully; archive seeds
@@ -62,6 +65,15 @@ export function specFromRun(run: RunOut): ResubmitSpec {
     models: models.length ? models : [run.model_name].filter(Boolean),
     evaluator_model:
       (cfg.evaluator_model as string | null | undefined) ?? null,
+    // PR29: persisted panel carries the primary judge at index 0 — the
+    // submit form models only the EXTRAS in evaluator_models (the schema
+    // re-folds evaluator_model as panel head server-side).
+    evaluator_models: Array.isArray(cfg.evaluator_models)
+      ? (cfg.evaluator_models as unknown[])
+          .map(String)
+          .filter(Boolean)
+          .slice(1)
+      : null,
     harness_configs: (cfg.harness_configs ?? []).map((c) => ({
       adapter: c.adapter,
       skill_packs: Array.isArray(c.skill_packs) ? [...c.skill_packs] : [],
@@ -113,6 +125,9 @@ export function consumeResubmit(): ResubmitSpec | null {
       !spec.models.every((m) => typeof m === "string") ||
       (spec.evaluator_model != null &&
         typeof spec.evaluator_model !== "string") ||
+      (spec.evaluator_models != null &&
+        (!Array.isArray(spec.evaluator_models) ||
+          !spec.evaluator_models.every((m) => typeof m === "string"))) ||
       (spec.rubric_template != null &&
         typeof spec.rubric_template !== "string") ||
       (spec.rubric_hint != null && typeof spec.rubric_hint !== "string") ||

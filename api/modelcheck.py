@@ -145,12 +145,16 @@ def _spec_models(body: RunCreate) -> list[_ModelUse]:
             needs_tools=hc.adapter not in TOOL_OPTIONAL_ADAPTERS,
             context=f"harness adapter {hc.adapter!r}",
         )
-    add(
-        "evaluator_model",
-        body.evaluator_model or body.model_name,
-        needs_tools=True,
-        context="eval judge (miniloop)",
-    )
+    # PR29 — every judge on the panel needs tools: each runs its own
+    # miniloop eval sandbox. ``evaluator_models`` was normalized with
+    # evaluator_model folded to the head; without a panel the single
+    # evaluator_model/model_name fallback applies.
+    panel = list(body.evaluator_models) if body.evaluator_models else [
+        body.evaluator_model or body.model_name
+    ]
+    for i, m in enumerate(panel):
+        label = "evaluator_model" if i == 0 else f"evaluator_models[{i}]"
+        add(label, m, needs_tools=True, context="eval judge (miniloop)")
     return out
 
 

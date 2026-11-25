@@ -1018,6 +1018,7 @@ async def evaluate_sandbox(
                 event_type="error",
                 payload={
                     "phase": "eval_scores_failed",
+                    "judge_model": model_name,
                     "reason": reason,
                     "detail": str(exc),
                     "fallback_detail": fallback_detail,
@@ -1030,6 +1031,9 @@ async def evaluate_sandbox(
             return []
         mode = "direct_fallback"
 
+    # PR29 — every row stamps the judging model so a multi-judge panel's
+    # scores stay attributable per judge in the results merge (source
+    # defaults to "llm" — judge-authored).
     rows = [
         Score(
             sandbox_id=sandbox_uuid,
@@ -1038,6 +1042,7 @@ async def evaluate_sandbox(
             dimension=entry.dimension,
             score=entry.score,
             rationale=entry.rationale,
+            judge_model=model_name,
         )
         for entry in parsed.entries
     ]
@@ -1050,6 +1055,7 @@ async def evaluate_sandbox(
                 dimension=OVERALL_DIMENSION,
                 score=parsed.overall,
                 rationale=parsed.summary,
+                judge_model=model_name,
             )
         )
 
@@ -1071,6 +1077,7 @@ async def evaluate_sandbox(
                 payload={
                     "phase": "eval_scored",
                     "eval_sandbox_id": eval_sid,
+                    "judge_model": model_name,
                     "mode": mode,
                     "container_status": container_state,
                     "exit_code": exit_code,

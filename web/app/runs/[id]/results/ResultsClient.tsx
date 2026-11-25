@@ -30,6 +30,7 @@ import {
   getSandboxScores,
   harnessConfigLabel,
   listEvents,
+  postHumanScore,
   runModels,
   TERMINAL_RUN_STATUSES,
   type CheckerResult,
@@ -39,6 +40,7 @@ import {
   type RunOut,
   type RunResults,
   type SandboxResult,
+  type VotesSummary,
 } from "@/lib/api";
 import { formatTs, shortId } from "@/lib/format";
 import { dimensionSpecMap, weightedDimTotal } from "@/lib/scoreMath";
@@ -66,6 +68,7 @@ import AnalyticsSection from "./AnalyticsSection";
 import FileBrowser from "./FileBrowser";
 import GridView from "./GridView";
 import OutputView from "./OutputView";
+import PairReview from "./PairReview";
 import PreviewControls from "./PreviewControls";
 import RescoreControls from "./RescoreControls";
 
@@ -120,6 +123,238 @@ function scoreTone(score: number): "good" | "mid" | "bad" {
   if (score >= 8) return "good";
   if (score >= 5) return "mid";
   return "bad";
+}
+
+/** PR29 — judge-disagreement badge threshold: a spread above this (max−min
+ * across panel judges, on the rubric's own scale) means the cell's mean is
+ * contested and worth a human look. */
+const SPREAD_BADGE_THRESHOLD = 2;
+
+/** PR29 — score-cell provenance badges (human override / checker /
+ * judge-panel spread). Rendered right of the score value. */
+function sourceBadges(entry: DimensionScore): React.ReactNode {
+  const out: React.ReactNode[] = [];
+  if (entry.source === "human") {
+    out.push(
+      <Badge
+        key="src"
+        tone="violet"
+        title={
+          entry.note
+            ? `Human override — ${entry.note}`
+            : "Human override — this score was set by hand and wins the cell outright"
+        }
+      >
+        human
+      </Badge>,
+    );
+  } else if (entry.source === "checker") {
+    out.push(
+      <Badge
+        key="src"
+        tone="gray"
+        title="Deterministic checker measurement (suite_pass) — no judge authored it"
+      >
+        checker
+      </Badge>,
+    );
+  }
+  if (entry.spread != null && (entry.judge_count ?? 0) >= 2) {
+    const hot = entry.spread > SPREAD_BADGE_THRESHOLD;
+    out.push(
+      <Badge
+        key="spread"
+        tone={hot ? "amber" : "gray"}
+        title={`Judge spread ${entry.spread} across ${entry.judge_count} judges (max − min)${
+          hot ? " — judges disagree; the mean is contested" : ""
+        }`}
+      >
+        ±{entry.spread}
+      </Badge>,
+    );
+  }
+  return out.length ? (
+    <span className="chip-row" style={{ display: "inline-flex", marginLeft: "0.3rem" }}>
+      {out}
+    </span>
+  ) : null;
+}
+
+/** PR29 — the per-judge breakdown shown when a cell expands: each judge's
+ * newest score + rationale, labelled by model (checker rows show
+ * "checker"). */
+function judgesBreakdown(entry: DimensionScore): React.ReactNode {
+  const judges = entry.judges ?? [];
+  if (judges.length === 0) return null;
+  return (
+    <div className="rationale" style={{ marginTop: "0.25rem" }}>
+      {judges.map((j, i) => (
+        <div key={i} className="dim-desc" style={{ marginBottom: "0.15rem" }}>
+          <span className="mono">{j.judge_model ?? "checker"}</span>
+          {": "}
+          <span className={`score-value score-value--${scoreTone(j.score)}`}>
+            {j.score}
+          </span>
+          {j.rationale ? ` — ${j.rationale}` : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** PR29 — inline human-override editor inside a score cell: score +
+ * optional rationale/note → POST /api/sandboxes/{id}/scores. The human row
+ * wins its cell outright; judge verdicts stay attached under it. */
+function HumanScoreForm({
+  sandboxId,
+  dimension,
+  initialScore,
+  onDone,
+  onCancel,
+}: {
+  sandboxId: string;
+  dimension: string;
+  initialScore: number;
+  onDone: () => void;
+  onCancel: () => void;
+}) {
+  const [score, setScore] = useState(String(initialScore));
+  const [rationale, setRationale] = useState("");
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const val = Number(score);
+  const valid = score.trim() !== "" && Number.isFinite(val);
+
+  async function save() {
+    if (!valid) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await postHumanScore(sandboxId, {
+        dimension,
+        score: val,
+        rationale: rationale.trim(),
+        note: note.trim() || null,
+      });
+      onDone();
+    } catch (e) {
+      setErr(errMsg(e, "could not save score"));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="rationale" style={{ marginTop: "0.3rem" }}>
+      <div className="row" style={{ gap: "0.4rem", flexWrap: "wrap" }}>
+        <input
+          className="input"
+          style={{ width: "5rem" }}
+          type="number"
+          step="0.1"
+          aria-label={`human score for ${dimension}`}
+          value={score}
+          onChange={(e) => setScore(e.target.value)}
+          disabled={busy}
+        />
+        <input
+          className="input"
+          style={{ minWidth: "10rem", flex: 1 }}
+          placeholder="rationale (optional)"
+          aria-label="override rationale"
+          value={rationale}
+          onChange={(e) => setRationale(e.target.value)}
+          disabled={busy}
+          maxLength={10_000}
+        />
+      </div>
+      <input
+        className="input"
+        style={{ width: "100%", marginTop: "0.3rem" }}
+        placeholder="note — why the override (optional)"
+        aria-label="override note"
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        disabled={busy}
+        maxLength={2000}
+      />
+      <div className="row" style={{ gap: "0.4rem", marginTop: "0.3rem" }}>
+        <button
+          type="button"
+          className="btn btn--sm"
+          disabled={busy || !valid}
+          onClick={() => void save()}
+        >
+          save human score
+        </button>
+        <button
+          type="button"
+          className="btn btn--sm btn--ghost"
+          disabled={busy}
+          onClick={onCancel}
+        >
+          cancel
+        </button>
+      </div>
+      {err ? <ErrorNote>{err}</ErrorNote> : null}
+    </div>
+  );
+}
+
+/** PR29 — blind A/B votes roll-up: per-sandbox W/L/T + win rate, plus the
+ * judge-vs-human agreement rate over comparable votes. */
+function VotesCard({
+  votes,
+  label,
+}: {
+  votes: VotesSummary;
+  label: (sandboxId: string) => string;
+}) {
+  const rows = Object.entries(votes.by_sandbox).sort(
+    (a, b) => (b[1].wins + b[1].losses / 2) - (a[1].wins + a[1].losses / 2),
+  );
+  return (
+    <Card title="Human votes" className="card--flush">
+      <div className="table-wrap">
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Sandbox</th>
+              <th>Wins</th>
+              <th>Losses</th>
+              <th>Ties</th>
+              <th>Win rate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(([id, st]) => (
+              <tr key={id}>
+                <td style={{ fontSize: "0.82rem" }}>{label(id)}</td>
+                <td className="num">{st.wins}</td>
+                <td className="num">{st.losses}</td>
+                <td className="num">{st.ties}</td>
+                <td className="num">
+                  {st.win_rate != null ? `${Math.round(st.win_rate * 100)}%` : "—"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="faint" style={{ fontSize: "0.72rem", margin: "0.5rem 0 0" }}>
+        {votes.total} merged vote{votes.total === 1 ? "" : "s"}
+        {votes.agreement_rate != null ? (
+          <>
+            {" · "}judge agreement {Math.round(votes.agreement_rate * 100)}%
+            {" "}({votes.agreed}/{votes.compared} comparable — votes where both
+            sides carry a judge mean on the voted dimension)
+          </>
+        ) : (
+          " · judge agreement n/a — no vote yet compares two judge-scored cells"
+        )}
+      </p>
+    </Card>
+  );
 }
 
 /** PR26 — deterministic suite checker status → badge tone + glyph. */
@@ -503,6 +738,11 @@ export default function ResultsClient({ runId }: { runId: string }) {
     [trialGroups, currentResults, sandboxes],
   );
   const [groupsOpen, setGroupsOpen] = useState<Set<string>>(new Set());
+  // PR29: cell the inline human-override form is open on (null = closed).
+  const [humanEdit, setHumanEdit] = useState<{
+    sb: string;
+    dim: string;
+  } | null>(null);
 
   const dimensionKeys = useMemo(() => {
     const set = new Set<string>();
@@ -599,23 +839,59 @@ export default function ResultsClient({ runId }: { runId: string }) {
     }
     const key = `${sb.sandbox_id}::${dim}`;
     const open = expanded.has(key);
-    const hasRationale = !!entry.rationale;
+    const hasRationale = !!entry.rationale || (entry.judges?.length ?? 0) > 1;
+    const editing =
+      humanEdit?.sb === sb.sandbox_id && humanEdit.dim === dim;
     return (
       <div>
         <span className={`score-value score-value--${scoreTone(entry.score)}`}>
           {entry.score}
         </span>
+        {sourceBadges(entry)}
+        <button
+          type="button"
+          className="btn btn--sm btn--ghost"
+          style={{ marginLeft: "0.2rem", padding: "0 0.25rem" }}
+          onClick={() =>
+            setHumanEdit(editing ? null : { sb: sb.sandbox_id, dim })
+          }
+          title="Set a human override score for this cell (wins over the judge mean)"
+        >
+          ✎
+        </button>
+        {editing ? (
+          <HumanScoreForm
+            sandboxId={sb.sandbox_id}
+            dimension={dim}
+            initialScore={entry.score}
+            onDone={() => {
+              setHumanEdit(null);
+              void refresh(true);
+            }}
+            onCancel={() => setHumanEdit(null)}
+          />
+        ) : null}
         {hasRationale ? (
           <div className="score-expand">
             <button
               type="button"
               className="btn btn--sm"
               onClick={() => toggleCell(sb.sandbox_id, dim)}
-              title={open ? "hide rationale" : "show rationale"}
+              title={open ? "hide rationale" : "show rationale + per-judge verdicts"}
             >
               {open ? "▾ why" : "▸ why"}
             </button>
-            {open ? <div className="rationale">{entry.rationale}</div> : null}
+            {open ? (
+              <div className="rationale">
+                {entry.rationale}
+                {entry.source === "human" && entry.judges?.length ? (
+                  <div className="dim-desc" style={{ marginTop: "0.2rem" }}>
+                    judges said:
+                  </div>
+                ) : null}
+                {judgesBreakdown(entry)}
+              </div>
+            ) : null}
           </div>
         ) : null}
       </div>
@@ -1186,6 +1462,27 @@ export default function ResultsClient({ runId }: { runId: string }) {
                   <code>suite_pass</code> row.
                 </p>
               </Card>
+            ) : null}
+
+            {currentResults ? (
+              <Card title="Blind A/B review">
+                <PairReview
+                  runId={runId}
+                  onVoted={() => void refresh(true)}
+                />
+              </Card>
+            ) : null}
+
+            {currentResults?.votes ? (
+              <VotesCard
+                votes={currentResults.votes}
+                label={(id) => {
+                  const sb = sandboxes.find((s) => s.sandbox_id === id);
+                  return sb
+                    ? `${sb.name ?? harnessConfigLabel(sb.harness_config)} · ${shortId(id)}`
+                    : shortId(id);
+                }}
+              />
             ) : null}
 
             {modelGroups.length > 1 ? (
