@@ -501,6 +501,26 @@ async def test_draft_rubric_failure_marks_run_failed(session_factory, monkeypatc
         assert errors[0].payload["stage"] == "rubric_generation"
 
 
+async def test_draft_rubric_failure_saves_capped_gateway_body(
+    session_factory, monkeypatch
+) -> None:
+    monkeypatch.setattr(rubric_mod, "_RETRY_BACKOFF_SECONDS", 0.0)
+    run = make_run(session_factory, status="submitted")
+    body = "model 'nope:1b' not found " + "x" * 2000
+
+    client = _mock_client(lambda r: httpx.Response(404, text=body))
+    await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=SETTINGS, client=client)
+    with session_factory() as s:
+        errors = [
+            e
+            for e in s.execute(select(Event).where(Event.run_id == run.id)).scalars()
+            if e.type == "error"
+        ]
+        message = errors[0].payload["message"]
+        assert "gateway returned 404: model 'nope:1b' not found" in message
+        assert len(message) < 600
+
+
 async def test_draft_rubric_double_failure_marks_failed(session_factory) -> None:
     run = make_run(session_factory, status="submitted")
 
