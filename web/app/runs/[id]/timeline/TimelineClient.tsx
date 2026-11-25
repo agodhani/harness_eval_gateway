@@ -17,6 +17,12 @@
  * synchronized scroll and time alignment by construction (see
  * lib/splitTimeline.ts + SplitTimeline.tsx). The sandbox filter dropdown is
  * merged-only; in split mode the lanes pick their own sandboxes.
+ *
+ * F31 adds an absolute/relative clock toggle (`?clock=relative` seeds it):
+ * relative re-bases each cell to its own `run_started` (else first event)
+ * so `+2m14s` means the same progress time on every cell regardless of
+ * paced/queued start skew (see lib/timelineModes.ts). Day markers are a
+ * wall-clock concept — they drop out in relative mode.
  */
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
@@ -45,6 +51,13 @@ import {
   type LaneSide,
 } from "@/lib/splitTimeline";
 import { sandboxStrips } from "@/lib/timelineAnalytics";
+import {
+  formatRelativeMs,
+  laneKey,
+  laneStartMs,
+  relMs,
+  type TimelineMode,
+} from "@/lib/timelineModes";
 import { Badge, Card, EmptyState, ErrorNote, InfoNote, Loading, statusTone } from "@/components/ui";
 import { DayMarker, EventRow } from "./EventRow";
 import SandboxMetricsBar from "./SandboxMetricsBar";
@@ -102,6 +115,12 @@ export default function TimelineClient({ runId }: { runId: string }) {
   );
   const laneTouchedRef = useRef(
     searchParams.get("left") != null && searchParams.get("right") != null,
+  );
+
+  // F31 — clock mode: `absolute` (shared wall clock, default) vs `relative`
+  // (each cell re-based to its own run_started/first event; `?clock=` seeds).
+  const [clockMode, setClockMode] = useState<TimelineMode>(() =>
+    searchParams.get("clock") === "relative" ? "relative" : "absolute",
   );
 
   const loading = loadInfo?.forId !== runId;
@@ -353,10 +372,28 @@ export default function TimelineClient({ runId }: { runId: string }) {
     });
   }, [sandboxIds]);
 
-  const splitRows = useMemo(
-    () => (viewMode === "split" ? buildSplitRows(filtered, lanes) : []),
-    [viewMode, filtered, lanes],
+  // F31 — per-lane t0 baselines + the label mapper EventRows consult in
+  // relative mode. `starts` derives from the FULL stream (not `filtered`):
+  // a filtered-out run_started must still anchor the lane's t+0.
+  const starts = useMemo(() => laneStartMs(events), [events]);
+  const timeLabelOf = useCallback(
+    (ev: EventOut): string | undefined => {
+      if (clockMode !== "relative") return undefined; // absolute → wall clock
+      const r = relMs(ev.ts, starts.get(laneKey(ev.sandbox_id)));
+      // missing/unparseable ts → fall back to the absolute label
+      return r === null ? undefined : formatRelativeMs(r);
+    },
+    [clockMode, starts],
   );
+
+  const splitRows = useMemo(() => {
+    if (viewMode !== "split") return [];
+    const rows = buildSplitRows(filtered, lanes);
+    // Relative clock has no shared wall clock — MM-DD separators are noise.
+    return clockMode === "relative"
+      ? rows.filter((r) => r.kind !== "day")
+      : rows;
+  }, [viewMode, filtered, lanes, clockMode]);
   const splitCounts = useMemo(
     () =>
       viewMode === "split"
@@ -524,6 +561,28 @@ export default function TimelineClient({ runId }: { runId: string }) {
               split
             </button>
           </div>
+          <div className="seg" role="tablist" aria-label="Clock mode">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={clockMode === "absolute"}
+              className={`seg__btn${clockMode === "absolute" ? " seg__btn--active" : ""}`}
+              onClick={() => setClockMode("absolute")}
+              title="Shared wall clock — every row shows its own UTC timestamp"
+            >
+              absolute
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={clockMode === "relative"}
+              className={`seg__btn${clockMode === "relative" ? " seg__btn--active" : ""}`}
+              onClick={() => setClockMode("relative")}
+              title="Each cell re-based to its own run_started — t+0 aligns cells for progress comparison"
+            >
+              relative
+            </button>
+          </div>
           <select
             className="select"
             value={filterSource}
@@ -615,12 +674,16 @@ export default function TimelineClient({ runId }: { runId: string }) {
               onPickLane={onPickLane}
               names={sandboxNames}
               displaySourceOf={displaySourceOf}
+              timeLabelOf={timeLabelOf}
             />
           ) : (
             filtered.map((ev, i) => {
               const prev = i > 0 ? filtered[i - 1] : null;
               const day = ev.ts.slice(5, 10); // MM-DD
-              const newDay = !prev || prev.ts.slice(5, 10) !== day;
+              // Day separators are a wall-clock concept — hidden in relative.
+              const newDay =
+                clockMode === "absolute" &&
+                (!prev || prev.ts.slice(5, 10) !== day);
               return (
                 <div key={ev.id}>
                   {newDay ? <DayMarker day={day} /> : null}
@@ -632,6 +695,7 @@ export default function TimelineClient({ runId }: { runId: string }) {
                       ev.sandbox_id ? sandboxNames.get(ev.sandbox_id) : undefined
                     }
                     displaySource={displaySourceOf(ev)}
+                    timeLabel={timeLabelOf(ev)}
                   />
                 </div>
               );
@@ -651,6 +715,9 @@ export default function TimelineClient({ runId }: { runId: string }) {
       <p className="footer-note">
         {viewMode === "split"
           ? "Split view — both lanes share one time axis; run-level and other-sandbox events span both columns. "
+          : ""}
+        {clockMode === "relative"
+          ? "Relative clock — each cell's t+0 is its own run_started (first event when absent); pre-start events read −N and day markers hide. "
           : ""}
         Click a row for the raw payload · events are append-only — corrections
         arrive as new rows · timestamps are UTC.

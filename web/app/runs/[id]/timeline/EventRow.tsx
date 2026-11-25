@@ -11,6 +11,9 @@
  * - {@link EventRow} — timestamp/id/source/type/summary row + raw payload.
  *   `showSandbox` hides the sandbox chip inside split lanes (the lane
  *   header already identifies the sandbox); shared full-width rows keep it.
+ *   `timeLabel` (F31) overrides the rendered time column — relative mode
+ *   passes the cell's `+2m14s` offset while the row title keeps the
+ *   absolute ISO ts either way.
  */
 import type { ReactNode } from "react";
 import type { EventOut } from "@/lib/api";
@@ -202,6 +205,7 @@ export function EventRow({
   showSandbox = true,
   sandboxName,
   displaySource,
+  timeLabel,
 }: {
   ev: EventOut;
   expanded: boolean;
@@ -214,6 +218,9 @@ export function EventRow({
    * judge-phase rows display "evaluator" even though the eval sandbox's
    * miniloop emitted them as "harness" (lib/evalPhase.ts boundary rule). */
   displaySource?: string;
+  /** F31 clock mode — relative `+…` label overriding the wall-clock column.
+   * Undefined → the row renders `formatTimeMs(ev.ts)` (absolute mode). */
+  timeLabel?: string;
 }) {
   const isErr = ev.type === "error";
   const source = displaySource ?? ev.source;
@@ -237,7 +244,7 @@ export function EventRow({
         title={`event #${ev.id} · ${ev.ts}`}
       >
         <span className="tl-id">#{ev.id}</span>
-        <span className="tl-time">{formatTimeMs(ev.ts)}</span>
+        <span className="tl-time">{timeLabel ?? formatTimeMs(ev.ts)}</span>
         <span className="tl-src" title={sourceNote}>
           <Badge tone={sourceTone(source)}>{source}</Badge>
         </span>

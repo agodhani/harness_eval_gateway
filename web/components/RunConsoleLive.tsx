@@ -11,6 +11,13 @@
  * Lane routing: evaluator-source events ride participant creds, so they're
  * pulled out of sandbox lanes into the bottom lane along with run-level
  * (orchestrator, null-sandbox) traffic.
+ *
+ * F31 — `absolute | relative` clock toggle in the console head: absolute
+ * shows wall-clock times per event (default); relative re-bases each lane
+ * to its own `run_started`/first event so `+2m14s` reads as the same
+ * progress time on every cell despite paced/queued start skew
+ * (lib/timelineModes.ts). Lane footers carry the matching stat — absolute
+ * shows the cell's wall-clock start, relative its elapsed-from-start.
  */
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -24,8 +31,17 @@ import {
   type RunOut,
   type SandboxOut,
 } from "@/lib/api";
-import { shortId, truncate } from "@/lib/format";
+import { formatTimeMs, shortId, truncate } from "@/lib/format";
 import { evalBoundaries, isJudgeEvent } from "@/lib/evalPhase";
+import {
+  RUN_LANE_KEY,
+  formatClockS,
+  formatRelativeMs,
+  laneStartMs,
+  lastEventMs,
+  relMs,
+  type TimelineMode,
+} from "@/lib/timelineModes";
 import { Badge, statusTone } from "@/components/ui";
 
 const POLL_MS = 6_000;
@@ -149,6 +165,7 @@ export default function RunConsoleLive({ run }: { run: RunOut }) {
   const [events, setEvents] = useState<EventOut[]>([]);
   const [loadInfo, setLoadInfo] = useState<{ forId: string; error: string | null } | null>(null);
   const [sseState, setSseState] = useState<SseState>("connecting");
+  const [clockMode, setClockMode] = useState<TimelineMode>("absolute");
   const lastIdRef = useRef(0);
   const laneRefs = useRef(new Map<string, HTMLDivElement>());
   const evalRef = useRef<HTMLDivElement>(null);
@@ -252,6 +269,27 @@ export default function RunConsoleLive({ run }: { run: RunOut }) {
     return { perSandbox, system };
   }, [events, run.sandboxes]);
 
+  // ---- F31 clock mode ------------------------------------------------------
+
+  // Per-lane t0 baselines (each cell's own run_started, else first event;
+  // "" = run-level lane — the system lane's single shared baseline so its
+  // mixed judge/orchestrator traffic stays on one clock).
+  const starts = useMemo(() => laneStartMs(events), [events]);
+
+  /** Time column for one event line: absolute → wall clock; relative → the
+   * owning lane's `+…` offset (key = the event's lane, RUN_LANE_KEY for the
+   * mixed system lane). Unparseable/missing baseline → wall clock. */
+  const evTime = useCallback(
+    (e: EventOut, laneKey: string): string => {
+      if (clockMode === "relative") {
+        const r = relMs(e.ts, starts.get(laneKey));
+        if (r !== null) return formatRelativeMs(r);
+      }
+      return formatTimeMs(e.ts);
+    },
+    [clockMode, starts],
+  );
+
   // ---- stick-to-bottom per lane --------------------------------------------
 
   useEffect(() => {
@@ -315,6 +353,28 @@ export default function RunConsoleLive({ run }: { run: RunOut }) {
             ).join(", ")}
           </span>
           <span className="evc__right">
+            <span className="seg" role="tablist" aria-label="Clock mode">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={clockMode === "absolute"}
+                className={`seg__btn${clockMode === "absolute" ? " seg__btn--active" : ""}`}
+                onClick={() => setClockMode("absolute")}
+                title="Shared wall clock — every event shows its own UTC timestamp"
+              >
+                absolute
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={clockMode === "relative"}
+                className={`seg__btn${clockMode === "relative" ? " seg__btn--active" : ""}`}
+                onClick={() => setClockMode("relative")}
+                title="Each lane re-based to its own run_started — t+0 aligns cells for progress comparison"
+              >
+                relative
+              </button>
+            </span>
             <span>{events.length} events</span>
             <Badge tone={statusTone(run.status)}>{run.status}</Badge>
             <Badge tone={live ? "green" : sseState === "reconnecting" ? "amber" : "gray"}>
@@ -338,6 +398,19 @@ export default function RunConsoleLive({ run }: { run: RunOut }) {
               const laneEvs = all.slice(-LANE_RENDER_CAP);
               const toks = laneTokens(all);
               const laneDone = Boolean(s.terminal_reason) || s.status === "done";
+              // F31 footer stat — absolute: the cell's wall-clock start (the
+              // stagger info); relative: elapsed-from-start measured to the
+              // lane's latest event ("running time covered by the stream" —
+              // render-purity forbids Date.now(), and on a live lane the
+              // latest event IS ~now anyway). Empty lanes show nothing.
+              const t0 = starts.get(s.id);
+              let clockFoot = "";
+              if (t0 !== undefined) {
+                clockFoot =
+                  clockMode === "relative"
+                    ? formatRelativeMs((lastEventMs(all) ?? t0) - t0)
+                    : `start ${formatClockS(t0)}`;
+              }
               return (
                 <div key={s.id} className="evc-lane">
                   <div className="evc-lane__head">
@@ -381,6 +454,9 @@ export default function RunConsoleLive({ run }: { run: RunOut }) {
                     ) : (
                       laneEvs.map((e) => (
                         <div key={e.id} className="evc-ev evc-line">
+                          <span className="evc-ev__t" title={e.ts}>
+                            {evTime(e, s.id)}
+                          </span>
                           <span className="evc-ev__type" data-type={e.type}>
                             {e.type}
                           </span>
@@ -397,6 +473,7 @@ export default function RunConsoleLive({ run }: { run: RunOut }) {
                   <div className="evc-lane__foot">
                     <span>{all.length} events</span>
                     <span>{toks.toLocaleString("en-US")} tok</span>
+                    {clockFoot ? <span>{clockFoot}</span> : null}
                     <span className="evc-lane__score">
                       <b className={s.terminal_reason ? "lp-t-signal" : "lp-t-faint"}>
                         {s.terminal_reason ?? s.status}
@@ -425,6 +502,9 @@ export default function RunConsoleLive({ run }: { run: RunOut }) {
             ) : (
               lanes.system.slice(-LANE_RENDER_CAP).map((e) => (
                 <div key={e.id} className="evc-ev evc-line">
+                  <span className="evc-ev__t" title={e.ts}>
+                    {evTime(e, RUN_LANE_KEY)}
+                  </span>
                   <span className="evc-ev__type" data-type={e.type}>
                     {e.type}
                   </span>

@@ -436,6 +436,7 @@ or tests change.
 | F23 | Task inputs (seeded workspace: repo_url or uploaded archive) |
 | F24 | Task preset library (vendored + user presets, preset_ref provenance) |
 | F25 | Benchmark suites + deterministic checkers (suite.yaml fan-out, objective checkers beside judge scores) |
+| F31 | Timeline compare-mode clock (absolute|relative toggle, per-cell t+0 re-basing) |
 
 ## Post-MVP roadmap
 
@@ -929,6 +930,20 @@ or tests change.
   executes on the host — `py_test` runs inside locked `heg-exec`; a
   missing Docker/image is `skipped`, not a failure. Paths are
   suite-jailed and byte-capped; slugs validate before filesystem touch.
+- **Timeline compare-mode clock (F31)**: timeline + run-console headers
+  carry an `absolute | relative` `.seg` toggle (`?clock=` seeds the
+  timeline). Relative re-bases each cell to its own earliest
+  `run_started` (else first event) so `+2m14s` compares progress across
+  paced/queued start skew; the pure transform lives in
+  `web/lib/timelineModes.ts` (`laneStartMs`/`relMs`/`formatRelativeMs`,
+  node-tested). Pre-`run_started` provisioning events keep NEGATIVE
+  offsets rather than clamping — the seed/spawn prelude is real signal.
+  Run-level (`sandbox_id: null`) events share the `""` baseline — the
+  console's mixed system lane keys everything to it so its clock stays
+  monotonic — and day markers drop out in relative mode. Console lanes
+  gained an `.evc-ev__t` time column + a footer stat (absolute:
+  `start HH:MM:SS`; relative: elapsed to the lane's latest event —
+  `Date.now()` is barred by the render-purity lint).
 
 ## Working conventions
 

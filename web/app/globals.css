@@ -1554,6 +1554,12 @@ table.table {
   gap: 0.6rem;
   white-space: nowrap;
 }
+/* F31 — per-event time column (wall clock or lane-relative +Ns). */
+.evc-ev__t {
+  width: 5.4rem;
+  flex-shrink: 0;
+  color: var(--text-faint);
+}
 .evc-ev__type {
   width: 7.2rem;
   flex-shrink: 0;

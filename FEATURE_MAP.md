@@ -38,6 +38,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F23 | Task inputs — seeded workspace (repo_url or uploaded archive, identical bytes per cell proven by `harness_config.seed_sha`) | ✅ | `sandbox/seeds.py`, `api/routers/uploads.py`, `api/schemas.py` (`TaskInputsIn`), `orchestrator/provision.py`, `sandbox/runtime.py`, `web/app/submit/page.tsx` (Inputs section) | `tests/unit/sandbox/test_seeds.py`, `tests/unit/api/test_uploads.py`, `tests/unit/orchestrator/test_provision_seed.py` |
 | F24 | Task preset library (vendored md + user presets, preset_ref on runs, /presets browse + detail) | ✅ | `task_presets/`, `api/presets.py`, `api/routers/presets.py`, `api/routers/runs.py` (preset_ref), `db/models.py` (`TaskPreset`, `Run.preset_*`), `web/app/presets/`, `web/components/SavePresetDialog.tsx`, `web/app/submit/page.tsx` | `tests/unit/api/test_presets.py`, `tests/unit/db/test_migrations.py`, `web/lib/resubmit.test.ts` |
 | F25 | Benchmark suites + deterministic checkers (vendored suite.yaml fan-out, objective pass/fail beside judge scores, batch aggregation) | ✅ | `benchmark_suites/`, `api/suites.py`, `api/routers/suites.py`, `scoring/checkers.py`, `db/models.py` (`SuiteRun`, `CheckerResult`, `Run.suite_*`), `orchestrator/lifecycle.py`, `web/app/suites/`, `web/app/suite-runs/` | `tests/unit/api/test_suites.py`, `tests/unit/scoring/test_checkers.py`, `tests/unit/orchestrator/test_lifecycle_suites.py`, `tests/unit/evaluator/test_suite_signal.py`, `tests/unit/db/test_migrations.py` |
+| F31 | Timeline compare-mode clock toggle (absolute wall clock vs per-cell relative t+0 — progress-rate comparison across staggered starts) | ✅ | `web/lib/timelineModes.ts`, `web/app/runs/[id]/timeline/{TimelineClient,EventRow,SplitTimeline}.tsx`, `web/components/RunConsoleLive.tsx`, `web/app/globals.css` (`.evc-ev__t`) | `web/lib/timelineModes.test.ts` |
 
 ## Feature details
 
@@ -1856,6 +1857,50 @@ rigged before it starts.
   (evaluator + rescore newest-wins), PR8 (locked `heg-exec` runner +
   signal pipeline), F8 (results page), F18 (the `prompt` adapter pin —
   prompt-cell tasks resolve to real no-sandbox cells)
+
+### F31 — Timeline compare-mode clock toggle ✅
+
+- **What:** an `absolute | relative` `.seg` toggle on the timeline
+  toolbar (`?clock=` seeds it) and on the run console's `evc` head —
+  both live and replay. Absolute (default) keeps the shared wall clock;
+  relative re-bases every event to ITS OWN cell's t+0 so a `+2m14s`
+  label means the same progress time on all cells regardless of
+  paced/queued/retried start skew — the split-view comparison the
+  feature exists for. Baselines derive per `sandbox_id`: the cell's own
+  earliest `run_started` when present, else its first event; run-level
+  (`sandbox_id: null`) events share the `""` lane baseline (the mixed
+  console system lane keys everything to it so its clock stays
+  monotonic). Events preceding their cell's `run_started`
+  (provisioning/`stage:"seed"` checkpoints) keep a faithful negative
+  `−Ns` offset — the pre-start prelude stays visible. Day markers (a
+  wall-clock concept) drop out in relative mode on merged + split.
+  The console gains a per-event time column (`.evc-ev__t`) and a
+  per-lane footer stat: absolute shows `start HH:MM:SS` (the stagger
+  info), relative shows elapsed-from-start measured to the lane's
+  latest event (`Date.now()` is barred by the render-purity lint — on
+  a live lane the latest event is ~now anyway). The transform is pure
+  (`web/lib/timelineModes.ts`: `laneStartMs`, `relMs`,
+  `formatRelativeMs` → `+0.0s`/`+42s`/`+2m14s`/`+1h07m`,
+  `formatClockS`, `lastEventMs`) so `node --test` covers offset
+  derivation, missing-`run_started` fallback, staggered t+0 alignment,
+  and input ordering preservation.
+- **Where:** `web/lib/timelineModes.ts` + `.test.ts`,
+  `web/app/runs/[id]/timeline/TimelineClient.tsx` (toggle, `starts`
+  memo, `timeLabelOf`, day-marker suppression in both views),
+  `EventRow.tsx` (`timeLabel` prop), `SplitTimeline.tsx`
+  (`timeLabelOf` passthrough),
+  `web/components/RunConsoleLive.tsx` (head toggle, `.evc-ev__t`
+  column, lane footer stat), `web/app/globals.css`.
+- **Verify:**
+  - Web: `npm test` → `web/lib/timelineModes.test.ts` (17 cases);
+    `npm run lint` + `npm run build` clean.
+  - Manual: run detail console + `/runs/{id}/timeline?clock=relative`
+    → lanes/cells each start at `+0.0s` with identical `+N` labels for
+    same-progress events; `?clock=` absent → identical wall-clock
+    rendering as before; a paced/queued second cell shows `start
+    HH:MM:SS` skew in absolute mode.
+- **Depends on:** F6 (event stream + timeline), PR10 split view +
+  PR9 metrics strips (the comparison surfaces it augments)
 
 ## Implementation sequence
 
