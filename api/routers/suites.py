@@ -199,6 +199,7 @@ async def run_suite(
         models=body.models,
         harness_configs=body.harness_configs,
         evaluator_model=body.evaluator_model,
+        evaluator_models=body.evaluator_models,
         budgets=body.budgets,
         trials=body.trials,
     )
@@ -233,6 +234,7 @@ async def run_suite(
             models=body.models,
             harness_configs=configs,
             evaluator_model=body.evaluator_model,
+            evaluator_models=body.evaluator_models,
             budgets=body.budgets,
             trials=body.trials,
         )

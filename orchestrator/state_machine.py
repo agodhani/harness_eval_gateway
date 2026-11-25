@@ -4,11 +4,18 @@ Allowed transitions mirror the lifecycle in AGENTS.md / docs/orchestrator-plan.m
 
     run:     submitted → rubric_review → [queued →] provisioning → running
              → evaluating → done | failed | cancelled
-    sandbox: provisioning → running → terminating → done | failed
+    sandbox: [queued →] provisioning → running → terminating → done | failed
 
 ``queued`` (PR15 pacing) parks an approved run while another run holds the
 single execution slot — see ``orchestrator/pacing.py``. ``queued → failed``
 exists so sweeps / a future cancel can retire parked runs.
+
+Sandbox ``queued`` (local-run pacing) parks a matrix cell BEFORE
+``docker run`` when an all-local-provider run hits the
+``SANDBOX_MAX_CONCURRENT_LOCAL`` cap — the cell's Sandbox row exists
+(status=queued) but no container does. Promotion flips it to
+``provisioning`` and the normal spawn pipeline runs; ``queued → failed``
+retires parked cells on run failure / startup sweep.
 
 PR5 adds the re-score loop: a terminal run may re-enter ``evaluating``
 (done|failed → evaluating) so the evaluator can re-run on stored artifacts;
@@ -46,6 +53,7 @@ RUN_TRANSITIONS: dict[str, frozenset[str]] = {
 }
 
 SANDBOX_TRANSITIONS: dict[str, frozenset[str]] = {
+    "queued": frozenset({"provisioning", "failed"}),
     "provisioning": frozenset({"running", "terminating", "failed"}),
     "running": frozenset({"terminating", "done", "failed"}),
     "terminating": frozenset({"done", "failed"}),

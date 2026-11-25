@@ -24,13 +24,13 @@ from typing import Any
 
 #: Env TASK_PROMPT — deliberately short; EVAL_PROMPT.md carries the spec.
 EVAL_TASK_PROMPT = (
-    "You are the evaluation judge for a coding-agent benchmark. Your "
-    "workspace contains a candidate submission (the files at the workspace "
-    "root — do NOT modify them), plus rubric.json and EVAL_PROMPT.md. "
-    "Read EVAL_PROMPT.md and follow it exactly: inspect the submission, "
-    "score every rubric dimension, and write scores.json to the workspace "
-    "root in the required schema. Verify scores.json by reading it back, "
-    "then call done. Do not modify any candidate files."
+    "You are the evaluation judge for an agent benchmark. Your workspace "
+    "contains a candidate submission (the files at the workspace root — do "
+    "NOT modify them), plus rubric.json and EVAL_PROMPT.md. Read "
+    "EVAL_PROMPT.md and follow it exactly: inspect the submission, score "
+    "every rubric dimension, and write scores.json to the workspace root "
+    "in the required schema. Verify scores.json by reading it back, then "
+    "call done. Do not modify any candidate files."
 )
 
 
@@ -111,12 +111,69 @@ before or after it — then read it back and fix it before calling `done`.
             "to these files.**"
         )
     )
+    # PR23: rubric dimension names drive the measured-signals guidance — a
+    # cyclomatic_complexity dim gets its measured-values instruction, and
+    # requirement-style dims get the exec/generated-suite evidence pointer;
+    # rubrics without them get the generic "measurements are context" line
+    # so a non-code rubric never reads as a code task.
+    dim_names = {
+        str(d.get("name") or "").strip()
+        for d in (rubric.get("dimensions") or [])
+        if isinstance(d, dict)
+    }
+    has_cc = "cyclomatic_complexity" in dim_names
+    req_like = sorted(
+        dim_names & {"functional_requirements", "acceptance_criteria"}
+    )
+    if has_cc:
+        measured_line = (
+            "score `cyclomatic_complexity` from its measured values — do NOT "
+            "estimate complexity by skimming. Cite the numbers in the "
+            "rationale (e.g. 'avg CC 4.2, worst fn `update` at 14'); if the "
+            "report shows no analyzable source, note that instead of "
+            "guessing. "
+        )
+    else:
+        measured_line = (
+            "use its measurements where they evidence a rubric dimension. "
+            "Metrics with no matching dimension — cyclomatic complexity on a "
+            "non-code rubric, for instance — are context only, never extra "
+            "scoring axes. "
+        )
+    if req_like:
+        exec_dims = " and ".join(f"`{n}`" for n in req_like)
+        exec_line = (
+            "Likewise, when an \"Executed checks\" section is present, treat "
+            "its build/test/coverage results as ground-truth evidence for "
+            f"{exec_dims} — a submission that fails to build or has failing "
+            "tests is not fully working; cite the counts (e.g. 'build ok, "
+            "5/5 tests pass, 82% coverage')."
+        )
+        gen_line = (
+            "the pass rate is objective evidence for "
+            f"{exec_dims} — a submission failing generated behavioral checks "
+            "is likely missing required behavior. "
+        )
+    else:
+        exec_line = (
+            "Likewise, when an \"Executed checks\" section is present, treat "
+            "its build/test/coverage results as ground-truth evidence for "
+            "whichever rubric dimensions they inform — a submission that "
+            "fails to build or has failing tests is not fully working; cite "
+            "the counts (e.g. 'build ok, 5/5 tests pass, 82% coverage')."
+        )
+        gen_line = (
+            "the pass rate is objective evidence for whichever rubric "
+            "dimensions it informs — a submission failing generated "
+            "behavioral checks is likely missing required behavior. "
+        )
     return f"""# Evaluation task — score the candidate submission
 
-You are a **strict, impartial evaluator** for a coding-agent benchmark. A
-coding agent was given a task; its final workspace is the submission you are
-scoring. Your job is to read the rubric and the submission, then produce
-**scores.json** — nothing else.
+You are a **strict, impartial evaluator** for an agent benchmark. An agent
+was given a task; its final workspace is the submission you are scoring —
+it may be code, extracted data, written text, or any other artifact the
+rubric describes. Your job is to read the rubric and the submission, then
+produce **scores.json** — nothing else.
 
 ## What is in this workspace (read-only inputs)
 
@@ -164,8 +221,8 @@ same object. Valid JSON in this schema:
 }}
 ```
 
-- `dimension` MUST be the `name` field of a rubric dimension (e.g.
-  `functional_requirements`). Score **every** dimension exactly once.
+- `dimension` MUST be the `name` field of a rubric dimension — the exact
+  names listed above. Score **every** dimension exactly once.
 - `score` is a number on the dimension's scale.
 - `rationale` MUST cite concrete evidence: file names, observed behavior,
   missing pieces. "Looks good" is not a rationale.
@@ -182,34 +239,29 @@ same object. Valid JSON in this schema:
    `read_file` reports `total_lines` and `eof` — when `eof` is false, continue
    with `offset` set to the next unread line. Never repeat an identical tool
    call; vary the arguments or move on.
-2. Apply the scale **consistently and strictly** — reward working,
-   requirement-matching code; penalize missing features, bugs you can point
-   to, and unfinished work. Do not inflate scores.
+2. Apply the scale **consistently and strictly** — reward submissions that
+   satisfy the rubric's requirements; penalize missing pieces, defects you
+   can point to, and unfinished work. Do not inflate scores.
 3. Judge the artifact, not the effort. A timed-out or minimal submission can
    still score well on what it does contain.
-4. **Use the measured signals.** When `ANALYSIS.md`/`analysis.json` is
-   present, score `cyclomatic_complexity` from its measured values — do NOT
-   estimate complexity by skimming. Cite the numbers in the rationale (e.g.
-   'avg CC 4.2, worst fn `update` at 14'); if the report shows no analyzable
-   source, note that instead of guessing. Likewise, when an "Executed
-   checks" section is present, treat its build/test/coverage results as
-   ground-truth evidence for `functional_requirements` and
-   `acceptance_criteria` — a submission that fails to build or has failing
-   tests is not fully working; cite the counts (e.g. 'build ok, 5/5 tests
-   pass, 82% coverage').
-5. **Use the generated-suite pass rate.** When a "Generated test suite"
+4. **Mark non-applicable dimensions honestly.** If a rubric dimension cannot
+   apply to this kind of submission — for example `cyclomatic_complexity`
+   when the submission contains no analyzable code, or a format rule on a
+   free-text artifact — still emit its score row: score it at the middle of
+   its scale and begin the rationale with "not applicable" followed by why.
+   Never drop, rename, or invent a dimension row.
+5. **Use the measured signals.** When `ANALYSIS.md`/`analysis.json` is
+   present, {measured_line}{exec_line}
+6. **Use the generated-suite pass rate.** When a "Generated test suite"
    section is present, an LLM (not the candidate) wrote pytest tests for the
-   task's stated behavior and they ran against the submission: the pass
-   rate is objective evidence for `functional_requirements` and
-   `acceptance_criteria` — a submission failing generated behavioral checks
-   is likely missing required behavior. Caveat: generated tests can
+   task's stated behavior and they ran against the submission: {gen_line}Caveat: generated tests can
    themselves be wrong — check `generated_tests/` or the report's failing
    names when a failure looks like a test bug rather than a submission bug,
    and weigh accordingly. Cite the counts (e.g. 'generated suite 7/10
    passed, 70% coverage').
-6. **Never modify candidate files.** The only file you create is
+7. **Never modify candidate files.** The only file you create is
    `scores.json`.
-7. After writing `scores.json`, read it back and confirm it is **one
+8. After writing `scores.json`, read it back and confirm it is **one
    complete JSON object** matching the schema (opening `{{`, closing `}}`,
    all fields inside). Fix it if needed, then call `done`.
 

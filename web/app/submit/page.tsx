@@ -26,6 +26,7 @@ import {
   getModels,
   listHarnesses,
   listPresets,
+  listRubricTemplates,
   listSkillPacks,
   NO_SANDBOX_ADAPTERS,
   PROVIDERS,
@@ -37,6 +38,7 @@ import {
   type HarnessConfig,
   type HarnessManifest,
   type ModelOptions,
+  type RubricTemplate,
   type SkillPack,
   type SkillpackImportResult,
   type TaskInputs,
@@ -71,6 +73,9 @@ const MAX_CONFIGS = 8;
 const MAX_MATRIX_CELLS = 32;
 // RunCreate.models caps at 8 extras → at most 1 primary + 8 extra rows.
 const MAX_MODEL_ROWS = 9;
+/** PR29: judge panel — primary judge (evaluator_model) + up to 2 extra
+ * judge rows (evaluator_models); the server folds them to a 1–3 panel. */
+const MAX_EXTRA_JUDGES = 2;
 
 /** PR27 per-config model-sampling knobs — form state stays stringly-typed
  * (empty = unset) and serializes to numbers/null in the payload. */
@@ -169,6 +174,14 @@ export default function SubmitPage() {
   const [presetCategory, setPresetCategory] = useState("");
   const [presetNotice, setPresetNotice] = useState<string | null>(null);
   const [savePresetOpen, setSavePresetOpen] = useState(false);
+  // PR23 — rubric generation steering. `rubricTemplate` names a template
+  // from GET /api/rubric-templates whose dimensions/criteria become the
+  // generator's basis (empty = preset's suggested_rubric → freeform task
+  // fallback); `rubricHint` is a free-text domain hint fed into the gen
+  // prompt (empty = preset category → none).
+  const [rubricTemplates, setRubricTemplates] = useState<RubricTemplate[]>([]);
+  const [rubricTemplate, setRubricTemplate] = useState("");
+  const [rubricHint, setRubricHint] = useState("");
   // Participant-model rows — row 1 is the required primary (→ model_name);
   // extra rows are the PR14 additional models (→ models, deduped). Model
   // starts EMPTY: prefilling a provider-specific name (e.g. an ollama tag)
@@ -182,6 +195,10 @@ export default function SubmitPage() {
   const [evalRow, setEvalRow] = useState<ModelRow>(() =>
     blankModelRow("ollama"),
   );
+  // PR29: additional judge rows (evaluator_models) — each scores every
+  // artifact independently on its own eval cred; results merge to the
+  // panel mean + spread.
+  const [evalExtras, setEvalExtras] = useState<ModelRow[]>([]);
   // Gateway's resolved default provider — learned from the no-param mount
   // fetch; new rows + unpicked selects track it.
   const [defaultProvider, setDefaultProvider] = useState("ollama");
@@ -278,6 +295,9 @@ export default function SubmitPage() {
           rs.map((row) => (row.picked ? row : { ...row, provider })),
         );
         setEvalRow((e) => (e.picked ? e : { ...e, provider }));
+        setEvalExtras((rs) =>
+          rs.map((r) => (r.picked ? r : { ...r, provider })),
+        );
       })
       .catch(() => {
         /* offline fallback: static MODEL_SUGGESTIONS */
@@ -319,6 +339,13 @@ export default function SubmitPage() {
         provider: "ollama",
         model: spec.evaluator_model ?? "",
       });
+      // PR29: the spec's panel extras restore as additional judge rows
+      // (panel[0] = evaluator_model already restored above).
+      setEvalExtras(
+        (spec.evaluator_models ?? [])
+          .slice(0, MAX_EXTRA_JUDGES)
+          .map((m) => ({ key: nextKey++, provider: "ollama", model: m })),
+      );
       setConfigs(
         spec.harness_configs.length
           ? spec.harness_configs.map((c) => ({
@@ -369,6 +396,10 @@ export default function SubmitPage() {
       if (spec.trials && spec.trials >= 1) {
         setTrials(Math.min(8, Math.trunc(spec.trials)));
       }
+      // PR23: the run's rubric template + hint ride the spec — restore them
+      // so a resubmit regenerates the same kind of rubric.
+      if (spec.rubric_template) setRubricTemplate(spec.rubric_template);
+      if (spec.rubric_hint) setRubricHint(spec.rubric_hint);
     });
     return () => {
       cancelled = true;
@@ -485,6 +516,15 @@ export default function SubmitPage() {
         /* API down — preset mode stays selectable but unverifiable;
            a preset_ref slug still submits (server resolves it). */
         if (!cancelled) setPresetsFailed(true);
+      });
+    // PR23 rubric templates — the select degrades to free-text behavior
+    // (hint-only submits) when the list can't load.
+    listRubricTemplates()
+      .then((list) => {
+        if (!cancelled) setRubricTemplates(list);
+      })
+      .catch(() => {
+        /* API down — the select just stays on "freeform" */
       });
     return () => {
       cancelled = true;
@@ -622,10 +662,18 @@ export default function SubmitPage() {
   const sandboxCount = configs.length * Math.max(modelCount, 1) * trials;
 
   const effectiveEvaluator = evalRow.model.trim() || primaryModel;
-  // PR14: flagged when the judge equals ANY participant model —
-  // non-independent judging for that matrix cell.
-  const sameModelEval =
-    effectiveEvaluator !== "" && participants.includes(effectiveEvaluator);
+  // PR29: the effective judge panel — primary judge + filled extras.
+  const judgePanel = useMemo(
+    () => [
+      effectiveEvaluator,
+      ...evalExtras.map((r) => r.model.trim()).filter(Boolean),
+    ].filter(Boolean),
+    [effectiveEvaluator, evalExtras],
+  );
+  // PR14 + PR29: flagged when ANY judge on the panel equals a participant
+  // model — non-independent judging for that matrix cell.
+  const judgeOverlap = participants.filter((m) => judgePanel.includes(m));
+  const sameModelEval = judgeOverlap.length > 0;
 
   const canAddConfig = configs.length < MAX_CONFIGS;
   // Row cap: 8 extras max (RunCreate.models bound) AND adding one more
@@ -643,7 +691,8 @@ export default function SubmitPage() {
   // (or an unkeyed/unreachable ollama) hides it.
   const ollamaInUse =
     modelRows.some((r) => r.provider === "ollama") ||
-    evalRow.provider === "ollama";
+    evalRow.provider === "ollama" ||
+    evalExtras.some((r) => r.provider === "ollama");
   const pullVisible = ollamaInUse && (catalogs.ollama?.pullSupported ?? false);
 
   const validation = useMemo(() => {
@@ -744,6 +793,21 @@ export default function SubmitPage() {
   function pickEvalProvider(provider: string) {
     setEvalRow((e) => ({ ...e, provider, picked: true }));
     ensureCatalog(provider);
+  }
+
+  function updateEvalExtra(key: number, patch: Partial<ModelRow>) {
+    setEvalExtras((rs) =>
+      rs.map((r) => (r.key === key ? { ...r, ...patch } : r)),
+    );
+  }
+
+  function addEvalExtra() {
+    if (evalExtras.length >= MAX_EXTRA_JUDGES) return;
+    setEvalExtras((rs) => [...rs, blankModelRow(defaultProvider)]);
+  }
+
+  function removeEvalExtra(key: number) {
+    setEvalExtras((rs) => rs.filter((r) => r.key !== key));
   }
 
   function addModelRow() {
@@ -904,8 +968,18 @@ export default function SubmitPage() {
         models,
         harness_configs,
         evaluator_model: evalRow.model.trim() || null,
+        // PR29: additional judges — the server folds evaluator_model in as
+        // panel head; empty extras → null (single-judge legacy shape).
+        evaluator_models:
+          evalExtras.map((r) => r.model.trim()).filter(Boolean).length
+            ? evalExtras.map((r) => r.model.trim()).filter(Boolean)
+            : null,
         budgets,
         task_inputs: taskInputsPayload() ?? null,
+        // PR23: empty strings → null (unset) — the server then falls back
+        // to the preset's suggested_rubric, then freeform task text.
+        rubric_template: rubricTemplate || null,
+        rubric_hint: rubricHint.trim() || null,
         trials,
       });
       // Run-create warnings (new backend field — absent on older backends):
@@ -1303,6 +1377,78 @@ export default function SubmitPage() {
               </div>
             ) : null}
           </div>
+
+          {/* PR23 — rubric generation steering: pick a vendored/user
+              template as the basis, or leave on auto to use the preset's
+              suggested_rubric (then freeform task text). The hint feeds a
+              domain line into the gen prompt. */}
+          <div className="field" style={{ marginTop: "0.9rem" }}>
+            <label className="field__label" htmlFor="rubric_template">
+              Rubric basis{" "}
+              <span className="faint">(optional — how the draft is generated)</span>
+            </label>
+            <select
+              id="rubric_template"
+              className="select"
+              value={rubricTemplate}
+              onChange={(e) => setRubricTemplate(e.target.value)}
+              disabled={submitting}
+            >
+              <option value="">
+                auto — preset suggestion, else freeform from the task
+              </option>
+              {rubricTemplates.map((t) => (
+                <option key={t.name} value={t.name}>
+                  {t.name} — {t.description || `${t.content.dimensions?.length ?? 0} dims`}
+                  {t.source === "vendored" ? "" : ` (${t.source})`}
+                </option>
+              ))}
+            </select>
+            {rubricTemplate === "" &&
+            taskMode === "preset" &&
+            selectedPreset?.suggested_rubric ? (
+              <span className="field__hint">
+                This preset suggests{" "}
+                {typeof selectedPreset.suggested_rubric.template === "string" ? (
+                  <>
+                    template <code>{selectedPreset.suggested_rubric.template}</code>
+                  </>
+                ) : Array.isArray(selectedPreset.suggested_rubric.dimensions) ? (
+                  "an inline rubric basis"
+                ) : typeof selectedPreset.suggested_rubric.hint === "string" ? (
+                  <>
+                    domain hint <code>{selectedPreset.suggested_rubric.hint}</code>
+                  </>
+                ) : (
+                  "a rubric basis"
+                )}{" "}
+                — used unless you pick a template above.
+              </span>
+            ) : (
+              <span className="field__hint">
+                A template seeds the draft&apos;s dimensions/criteria — the
+                generator refines them for this task instead of starting from
+                scratch.
+              </span>
+            )}
+            <input
+              id="rubric_hint"
+              className="input"
+              style={{ marginTop: "0.5rem" }}
+              placeholder='Domain hint — e.g. "structured extraction", "customer support reply"'
+              value={rubricHint}
+              onChange={(e) => setRubricHint(e.target.value)}
+              disabled={submitting}
+              maxLength={2000}
+            />
+            <span className="field__hint">
+              {rubricHint.trim() === "" &&
+              taskMode === "preset" &&
+              selectedPreset?.category
+                ? `Empty — the preset's category "${selectedPreset.category}" is the fallback hint.`
+                : "Guides which dimensions the generator proposes (1–12 arbitrary names)."}
+            </span>
+          </div>
         </Card>
 
         <Card title="Models">
@@ -1483,21 +1629,81 @@ export default function SubmitPage() {
                 mono
               />
             </div>
+            {/* PR29 — judge panel: up to 2 extra judges each re-scoring
+                every artifact; results merge to the panel mean + spread. */}
+            {evalExtras.map((row, i) => (
+              <div className="model-row" key={row.key}>
+                <span className="model-row__label">judge {i + 2}</span>
+                <select
+                  className="select"
+                  aria-label={`judge ${i + 2} provider`}
+                  title="Which upstream's catalog to browse — informational only"
+                  value={row.provider}
+                  onChange={(e) =>
+                    updateEvalExtra(row.key, {
+                      provider: e.target.value,
+                      picked: true,
+                    })
+                  }
+                  disabled={submitting}
+                >
+                  {PROVIDERS.map((p) => (
+                    <option key={p} value={p}>
+                      {p}
+                    </option>
+                  ))}
+                </select>
+                <ComboInput
+                  id={`evaluator_judge_${i + 2}`}
+                  value={row.model}
+                  onChange={(v) => updateEvalExtra(row.key, { model: v })}
+                  suggestions={suggestionsFor(row.provider)}
+                  placeholder="additional judge model"
+                  disabled={submitting}
+                  mono
+                />
+                <button
+                  type="button"
+                  className="btn btn--sm"
+                  aria-label={`Remove judge ${i + 2}`}
+                  title="Remove this judge from the panel"
+                  onClick={() => removeEvalExtra(row.key)}
+                  disabled={submitting}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+            {evalExtras.length < MAX_EXTRA_JUDGES ? (
+              <div className="model-row">
+                <button
+                  type="button"
+                  className="btn btn--sm"
+                  onClick={addEvalExtra}
+                  disabled={submitting}
+                  title="Add another judge — every panel judge re-scores every artifact; results merge to the mean with a disagreement spread"
+                >
+                  + add judge{evalExtras.length ? ` (${evalExtras.length + 2}/3)` : " panel"}
+                </button>
+              </div>
+            ) : null}
             {sameModelEval ? (
               <InfoNote>
-                Evaluator uses the <strong>same model</strong> as a participant
-                {effectiveEvaluator ? (
+                Judge panel uses a <strong>participant model</strong>
+                {judgeOverlap.length ? (
                   <>
                     {" "}
-                    (<code>{effectiveEvaluator}</code>)
+                    (<code>{judgeOverlap.join(", ")}</code>)
                   </>
                 ) : null}{" "}
-                — scores may not be fully independent. This is allowed; the
-                results page flags it.
+                — those scores may not be fully independent. This is allowed;
+                the results page flags it.
               </InfoNote>
             ) : (
               <span className="field__hint">
-                Leave empty to reuse the primary participant model.
+                Leave empty to reuse the primary participant model. A panel
+                of 2–3 judges merges scores to a mean with a disagreement
+                spread on the results matrix.
               </span>
             )}
           </div>
@@ -1922,6 +2128,23 @@ export default function SubmitPage() {
                     prices; unpriced models can&apos;t trip it.
                   </span>
                   {fieldErrors.max_cost_usd ? <span className="field__error">{fieldErrors.max_cost_usd}</span> : null}
+                </div>
+                <div className="field">
+                  <label className="check-item" style={{ marginTop: "1.7rem" }}>
+                    <input
+                      type="checkbox"
+                      checked={budgets.auto_extend ?? false}
+                      onChange={(e) =>
+                        setBudgets({ ...budgets, auto_extend: e.target.checked })
+                      }
+                      disabled={submitting}
+                    />
+                    Auto-extend budgets <span className="faint">(once)</span>
+                  </label>
+                  <span className="dim-desc">
+                    F30: when a cell crosses ~80% of a cap, grant it +50% on
+                    that limit automatically — one bump per cell.
+                  </span>
                 </div>
               </div>
             </div>

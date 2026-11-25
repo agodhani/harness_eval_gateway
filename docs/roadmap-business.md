@@ -168,7 +168,7 @@ heatmap, output browser.
 - **Verify:** run submitted from preset carries `preset_ref`; same-preset
   runs group on `/presets/[slug]`; save-as-preset round-trips.
 
-### PR23 — Custom rubric dimensions + rubric templates
+### PR23 — Custom rubric dimensions + rubric templates ✅ shipped
 - **Scope:** unlock `CANONICAL_DIMENSIONS`. `RubricContent` accepts 1–12
   arbitrary dimensions (normalized names, dedup, min/max scale kept);
   evaluator `EVAL_PROMPT` + `scores` table already take arbitrary names —
@@ -381,7 +381,10 @@ heatmap, output browser.
 - **Verify:** grid renders 8×4; weighted total differs from raw Σ on a
   weighted rubric.
 
-### PR32 — Cross-run compare + leaderboards
+### PR32 — Cross-run compare + leaderboards ✅ shipped
+- **Landed as F27:** `/api/analytics/leaderboard` + `/compare` +
+  `/leaderboard` + the preset-embedded board all shipped. Details:
+  `FEATURE_MAP.md` F27.
 - **Scope:**
   - `/compare?runs=id1,id2` — two runs side by side: spec diff
     (models/configs/budgets/rubric version), score matrices,
@@ -428,7 +431,11 @@ heatmap, output browser.
 - **Verify:** browse a 2048 artifact, open `index.html`; diff two
   sandboxes' `index.html` shows unified diff; path traversal 404s.
 
-### PR35 — Export + share
+### PR35 — Export + share ✅ shipped
+- **Landed as F28:** export endpoint + flattened CSV + the stretch —
+  `runs.share_token` capability links and the read-only `/share/{token}`
+  view all shipped. Details: `FEATURE_MAP.md` F28. PR19 keeps auth +
+  templates.
 - **Scope:** `GET /api/runs/{id}/export?fmt=json|csv` — full run bundle:
   spec, rubric, score matrix (+versions), analytics, events-lite
   (summary rows, not full payloads); CSV = flattened per-cell rows.
@@ -442,7 +449,7 @@ heatmap, output browser.
 - **Verify:** JSON export re-imports/validates against schemas; CSV
   opens in sheets with one row per sandbox×dimension.
 
-### PR36 — Dashboard home
+### PR36 — Dashboard home ✅ shipped
 - **Scope:** `/dashboard` (nav + landing CTA): cards — total est. spend
   over time, runs per week, model leaderboard top-5 (PR32 aggregate),
   harness leaderboard top-5, terminal-reason mix donut, queue/active

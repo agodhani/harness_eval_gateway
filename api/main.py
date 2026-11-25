@@ -26,7 +26,9 @@ from api.routers import (
     preview,
     prices,
     results,
+    rubric_templates,
     runs,
+    sandboxes,
     skillpacks,
     suites,
     uploads,
@@ -61,12 +63,14 @@ def create_app() -> FastAPI:
     app.include_router(models.router)
     app.include_router(events.router)
     app.include_router(runs.router)
+    app.include_router(sandboxes.router)
     app.include_router(results.router)
     app.include_router(analytics.router)
     app.include_router(prices.router)
     app.include_router(preview.router)
     app.include_router(skillpacks.router)
     app.include_router(presets.router)
+    app.include_router(rubric_templates.router)
     app.include_router(suites.router)
     app.include_router(uploads.router)
     return app

@@ -604,3 +604,222 @@ def test_preset_analytics_empty_and_unscored(api, session_factory) -> None:
     assert data["trend"] == []
 
     assert api.client.get("/api/presets/ghost/analytics").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# PR23 — suggested_rubric + rubric_template/rubric_hint submit wiring
+# ---------------------------------------------------------------------------
+
+GAMMA_MD = """\
+---
+slug: gamma-preset
+title: Gamma preset
+description: the gamma task
+category: extraction
+tags: [gamma]
+suggested_rubric: extraction-accuracy
+---
+
+Extract the gamma things.
+"""
+
+
+def _run_config(api, run_id: str) -> dict:
+    detail = api.client.get(f"/api/runs/{run_id}").json()
+    return detail["config"]
+
+
+def test_suggested_rubric_frontmatter_parsing() -> None:
+    """Vendored ``suggested_rubric: <name>`` → ``{"template": name}``;
+    a ``hint:`` prefix maps to the domain-hint form."""
+    preset = preset_store.parse_preset_md(GAMMA_MD, filename="gamma-preset.md")
+    assert preset.suggested_rubric == {"template": "extraction-accuracy"}
+
+    hinted = GAMMA_MD.replace(
+        "suggested_rubric: extraction-accuracy", "suggested_rubric: hint: support tickets"
+    )
+    preset = preset_store.parse_preset_md(hinted, filename="gamma-preset.md")
+    assert preset.suggested_rubric == {"hint": "support tickets"}
+
+
+def test_vendored_suggested_rubrics_resolve() -> None:
+    """Every vendored preset that declares ``suggested_rubric`` names a
+    template that actually resolves in the merged library — a committed
+    typo would silently never apply, so the contract test pins it."""
+    from api import rubric_templates as template_store
+
+    preset_templates = {}
+    for p in preset_store.list_vendored(VENDORED_DIR):
+        if not p.suggested_rubric:
+            continue
+        name = p.suggested_rubric.get("template")
+        assert name, f"{p.slug}: suggested_rubric without template"
+        preset_templates[p.slug] = name
+        tpl = template_store.get_vendored(REPO_ROOT / "rubric_templates", name)
+        assert tpl is not None, (
+            f"{p.slug}: suggested_rubric template {name!r} not vendored"
+        )
+    # the non-code presets picked their domain templates
+    assert preset_templates.get("extraction-classification") == "extraction-accuracy"
+    assert preset_templates.get("support-reply") == "support-tone-compliance"
+
+
+def test_create_and_patch_suggested_rubric(api) -> None:
+    resp = api.client.post(
+        "/api/presets/custom-rubric",
+        json={
+            "title": "Custom",
+            "task_prompt": "do the custom thing",
+            "suggested_rubric": {"template": "code-default"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["suggested_rubric"] == {"template": "code-default"}
+
+    # invalid shapes 422 at the boundary
+    for bad in ("nope", {"bogus": 1}, {}, {"template": ""}):
+        resp = api.client.post(
+            "/api/presets/bad-shape",
+            json={
+                "title": "Bad",
+                "task_prompt": "x",
+                "suggested_rubric": bad,
+            },
+        )
+        assert resp.status_code == 422, bad
+
+    resp = api.client.patch(
+        "/api/presets/custom-rubric",
+        json={"suggested_rubric": {"hint": "tickets"}},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["suggested_rubric"] == {"hint": "tickets"}
+
+    # explicit null clears it
+    resp = api.client.patch(
+        "/api/presets/custom-rubric", json={"suggested_rubric": None}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["suggested_rubric"] is None
+
+
+def test_suggested_rubric_basis_serialized_size_cap(api) -> None:
+    """Item values inside the inline basis are bounded too — the fragment
+    is carried verbatim into ``config.rubric_basis`` and JSON-dumped into
+    the rubric-gen prompt, so oversized content 422s at the boundary."""
+    resp = api.client.post(
+        "/api/presets/huge-basis",
+        json={
+            "title": "Huge",
+            "task_prompt": "x",
+            "suggested_rubric": {
+                "dimensions": [{"name": "d", "description": "y" * 40_000}]
+            },
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_submit_preset_suggested_rubric_fills_template(api, presets_dir: Path) -> None:
+    """A preset's ``suggested_rubric`` supplies the run's rubric_template
+    ONLY when the submit didn't name one — explicit always wins."""
+    (presets_dir / "gamma-preset.md").write_text(GAMMA_MD)
+
+    resp = api.client.post(
+        "/api/runs",
+        json=_run_body(task_prompt="ignored", preset_ref="gamma-preset"),
+    )
+    assert resp.status_code == 201, resp.text
+    config = _run_config(api, resp.json()["id"])
+    assert config["rubric_template"] == "extraction-accuracy"
+    # category flows as the domain hint too
+    assert config["rubric_hint"] == "extraction"
+
+    # explicit template overrides the suggestion
+    resp = api.client.post(
+        "/api/runs",
+        json=_run_body(
+            task_prompt="ignored",
+            preset_ref="gamma-preset",
+            rubric_template="code-default",
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+    config = _run_config(api, resp.json()["id"])
+    assert config["rubric_template"] == "code-default"
+
+
+def test_submit_preset_category_becomes_hint(api) -> None:
+    """No suggested_rubric, no explicit hint → the preset's category is the
+    domain hint (the PR23 hint fallback chain)."""
+    resp = api.client.post(
+        "/api/runs",
+        json=_run_body(task_prompt="ignored", preset_ref="beta-preset"),
+    )
+    assert resp.status_code == 201, resp.text
+    config = _run_config(api, resp.json()["id"])
+    assert config["rubric_hint"] == "writing"
+    assert "rubric_template" not in config
+
+    # an explicit hint always wins over the category
+    resp = api.client.post(
+        "/api/runs",
+        json=_run_body(
+            task_prompt="ignored",
+            preset_ref="beta-preset",
+            rubric_hint="poetry",
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+    assert _run_config(api, resp.json()["id"])["rubric_hint"] == "poetry"
+
+
+def test_submit_rubric_template_validation(api) -> None:
+    """Explicit ``rubric_template`` must resolve — a typo 422s, not a
+    silent freeform fallback."""
+    resp = api.client.post(
+        "/api/runs",
+        json=_run_body(rubric_template="no-such-template"),
+    )
+    assert resp.status_code == 422
+    assert "rubric_template" in resp.json()["detail"]
+
+    resp = api.client.post(
+        "/api/runs",
+        json=_run_body(
+            rubric_template="code-default", rubric_hint="code task"
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+    config = _run_config(api, resp.json()["id"])
+    assert config["rubric_template"] == "code-default"
+    assert config["rubric_hint"] == "code task"
+
+
+def test_submit_inline_suggested_rubric_becomes_basis(api, session_factory) -> None:
+    """A user preset's inline ``{"dimensions": [...]}`` suggestion persists
+    as ``config.rubric_basis`` — the draft path uses it verbatim."""
+    with session_factory() as s:
+        s.add(
+            TaskPreset(
+                slug="inline-rubric",
+                title="Inline",
+                task_prompt="do inline things",
+                category="custom",
+                suggested_rubric={
+                    "dimensions": [
+                        {"name": "accuracy", "min_score": 0.0, "max_score": 10.0},
+                    ]
+                },
+            )
+        )
+        s.commit()
+    resp = api.client.post(
+        "/api/runs",
+        json=_run_body(task_prompt="ignored", preset_ref="inline-rubric"),
+    )
+    assert resp.status_code == 201, resp.text
+    config = _run_config(api, resp.json()["id"])
+    assert config["rubric_basis"]["dimensions"][0]["name"] == "accuracy"
+    assert "rubric_template" not in config
+    assert config["rubric_hint"] == "custom"

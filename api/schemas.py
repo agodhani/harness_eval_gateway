@@ -6,6 +6,7 @@ docs). Run-spec schemas (F1) and results schemas (F8) land with their routers.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from datetime import datetime
@@ -223,11 +224,19 @@ class BudgetsIn(BaseModel):
     """
 
     max_iters: int = Field(default=50, ge=1, le=1000)
-    token_budget: int = Field(default=200_000, ge=1_000)
+    # F30: bumped 200k → 500k — a real agentic task routinely burns past
+    # 200k on retries alone; the budget exists to stop runaways, not to
+    # starve honest work.
+    token_budget: int = Field(default=500_000, ge=1_000)
     wall_clock_seconds: int = Field(default=3600, ge=60, le=86_400)
     # PR28: per-sandbox/per-cell caps; None = unset (no per-cell limit).
     sandbox_token_budget: int | None = Field(default=None, ge=1_000)
     max_cost_usd: float | None = Field(default=None, gt=0)
+    # F30 stretch: on the first ``budget_warning`` the monitor grants the
+    # cell one automatic +50% extension on the warning limit (append-only
+    # ``budget_extended`` event, via="auto") — the same store a manual
+    # POST /api/sandboxes/{id}/extend_budget writes.
+    auto_extend: bool = False
 
 
 #: PR14 — sanity cap on the expanded comparison matrix (configs × models);
@@ -341,6 +350,39 @@ class TaskInputsIn(BaseModel):
         return self
 
 
+def _normalize_evaluator_panel(
+    evaluator_model: str | None, evaluator_models: list[str] | None
+) -> list[str] | None:
+    """PR29 — normalize the judge-panel spec shared by ``RunCreate`` /
+    ``SuiteRunIn``: dedupe/blank-drop ``evaluator_models`` preserving
+    order, then fold ``evaluator_model`` in as panel head — the single
+    field names the PRIMARY judge and ``config.evaluator_model`` persists
+    panel[0] so back-compat readers (rescore defaults, same_model_eval)
+    stay truthful. ``None`` when no panel was submitted (single-judge
+    runs keep the pre-PR29 config shape)."""
+    if evaluator_models is None:
+        return None
+    seen: set[str] = set()
+    panel: list[str] = []
+    for m in evaluator_models:
+        if m and m not in seen:
+            seen.add(m)
+            panel.append(m)
+    if not panel:
+        return None
+    if evaluator_model:
+        if evaluator_model in panel:
+            panel.remove(evaluator_model)
+        panel.insert(0, evaluator_model)
+        if len(panel) > 3:
+            raise ValueError(
+                "evaluator_model + evaluator_models would make a "
+                f"{len(panel)}-judge panel; max is 3 — drop "
+                "evaluator_model or shorten the list"
+            )
+    return panel
+
+
 class RunCreate(BaseModel):
     """POST /api/runs body — one evaluation submission."""
 
@@ -374,10 +416,33 @@ class RunCreate(BaseModel):
     evaluator_model: Annotated[str, StringConstraints(strip_whitespace=True)] | None = (
         Field(default=None, max_length=255)
     )
+    # PR29 — judge panel: an ordered list of 1–3 evaluator models, each
+    # scoring every artifact (results cells then carry the judge mean +
+    # spread). Extends ``evaluator_model`` — the single field keeps
+    # naming the panel's primary judge (folded to panel head when both
+    # are submitted). Omitted → single-judge run on
+    # evaluator_model/model_name, the pre-PR29 shape.
+    evaluator_models: (
+        list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]]
+        | None
+    ) = Field(default=None, max_length=3)
     budgets: BudgetsIn = Field(default_factory=BudgetsIn)
     # PR24 — seed every sandbox workspace from a repo or uploaded archive.
     # None = the historical empty-workspace behavior.
     task_inputs: TaskInputsIn | None = None
+    # PR23 — optional rubric-generation steering:
+    # ``rubric_template`` names a template from the merged library (vendored
+    # ``rubric_templates/*.json`` + user ``rubric_templates`` rows) used as
+    # the generator's basis instead of freeform drafting; when absent, a
+    # resolved preset's ``suggested_rubric`` fills in. ``rubric_hint`` is a
+    # free-text domain hint fed into the gen prompt so non-coding tasks get
+    # fitting dimensions (a resolved preset's category is the fallback).
+    rubric_template: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, max_length=64
+    )
+    rubric_hint: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, max_length=2000
+    )
     # PR27 — repeats per matrix cell: every effective config × model cell
     # spawns this many sandboxes (``trial_index`` 1..N stamped on each) so
     # results report mean ± sd instead of single samples. 1 = pre-PR27.
@@ -392,6 +457,10 @@ class RunCreate(BaseModel):
         post-trial sandbox count."""
         if self.preset_ref is not None and not self.preset_ref:
             self.preset_ref = None
+        if self.rubric_template is not None and not self.rubric_template:
+            self.rubric_template = None
+        if self.rubric_hint is not None and not self.rubric_hint:
+            self.rubric_hint = None
         if self.models is not None:
             seen = {self.model_name}
             cleaned: list[str] = []
@@ -400,6 +469,9 @@ class RunCreate(BaseModel):
                     seen.add(m)
                     cleaned.append(m)
             self.models = cleaned or None
+        self.evaluator_models = _normalize_evaluator_panel(
+            self.evaluator_model, self.evaluator_models
+        )
         model_count = 1 + len(self.models or [])
         pinned = sum(1 for hc in self.harness_configs if hc.model)
         cells = pinned + (len(self.harness_configs) - pinned) * model_count
@@ -412,6 +484,28 @@ class RunCreate(BaseModel):
                 f"max is {MAX_MATRIX_CELLS}"
             )
         return self
+
+
+class SandboxBudgetOut(BaseModel):
+    """F30 — live budget summary for one cell on the run detail payload.
+
+    ``used_tokens``/``limit_tokens`` describe the BINDING token ceiling:
+    the cell's own ``sandbox_token_budget`` when set (scope="sandbox"),
+    else the shared run ceiling (scope="run"). ``limit_*`` values already
+    include ``budget_extended`` grants, so the UI can show post-extension
+    headroom. ``warning`` flips when spend crosses the ~80% warn fraction
+    or a ``budget_warning`` checkpoint exists (gateway- or monitor-side).
+    """
+
+    used_tokens: int
+    limit_tokens: int
+    scope: str  # "run" | "sandbox"
+    pct: float
+    warning: bool = False
+    extended_tokens: int = 0
+    extended_cost_usd: float = 0.0
+    # Post-extension cost ceiling (max_cost_usd + grants); None = no cap.
+    limit_cost_usd: float | None = None
 
 
 class SandboxOut(BaseModel):
@@ -429,6 +523,10 @@ class SandboxOut(BaseModel):
     # Optional config label (PR1) — ``<adapter>-<shortid>`` default assigned
     # at provisioning; NULL on sandboxes that predate the column.
     name: str | None = None
+    # F30: live token/cost budget summary — powers the warning badge +
+    # extend affordance on run detail. Not an ORM attr; populated by
+    # ``_run_out`` from metered usage + extension events.
+    budget: SandboxBudgetOut | None = None
 
 
 class RubricOut(BaseModel):
@@ -476,6 +574,13 @@ class RunOut(BaseModel):
     # 1-based position among ``queued`` runs (approval/queue-entry order) —
     # set only while the run is parked; null in every other status.
     queue_position: int | None = None
+    # PR35: the run's read-only share view path (``/share/{token}``) when a
+    # link has been minted — null until POST /api/runs/{id}/share runs.
+    share_url: str | None = None
+    # F30 local-run pacing: the concurrent-container cap in effect for this
+    # run (all models resolve to a local provider → cells park as queued
+    # sandboxes past it). Null = no cap (remote models, or disabled).
+    sandbox_pacing_cap: int | None = None
     # Submit-time advisory warnings from the model-catalog check (e.g.
     # "model not in provider catalog") — populated on POST /api/runs only;
     # empty on reads (warnings are advisory, not persisted state).
@@ -904,6 +1009,95 @@ class RunTrends(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+#: Serialized-size cap on the inline rubric basis a preset's
+#: ``suggested_rubric`` can declare — ``_persist_run`` carries the
+#: ``summary``/``title``/``dimensions``/``criteria`` fragment verbatim into
+#: ``config.rubric_basis``, which ``_user_prompt`` JSON-dumps into the
+#: rubric-gen message. Vendored templates run ~2KB; this bound stays far
+#: past a legitimate basis and far under ``task_prompt``'s 100K.
+_SUGGESTED_RUBRIC_BASIS_MAX_CHARS = 32_000
+
+
+def _validate_suggested_rubric(v: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Shared shape check for a preset's ``suggested_rubric`` (PR23).
+
+    Accepted forms — the submit flow reads them in this order when no
+    explicit ``rubric_template`` was submitted:
+
+    - ``{"template": "<name>"}`` — a rubric_templates library name
+      (vendored file or user row) resolved as the generation basis.
+    - ``{"hint": "<text>"}`` — a domain hint fed into the gen prompt.
+    - ``{"dimensions": [...]}`` — an inline rubric fragment used as the
+      basis directly (may also carry summary/title/criteria keys).
+
+    Any combination of those keys is accepted; anything else 422s.
+    """
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise ValueError(  # noqa: TRY004 — ValueError maps to a 422 in a pydantic validator
+            "suggested_rubric must be an object — "
+            '{"template": name}, {"hint": text}, or {"dimensions": [...]}'
+        )
+    allowed = {"template", "hint", "dimensions", "summary", "criteria", "title"}
+    unknown = sorted(set(v) - allowed)
+    if unknown:
+        raise ValueError(f"suggested_rubric: unknown keys {unknown}")
+    if "template" in v and (
+        not isinstance(v.get("template"), str) or not v["template"].strip()
+    ):
+        raise ValueError("suggested_rubric.template must be a non-empty name")
+    if "hint" in v and (
+        not isinstance(v.get("hint"), str) or not v["hint"].strip()
+    ):
+        raise ValueError("suggested_rubric.hint must be non-empty text")
+    # These strings reach the rubric-gen prompt verbatim (hint as the
+    # domain-hint line, summary/title inside the basis JSON), so they're
+    # capped like the item lists. ``hint`` shares ``RunCreate.rubric_hint``'s
+    # bound; ``title`` shares ``PresetCreate.title``'s.
+    for key, cap in (("hint", 2000), ("summary", 2000), ("title", 255)):
+        if key not in v:
+            continue
+        if not isinstance(v[key], str):
+            raise ValueError(  # noqa: TRY004 — ValueError maps to a 422
+                f"suggested_rubric.{key} must be text"
+            )
+        if len(v[key]) > cap:
+            raise ValueError(
+                f"suggested_rubric.{key} allows at most {cap} chars"
+            )
+    for key in ("dimensions", "criteria"):
+        items = v.get(key)
+        if items is None:
+            continue
+        if not isinstance(items, list):
+            raise ValueError(  # noqa: TRY004 — ValueError maps to a 422
+                f"suggested_rubric.{key} must be a list"
+            )
+        if len(items) > 24:
+            raise ValueError(
+                f"suggested_rubric.{key} allows at most 24 items"
+            )
+        if not all(isinstance(item, dict) for item in items):
+            raise ValueError(f"suggested_rubric.{key} items must be objects")
+    basis = {
+        k: v[k] for k in ("summary", "title", "dimensions", "criteria") if k in v
+    }
+    if basis and (
+        len(json.dumps(basis, ensure_ascii=False, default=str))
+        > _SUGGESTED_RUBRIC_BASIS_MAX_CHARS
+    ):
+        raise ValueError(
+            "suggested_rubric basis exceeds "
+            f"{_SUGGESTED_RUBRIC_BASIS_MAX_CHARS} serialized chars"
+        )
+    if not v.get("template") and not v.get("hint") and not v.get("dimensions"):
+        raise ValueError(
+            "suggested_rubric must declare template, hint, or dimensions"
+        )
+    return v
+
+
 class PresetOut(BaseModel):
     """One task preset — a vendored ``task_presets/<slug>.md`` file or a
     user-saved ``task_presets`` row. Both sources read identically; ``source``
@@ -924,6 +1118,10 @@ class PresetOut(BaseModel):
     revision: int = 1
     suggested_adapter: str | None = None
     suggested_models: list[str] = Field(default_factory=list)
+    # PR23 — rubric-generation basis a preset-submit falls back to when no
+    # explicit ``rubric_template`` was sent (``{"template"|"hint"|
+    # "dimensions"}`` — see _validate_suggested_rubric).
+    suggested_rubric: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     # Library-browse aggregates — every run whose preset_ref matches the
@@ -963,6 +1161,8 @@ class PresetCreate(BaseModel):
     suggested_models: list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]] | None = Field(
         default=None, max_length=8
     )
+    # PR23 — optional rubric basis the preset's submits fall back to.
+    suggested_rubric: dict[str, Any] | None = None
 
     @field_validator("tags", "suggested_models", mode="after")
     @classmethod
@@ -970,6 +1170,11 @@ class PresetCreate(BaseModel):
         if isinstance(v, list):
             return [t for t in v if t]
         return v
+
+    @field_validator("suggested_rubric", mode="after")
+    @classmethod
+    def _suggested_rubric_shape(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        return _validate_suggested_rubric(v)
 
 
 class PresetUpdate(BaseModel):
@@ -1001,6 +1206,8 @@ class PresetUpdate(BaseModel):
     suggested_models: list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]] | None = Field(
         default=None, max_length=8
     )
+    # PR23 — explicit null clears the suggestion; omit keeps it.
+    suggested_rubric: dict[str, Any] | None = None
 
     @field_validator("tags", "suggested_models", mode="after")
     @classmethod
@@ -1008,6 +1215,11 @@ class PresetUpdate(BaseModel):
         if isinstance(v, list):
             return [t for t in v if t]
         return v
+
+    @field_validator("suggested_rubric", mode="after")
+    @classmethod
+    def _suggested_rubric_shape(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        return _validate_suggested_rubric(v)
 
 
 class PresetRunPoint(BaseModel):
@@ -1064,6 +1276,24 @@ class PresetAnalytics(BaseModel):
     mean_overall_score: float | None = None
     n_scored: int = 0
     trend: list[PresetTrendPoint] = Field(default_factory=list)  # oldest first
+
+
+# ---------------------------------------------------------------------------
+# PR23 — rubric template library (api/routers/rubric_templates.py)
+# ---------------------------------------------------------------------------
+
+
+class RubricTemplateOut(BaseModel):
+    """One rubric template — a vendored ``rubric_templates/<name>.json``
+    file or a user ``rubric_templates`` row. ``content`` is a validated
+    RubricContent-shaped dict the generator refines when the template is
+    the run's ``rubric_template`` basis."""
+
+    name: str
+    description: str = ""
+    content: dict[str, Any] = Field(default_factory=dict)
+    source: str = "user"  # "vendored" | "user"
+    created_at: datetime | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1145,6 +1375,12 @@ class SuiteRunIn(BaseModel):
     evaluator_model: Annotated[str, StringConstraints(strip_whitespace=True)] | None = (
         Field(default=None, max_length=255)
     )
+    # PR29 parity — optional 1–3 judge panel every suite task evaluates
+    # with (same ``_normalize_evaluator_panel`` fold as RunCreate).
+    evaluator_models: (
+        list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]]
+        | None
+    ) = Field(default=None, max_length=3)
     budgets: BudgetsIn = Field(default_factory=BudgetsIn)
     # PR27 parity — each suite task's matrix multiplies by trials the same
     # way a normal submit does.
@@ -1163,6 +1399,9 @@ class SuiteRunIn(BaseModel):
                     seen.add(m)
                     cleaned.append(m)
             self.models = cleaned or None
+        self.evaluator_models = _normalize_evaluator_panel(
+            self.evaluator_model, self.evaluator_models
+        )
         model_count = 1 + len(self.models or [])
         pinned = sum(1 for hc in self.harness_configs if hc.model)
         cells = pinned + (len(self.harness_configs) - pinned) * model_count
@@ -1326,3 +1565,114 @@ class Leaderboard(BaseModel):
     n_scored: int = 0  # cells carrying a latest ``overall`` score
     by_model: list[LeaderboardEntry] = Field(default_factory=list)
     by_config: list[LeaderboardEntry] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# PR36 — dashboard summary (api/routers/analytics.py GET /api/analytics/summary)
+# ---------------------------------------------------------------------------
+
+
+class DashboardTotals(BaseModel):
+    """All-time rollup for the dashboard KPI strip."""
+
+    runs: int = 0
+    sandboxes: int = 0
+    # Sandbox cells carrying at least one ``overall`` score row.
+    scored_sandboxes: int = 0
+    # Metered llm_response events — participant, judge, and run-level
+    # control-plane calls (rubric drafting) alike.
+    llm_turns: int = 0
+    tokens: TokenUsage = Field(default_factory=TokenUsage)
+    # Estimated spend over priced traffic. None when ANY metered call was
+    # unpriced (PR21 convention — a partial total would read as complete).
+    estimated_cost_usd: float | None = None
+    # Metered calls with no resolvable rate — explains a null total.
+    unpriced_llm_turns: int = 0
+
+
+class DashboardWeekPoint(BaseModel):
+    """One ISO-week bucket (Monday-anchored, UTC) — runs created + metered
+    traffic + est. spend for the spend/runs-per-week cards."""
+
+    week: str  # ISO label — "2026-W05"
+    week_start: datetime
+    runs: int = 0  # runs created inside the bucket
+    llm_turns: int = 0
+    # Same honesty rule as the totals: null when any metered call in the
+    # week was unpriced — the gap is labeled, never zero-filled.
+    estimated_cost_usd: float | None = None
+    unpriced_llm_turns: int = 0
+
+
+class DashboardTerminalSlice(BaseModel):
+    """One terminal-reason count for the outcome donut."""
+
+    reason: str
+    count: int
+
+
+class DashboardQueueRun(BaseModel):
+    """One run shown in the queue/active card."""
+
+    run_id: uuid.UUID
+    status: str
+    task_prompt: str  # truncated server-side
+    model_name: str
+    preset_ref: str | None = None
+    # 1-based position among ``queued`` runs (pacing order) — only on
+    # queued entries.
+    queue_position: int | None = None
+    created_at: datetime | None = None
+    started_at: datetime | None = None  # approval/queue-entry time
+
+
+class DashboardQueue(BaseModel):
+    """Live lane: in-flight runs, the pacing queue, and runs parked before
+    the queue (awaiting a rubric decision)."""
+
+    # provisioning | running | evaluating — pacing serializes to one, but a
+    # rescued/crashed state can show more; the list is the honest shape.
+    active: list[DashboardQueueRun] = Field(default_factory=list)
+    # ``queued`` runs in promotion order, queue_position stamped.
+    queued: list[DashboardQueueRun] = Field(default_factory=list)
+    # submitted + rubric_review — submitted but not yet in the queue.
+    awaiting_review: int = 0
+
+
+class DashboardRecentRun(BaseModel):
+    """One row of the recent-runs table — the runs-list shape plus the
+    mean-overall column (newest-wins per sandbox, then averaged)."""
+
+    run_id: uuid.UUID
+    status: str
+    task_prompt: str  # truncated server-side
+    model_name: str
+    preset_ref: str | None = None
+    sandbox_count: int = 0
+    created_at: datetime | None = None
+    finished_at: datetime | None = None
+    # Mean of the run's latest ``overall`` scores; null when unscored.
+    mean_overall_score: float | None = None
+
+
+class DashboardSummary(BaseModel):
+    """GET /api/analytics/summary response — everything the /dashboard cards
+    need that isn't already served by the leaderboard aggregate."""
+
+    generated_at: datetime
+    # The explicit ``?price_model=`` repricing basis, or null for per-model
+    # auto pricing (same convention as RunTrends).
+    price_model: str | None = None
+    totals: DashboardTotals = Field(default_factory=DashboardTotals)
+    # Consecutive ISO-week buckets, oldest first, ending at the CURRENT
+    # week — ``?weeks=`` sets the window (zero-filled weeks are honest
+    # zeros: no runs, no traffic).
+    weeks: list[DashboardWeekPoint] = Field(default_factory=list)
+    # All-time terminal-reason histogram over sandboxes that reached a
+    # terminal state, count-desc.
+    terminal_mix: list[DashboardTerminalSlice] = Field(default_factory=list)
+    # Sandboxes with no terminal_reason yet — pending lanes stay visible,
+    # not dropped into the donut.
+    terminal_pending: int = 0
+    queue: DashboardQueue = Field(default_factory=DashboardQueue)
+    recent_runs: list[DashboardRecentRun] = Field(default_factory=list)

@@ -6,7 +6,7 @@ freeform prompt. Two sources share ONE slug namespace:
 - **vendored** — ``task_presets/<slug>.md`` at the repo root: a YAML-ish
   frontmatter block (``slug`` — which must equal the filename stem —
   ``title``, ``description``, ``category``, ``tags``, optional
-  ``suggested_adapter``/``suggested_models``)
+  ``suggested_adapter``/``suggested_models``/``suggested_rubric``)
   followed by a markdown body that IS the task prompt. Committed + baked
   into the api image like ``skillpacks/``.
 - **user** — ``task_presets`` table rows created via
@@ -88,6 +88,9 @@ class Preset:
     revision: int = 1
     suggested_adapter: str | None = None
     suggested_models: list[str] = field(default_factory=list)
+    # PR23: ``{"template"|"hint"|"dimensions"}`` rubric-basis hint a submit
+    # falls back to when RunCreate.rubric_template is absent.
+    suggested_rubric: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -165,6 +168,25 @@ def _list_value(value: Any) -> list[str]:
     return out
 
 
+def _suggested_rubric_value(value: Any) -> dict[str, Any] | None:
+    """Normalize the vendored frontmatter ``suggested_rubric`` key (PR23).
+
+    The mini frontmatter parser yields scalars, so the committed form is a
+    bare template name — ``suggested_rubric: extraction-accuracy`` →
+    ``{"template": "extraction-accuracy"}`` (resolved at submit; an
+    unresolvable name is ignored rather than failing the preset). A
+    ``hint: <text>`` prefixed scalar maps to the domain-hint form. User
+    presets store the full dict form directly.
+    """
+    text = _scalar(value)
+    if not text:
+        return None
+    if text.lower().startswith("hint:"):
+        hint = text[5:].strip()
+        return {"hint": hint} if hint else None
+    return {"template": text}
+
+
 def parse_preset_md(text: str, *, filename: str) -> Preset:
     """Parse one ``<slug>.md`` preset file into a vendored ``Preset``.
 
@@ -205,6 +227,7 @@ def parse_preset_md(text: str, *, filename: str) -> Preset:
         revision=1,
         suggested_adapter=_scalar(meta.get("suggested_adapter")) or None,
         suggested_models=_list_value(meta.get("suggested_models")),
+        suggested_rubric=_suggested_rubric_value(meta.get("suggested_rubric")),
     )
 
 
@@ -272,6 +295,9 @@ def user_to_preset(row: TaskPreset) -> Preset:
         revision=row.revision or 1,
         suggested_adapter=row.suggested_adapter,
         suggested_models=[str(m) for m in (row.suggested_models or [])],
+        suggested_rubric=dict(row.suggested_rubric)
+        if isinstance(row.suggested_rubric, dict)
+        else None,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

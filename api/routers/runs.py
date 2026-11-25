@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from api import modelcheck
 from api import presets as preset_store
+from api import rubric_templates as template_store
 from api.config import get_settings
 from api.deps import get_db
 from api.schemas import (
@@ -33,21 +34,24 @@ from api.schemas import (
     RunDeleteOut,
     RunOut,
     RunSummary,
+    SandboxBudgetOut,
     SandboxOut,
 )
 from db.models import (
     Artifact,
     CheckerResult,
     Event,
+    PairwiseVote,
     Rubric,
     Run,
     Sandbox,
     Score,
 )
+from gateway import metering
 from orchestrator import adapters as orch_adapters
 from orchestrator import events as orch_events
 from orchestrator import pacing, provision, runner, state_machine
-from orchestrator.matrix import participant_models, run_models
+from orchestrator.matrix import judge_models, participant_models, run_models
 from orchestrator.rubric import RubricContent
 from sandbox import seeds
 from skillpack_import.store import imported_root
@@ -92,11 +96,12 @@ def _run_sandboxes(session: Session, run_id: uuid.UUID) -> list[Sandbox]:
 
 
 def _same_model_eval(run: Run) -> bool:
-    """True when the judge model equals ANY participant model — non-independent
-    judging for that cell (PR14: participants are a set, not just model_name;
-    per-config ``model`` pins count too — ``run_models``)."""
-    evaluator = (run.config or {}).get("evaluator_model") or run.model_name
-    return evaluator in set(run_models(run.config, run.model_name))
+    """True when ANY judge model equals a participant model — non-independent
+    judging for that cell (PR29: the flag aggregates across the judge
+    panel; PR14: participants are a set, not just model_name — per-config
+    ``model`` pins count too — ``run_models``)."""
+    participants = set(run_models(run.config, run.model_name))
+    return bool(set(judge_models(run.config, run.model_name)) & participants)
 
 
 def _queue_positions(session: Session) -> dict[uuid.UUID, int]:
@@ -111,10 +116,69 @@ def _queue_positions(session: Session) -> dict[uuid.UUID, int]:
     return {run_id: i + 1 for i, run_id in enumerate(rows)}
 
 
+def _sandbox_budget_map(
+    session: Session, run: Run, sandboxes: list[Sandbox]
+) -> dict[uuid.UUID, SandboxBudgetOut]:
+    """F30 — live per-cell budget summaries for the run detail payload.
+
+    Two grouped queries (usage + budget-state events) cover every cell —
+    no per-row fanout, so a 32-sandbox run stays cheap. ``None`` keys in
+    ``usage_by_sandbox`` are sandbox-less traffic (service/eval creds);
+    they still count toward the shared run ceiling, so they fold into
+    ``run_total``.
+    """
+    budgets = provision.budgets_for(run)
+    token_budget = budgets.get("token_budget")
+    sb_cap = budgets.get("sandbox_token_budget")
+    max_cost = budgets.get("max_cost_usd")
+    if not token_budget:
+        return {}
+    usage = metering.usage_by_sandbox(session, run.id)
+    states = metering.budget_states(session, run.id)
+    run_total = sum(usage.values())
+    out: dict[uuid.UUID, SandboxBudgetOut] = {}
+    for s in sandboxes:
+        st = states.get(s.id) or {
+            "added_tokens": 0,
+            "added_cost_usd": 0.0,
+            "warned": set(),
+        }
+        ext_tok = int(st["added_tokens"])
+        ext_cost = float(st["added_cost_usd"])
+        if sb_cap:
+            used = int(usage.get(s.id, 0))
+            limit = int(sb_cap) + ext_tok
+            scope = "sandbox"
+        else:
+            used = run_total
+            limit = int(token_budget) + ext_tok
+            scope = "run"
+        pct = used / limit if limit else 0.0
+        out[s.id] = SandboxBudgetOut(
+            used_tokens=used,
+            limit_tokens=limit,
+            scope=scope,
+            pct=round(pct, 3),
+            warning=bool(st["warned"])
+            or pct >= metering.BUDGET_WARN_FRACTION,
+            extended_tokens=ext_tok,
+            extended_cost_usd=ext_cost,
+            limit_cost_usd=(float(max_cost) + ext_cost) if max_cost else None,
+        )
+    return out
+
+
 def _run_out(
     session: Session, run: Run, *, warnings: list[str] | None = None
 ) -> RunOut:
     rubric = _latest_rubric(session, run.id)
+    sandboxes = _run_sandboxes(session, run.id)
+    budget_map = _sandbox_budget_map(session, run, sandboxes)
+    sandbox_outs: list[SandboxOut] = []
+    for s in sandboxes:
+        s_out = SandboxOut.model_validate(s)
+        s_out.budget = budget_map.get(s.id)
+        sandbox_outs.append(s_out)
     return RunOut(
         id=run.id,
         status=run.status,
@@ -130,13 +194,18 @@ def _run_out(
         queue_position=(
             _queue_positions(session).get(run.id) if run.status == "queued" else None
         ),
+        # F30: the local-provider container cap in effect — the UI uses it
+        # to label queued cells ("local pacing · max N").
+        sandbox_pacing_cap=pacing.local_sandbox_cap(get_settings(), run)
+        or None,
         warnings=list(warnings or []),
         preset_ref=run.preset_ref,
         preset_revision=run.preset_revision,
         suite_ref=run.suite_ref,
         suite_index=run.suite_index,
         suite_run_id=run.suite_run_id,
-        sandboxes=[SandboxOut.model_validate(s) for s in _run_sandboxes(session, run.id)],
+        share_url=f"/share/{run.share_token}" if run.share_token else None,
+        sandboxes=sandbox_outs,
         rubric=RubricOut.model_validate(rubric) if rubric else None,
     )
 
@@ -247,7 +316,15 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
             entry.pop("model_options", None)
         configs_in.append(entry)
 
-    evaluator_model = body.evaluator_model or body.model_name
+    # PR29 — judge panel: ``evaluator_models`` (already normalized with
+    # evaluator_model folded to panel head) when the spec carried one;
+    # else the single evaluator_model/model_name fallback. panel[0] is
+    # the primary judge and fills ``evaluator_model`` for back-compat
+    # readers (rescore defaults, results field).
+    evaluator_models = list(body.evaluator_models) if body.evaluator_models else [
+        body.evaluator_model or body.model_name
+    ]
+    evaluator_model = evaluator_models[0]
     # PR14: persist the run's model list ([model_name] + deduped extras) so
     # lifecycle/results/analytics can expand the matrix without re-parsing
     # the raw request. Per-config ``model`` pins stay inside each config
@@ -257,6 +334,13 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
         "harness_configs": configs_in,
         "models": models,
         "evaluator_model": evaluator_model,
+        # The ordered judge panel — only persisted when the spec actually
+        # carried one, so legacy/single-judge runs keep their config shape.
+        **(
+            {"evaluator_models": evaluator_models}
+            if body.evaluator_models is not None
+            else {}
+        ),
         "budgets": body.budgets.model_dump(),
         # PR24: the seed spec — only present on seeded runs (unseeded keeps
         # the legacy config shape). Provisioning materializes it once and
@@ -273,8 +357,10 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
     }
     # Judge == any participant model flags non-independent scoring; pins
     # count as participants even when outside the run's model list.
-    config["same_model_eval"] = evaluator_model in set(
-        run_models(config, body.model_name)
+    # PR29: ANY panel member counts — a 3-judge panel where one judge is
+    # a participant is still non-independent.
+    config["same_model_eval"] = bool(
+        set(evaluator_models) & set(run_models(config, body.model_name))
     )
 
     # PR22 preset resolution — a preset_ref asserts the task came from the
@@ -284,6 +370,7 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
     task_prompt = body.task_prompt
     preset_ref: str | None = None
     preset_revision: int | None = None
+    preset: preset_store.Preset | None = None
     if body.preset_ref:
         preset = preset_store.resolve(
             session, get_settings().TASK_PRESETS_DIR, body.preset_ref
@@ -299,6 +386,65 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
         task_prompt = preset.task_prompt
         preset_ref = preset.slug
         preset_revision = preset.revision
+
+    # PR23 — rubric-generation steering. An explicit ``rubric_template``
+    # wins outright and must resolve (a typo 422s, not a silent freeform
+    # fallback); a resolved preset's ``suggested_rubric`` fills in only when
+    # no template was submitted, and an unresolvable suggestion degrades
+    # quietly (a suggestion is a hint, not a contract). ``rubric_hint``
+    # falls back to the preset's category so preset tasks keep their domain
+    # in the gen prompt.
+    rubric_template = body.rubric_template
+    rubric_hint = body.rubric_hint
+    rubric_basis: dict[str, Any] | None = None
+    # getattr: test fixtures lean on the settings namespace — the repo-root
+    # default mirrors api.config's vendored dir.
+    templates_dir = getattr(get_settings(), "RUBRIC_TEMPLATES_DIR", None) or (
+        Path(__file__).resolve().parents[2] / "rubric_templates"
+    )
+    if rubric_template is not None:
+        resolved_template = template_store.resolve(
+            session, templates_dir, rubric_template
+        )
+        if resolved_template is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"unknown rubric_template {rubric_template!r} — "
+                    "GET /api/rubric-templates lists valid names"
+                ),
+            )
+        rubric_template = resolved_template.name
+    elif preset is not None:
+        suggested = preset.suggested_rubric or {}
+        suggested_template = str(suggested.get("template") or "").strip()
+        if suggested_template:
+            resolved_template = template_store.resolve(
+                session, templates_dir, suggested_template
+            )
+            if resolved_template is not None:
+                rubric_template = resolved_template.name
+        if rubric_template is None and isinstance(
+            suggested.get("dimensions"), list
+        ):
+            # Inline rubric fragment — carried verbatim as the basis.
+            rubric_basis = {
+                k: suggested[k]
+                for k in ("summary", "title", "dimensions", "criteria")
+                if k in suggested
+            }
+        if rubric_hint is None:
+            suggested_hint = str(suggested.get("hint") or "").strip()
+            if suggested_hint:
+                rubric_hint = suggested_hint
+    if rubric_hint is None and preset is not None and preset.category:
+        rubric_hint = preset.category
+    if rubric_template is not None:
+        config["rubric_template"] = rubric_template
+    if rubric_basis is not None:
+        config["rubric_basis"] = rubric_basis
+    if rubric_hint is not None:
+        config["rubric_hint"] = rubric_hint
 
     run = Run(
         status="submitted",
@@ -499,6 +645,7 @@ def _hard_delete_run(session: Session, run: Run) -> None:
     sandbox_ids = select(Sandbox.id).where(Sandbox.run_id == run.id)
     session.execute(delete(Score).where(Score.sandbox_id.in_(sandbox_ids)))
     session.execute(delete(Artifact).where(Artifact.sandbox_id.in_(sandbox_ids)))
+    session.execute(delete(PairwiseVote).where(PairwiseVote.run_id == run.id))
     session.execute(
         delete(CheckerResult).where(CheckerResult.run_id == run.id)
     )

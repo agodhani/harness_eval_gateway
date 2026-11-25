@@ -320,15 +320,16 @@ async def test_evaluate_partial_scores_keeps_valid(seeded, session_factory) -> N
         ]
     }
     rows = await _eval(seeded, session_factory, FakeRuntime(scores_obj=partial))
-    # no `overall` in the doc -> synthesized as the mean of the valid entries
+    # no `overall` in the doc -> synthesized from the valid entries
     assert [r.dimension for r in rows] == ["functional_requirements", "overall"]
     assert rows[-1].score == 8.0
     events = _events_in_db(session_factory)
     scored = [e for e in events if e.payload.get("phase") == "eval_scored"]
     assert scored and scored[0].payload["warnings"]
-    assert "overall missing — computed as mean of dimension scores" in (
-        scored[0].payload["warnings"]
-    )
+    assert (
+        "overall missing — computed from dimension scores "
+        "(scale-normalized to 0-10)"
+    ) in scored[0].payload["warnings"]
     assert scored[0].payload["overall"] == 8.0
 
 
@@ -351,7 +352,8 @@ async def test_evaluate_genuine_overall_no_synthesis_warning(
     ]
     assert scored[0].payload["overall"] == 7.0
     assert not any(
-        "computed as mean" in w for w in scored[0].payload["warnings"]
+        "computed from dimension scores" in w
+        for w in scored[0].payload["warnings"]
     )
 
 
@@ -1033,3 +1035,47 @@ async def test_evaluate_prompt_output_analysis_persists(
     static = next(s for s in report["signals"] if s["name"] == "static_analysis")
     # output.txt isn't a source language — 0 files analyzed, not an error
     assert static["metrics"]["files_analyzed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# PR29 — judge attribution
+# ---------------------------------------------------------------------------
+
+
+async def test_evaluate_stamps_judge_model_on_rows_and_events(
+    seeded, session_factory
+) -> None:
+    """PR29 — every Score row + the eval_scored checkpoint names the
+    judging model; a panel keeps each judge's verdict attributable."""
+    rows = await _eval(seeded, session_factory, FakeRuntime(), model="judge-b")
+    assert rows
+    assert all(r.judge_model == "judge-b" for r in rows)
+    assert all(r.source == "llm" for r in rows)
+
+    db_rows = _scores_in_db(session_factory)
+    assert {r.judge_model for r in db_rows} == {"judge-b"}
+    assert {r.source for r in db_rows} == {"llm"}
+
+    scored = next(
+        e for e in _events_in_db(session_factory)
+        if e.payload.get("phase") == "eval_scored"
+    )
+    assert scored.payload["judge_model"] == "judge-b"
+
+
+async def test_evaluate_failure_event_names_judge(
+    seeded, session_factory
+) -> None:
+    """eval_scores_failed carries judge_model — the timeline attributes a
+    panel member's failure to that judge, not 'the evaluator'."""
+    fake = FakeRuntime(scores_obj=None)
+    rows = await _eval(
+        seeded, session_factory, fake,
+        model="judge-b", direct_client=_failing_client(),
+    )
+    assert rows == []
+    err = next(
+        e for e in _events_in_db(session_factory)
+        if e.payload.get("phase") == "eval_scores_failed"
+    )
+    assert err.payload["judge_model"] == "judge-b"

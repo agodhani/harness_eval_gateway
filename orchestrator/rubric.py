@@ -24,10 +24,16 @@ same prompt AND parse/validation failures with the validation error fed
 back into the prompt (judge ``prior_error`` pattern); and small lenient
 coercions before validation (``generated_by`` non-dict → ``{"source": ...}``,
 numeric strings in dimension/criterion number fields). Structural problems
-— missing/extra/dup dimensions — still hard-fail.
+— duplicate dimensions after normalization — still hard-fail.
 
-The rubric's ``dimensions`` must cover exactly the four canonical names the
-evaluator (F7) scores against; LLM variants are normalized by name-match.
+PR23 (F26) unlocked the dimension set: ``dimensions`` accepts 1–12 arbitrary
+names (snake_case normalized, the canonical alias map stays as a soft
+normalizer, deduplicated after normalization). The four canonical names
+remain the DEFAULT the generation prompt requests for freeform coding tasks;
+a submitted ``rubric_hint``/preset category steers non-code tasks toward
+fitting dimensions, and a ``rubric_template`` (vendored ``rubric_templates/
+*.json`` or a user ``rubric_templates`` row) supplies the rubric basis the
+generator refines instead of drafting freeform.
 """
 
 from __future__ import annotations
@@ -36,9 +42,9 @@ import asyncio
 import json
 import logging
 import os
-import re
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -49,6 +55,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from db.models import Rubric, Run
 from gateway.creds import mint_cred
 from gateway.metering import tokens_used
+from scoring.checkers import RESERVED_DIMENSION_NAMES, fold_dimension_name
 
 from . import state_machine
 from .events import emit
@@ -58,7 +65,11 @@ if TYPE_CHECKING:  # avoid a runtime api.* import cycle; settings is duck-typed
 
 log = logging.getLogger(__name__)
 
-# Canonical rubric dimensions — the F7/evaluator contract (AGENTS.md MVP set).
+# Canonical rubric dimensions — the DEFAULT set the generation prompt asks
+# for on freeform coding tasks (the ``code-default`` rubric template). Since
+# PR23 (F26) a rubric may carry 1–12 arbitrary dimensions; these names stay
+# special only as the code-task default, the alias map's targets, and the
+# results UI's sort anchor (canonical-first ordering in web/lib/api.ts).
 CANONICAL_DIMENSIONS = (
     "functional_requirements",
     "acceptance_criteria",
@@ -66,37 +77,18 @@ CANONICAL_DIMENSIONS = (
     "cyclomatic_complexity",
 )
 
-# LLM-friendly aliases normalized onto the canonical names before validation.
-_DIMENSION_ALIASES = {
-    "functional": "functional_requirements",
-    "functional_req": "functional_requirements",
-    "functional_reqs": "functional_requirements",
-    "requirements": "functional_requirements",
-    "acceptance": "acceptance_criteria",
-    "acceptance_tests": "acceptance_criteria",
-    "code": "code_quality",
-    "implementation": "code_quality",
-    "implementation_quality": "code_quality",
-    "code_implementation": "code_quality",
-    "code_implementation_quality": "code_quality",
-    "quality": "code_quality",
-    "complexity": "cyclomatic_complexity",
-    "cyclomatic": "cyclomatic_complexity",
-}
+#: ``RubricContent.dimensions`` count bounds (PR23).
+MIN_DIMENSIONS = 1
+MAX_DIMENSIONS = 12
+#: ``RubricDimension.name`` bound (normalized form) — the name keys
+#: ``scores.dimension`` (String(128)) and the eval parser truncates longer
+#: judge-emitted names, so a longer rubric name would silently lose its score.
+MAX_DIMENSION_NAME = 128
 
-_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
-
-
-def _normalize_dimension_name(name: str) -> str:
-    """``"Code Implementation Quality!!"`` → ``code_implementation_quality``."""
-    return _NON_ALNUM_RE.sub("_", name.strip().lower()).strip("_")
-
-
-def _canonical_dimension(name: str) -> str:
-    norm = _normalize_dimension_name(name)
-    if norm in CANONICAL_DIMENSIONS:
-        return norm
-    return _DIMENSION_ALIASES.get(norm, norm)
+#: Reserved score-namespace names (``orchestrator.rubric`` authoring guard)
+#: and the LLM-phrasing alias map + shared fold live in
+#: ``scoring.checkers`` — ``evaluator.scores`` applies the same contract to
+#: judge output, so both sides import the one definition.
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +97,13 @@ def _canonical_dimension(name: str) -> str:
 
 
 class RubricDimension(BaseModel):
+    """One scored axis — ``name`` is the stable key scores are stored under.
+
+    PR23: arbitrary names are allowed (1–12 dimensions per rubric); the name
+    normalizes to snake_case and folds through the canonical alias map only
+    when it matches a known alias — a soft normalizer, never a validator.
+    """
+
     name: str
     title: str = ""
     description: str = ""
@@ -122,40 +121,68 @@ class RubricCriterion(BaseModel):
     weight: float = 1.0
 
 
+def _normalized_dimension_name(value: str) -> str:
+    """Soft-normalize a dimension/criterion reference.
+
+    Folds whitespace/punctuation/case variants to snake_case and maps known
+    aliases onto the canonical spellings; anything else passes through.
+    Raises ``ValueError`` when nothing usable remains — a name made purely
+    of punctuation would key scores under ``""``.
+    """
+    normalized = fold_dimension_name(value)
+    if not normalized:
+        raise ValueError(f"dimension name {value!r} normalizes to empty")
+    if len(normalized) > MAX_DIMENSION_NAME:
+        raise ValueError(
+            f"dimension name {value!r} normalizes to {len(normalized)} chars "
+            f"(max {MAX_DIMENSION_NAME})"
+        )
+    return normalized
+
+
 class RubricContent(BaseModel):
     """Validated rubric JSON — what gets frozen into ``rubrics.content``.
 
-    ``extra="allow"`` keeps LLM-added top-level fields; ``dimensions`` is
-    strict: after name normalization it must be EXACTLY the four canonical
-    dimensions (F7 scores per dimension name).
+    ``extra="allow"`` keeps LLM-added top-level fields. ``dimensions``
+    accepts 1–12 entries (PR23): each name soft-normalizes (snake_case +
+    canonical aliases); names normalizing to empty or past
+    ``MAX_DIMENSION_NAME``, reserved score fields, and duplicates after
+    normalization are rejected.
     """
 
     model_config = ConfigDict(extra="allow")
 
     summary: str = ""
-    dimensions: list[RubricDimension] = Field(min_length=1)
+    dimensions: list[RubricDimension] = Field(
+        min_length=MIN_DIMENSIONS, max_length=MAX_DIMENSIONS
+    )
     criteria: list[RubricCriterion] = Field(default_factory=list)
     generated_by: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def _enforce_canonical_dimensions(self) -> RubricContent:
+    def _normalize_dimensions(self) -> RubricContent:
         seen: list[str] = []
         for dim in self.dimensions:
-            canonical = _canonical_dimension(dim.name)
+            canonical = _normalized_dimension_name(dim.name)
+            if canonical in RESERVED_DIMENSION_NAMES:
+                raise ValueError(
+                    f"dimension name {canonical!r} is a reserved score field"
+                )
             dim.name = canonical
             seen.append(canonical)
         names = set(seen)
-        missing = [d for d in CANONICAL_DIMENSIONS if d not in names]
-        extra = sorted(names - set(CANONICAL_DIMENSIONS))
-        problems = []
-        if missing:
-            problems.append(f"missing dimensions: {missing}")
-        if extra:
-            problems.append(f"unexpected dimensions: {extra}")
         if len(seen) != len(names):
-            problems.append("duplicate dimensions after normalization")
-        if problems:
-            raise ValueError("; ".join(problems))
+            dupes = sorted({n for n in seen if seen.count(n) > 1})
+            raise ValueError(f"duplicate dimensions after normalization: {dupes}")
+        for criterion in self.criteria:
+            # Criteria reference dimensions by name — soft-normalize the same
+            # way so "Accuracy" binds a dim normalized to ``accuracy``. An
+            # unusable reference (punctuation only) is evidence text, not
+            # structure — keep it verbatim rather than rejecting the rubric.
+            if fold_dimension_name(criterion.dimension):
+                criterion.dimension = _normalized_dimension_name(
+                    criterion.dimension
+                )
         return self
 
 
@@ -212,8 +239,8 @@ def _normalize_rubric_dict(data: dict[str, Any]) -> dict[str, Any]:
     """Lenient pre-validation coercions on the parsed rubric dict.
 
     Only shape-preserving fixes for observed small-model quirks — the
-    structural contract (exactly the four canonical dimensions) is still
-    enforced by :class:`RubricContent` validation:
+    structural contract (1–12 dimensions, unique after normalization) is
+    still enforced by :class:`RubricContent` validation:
 
     - ``generated_by`` emitted as a scalar (live: the string
       ``"rubric_generator"``) wraps as ``{"source": <value>}``; a null
@@ -314,26 +341,95 @@ _DIMENSION_DOC = (
     "- `cyclomatic_complexity`: is the control flow reasonably simple?\n"
 )
 
-SYSTEM_PROMPT = (
-    "You design evaluation rubrics for coding-agent benchmarks. Given a task "
-    "prompt, output ONLY a JSON rubric — no prose, no markdown fences.\n\n"
+_SYSTEM_BASE = (
+    "You design evaluation rubrics for agent benchmarks — the task may be a "
+    "coding task or any other AI-workload task (extraction, summarisation, "
+    "support replies, ...). Given a task prompt, output ONLY a JSON rubric — "
+    "no prose, no markdown fences.\n\n"
     "Required top-level shape:\n"
     '{"summary": "<one-paragraph rubric summary>", '
     '"dimensions": [{"name", "title", "description", "weight", '
     '"min_score", "max_score"}], '
     '"criteria": [{"id", "text", "dimension", "weight"}], '
     '"generated_by": {}}\n\n'
+)
+
+_SYSTEM_DEFAULT = (
     "The `dimensions` array must contain EXACTLY these four entries, one per "
     "canonical name (use the names verbatim):\n"
     + _DIMENSION_DOC
     + "\nEach dimension scores on a 0-10 scale (min_score=0.0, max_score=10.0, "
     "weight=1.0).\n"
     "`criteria` decomposes the task prompt's concrete requirements into "
-    "checkable items; each criterion's `dimension` must be one of the four "
-    "canonical names and `id` a short slug (e.g. \"creates-hello-txt\")."
+    "checkable items; each criterion's `dimension` must be one of the rubric's "
+    "dimension names and `id` a short slug (e.g. \"creates-hello-txt\")."
 )
 
-_USER_TEMPLATE = "Task prompt:\n{task_prompt}\n\nReturn JSON only."
+_SYSTEM_HINTED = (
+    "The `dimensions` array names the scored axes — between "
+    f"{MIN_DIMENSIONS} and {MAX_DIMENSIONS} entries, snake_case `name` keys, "
+    "each with its own min_score/max_score scale and weight. Choose names "
+    "that fit the task's domain (see the task domain hint below): for "
+    "software-engineering submissions the canonical default is\n"
+    + _DIMENSION_DOC
+    + "\nFor other domains pick fitting dimensions instead (e.g. `accuracy`, "
+    "`completeness`, `tone`, `format_compliance`) — do not force code "
+    "dimensions onto a non-code task.\n"
+    "`criteria` decomposes the task prompt's concrete requirements into "
+    "checkable items; each criterion's `dimension` must be one of the rubric's "
+    "dimension names and `id` a short slug (e.g. \"extracts-total\")."
+)
+
+_SYSTEM_TEMPLATE = (
+    "A rubric template is provided as the generation basis. Keep its "
+    "dimension `name` keys and overall scale conventions, and adapt titles, "
+    "descriptions, weights, scales and criteria to THIS task — the template "
+    "is the starting point, not the verdict. Add or drop a dimension only "
+    "when the task clearly demands it (never below 1 or above "
+    f"{MAX_DIMENSIONS} dimensions, snake_case `name` keys).\n"
+    "`criteria` decomposes the task prompt's concrete requirements into "
+    "checkable items; each criterion's `dimension` must be one of the rubric's "
+    "dimension names and `id` a short slug (e.g. \"extracts-total\")."
+)
+
+
+def _system_prompt(*, rubric_basis: dict[str, Any] | None, domain_hint: str | None) -> str:
+    """System prompt for the draft call — the dimension contract varies with
+    the generation basis (PR23):
+
+    - a template basis → refine it, keep its dimension names;
+    - a domain hint → pick 1–12 fitting names (canonical four offered as the
+      code-task default only);
+    - neither → the historical MVP contract: exactly the four canonical
+      dimensions.
+    """
+    if rubric_basis is not None:
+        return _SYSTEM_BASE + _SYSTEM_TEMPLATE
+    if domain_hint:
+        return _SYSTEM_BASE + _SYSTEM_HINTED
+    return _SYSTEM_BASE + _SYSTEM_DEFAULT
+
+
+# Back-compat alias — the historical prompt (no basis/hint) is what tests
+# and external references assert on.
+SYSTEM_PROMPT = _SYSTEM_BASE + _SYSTEM_DEFAULT
+
+
+def _user_prompt(
+    task_prompt: str,
+    *,
+    rubric_basis: dict[str, Any] | None = None,
+    domain_hint: str | None = None,
+) -> str:
+    """User-turn content: the task plus optional domain hint / template."""
+    parts = [f"Task prompt:\n{task_prompt}"]
+    if domain_hint:
+        parts.append(f"Task domain hint: {domain_hint}")
+    if rubric_basis is not None:
+        basis_json = json.dumps(rubric_basis, ensure_ascii=False, default=str)
+        parts.append(f"Rubric template to use as the basis:\n{basis_json}")
+    parts.append("Return JSON only.")
+    return "\n\n".join(parts)
 
 
 def _retry_feedback(error: Exception) -> str:
@@ -372,8 +468,9 @@ def parse_rubric_json(text: str) -> RubricContent:
     Tolerates ``` fences and leading/trailing prose, plus the small
     coercions in :func:`_normalize_rubric_dict`. Raises
     :class:`RubricParseError` (no JSON) or pydantic ``ValidationError``
-    (schema/canonical-dimension violations) — the caller retries on either
-    with the failure fed back into the prompt.
+    (schema violations — incl. the 1–12 dimension bounds and
+    duplicate-after-normalization) — the caller retries on either with the
+    failure fed back into the prompt.
     """
     data = json.loads(_extract_json(text))
     if not isinstance(data, dict):
@@ -413,11 +510,19 @@ async def _request_rubric(
     task_prompt: str,
     max_tokens: int,
     retries: int | None = None,
+    rubric_basis: dict[str, Any] | None = None,
+    domain_hint: str | None = None,
 ) -> RubricContent:
     """Chat-completions → RubricContent with a bounded retry.
 
     ``retries`` = extra attempts beyond the first (``None`` → env
     ``RUBRIC_GEN_RETRIES``, default 2 → up to 3 calls total).
+
+    PR23: ``rubric_basis`` (a rubric template's content, from
+    ``config.rubric_template``/``config.rubric_basis``) switches generation
+    from freeform drafting to refining that template; ``domain_hint`` (a
+    submitted ``rubric_hint`` or the resolved preset's category) steers the
+    dimension set for non-coding tasks.
 
     - Parse/validation failures (``ValueError`` — RubricParseError,
       JSONDecodeError, pydantic ValidationError) retry with the failure
@@ -435,8 +540,18 @@ async def _request_rubric(
         else _env_int("RUBRIC_GEN_RETRIES", DEFAULT_GEN_RETRIES),
     )
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": _USER_TEMPLATE.format(task_prompt=task_prompt)},
+        {
+            "role": "system",
+            "content": _system_prompt(
+                rubric_basis=rubric_basis, domain_hint=domain_hint
+            ),
+        },
+        {
+            "role": "user",
+            "content": _user_prompt(
+                task_prompt, rubric_basis=rubric_basis, domain_hint=domain_hint
+            ),
+        },
     ]
     body_base = {
         "model": model,
@@ -515,6 +630,58 @@ def _message_content(resp_json: dict[str, Any]) -> str:
 def _load_run(session_factory: sessionmaker[Session], run_id: uuid.UUID) -> Run | None:
     with session_factory() as session:
         return session.get(Run, run_id)
+
+
+def _default_templates_dir() -> str:
+    return str(Path(__file__).resolve().parents[1] / "rubric_templates")
+
+
+def _rubric_context(
+    session_factory: sessionmaker[Session],
+    run: Run,
+    settings: Any,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve the generation basis + domain hint from ``run.config`` (PR23).
+
+    ``config.rubric_template`` names a template in the merged store
+    (vendored ``rubric_templates/*.json`` + user ``rubric_templates`` rows);
+    ``config.rubric_basis`` is an inline rubric fragment (a preset's
+    ``suggested_rubric`` carried on the run) — the inline form wins when
+    both exist. ``config.rubric_hint`` is the free-text domain hint the
+    prompt echoes. Resolution failures degrade to freeform drafting: a
+    stored template may have been deleted between submit and draft, which
+    must not fail the run.
+    """
+    config = run.config or {}
+    hint = str(config.get("rubric_hint") or "").strip() or None
+    basis: dict[str, Any] | None = None
+    inline = config.get("rubric_basis")
+    if isinstance(inline, dict) and inline.get("dimensions"):
+        basis = inline
+    elif isinstance(config.get("rubric_template"), str):
+        name = str(config["rubric_template"]).strip()
+        if name:
+            try:
+                # Lazy import — api.* must not land in orchestrator's
+                # import graph (the router imports this module).
+                from api import rubric_templates as template_store
+
+                templates_dir = str(
+                    getattr(settings, "RUBRIC_TEMPLATES_DIR", "")
+                    or _default_templates_dir()
+                )
+                with session_factory() as session:
+                    template = template_store.resolve(session, templates_dir, name)
+                if template is not None:
+                    basis = template.content
+            except Exception:  # noqa: BLE001 — drafting must not fail here
+                log.warning(
+                    "draft_rubric: could not resolve rubric_template %r for "
+                    "run %s — drafting freeform",
+                    name,
+                    run.id,
+                )
+    return basis, hint
 
 
 def _persist_draft(
@@ -709,6 +876,12 @@ async def draft_rubric(
                 max_tokens=used + int(settings.EVAL_TOKEN_BUDGET),
             )
             model = settings.RUBRIC_MODEL or run.model_name
+            # PR23: template basis + domain hint from the run config (the
+            # submit path persists rubric_template/rubric_basis/rubric_hint
+            # and the preset fallbacks it resolved).
+            rubric_basis, domain_hint = _rubric_context(
+                session_factory, run, settings
+            )
             content = await _request_rubric(
                 client,
                 gateway_url=settings.GATEWAY_URL,
@@ -716,6 +889,8 @@ async def draft_rubric(
                 model=model,
                 task_prompt=run.task_prompt,
                 max_tokens=int(settings.RUBRIC_MAX_TOKENS),
+                rubric_basis=rubric_basis,
+                domain_hint=domain_hint,
             )
         _persist_draft(session_factory, run_id, content, model=model)
         log.info("draft_rubric: run %s -> rubric_review", run_id)

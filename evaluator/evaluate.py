@@ -107,6 +107,7 @@ from evaluator.scores import (
     ParsedScores,
     ScoresFileError,
     load_scores_file,
+    rubric_dimension_scales,
 )
 from evaluator.testgen import GENERATED_TESTS_DIRNAME, generate_tests_signal
 from sandbox.runtime import DEFAULT_IMAGE, SandboxRuntime
@@ -980,7 +981,11 @@ async def evaluate_sandbox(
     scores_path = eval_ws / SCORES_FILENAME
     mode = "agentic"
     try:
-        parsed = await asyncio.to_thread(load_scores_file, scores_path)
+        parsed = await asyncio.to_thread(
+            load_scores_file,
+            scores_path,
+            dimension_scales=rubric_dimension_scales(rubric),
+        )
     except ScoresFileError as exc:
         reason = "scores_missing" if not scores_path.exists() else "scores_invalid"
         # Direct-judge fallback: the tool loop failed at OUTPUT, not
@@ -1013,6 +1018,7 @@ async def evaluate_sandbox(
                 event_type="error",
                 payload={
                     "phase": "eval_scores_failed",
+                    "judge_model": model_name,
                     "reason": reason,
                     "detail": str(exc),
                     "fallback_detail": fallback_detail,
@@ -1025,6 +1031,9 @@ async def evaluate_sandbox(
             return []
         mode = "direct_fallback"
 
+    # PR29 — every row stamps the judging model so a multi-judge panel's
+    # scores stay attributable per judge in the results merge (source
+    # defaults to "llm" — judge-authored).
     rows = [
         Score(
             sandbox_id=sandbox_uuid,
@@ -1033,6 +1042,7 @@ async def evaluate_sandbox(
             dimension=entry.dimension,
             score=entry.score,
             rationale=entry.rationale,
+            judge_model=model_name,
         )
         for entry in parsed.entries
     ]
@@ -1045,6 +1055,7 @@ async def evaluate_sandbox(
                 dimension=OVERALL_DIMENSION,
                 score=parsed.overall,
                 rationale=parsed.summary,
+                judge_model=model_name,
             )
         )
 
@@ -1066,6 +1077,7 @@ async def evaluate_sandbox(
                 payload={
                     "phase": "eval_scored",
                     "eval_sandbox_id": eval_sid,
+                    "judge_model": model_name,
                     "mode": mode,
                     "container_status": container_state,
                     "exit_code": exit_code,

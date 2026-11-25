@@ -38,8 +38,13 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F23 | Task inputs — seeded workspace (repo_url or uploaded archive, identical bytes per cell proven by `harness_config.seed_sha`) | ✅ | `sandbox/seeds.py`, `api/routers/uploads.py`, `api/schemas.py` (`TaskInputsIn`), `orchestrator/provision.py`, `sandbox/runtime.py`, `web/app/submit/page.tsx` (Inputs section) | `tests/unit/sandbox/test_seeds.py`, `tests/unit/api/test_uploads.py`, `tests/unit/orchestrator/test_provision_seed.py` |
 | F24 | Task preset library (vendored md + user presets, preset_ref on runs, /presets browse + detail) | ✅ | `task_presets/`, `api/presets.py`, `api/routers/presets.py`, `api/routers/runs.py` (preset_ref), `db/models.py` (`TaskPreset`, `Run.preset_*`), `web/app/presets/`, `web/components/SavePresetDialog.tsx`, `web/app/submit/page.tsx` | `tests/unit/api/test_presets.py`, `tests/unit/db/test_migrations.py`, `web/lib/resubmit.test.ts` |
 | F25 | Benchmark suites + deterministic checkers (vendored suite.yaml fan-out, objective pass/fail beside judge scores, batch aggregation) | ✅ | `benchmark_suites/`, `api/suites.py`, `api/routers/suites.py`, `scoring/checkers.py`, `db/models.py` (`SuiteRun`, `CheckerResult`, `Run.suite_*`), `orchestrator/lifecycle.py`, `web/app/suites/`, `web/app/suite-runs/` | `tests/unit/api/test_suites.py`, `tests/unit/scoring/test_checkers.py`, `tests/unit/orchestrator/test_lifecycle_suites.py`, `tests/unit/evaluator/test_suite_signal.py`, `tests/unit/db/test_migrations.py` |
+| F26 | Custom rubric dimensions + rubric templates (1–12 arbitrary dimensions, template basis + domain hint at submit, preset `suggested_rubric`, structured rubric editor) | ✅ | `orchestrator/rubric.py`, `rubric_templates/`, `api/rubric_templates.py`, `api/routers/rubric_templates.py`, `db/models.py` (`RubricTemplate`, `TaskPreset.suggested_rubric`), `evaluator/{prompts,judge_direct}.py`, `web/lib/{rubricEdit,api,resubmit}.ts`, `web/components/RubricEditor.tsx`, `web/app/submit/page.tsx`, `web/app/runs/[id]/` | `tests/unit/orchestrator/test_rubric.py`, `tests/unit/api/test_rubric_templates.py`, `test_runs.py`, `test_results.py`, `test_presets.py`, `tests/unit/evaluator/test_prompts.py`, `test_judge_direct.py`, `tests/unit/db/test_migrations.py`, `web/lib/rubricEdit.test.ts` |
 | F27 | Cross-run compare + leaderboards (global model + config-family rankings w/ filters, `/compare` two-run diff, preset-embedded board) | ✅ | `api/routers/analytics.py` (`GET /api/analytics/leaderboard`), `api/schemas.py` (`Leaderboard`/`LeaderboardEntry`), `web/app/leaderboard/`, `web/app/compare/`, `web/components/LeaderboardBoards.tsx`, `web/lib/compareRuns.ts`, `web/lib/api.ts`, `web/app/presets/[slug]/PresetDetailClient.tsx` | `tests/unit/api/test_leaderboard.py`, `web/lib/compareRuns.test.ts` |
+| F28 | Run export + share links (`?fmt=json|csv` bundle — spec, rubrics, matrix, analytics, events-lite; `runs.share_token` + read-only `/share/{token}` results+timeline view) | ✅ | `api/routers/results.py` (`/export`, `/share` mint/revoke + `GET /api/share/{token}`), `db/models.py` (`Run.share_token`), `db/migrations/versions/c5f9a2b8d4e7_runs_share_token.py`, `web/lib/api.ts`, `web/components/ExportButtons.tsx`, `web/app/share/[token]/` | `tests/unit/api/test_export.py`, `tests/unit/db/test_migrations.py`, `web/lib/api.test.ts` |
+| F29 | Dashboard home (`/dashboard`: summary aggregate — KPI strip, weekly spend + runs charts, terminal-mix donut, queue lane, top-5 boards, recent runs) | ✅ | `api/routers/analytics.py` (`GET /api/analytics/summary`), `api/schemas.py` (`DashboardSummary`/`DashboardTotals`/`DashboardWeekPoint`/`DashboardQueue*`/`DashboardTerminalSlice`/`DashboardRecentRun`), `web/app/dashboard/`, `web/lib/dashboard.ts`, `web/lib/api.ts`, `web/components/SiteHeader.tsx`, `web/components/landing/Hero.tsx` | `tests/unit/api/test_summary.py`, `web/lib/dashboard.test.ts` |
+| F30 | Local-run sandbox pacing + budget resilience (queued sandbox status for all-local runs, live `extend_budget`/auto_extend via append-only events, ~80% budget warnings, 500k default budget) | ✅ | `orchestrator/pacing.py` (`local_sandbox_cap`, `claim_queued_sandbox`), `orchestrator/provision.py` (`queue_sandbox`, `spawn_queued`, `_launch`), `orchestrator/lifecycle.py` (`_watch_cells_paced`), `gateway/metering.py` (`budget_state*`, `usage_by_sandbox`), `gateway/main.py` (`_budget_gate`), `orchestrator/monitor.py`, `api/routers/sandboxes.py`, `api/routers/runs.py` (`sandbox_pacing_cap`, per-cell `budget`), `web/app/runs/[id]/RunDetailClient.tsx` | `tests/unit/orchestrator/test_sandbox_pacing.py`, `test_monitor.py` (F30 section), `tests/unit/gateway/test_proxy.py` (F30 section), `tests/unit/api/test_sandboxes.py` |
 | F31 | Timeline compare-mode clock toggle (absolute wall clock vs per-cell relative t+0 — progress-rate comparison across staggered starts) | ✅ | `web/lib/timelineModes.ts`, `web/app/runs/[id]/timeline/{TimelineClient,EventRow,SplitTimeline}.tsx`, `web/components/RunConsoleLive.tsx`, `web/app/globals.css` (`.evc-ev__t`) | `web/lib/timelineModes.test.ts` |
+| F32 | Judge quality: panel scoring + human override + blind A/B votes (`evaluator_models` 1–3 judge panel, per-judge score rows merged to mean+spread, human-score override winning its cell, anonymized pair sessions + dimension votes feeding win/loss + judge-agreement roll-ups) | ✅ | `api/schemas.py`, `api/routers/{runs,results}.py`, `api/modelcheck.py`, `orchestrator/lifecycle.py`, `evaluator/evaluate.py`, `db/models.py` (`Score.judge_model/source/note`, `PairwiseVote`) + migration `c7a9e1b3d5f2`, `web/lib/{api,resubmit}.ts`, `web/app/submit/page.tsx`, `web/app/runs/[id]/results/{ResultsClient,PairReview}.tsx` | `tests/unit/api/test_runs.py`, `test_results.py`, `test_modelcheck.py`, `tests/unit/orchestrator/test_lifecycle.py`, `test_rescore.py`, `tests/unit/evaluator/test_evaluate.py`, `tests/unit/db/test_migrations.py`, `web/lib/resubmit.test.ts` |
 
 ## Feature details
 
@@ -403,8 +408,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   clamped to the eval-attempt deadline),
   `TESTGEN_MAX_TOKENS_RETRY` (8192) — retries cover empty content,
   zero-runnable-file output, and timeouts. A scores doc missing
-  `overall` gets it synthesized as the mean of dimension scores +
-  warning (`parse_scores_json`).
+  `overall` gets it synthesized from the dimension scores
+  (scale-normalized to 0-10) + warning (`parse_scores_json`).
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
   `prompts.py`, `judge_direct.py` — direct-completion fallback,
   `testgen.py` — PR8 suite generation + exec orchestration),
@@ -922,7 +927,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     denormalized `rubric_version` (stamped at write time, survives rubric
     lookups). `GET /api/runs/{id}/results?rubric_version=N` filters the
     matrix to one version's scores; the default view is per-sandbox
-    newest-wins (created_at, seq insertion-order tiebreak). `GET
+    newest-wins (asc created_at, seq, rubric_version, id → last row
+    wins). `GET
     /api/runs/{id}/rubrics`
     lists versions + score counts; `GET /api/rubrics/{id}` returns one
     version incl. content (prefills the editor).
@@ -1714,9 +1720,11 @@ rigged before it starts.
   `preset_ref`/`preset_revision`.
 - **Web:** `/presets` index (search + category chips, runs count +
   last-run mean columns, "run →" submit link); `/presets/[slug]` detail
-  (prompt, KPI strip, trend chart via the analysis recharts theme,
-  per-model + per-config leaderboards, run history, edit/delete for user
-  presets); submit page custom|preset toggle + scrollable picker
+  (prompt, KPI strip + loading hints from the local analytics
+  aggregates, trend chart via the analysis recharts theme, the
+  preset-filtered global leaderboard boards — F27 embed, run history,
+  edit/delete for user presets); submit page custom|preset toggle +
+  scrollable picker
   (`.preset-pick`), `?preset=` prefill, "edit as custom copy" detach,
   suggested adapter/model "apply to empty fields", "save as preset"
   dialog (`SavePresetDialog` — shared, also edit mode); run detail shows
@@ -1859,6 +1867,118 @@ rigged before it starts.
   signal pipeline), F8 (results page), F18 (the `prompt` adapter pin —
   prompt-cell tasks resolve to real no-sandbox cells)
 
+### F26 — Custom rubric dimensions + rubric templates ✅
+
+- **What:** the rubric dimension set is no longer locked to the four
+  canonical coding axes. `RubricContent.dimensions` accepts **1–12
+  arbitrary dimensions** — names soft-normalize to snake_case and fold
+  through the canonical alias map (a *soft* normalizer, never a
+  validator); names normalizing to empty or past 128 chars, reserved
+  score-namespace names (`overall`/`suite_pass`/`scores`/`summary`/
+  `total`), and duplicates after normalization are rejected. Each
+  dimension keeps its own `title`/`description`/
+  `weight`/`min_score`/`max_score`, so non-10-point scales persist and
+  score correctly. `scores.dimension` stays keyed by dimension name —
+  an `accuracy`/`tone`/`compliance` rubric drafts, freezes, evaluates,
+  and renders with no canonical names anywhere.
+- **Generation steering:** the rubric gen prompt now takes a **domain
+  hint** (`RunCreate.rubric_hint` → falling back to the preset's
+  `category`) and a **template basis** (`RunCreate.rubric_template` →
+  falling back to the preset's `suggested_rubric` → falling back to
+  freeform task text). A template's dimensions/criteria seed the draft;
+  the generator refines them for the task rather than starting from
+  scratch. `draft_rubric()` reads `run.config` so suite/preset submits
+  resolve identically.
+- **Rubric templates** (`api/rubric_templates.py`,
+  `rubric_templates/*.json`): a merged store like presets — vendored
+  JSON seeds (`code-default`, `extraction-accuracy`,
+  `summarisation-fidelity`, `support-tone-compliance`) plus
+  `rubric_templates` DB rows for user-authored ones.
+  `GET /api/rubric-templates` lists `{name, description, content,
+  source}`; `GET /api/rubric-templates/{name}` gets one (vendored seeds
+  re-validate through `RubricContent` on every read — a contract test
+  pins the committed files).
+- **Preset `suggested_rubric`:** `task_presets.suggested_rubric`
+  (nullable JSONB) + vendored frontmatter — `{template: name}` |
+  `{hint: text}` | inline `{dimensions: [...]}`. User presets PATCH it;
+  vendored presets carry it (code presets → `code-default`, extraction
+  → `extraction-accuracy`, support-reply → `support-tone-compliance`).
+  Submit resolution order: explicit `rubric_template` → preset
+  `suggested_rubric` → freeform task text. `rubric_template`,
+  `rubric_basis`, `rubric_hint` persist on `run.config`.
+- **Evaluator:** `evaluator/prompts.py` is dimension-aware — the
+  measured-signals rule names only the dims the rubric actually
+  carries (`cyclomatic_complexity` gets the measured-CC instruction,
+  `functional_requirements`/`acceptance_criteria` get the
+  exec/generated-suite evidence pointer); a non-code rubric gets the
+  generic "measurements are context only" phrasing plus the explicit
+  **"not applicable"** rule (mid-scale score + "not applicable"
+  rationale prefix — never drop the row). `judge_direct.py`'s fallback
+  prompt is domain-neutral and carries the same rule. Collectors still
+  report whatever signals they can measure; the judge brief — not the
+  collector — decides applicability.
+- **DB:** migration `f6a7b8c9d0e1_rubric_templates.py` (revises
+  `c5f9a2b8d4e7`) — `rubric_templates` table (`id` Uuid PK, `name`
+  unique-indexed, description, JSONB content, source, timestamps) +
+  `task_presets.suggested_rubric`.
+- **API:** `RunCreate.rubric_template`/`rubric_hint` (nullable);
+  `RubricTemplateOut`; `Preset*` schemas carry `suggested_rubric`;
+  unknown template name → 422 at submit. `dimensionOrder` in
+  `web/lib/api.ts` stays canonical-first, then arbitrary names
+  alphabetically.
+- **Web:** `web/lib/rubricEdit.ts` — pure form-state helpers mirroring
+  the backend contract (`canonicalDimension`, `draftFromContent`,
+  `buildRubricContent` preserving unknown extras, `validateDraft`
+  enforcing 1–12/dedup/scale/ref rules) → `web/components/
+  RubricEditor.tsx`, a shared structured editor: summary, dimension
+  rows (name/title/description/weight/min–max scale, with the resolved
+  score key previewed), criteria rows (id/text/dimension-select/
+  weight), add/remove — **raw JSON behind a toggle** that serializes
+  the form and syncs back on valid parse. Both edit sites use it:
+  run-detail draft review (PUT) and results-page `RescoreControls`
+  (new version + optional re-score) — save is disabled while the
+  draft is invalid. Submit gains a **Rubric basis** select (auto →
+  preset suggestion → freeform; explicit template names) + a domain-
+  hint input; preset suggestions display inline. `resubmit.ts` carries
+  `rubric_template`/`rubric_hint` so resubmits regenerate the same
+  basis.
+- **Where:** `orchestrator/rubric.py`, `evaluator/prompts.py`,
+  `evaluator/judge_direct.py`, `evaluator/scores.py` (judge-output
+  fold/reserved-name drop + scale-normalized synthesized `overall`),
+  `scoring/checkers.py` (single-sourced `RESERVED_DIMENSION_NAMES` +
+  `DIMENSION_ALIASES`/`fold_dimension_name` shared by authoring and
+  eval), `rubric_templates/`,
+  `api/rubric_templates.py`, `api/routers/rubric_templates.py`,
+  `api/config.py` (`RUBRIC_TEMPLATES_DIR`), `api/presets.py`,
+  `api/routers/{presets,runs}.py`, `api/schemas.py`,
+  `db/models.py` + migration `f6a7b8c9d0e1`, `web/lib/{rubricEdit,
+  api,resubmit}.ts`, `web/components/RubricEditor.tsx`,
+  `web/app/submit/page.tsx`, `web/app/runs/[id]/RunDetailClient.tsx`,
+  `web/app/runs/[id]/results/RescoreControls.tsx`.
+- **Verify:**
+  - Unit: `tests/unit/orchestrator/test_rubric.py` (1–12 bounds,
+    normalization, alias folding, dedup, gen-prompt context variants,
+    retry semantics); `tests/unit/api/test_rubric_templates.py` (seed
+    validation, list/get, merged store); `test_runs.py`/`test_results.py`
+    (arbitrary dims accepted, dedup/over-12 → 422, template/hint persist,
+    preset suggestion resolution); `tests/unit/evaluator/test_prompts.py`
+    + `test_judge_direct.py` (dimension-aware guidance, not-applicable
+    rule, domain-neutral wording); `tests/unit/db/test_migrations.py`
+    (new head + `suggested_rubric`/`rubric_templates` round-trips).
+  - Web: `lib/rubricEdit.test.ts` (normalization, validation, content
+    build round-trip); `eslint` + `next build` clean.
+  - Manual: submit an extraction/support preset → the draft rubric
+    carries `accuracy`-style dims (no `cyclomatic_complexity`) →
+    approve → scores persist under those names → results render
+    alphabetically after the canonical block.
+- **Depends on:** F24 (preset `suggested_rubric` rides the preset
+  library + category hint), F2 (rubric gen pipeline), F7/F14
+  (evaluator + rescore), F25 (suite fan-out inherits the fields).
+  **Feeds:** the multi-domain business-eval direction — non-coding
+  task evaluation needs arbitrary rubrics; later judge-quality work
+  (calibration, pairwise comparison) builds on dynamic dimension
+  sets.
+
 ### F31 — Timeline compare-mode clock toggle ✅
 
 - **What:** an `absolute | relative` `.seg` toggle on the timeline
@@ -1949,9 +2069,10 @@ rigged before it starts.
   `delta` (null-propagating).
 - **Shared boards** (`web/components/LeaderboardBoards.tsx`): rank,
   label (+shared family name), adapter badge, mean ± sd, n/sandboxes,
-  runs — used by `/leaderboard` AND `/presets/[slug]`, which now embeds
-  the preset-filtered global board (with a synthesised fallback from
-  the preset-local aggregates when the endpoint isn't there).
+  runs — used by `/leaderboard` AND `/presets/[slug]`, which embeds
+  the preset-filtered global board (a failed fetch renders an inline
+  error; while loading, the preset-local aggregates' scored counts
+  hint what's coming).
 - **Where:** `api/routers/analytics.py`, `api/schemas.py`,
   `tests/unit/api/test_leaderboard.py`, `web/lib/api.ts`,
   `web/lib/compareRuns.ts` + `.test.ts`, `web/components/
@@ -1959,10 +2080,11 @@ rigged before it starts.
   `web/app/presets/[slug]/PresetDetailClient.tsx`,
   `web/components/SiteHeader.tsx` (nav gains Compare + Leaderboard).
 - **Verify:**
-  - Unit: `tests/unit/api/test_leaderboard.py` (8 tests — model/config
+  - Unit: `tests/unit/api/test_leaderboard.py` (10 tests — model/config
     ranking + sample sd, n vs sandboxes coverage, preset/date/min-trials
-    filters, newest-wins, empty scope) against per-test file-backed
-    SQLite (the shared :memory: engine leaks rows across tests).
+    filters, newest-wins, empty scope, since/until tz handling) against
+    per-test file-backed SQLite (the shared :memory: engine leaks rows
+    across tests).
   - Web: `lib/compareRuns.test.ts` (9 tests); eslint + `next build`
     clean (`/compare`, `/leaderboard` prerender).
   - Manual: score ≥2 runs → `/leaderboard` ranks models + config
@@ -1971,6 +2093,310 @@ rigged before it starts.
 - **Depends on:** F8/F9 (results + analytics shapes it reuses), F20
   (trials axis for min_trials), F24 (preset_ref filter), F22 (mean±sd
   + pricing-honesty conventions), F25 (suite provenance on the diff).
+
+### F28 — Run export + share links (PR35) ✅
+
+- **`GET /api/runs/{id}/export?fmt=json|csv`** (`api/routers/results.py`)
+  — the full run bundle as a download (`Content-Disposition: attachment`,
+  `heg-run-<uuid>.{json,csv}`):
+  - `fmt=json` → `RunExport` (`format: "heg-run-export"`,
+    `format_version: 1`): `spec` (`RunSpecOut` — task, models, trials,
+    verbatim config, preset/suite provenance, lifecycle stamps), `rubrics`
+    (EVERY version incl. content — score provenance needs it), `results`
+    (the `RunResults` payload the results page reads), `analytics` (the
+    `RunAnalytics` payload the analysis page reads — both computed by
+    calling the same handlers the UI uses, never re-derived), and
+    `events` — **events-lite** rows (`EventLiteOut`): the stored payload
+    projected to top-level scalar fields (strings capped at 300 chars) +
+    the small `usage` token dict verbatim; message bodies/tool args/diffs
+    dropped — a summary index, not a transcript. Bounded at 50k rows with
+    `events_total`/`events_truncated` reporting the true stream length.
+  - `fmt=csv` → the flattened sheet: **one row per sandbox × score
+    dimension** (`dimension`/`score`/`rationale`), the judge `overall`
+    emitted as a last dimension row per sandbox, and one empty-dimension
+    row per unscored sandbox so the sheet covers the whole matrix.
+    Per-sandbox fields (name/adapter/model/cell/trial/status/terminal/
+    `empty_workspace`/`eval_error`/`rubric_version`) plus participant-
+    phase analytics (turns, tokens in/out/cache/total, wall clock, est.
+    cost) repeat per row — sheets pivot on them. Dimensions sort
+    alphabetically (deterministic across sibling runs); a UTF-8 BOM keeps
+    Excel on UTF-8, and string cells opening with a formula trigger
+    (`= + - @`, tab, CR) get a `'` prefix so submitter/judge text can't
+    land as a live Excel formula.
+- **Share links (stretch, shipped):** `runs.share_token` (nullable
+  unique str, migration `c5f9a2b8d4e7` chained on `e4f5a6b7c8d9`).
+  `POST /api/runs/{id}/share` mints `secrets.token_urlsafe(16)`
+  idempotently → `{token, url: "/share/{token}"}` (the mint claims the
+  slot with a conditional UPDATE so concurrent POSTs return the winner's
+  token on every dialect); `DELETE` revokes (idempotent).
+  `GET /api/share/{token}` → `ShareOut` (spec + `RunResults` + bounded
+  events-lite) — unknown and revoked tokens 404 identically. Unlike the
+  export, the share bundle scrubs control-plane filesystem references:
+  `artifact_path`/`artifacts`/`thumbnail`, the
+  `previewable`/`preview_type`/`preview_candidates` probe fields, the
+  analysis `workspace` path, and the `_SHARE_FS_KEYS` event-payload +
+  signal-metric keys are all stripped before serving.
+  `RunOut.share_url` advertises the minted path on run detail. The token
+  is the only credential the share surface checks — the app ships
+  unauthenticated, so this is PR19's extension point, not a security
+  boundary today.
+- **Web:** `web/components/ExportButtons.tsx` on the results + analysis
+  page headers — `⬇ json`/`⬇ csv` anchor downloads (attachment-served,
+  same idiom as `artifactDownloadUrl`) and a `🔗 share` button that mints,
+  copies the absolute link, then offers open/copy/revoke chips.
+  `web/app/share/[token]/` renders the read-only view: spec header +
+  score matrix (same `.matrix` idiom, rationale inline) + the events-lite
+  index reusing the timeline's `EventRow`/`summarizeEvent` (expanding a
+  row shows the bounded projection), render-capped at 500 rows.
+- **Where:** `api/routers/results.py`, `api/schemas.py` (`RunOut.share_url`),
+  `api/routers/runs.py` (`_run_out`), `db/models.py`,
+  `db/migrations/versions/c5f9a2b8d4e7_runs_share_token.py`,
+  `tests/unit/api/test_export.py`, `web/lib/api.ts` + `.test.ts`,
+  `web/components/ExportButtons.tsx`, `web/app/share/[token]/`,
+  `web/app/runs/[id]/{results,analysis}/`.
+- **Verify:**
+  - Unit: `tests/unit/api/test_export.py` (14 tests — JSON round-trip
+    through `RunExport.model_validate`, events-lite projection, CSV
+    shape/BOM/empty-run header + legacy `harness` config key, 404/422,
+    share mint/idempotent/revoke/unknown-token 404 + fs-ref scrub,
+    events_total bounds); migration tests cover the new head + unique index +
+    downgrade.
+  - Web: `api.test.ts` `runExportUrl` describe; eslint + `next build`
+    clean (`/share/[token]` prerender).
+  - Manual: results/analysis headers → `⬇ csv` opens in Sheets one row
+    per sandbox×dimension; `⬇ json` is a self-contained bundle;
+    `🔗 share` copies a link opening the read-only view.
+- **Depends on:** F8/F9 (results + analytics payloads the bundle reuses),
+  F6 (events schema the lite projection mirrors).
+
+### F29 — Dashboard home (PR36) ✅
+
+- **What:** the home surface — one page answering "what did I spend,
+  what's running, who's winning, what happened lately" instead of
+  hunting across /runs, /leaderboard, and per-run analysis.
+- **`GET /api/analytics/summary`** (`api/routers/analytics.py`) —
+  server-side aggregate so the page isn't five client-composed
+  fetches. One scan over runs + sandboxes + `llm_response` events
+  produces: **totals** (runs, sandboxes, scored cells, metered turns,
+  token rollup, estimated cost, unpriced-turn count), a **weekly
+  series** (`?weeks=` ISO-Monday buckets ending at the current week —
+  runs created, turns, spend per week), **terminal mix** (counts per
+  terminal_reason + a separate pending count), **queue** (active
+  provisioning/running/evaluating runs + queued runs stamped with
+  1-based promotion-order position + an awaiting-review count for
+  submitted/rubric_review), and **recent runs** (`?recent=`, newest
+  first, each with sandbox count + newest-wins mean `overall`).
+  `?price_model=` reprices every call at one rate — same convention as
+  the trends endpoint, echoed back so the card can label the basis.
+  Run-level metered events (rubric drafting — `sandbox_id` null) are
+  priced on the payload's `model` field; sandbox events after the
+  first evaluator-source event price at the run's `evaluator_model`
+  (same participant/judge boundary as per-run analytics). Empty DB →
+  zeroed totals + all-zero weeks, never a crash.
+- **Honest cost (PR21 carried forward):** a metered call whose model
+  has no rate poisons its week's total to `null` (a partial sum would
+  read as complete) and increments `unpriced_llm_turns`; the grand
+  total follows the same rule. Zero traffic is an honest `0.0` — only
+  *unpriced* traffic is `null`. The card renders `unpriced` with the
+  call count, and weeks with unpriced traffic leave gaps in the bar
+  series (named in the legend), never fabricated $0 bars.
+- **`/dashboard`** (`web/app/dashboard/`) — KPI strip (runs, sandboxes
+  + scored coverage, turns + tokens, est. spend with pricing basis,
+  queue headline), spend/week + runs/week bar charts (shared `C`
+  palette + `ChartFrame`/`ChartTip`/`SeriesChips` conventions),
+  terminal-mix donut (terminated count centered; pending lanes kept
+  out of the donut and named beside it), queue/active table (lane,
+  run link, task, model; queued rows show promotion position),
+  top-5 `BoardTable`s from `GET /api/analytics/leaderboard` (PR32
+  aggregate reused — one failure hides the boards, not the page),
+  recent-runs table (preset link, status badge, cell count, mean
+  overall). Polls every 15 s only while the lane is busy (active,
+  queued, or awaiting-review runs). Zero-run DB renders a single
+  honest empty state with a submit CTA.
+- **Transforms** (`web/lib/dashboard.ts`, node-tested): `weekLabel`
+  (ISO week_start → `MM-DD` tick, TZ-free string slice),
+  `weekRows`/`unpricedWeeks` (chart rows preserving null costs),
+  `donutData` (slices + shares over terminated + pending, count-desc
+  tie-alpha sort), `queueHeadline` ("1 running · 2 queued · 3
+  awaiting review" / "idle").
+- **Where:** `api/routers/analytics.py`, `api/schemas.py`,
+  `tests/unit/api/test_summary.py`, `web/lib/api.ts`
+  (`getAnalyticsSummary` + `Dashboard*` types), `web/lib/dashboard.ts`
+  + `.test.ts`, `web/app/dashboard/` (`page.tsx` Suspense wrapper +
+  `DashboardClient.tsx`), `web/components/SiteHeader.tsx` (Dashboard
+  first in nav), `web/components/landing/Hero.tsx` (dashboard CTA).
+- **Verify:**
+  - Unit: `tests/unit/api/test_summary.py` (7 tests — empty scope,
+    week buckets + totals incl. eval-boundary + run-level pricing,
+    terminal mix + queue positions, recent-runs mean score,
+    unpriced → null + `?price_model=` rescue, window params) on
+    per-test file-backed SQLite.
+  - Web: `lib/dashboard.test.ts` (11 tests); eslint + `next build`
+    clean (`/dashboard` prerenders static).
+  - Manual: run a few evaluations → `/dashboard` fills in; submit a
+    run and watch the queue card tick; an unpriced model's run shows
+    `unpriced` spend, never `$0`.
+- **Depends on:** F9/F13 (analytics + chart conventions), F21 (pricing
+  honesty semantics), F27 (leaderboard endpoint + shared boards),
+  F15 pacing (queue position semantics from `started_at` ordering).
+
+### F30 — Local-run sandbox pacing + budget resilience ✅
+
+Two related resilience layers: **queued sandboxes** pace concurrent
+containers on local providers, and **live budget controls** let a cell
+gain headroom (or warn) instead of dying at a hard cap.
+
+- **Sandbox `queued` status** (`orchestrator/state_machine.py`,
+  `db/models.py` comment): a real row status — `queued → provisioning |
+  failed`. `pacing.ACTIVE_SANDBOX_STATES` (provisioning/running/
+  terminating) excludes it; `runner.startup_sweep` fails parked cells
+  with their run (no container exists to leak). No migration.
+- **Local-provider cap** (`orchestrator/pacing.py::local_sandbox_cap`):
+  `SANDBOX_MAX_CONCURRENT_LOCAL` (api Settings, default 2, 0 disables)
+  applies only when EVERY participant model resolves to a local
+  provider — `pacing.provider_for_model`/`_provider_routes` mirror the
+  gateway's `PROVIDER_ROUTES` glob + `UPSTREAM_PROVIDER` fallback against
+  `LOCAL_PROVIDERS = {ollama}` (the api can't import gateway settings).
+  One remote model = mixed contention = no cap.
+- **Queue/claim/spawn** (`provision.queue_sandbox`,
+  `pacing.claim_queued_sandbox`, `provision.spawn_queued`): the provision
+  loop spawns until `active_sandbox_count >= cap`, then parks the rest —
+  `sandbox_queued` checkpoint carries `ahead`/`cap`; promotion flips
+  `queued → provisioning` (the flip IS the claim, one committed session)
+  and emits `sandbox_dequeued` with `queued_seconds`. The promoted cell
+  runs the identical `_launch` pipeline as a first-pass spawn (pack
+  staging → `SPAWN_*` mem gate → cred/env/spec → `docker run` →
+  `_mark_spawned`). A failed spawn frees the slot — only active states
+  count. Prompt cells hold no slot.
+- **Paced scheduler** (`lifecycle._watch_cells_paced`): one task per
+  cell — `watch_sandbox` for spawned cells, `spawn_queued`+watch for
+  claimed ones; claims run synchronously between `asyncio.wait`
+  completions so FIFO order is deterministic. Uncapped runs keep plain
+  `asyncio.gather`.
+- **Extension store** (`gateway/metering.py::budget_state` /
+  `budget_states` / `usage_by_sandbox`): `budget_extended` and
+  `budget_warning` checkpoints ARE the store — summed per read, so a
+  control-plane bump takes effect on the gateway's next request and the
+  monitor's next poll without restarting the cell. `added_tokens`
+  widens BOTH ceilings the cred passes through (run `max_tokens` +
+  `sandbox_max_tokens` claims); `added_cost_usd` widens `max_cost_usd`.
+- **Warnings** (`BUDGET_WARN_FRACTION = 0.8`): spend ≥ ~80% of the
+  EFFECTIVE cap emits `budget_warning` once per (sandbox, limit kind) —
+  dedup by reading the same checkpoint rows back; the gateway emits on
+  the request path, the monitor poll backstops stopped-calling cells
+  (including the `cost` limit, which only the monitor can compute).
+- **auto_extend** (`budgets.auto_extend`, submit checkbox): on the
+  first warn condition the monitor grants +50% of the warned limit as a
+  `budget_extended` `via="auto"` row — once per cell (any prior grant,
+  manual or auto, satisfies it).
+- **API** (`api/routers/sandboxes.py`):
+  `POST /api/sandboxes/{id}/extend_budget` — `{tokens ≥ 1000?,
+  cost_usd > 0?}` (at least one), 404 unknown / 409 terminal / 422
+  empty; response echoes post-grant `SandboxBudgetOut` so the UI swaps
+  it in place. `RunOut.sandbox_pacing_cap` (cap in effect or null) +
+  `SandboxOut.budget` (`SandboxBudgetOut`: used/limit/scope/pct/
+  warning/extended/limit_cost — binding limit = per-cell cap when set,
+  else the shared run ceiling; two grouped queries, no per-row fanout).
+- **Defaults**: `BudgetsIn.token_budget`,
+  `gateway DEFAULT_RUN_TOKEN_BUDGET`, `.env.example`, docker-compose
+  and `DEFAULT_BUDGETS` moved 200k → 500k — budgets stop runaways, not
+  honest work.
+- **Web** (`web/lib/api.ts`, `RunDetailClient.tsx`, `submit/page.tsx`):
+  `SandboxStatus` gains `"queued"`; run detail shows a "local pacing ·
+  max N" note + "pacing queue" hint on queued cells, a per-cell Budget
+  column (pct, `near cap` amber badge, `+extended` teal badge), `+50%`/
+  `+100%` extend buttons on live cells near cap, and a
+  `resubmit ×2 budget` button on `budget_exceeded` cells (doubles the
+  BINDING limit — scope-aware). Submit page gains the `auto_extend`
+  checkbox.
+- **Verify:**
+  - Unit: `tests/unit/orchestrator/test_sandbox_pacing.py` (cap policy,
+    queue/claim FIFO, paced lifecycle incl. gated-runtime promotion and
+    failed-spawn slot semantics); `test_monitor.py` F30 section
+    (extension defers cap, warning once, auto_extend once/off/manual-
+    skip); `tests/unit/gateway/test_proxy.py` F30 section (extension
+    widens both gates, warning emit/dedup/threshold);
+    `tests/unit/api/test_sandboxes.py` (extend 404/409/422/200, scope,
+    accumulation, run-detail budget block).
+  - Web: `eslint` + `next build` clean.
+  - Manual: an all-ollama 3+ cell run with `SANDBOX_MAX_CONCURRENT_LOCAL=2`
+    shows 2 running + N queued cells; near a small budget the cell shows
+    `near cap` + extend buttons, and the grant appears as a
+    `budget_extended` timeline event.
+- **Depends on:** F2 (orchestrator + monitor), F3 (gateway budget gate
+  + cred claims), PR15 (run-pacing pattern this mirrors), F21 (per-cell
+  budgets this extends), F8 (run detail surface).
+
+### F32 — Judge quality: panel scoring + human override + blind A/B votes (PR29) ✅
+
+- **What:** three trust layers on top of the single LLM judge.
+  **Panel:** `RunCreate.evaluator_models` (1–3 entries, deduped
+  order-preserving, `evaluator_model` folds in as panel head) runs every
+  judge through the full eval loop per artifact — own minted cred, own
+  baseline workspace copy, failure isolation (one judge's failure doesn't
+  mask the others' scores). Score rows carry `judge_model` + `source`
+  (`evaluator`/`checker`/`human`) + `note`; `eval_scored`/
+  `eval_scores_failed` payloads name the judge. The results merge
+  buckets a (dimension, sandbox) cell by source: a **human row wins
+  outright**, else the cell is the judge **mean** with `spread` =
+  max−min when ≥2 judge buckets differ, `judge_count`, and the per-judge
+  `judges[]` list attached for the expand-row breakdown. `evaluator_models`
+  on `RunResults` names the resolved panel (index 0 = the primary judge
+  the legacy NULL-`judge_model` rows fold into); a rescore with `model=`
+  re-judges under that one judge, without it re-runs the whole panel.
+  **Human override:** `POST /api/sandboxes/{id}/scores` writes a
+  `source="human"` row (seq above the sandbox max, `note` = why the
+  override) that wins its cell outright, survives every
+  `?rubric_version=` view, and emits a `human_score` checkpoint.
+  **Blind A/B:** `POST /api/runs/{id}/pair` picks two artifact-bearing
+  sandboxes (random or `sandbox_ids`-pinned) and returns anonymized A/B
+  sides — file listings only (`workspace/` tree; artifact-root prompt
+  cells expose `output.txt` only; `meta.json`/`transcript`/analysis
+  never surface, no sandbox ids/model names). `GET .../files/{side}/
+  {path}` reads a capped text file (session TTL 2h, in-memory — expiry
+  404s with "post a new pair"). `POST .../vote` records a per-dimension
+  winner (`A`/`B`/`tie`) and the response reveals the real ids;
+  `GET /api/runs/{id}/votes` lists newest-first and
+  `RunResults.votes` rolls up W/L/T + win rate per sandbox plus
+  judge-vs-human agreement (newest-wins per unordered pair+dim).
+- **Where:** `api/schemas.py` (`evaluator_models`, `HumanScoreIn`,
+  `PairCreateIn`/`PairOut`, `PairVoteIn`/`PairwiseVoteOut`,
+  `VotesSummary`, `JudgeScore`/`spread`/`judge_count`/`source`/`note` on
+  results shapes), `api/routers/runs.py` (panel normalize + persist,
+  `same_model_eval` across the panel), `api/modelcheck.py` (all judges
+  validated), `api/routers/results.py` (merge buckets, human-score POST,
+  pair sessions/files/vote/list + `votes` roll-up), `orchestrator/
+  lifecycle.py` (per-judge eval loop; `suite_pass` rows stamp
+  `source="checker"`), `evaluator/evaluate.py` (judge_model/source on
+  rows + event payloads), `db/models.py` + migration `c7a9e1b3d5f2`
+  (`scores.judge_model/source/note`, `pairwise_votes`), `web/lib/api.ts`
+  (types + fns), `web/lib/resubmit.ts` (panel extras round-trip),
+  `web/app/submit/page.tsx` (up-to-3 judge rows, panel-aware
+  same-model warning), `web/app/runs/[id]/results/ResultsClient.tsx`
+  (human/checker badges, ±spread badge, per-judge breakdown, inline
+  human-score editor, `VotesCard`), `PairReview.tsx` (blind A/B card:
+  two anonymized file panes → per-dimension vote → post-vote reveal).
+- **Verify:**
+  - Unit: `test_runs.py` (panel normalize/dedupe/cap, config shape);
+    `test_results.py` (mean+spread merge, human-wins, rubric_version
+    keep, pair/votes endpoints, roll-up); `test_modelcheck.py` (every
+    judge checked); `test_lifecycle.py` (per-judge pass order, cred
+    minting, failure isolation, `suite_pass` source); `test_rescore.py`
+    (panel re-run vs `model=` override); `test_evaluate.py`
+    (judge_model/source stamps); `test_migrations.py` (new head).
+  - Web: `lib/resubmit.test.ts` (panel head/extras round-trip);
+    `eslint` + `next build` clean.
+  - Manual: submit a run with 2–3 judges → per-judge `eval_scored`
+    checkpoints → results cells show `±spread` on disagreement → ✎ a
+    cell to a human score → `human` badge + judges still listed under
+    it → "new blind pair" → browse A/B → vote → ids reveal + Human
+    votes card updates.
+- **Depends on:** F26 (arbitrary dimension names make per-dimension
+  votes meaningful), F7/F14 (eval loop + rescore), F19 (jailed file
+  reads the pair file endpoint reuses). **Feeds:** the last trust-gap
+  before multi-domain evals — panel disagreement flags suspect cells,
+  human override fixes them in place, blind votes give a judge-quality
+  signal independent of the judge.
 
 ## Implementation sequence
 

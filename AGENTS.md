@@ -131,7 +131,8 @@ adapters are added.
    generation call once at raised caps on empty/timed-out/zero-file output
    (`TESTGEN_MAX_TOKENS_RETRY`, up to 2× `TESTGEN_TIMEOUT_SECONDS` clamped
    to the eval-attempt deadline); a scores doc
-   missing `overall` gets it synthesized as the dimension mean + a warning.
+   missing `overall` gets it synthesized from the dimension scores
+   (scale-normalized to 0-10) + a warning.
 7. **Artifact store** — `./data/artifacts/<run_id>/<sandbox_id>/` — repo
    tarballs, transcripts, event exports.
 
@@ -167,6 +168,19 @@ adapters are added.
    by `SPAWN_MEM_WAIT_SECONDS` — expiry fails that one sandbox and makes
    the remaining configs fail fast (one probe each), so sustained pressure
    can't hold the run's slot for N×cap.
+   **Local-run sandbox pacing (F30):** when EVERY participant model
+   resolves to a local provider (ollama — `pacing.provider_for_model`
+   mirrors the gateway's `PROVIDER_ROUTES`/`UPSTREAM_PROVIDER` routing),
+   at most `SANDBOX_MAX_CONCURRENT_LOCAL` (default 2, 0 disables) cells'
+   containers are active at once. Cells past the cap insert as
+   `Sandbox.status="queued"` BEFORE `docker run` (`sandbox_queued`
+   checkpoint, FIFO `ahead` position) and promote `queued → provisioning`
+   via `pacing.claim_queued_sandbox` as siblings go terminal —
+   `lifecycle._watch_cells_paced` runs the claim between `asyncio.wait`
+   completions so order is deterministic. The launch then runs the same
+   pipeline (pack staging, mem gate, cred, `docker run`) — the cap is a
+   container-slot count, not a call-rate limit: a small local model can't
+   honestly serve N parallel agents anyway. Prompt cells hold no slot.
 4. **Execute** — agent loops; all model calls via gateway; adapter streams
    normalized events; UI shows live timeline.
 5. **Terminate** — each sandbox reaches a terminal state (below); workspace
@@ -196,6 +210,19 @@ verdict (PR28) — the terminate checkpoint's `payload.limit` says which:
 (per-cell ceiling, cred `sandbox_max_tokens` metered against the cell's
 own usage + monitor backstop), `cost` (`max_cost_usd` vs the cell's
 estimated spend at the layered price table — priced models only).
+
+**Budget resilience (F30):** caps are live-widenable, not one-shot.
+`POST /api/sandboxes/{id}/extend_budget` appends a `budget_extended`
+checkpoint; the gateway's `_budget_gate` and the monitor's poll sum those
+rows into the cred's effective ceilings (token grants widen BOTH the run
+and per-sandbox limits the cred passes through; cost grants widen
+`max_cost_usd`) — a control-plane bump takes effect on the next
+call/poll, no restart. When spend crosses ~80% of the effective cap,
+`budget_warning` checkpoints emit once per (sandbox, limit kind) — the
+gateway on the request path, the monitor poll as backstop — and surface
+in the UI as a "near cap" badge with an extend affordance.
+`budgets.auto_extend` (submit checkbox) makes the monitor grant +50%
+once on the first warning (`via="auto"`).
 
 Provisional defaults (confirm with user): 60 min wall clock, $2 spend cap,
 stuck-loop = 3 consecutive identical tool calls.
@@ -298,7 +325,27 @@ Anthropic/OpenAI landed (env-switched, `PROVIDER_ROUTES` per-model).
 ## Rubric
 
 MVP dimensions: functional requirements, acceptance criteria, code
-implementation quality, cyclomatic complexity. Since PR6/PR7 the judge
+implementation quality, cyclomatic complexity. Since PR23 (F26) those four
+are only the **code-task default** — `RubricContent.dimensions` accepts
+1–12 arbitrary dimensions (names soft-normalize to snake_case + a small
+canonical-alias map; rejected only on names normalizing to empty or past
+128 chars, reserved score-namespace names, or duplicates after
+normalization), so non-coding rubrics (extraction accuracy, tone,
+compliance,
+…) generate, freeze, score, and render with no code axes at all.
+Generation can be steered: `RunCreate.rubric_hint` (fallback: preset
+category) feeds a domain line into the gen prompt, and a **rubric
+template** (`RunCreate.rubric_template` — vendored JSON seeds under
+`rubric_templates/` + user `rubric_templates` rows, `GET
+/api/rubric-templates`) replaces the freeform task text as the generation
+basis; a preset's `suggested_rubric` (`task_presets.suggested_rubric`
+JSONB / vendored frontmatter) fills in when no explicit template is sent.
+Collectors still report every measurable signal; the judge brief names
+only the dimensions the rubric carries and marks non-applicable dims
+(e.g. `cyclomatic_complexity` on a non-code artifact) mid-scale with a
+"not applicable" rationale rather than dropping the row.
+
+Since PR6/PR7 the judge
 scores from **measured** signals where available — the `scoring` package's
 static-analysis collector (lizard, parse-only) computes real cyclomatic
 complexity/size/language mix, and the `exec` collector runs the
@@ -391,6 +438,8 @@ task_presets/  # vendored task presets (<slug>.md — frontmatter + prompt body)
 api/presets.py # preset store: vendored discovery + merged vendored/user resolve
 benchmark_suites/ # vendored benchmark suites (<slug>/suite.yaml + tests/)
 api/suites.py  # suite store: yaml parse, slug-safe resolve, jailed check paths
+rubric_templates/ # vendored rubric templates (<name>.json, F26)
+api/rubric_templates.py # merged template store: vendored + user rows
 scoring/checkers.py # deterministic suite checkers (output + workspace + py_test)
 web/           # Next.js app
 db/            # schema + Alembic migrations
@@ -436,8 +485,12 @@ or tests change.
 | F23 | Task inputs (seeded workspace: repo_url or uploaded archive) |
 | F24 | Task preset library (vendored + user presets, preset_ref provenance) |
 | F25 | Benchmark suites + deterministic checkers (suite.yaml fan-out, objective checkers beside judge scores) |
+| F26 | Custom rubric dimensions + rubric templates (arbitrary dims, template basis + domain hint) |
 | F31 | Timeline compare-mode clock (absolute|relative toggle, per-cell t+0 re-basing) |
 | F27 | Cross-run compare + leaderboards (global model/config-family rankings, run-vs-run diff) |
+| F28 | Run export + share links (`/export?fmt=json|csv` bundle; `/share/{token}` read-only view) |
+| F29 | Dashboard home (/dashboard summary aggregate — KPIs, weekly spend/runs, queue lane, top-5 boards) |
+| F32 | Judge quality: panel scoring + human override + blind A/B votes |
 
 ## Post-MVP roadmap
 
@@ -457,9 +510,13 @@ or tests change.
 - Higher-fidelity instrumentation via harness hooks/plugins
 - Gateway response caching / deterministic replay
 - Multi-host / K8s sandbox scaling
-- Auth, saved run templates, share links
+- Auth, saved run templates, share links — **share links landed as
+  PR35/F28** (`runs.share_token` + read-only `/share/{token}`); auth +
+  templates remain PR19 territory
 - ~~Dynamic model picker~~ + ~~named harness configs~~ — **landed as F15**
-- Cross-run analytics & cost dashboards
+- ~~Cross-run analytics & cost dashboards~~ — **landed (F13 trends +
+  PR36/F29 `/dashboard`)**: weekly spend/runs, terminal mix, queue lane,
+  top-5 boards, recent runs
 - Timeline-side analytics — **landed (PR9)**: per-sandbox metrics strip on
   `web/app/runs/[id]/timeline/` (turns/tokens/latency/speed/cost/errors
   chips + judge line; chips double as sandbox-filter selectors; 15s
@@ -963,6 +1020,115 @@ or tests change.
   `web/lib/compareRuns.ts` holds the pure transforms; the shared
   `LeaderboardBoards` renders on /leaderboard and embedded, preset-
   filtered, on /presets/[slug].
+- **Run export is a projection, not a transcript (PR35/F28)** —
+  `GET /api/runs/{id}/export?fmt=json` ships the `heg-run-export` v1
+  bundle: spec + every rubric version + the verbatim `RunResults`/
+  `RunAnalytics` payloads (the endpoint CALLS the same handlers the UI
+  uses — never re-derive) + events-lite rows: event payloads projected
+  to top-level scalars (strings capped) plus the `usage` dict; nested
+  content dropped on purpose. `fmt=csv` flattens to one row per
+  sandbox×dimension (judge `overall` = last dim row per sandbox;
+  unscored sandboxes still get one empty row; per-sandbox + analytics
+  columns repeat; UTF-8 BOM for Excel). The bundle models
+  (`RunExport`/`EventLiteOut`/`RunSpecOut`) live in
+  `api/routers/results.py` per the Phase-2 ownership split.
+- **Share links are the PR19 extension point (PR35/F28)** —
+  `runs.share_token` (nullable unique, migration `c5f9a2b8d4e7` chained
+  on `e4f5a6b7c8d9`) minted idempotently by `POST /api/runs/{id}/share`,
+  revoked by DELETE. `GET /api/share/{token}` serves a read-only bundle
+  (spec + matrix + bounded events-lite) to `/share/{token}` — the app
+  is unauthenticated, so the token is capability-URL prep for PR19
+  auth, NOT a security boundary today; when auth lands, the
+  control-plane routes lock down while `/share/*` stays open on the
+  token.
+- **Dashboard summary is one server-side aggregate (PR36/F29)** —
+  `GET /api/analytics/summary` returns everything `/dashboard` needs
+  that the leaderboard doesn't already serve (KPI totals, `?weeks=`
+  ISO-Monday buckets of runs/turns/spend ending at the current week,
+  terminal-reason counts + a separate pending count, the queue lane —
+  active runs + `queued` stamped with promotion-order position from
+  `started_at`, awaiting-review count, and `?recent=` newest runs with
+  newest-wins mean `overall`). One events scan prices each metered
+  call exactly like per-run analytics: sandbox events after the first
+  evaluator-source event bill at the run's `evaluator_model`;
+  run-level calls (`sandbox_id` null — rubric drafting) bill at the
+  payload `model`. Unpriced calls null their week's total + the grand
+  total (never zero-filled; `unpriced_llm_turns` names the gap),
+  `?price_model=` reprices all traffic like the trends endpoint.
+  `/dashboard` reuses the PR32 leaderboard for its top-5 boards and
+  polls only while the lane is busy. `web/lib/dashboard.ts` holds the
+  pure chart transforms (node-tested).
+- **F30 — local-run sandbox pacing reuses the run-queue pattern, one
+  level down**: `"queued"` is a real SANDBOX status (rows persist —
+  sweeps/UI see parked cells; `ACTIVE_SANDBOX_STATES` =
+  provisioning/running/terminating explicitly excludes it), applied ONLY
+  when every participant model resolves local (`pacing.LOCAL_PROVIDERS`
+  = ollama — provider routing is mirrored in `pacing.provider_for_model`
+  rather than imported, since gateway settings differ from api
+  settings). The cap is a concurrent-CONTAINER count driven by
+  `lifecycle._watch_cells_paced` — claims run on the loop thread between
+  `asyncio.wait` completions so FIFO order is deterministic, and a
+  failed spawn never eats a slot (only active states count). A queued
+  cell's launch re-runs the full spawn pipeline (`provision._launch` —
+  staging/mem gate/cred/docker) — pacing wraps, it doesn't shortcut.
+  `queue_sandbox`/`claim_queued_sandbox`/`spawn_queued` mirror
+  `place_run`/`claim_next_queued` semantics.
+- **F30 — budget extensions are events, not columns**: no migration —
+  `extend_budget`/`auto_extend` grants are append-only `budget_extended`
+  checkpoints summed per read (`metering.budget_state`/`budget_states`),
+  so a control-plane bump is live on the gateway's next request and the
+  monitor's next poll without restarting the cell, and the timeline
+  shows the grant. `budget_warning` checkpoints (once per sandbox+limit,
+  ~80% of the EFFECTIVE cap) dedup the same way — read-then-emit on both
+  the gateway request path and the monitor backstop. The default run
+  budget moved 200k → 500k (`BudgetsIn`/`DEFAULT_RUN_TOKEN_BUDGET`
+  aligned) — budgets stop runaways, not honest work.
+
+- **Rubric dimensions are open, not canonical-locked (PR23/F26)** — the
+  exact-four validator was the last thing keeping eval coding-only.
+  `RubricContent` now takes 1–12 arbitrary dims; the canonical names
+  remain as (a) the `code-default` template's set, (b) alias-fold
+  targets for common LLM re-phrasings, and (c) the results table's
+  sort anchor (canonical-first, then alpha). Structural rejections:
+  names that normalize to empty or past 128 chars, reserved
+  score-namespace names (`overall`, `suite_pass`, `scores`, `summary`,
+  `total`), and duplicates after normalization — a 3-dim rubric is
+  valid, not an error. Generation steering resolves strictly: explicit
+  `rubric_template` → preset `suggested_rubric` → freeform task text,
+  with `rubric_hint` → preset `category` → none for the domain line;
+  all three land on `run.config` so `draft_rubric` resolves them at
+  draft time. Rubric templates reuse the preset merged-store pattern
+  (vendored `rubric_templates/*.json` + DB rows). The judge brief —
+  not the collector set — decides signal applicability: collectors
+  always report what they can measure, and `evaluator/prompts.py`
+  phrases the measured-signals rule around the rubric's actual dims,
+  marking non-applicable dims mid-scale + "not applicable" instead of
+  fabricating or dropping rows. Frontend editing is the shared
+  `RubricEditor` (structured form, raw JSON behind a toggle); raw-JSON
+  textareas are gone from both edit sites.
+- **Judge quality is panel + human + blind vote, not one verdict
+  (PR29/F32)** — `RunCreate.evaluator_models` (1–3, deduped,
+  `evaluator_model` folds to panel head) runs every judge through the
+  full eval loop per artifact: own cred, own baseline copy, failure
+  isolated. Score rows stamp `judge_model`/`source`
+  (`evaluator`|`checker`|`human`)/`note`; the results merge buckets by
+  source — a `source="human"` row (`POST /api/sandboxes/{id}/scores`)
+  wins its cell outright and survives every `?rubric_version=` view,
+  else the cell is the judge MEAN with `spread` = max−min over ≥2
+  judge buckets + a per-judge breakdown. `suite_pass` rows stamp
+  `source="checker"`. Blind A/B is deliberately anonymized:
+  `POST /api/runs/{id}/pair` returns A/B sides carrying file listings
+  only (workspace tree; prompt cells expose `output.txt` only —
+  `meta.json`/`transcript`/analysis and sandbox/model identities never
+  surface pre-vote), pair sessions are in-memory with a 2h TTL
+  (restart/expiry → "post a new pair"), and the vote POST resolves to
+  real ids in its response. `RunResults.votes` merges newest-wins per
+  (unordered pair, dimension) into W/L/T + win rate plus
+  judge-vs-human agreement on comparable votes. Frontend: submit's
+  evaluator row grows up to 2 extra judge rows (extras-only payload —
+  the server re-folds the head); results gains `human`/`checker`/`±N`
+  badges, an inline human-score editor per cell, the `VotesCard`
+  roll-up, and the `PairReview` blind A/B card.
 
 ## Working conventions
 

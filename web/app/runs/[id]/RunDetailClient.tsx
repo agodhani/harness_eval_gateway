@@ -14,7 +14,9 @@ import {
   ApiError,
   approveRun,
   CANCELLABLE_RUN_STATUSES,
+  DEFAULT_BUDGETS,
   deleteRun,
+  extendBudget,
   getRun,
   getRunResults,
   runModels,
@@ -33,7 +35,9 @@ import {
   specFromRun,
   stageResubmit,
 } from "@/lib/resubmit";
+import { draftFromContent, validateDraft } from "@/lib/rubricEdit";
 import RunConsoleLive from "@/components/RunConsoleLive";
+import RubricEditor from "@/components/RubricEditor";
 import { SavePresetDialog } from "@/components/SavePresetDialog";
 import {
   Badge,
@@ -317,9 +321,11 @@ export default function RunDetailClient({ runId }: { runId: string }) {
   // previous run's data (and its polling status) leaking across navigation.
   const run = loadedId === runId ? runData : null;
 
-  // rubric editing state
+  // rubric editing state — `draftContent` is the working RubricContent the
+  // structured editor reports back; `draftValid` gates the save button.
   const [editing, setEditing] = useState(false);
-  const [draftJson, setDraftJson] = useState("");
+  const [draftContent, setDraftContent] = useState<RubricContent>({});
+  const [draftValid, setDraftValid] = useState(false);
   const [rubricBusy, setRubricBusy] = useState(false);
   const [rubricError, setRubricError] = useState<string | null>(null);
 
@@ -333,6 +339,8 @@ export default function RunDetailClient({ runId }: { runId: string }) {
   const [cancelling, setCancelling] = useState(false);
   // PR22 — save this run's task prompt as a reusable preset.
   const [savePresetOpen, setSavePresetOpen] = useState(false);
+  // F30 — sandbox ids with an extend_budget POST in flight.
+  const [extending, setExtending] = useState<Set<string>>(new Set());
 
   const refresh = useCallback(
     async (silent = true) => {
@@ -422,6 +430,51 @@ export default function RunDetailClient({ runId }: { runId: string }) {
     router.push("/submit");
   }
 
+  /** F30 — resubmit with the BINDING budget doubled (the one this cell
+   * exhausted: its per-sandbox cap when scope="sandbox", else the shared
+   * run ceiling). Budget-dead cells can't resume — a bigger retry is the
+   * honest affordance. */
+  function resubmitBiggerBudget(s: SandboxOut) {
+    if (!run) return;
+    const spec = specFromRun(run);
+    const b = { ...(spec.budgets ?? { ...DEFAULT_BUDGETS }) };
+    if (s.budget?.scope === "sandbox" && b.sandbox_token_budget) {
+      b.sandbox_token_budget = Math.round(b.sandbox_token_budget * 2);
+    } else {
+      b.token_budget = Math.round(
+        (b.token_budget ?? DEFAULT_BUDGETS.token_budget) * 2,
+      );
+    }
+    spec.budgets = b;
+    stageResubmit(spec);
+    router.push("/submit");
+  }
+
+  /** F30 — grant this live cell a larger allowance; the gateway gate +
+   * monitor poll pick it up on their next read (no restart). */
+  async function extendCell(sid: string, fraction: number) {
+    const sb = run?.sandboxes.find((x) => x.id === sid);
+    const limit = sb?.budget?.limit_tokens;
+    if (!limit || extending.has(sid)) return;
+    setExtending((prev) => new Set(prev).add(sid));
+    setError(null);
+    try {
+      await extendBudget(sid, {
+        // ge=1000 on the API — clamp so a tiny cap still grants.
+        tokens: Math.max(1000, Math.round(limit * fraction)),
+      });
+      await refresh(true);
+    } catch (err) {
+      setError(errMsg(err, "Extend failed."));
+    } finally {
+      setExtending((prev) => {
+        const next = new Set(prev);
+        next.delete(sid);
+        return next;
+      });
+    }
+  }
+
   /** Cancel a pre-spawn run or delete a terminal one — DELETE /api/runs/{id}
    * decides which ("cancelled" → status flip; "deleted" → hard removal).
    * In-flight runs (provisioning/running/evaluating) are gated off the
@@ -459,7 +512,12 @@ export default function RunDetailClient({ runId }: { runId: string }) {
 
   function startEdit() {
     if (!rubric) return;
-    setDraftJson(JSON.stringify(rubric.content, null, 2));
+    const content = rubric.content ?? {};
+    setDraftContent(content);
+    const v = validateDraft(draftFromContent(content));
+    setDraftValid(
+      v.errors.length === 0 && Object.keys(v.fieldErrors).length === 0,
+    );
     setRubricError(null);
     setEditing(true);
   }
@@ -467,20 +525,9 @@ export default function RunDetailClient({ runId }: { runId: string }) {
   async function saveRubric() {
     if (!rubric) return;
     setRubricError(null);
-    let parsed: RubricContent;
-    try {
-      const v: unknown = JSON.parse(draftJson);
-      if (!v || typeof v !== "object" || Array.isArray(v)) {
-        throw new Error("rubric content must be a JSON object");
-      }
-      parsed = v as RubricContent;
-    } catch (err) {
-      setRubricError(`Invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
-      return;
-    }
     setRubricBusy(true);
     try {
-      await updateRubric(runId, parsed);
+      await updateRubric(runId, draftContent);
       setEditing(false);
       setNotice("Rubric saved.");
       await refresh(true);
@@ -761,6 +808,13 @@ export default function RunDetailClient({ runId }: { runId: string }) {
           </Card>
 
           <Card title={`Sandboxes (${run.sandboxes.length})`}>
+            {run.sandbox_pacing_cap ? (
+              <div className="faint" style={{ marginBottom: "0.5rem" }}>
+                local pacing · max {run.sandbox_pacing_cap} concurrent
+                {run.sandbox_pacing_cap === 1 ? "" : "s"} — all models are
+                local, so cells past the cap park as queued and promote FIFO.
+              </div>
+            ) : null}
             {run.sandboxes.length === 0 ? (
               <EmptyState>No sandboxes provisioned yet.</EmptyState>
             ) : (
@@ -771,6 +825,7 @@ export default function RunDetailClient({ runId }: { runId: string }) {
                       <th>Sandbox</th>
                       <th>Config</th>
                       <th>Status</th>
+                      <th>Budget</th>
                       <th>Terminal reason</th>
                       <th>Finished</th>
                     </tr>
@@ -783,6 +838,8 @@ export default function RunDetailClient({ runId }: { runId: string }) {
                       const packs = Array.isArray(hc.skill_packs)
                         ? (hc.skill_packs as string[])
                         : [];
+                      const terminal =
+                        s.status === "done" || s.status === "failed";
                       return (
                         <tr key={s.id}>
                           <td className="num">
@@ -820,6 +877,73 @@ export default function RunDetailClient({ runId }: { runId: string }) {
                           </td>
                           <td>
                             <Badge tone={statusTone(s.status)}>{s.status}</Badge>
+                            {s.status === "queued" ? (
+                              <div
+                                className="faint"
+                                style={{ fontSize: "0.7rem" }}
+                                title="Parked on the local-pacing cap — this cell's row exists but no container does; it promotes as siblings finish."
+                              >
+                                pacing queue
+                              </div>
+                            ) : null}
+                          </td>
+                          <td>
+                            {s.budget ? (
+                              <div className="stack" style={{ gap: "0.3rem" }}>
+                                <span
+                                  className={s.budget.warning ? "" : "faint"}
+                                  title={`${s.budget.used_tokens.toLocaleString()} / ${s.budget.limit_tokens.toLocaleString()} tokens (${s.budget.scope} ceiling${s.budget.extended_tokens ? ` · +${s.budget.extended_tokens.toLocaleString()} extended` : ""})`}
+                                >
+                                  {Math.round(s.budget.pct * 100)}%
+                                </span>
+                                {s.budget.warning ? (
+                                  <Badge
+                                    tone="amber"
+                                    title="Crossed ~80% of the effective cap — extend to give the cell headroom."
+                                  >
+                                    near cap
+                                  </Badge>
+                                ) : null}
+                                {s.budget.extended_tokens > 0 ? (
+                                  <Badge
+                                    tone="teal"
+                                    title={`+${s.budget.extended_tokens.toLocaleString()} tokens granted via extend_budget`}
+                                  >
+                                    +extended
+                                  </Badge>
+                                ) : null}
+                                {!terminal && s.budget.warning ? (
+                                  <span className="row" style={{ gap: "0.3rem" }}>
+                                    {[0.5, 1].map((f) => (
+                                      <button
+                                        key={f}
+                                        type="button"
+                                        className="btn btn--sm"
+                                        title={`Grant +${Math.round(f * 100)}% of the current ${s.budget!.limit_tokens.toLocaleString()}-token cap (takes effect on the cell's next call)`}
+                                        disabled={extending.has(s.id)}
+                                        onClick={() => void extendCell(s.id, f)}
+                                      >
+                                        {extending.has(s.id)
+                                          ? "…"
+                                          : `+${Math.round(f * 100)}%`}
+                                      </button>
+                                    ))}
+                                  </span>
+                                ) : null}
+                                {s.terminal_reason === "budget_exceeded" ? (
+                                  <button
+                                    type="button"
+                                    className="btn btn--sm"
+                                    title="Budget-dead cells can't resume — stage a resubmit with the binding budget doubled."
+                                    onClick={() => resubmitBiggerBudget(s)}
+                                  >
+                                    resubmit ×2 budget
+                                  </button>
+                                ) : null}
+                              </div>
+                            ) : (
+                              <span className="faint">—</span>
+                            )}
                           </td>
                           <td>
                             {s.terminal_reason ? (
@@ -863,7 +987,8 @@ export default function RunDetailClient({ runId }: { runId: string }) {
                     type="button"
                     className="btn btn--sm"
                     onClick={saveRubric}
-                    disabled={rubricBusy}
+                    disabled={rubricBusy || !draftValid}
+                    title={!draftValid ? "fix the rubric errors below first" : undefined}
                   >
                     {rubricBusy ? "Saving…" : "Save rubric"}
                   </button>
@@ -913,18 +1038,21 @@ export default function RunDetailClient({ runId }: { runId: string }) {
             )
           ) : editing ? (
             <div className="stack">
-              <p className="field__hint">
-                Edit the rubric JSON. <code>dimensions</code> must contain exactly:{" "}
-                <code>functional_requirements</code>, <code>acceptance_criteria</code>,{" "}
-                <code>code_quality</code>, <code>cyclomatic_complexity</code>.
-              </p>
-              <textarea
-                className="textarea"
-                style={{ minHeight: "320px" }}
-                value={draftJson}
-                onChange={(e) => setDraftJson(e.target.value)}
+              <RubricEditor
+                key={rubric.id}
+                content={draftContent}
+                onChange={(c, meta) => {
+                  setDraftContent(c);
+                  setDraftValid(meta.valid);
+                }}
                 disabled={rubricBusy}
-                spellCheck={false}
+                note={
+                  <>
+                    Edit the rubric — 1–12 dimensions, arbitrary snake_case
+                    names (canonical aliases normalize). Raw JSON is behind the
+                    toggle.
+                  </>
+                }
               />
               {rubricError ? <ErrorNote>{rubricError}</ErrorNote> : null}
             </div>

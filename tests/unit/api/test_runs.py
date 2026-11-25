@@ -25,7 +25,16 @@ from api import modelcheck
 from api.deps import get_db
 from api.main import app
 from api.routers import runs as runs_router
-from db.models import Artifact, Base, Event, Rubric, Run, Sandbox, Score
+from db.models import (
+    Artifact,
+    Base,
+    Event,
+    PairwiseVote,
+    Rubric,
+    Run,
+    Sandbox,
+    Score,
+)
 from db.session import make_engine, make_session_factory
 from orchestrator import lifecycle as lifecycle_mod
 from orchestrator import rubric as rubric_mod
@@ -244,11 +253,14 @@ def test_create_run_defaults(api) -> None:
     assert cfg["harness_configs"][0]["skill_packs"] == []
     assert cfg["budgets"] == {
         "max_iters": 50,
-        "token_budget": 200_000,
+        # F30: bumped 200k → 500k (matches DEFAULT_RUN_TOKEN_BUDGET).
+        "token_budget": 500_000,
         "wall_clock_seconds": 3600,
         # PR28: optional per-sandbox caps default unset (no per-cell limit).
         "sandbox_token_budget": None,
         "max_cost_usd": None,
+        # F30: auto-extension opt-in — off unless the submit asks for it.
+        "auto_extend": False,
     }
     # evaluator defaults to participant model -> same_model_eval flag
     assert cfg["evaluator_model"] == "qwen3:8b"
@@ -516,11 +528,28 @@ def test_get_and_update_rubric(api) -> None:
     assert resp.json()["content"]["summary"] == "human-edited rubric"
     assert resp.json()["status"] == "draft"  # still editable until approve
 
-    # canonical dimensions are enforced at the boundary
+    # PR23: the boundary enforces the flexible contract — an empty
+    # dimensions list or names colliding after normalization 422; a
+    # subset of arbitrary dims is a valid rubric.
     bad = _rubric_content()
-    bad["dimensions"] = bad["dimensions"][:3]
+    bad["dimensions"] = []
     resp = client.put(f"/api/runs/{run_id}/rubric", json={"content": bad})
     assert resp.status_code == 422
+    dup = _rubric_content()
+    dup["dimensions"][1]["name"] = "functional_requirements"
+    resp = client.put(f"/api/runs/{run_id}/rubric", json={"content": dup})
+    assert resp.status_code == 422
+    custom = _rubric_content()
+    custom["dimensions"] = [
+        {"name": "Accuracy", "min_score": 0.0, "max_score": 10.0},
+        {"name": "tone", "min_score": 0.0, "max_score": 10.0},
+    ]
+    resp = client.put(f"/api/runs/{run_id}/rubric", json={"content": custom})
+    assert resp.status_code == 200
+    assert [d["name"] for d in resp.json()["content"]["dimensions"]] == [
+        "accuracy",
+        "tone",
+    ]
 
 
 def test_approve_freezes_rubric_and_starts_lifecycle(api) -> None:
@@ -1109,3 +1138,104 @@ def test_create_run_model_options_value_bounds(api) -> None:
         )
         resp = api.client.post("/api/runs", json=body)
         assert resp.status_code == 422, (opts, resp.text)
+
+
+# ---------------------------------------------------------------------------
+# PR29 — judge panel (evaluator_models)
+# ---------------------------------------------------------------------------
+
+
+def test_create_run_evaluator_panel_persists(api) -> None:
+    """PR29: evaluator_models lands on config as the ordered panel with
+    evaluator_model folded to panel head (the primary judge)."""
+    data = _post_run(
+        api.client,
+        _valid_body(
+            evaluator_model="judge-a",
+            evaluator_models=["judge-b", "judge-c"],
+        ),
+    )
+    cfg = data["config"]
+    # evaluator_model folds to panel head → panel order a, b, c
+    assert cfg["evaluator_models"] == ["judge-a", "judge-b", "judge-c"]
+    # primary judge keeps the back-compat slot readers depend on
+    assert cfg["evaluator_model"] == "judge-a"
+    # no judge is a participant → flag stays False
+    assert cfg["same_model_eval"] is False
+
+
+def test_create_run_evaluator_panel_without_single_field(api) -> None:
+    """evaluator_models alone: panel[0] becomes the primary judge."""
+    body = _valid_body(evaluator_models=["judge-b", "judge-a"])
+    del body["evaluator_model"]
+    data = _post_run(api.client, body)
+    cfg = data["config"]
+    assert cfg["evaluator_models"] == ["judge-b", "judge-a"]
+    assert cfg["evaluator_model"] == "judge-b"
+
+
+def test_create_run_evaluator_panel_same_model_eval_any_judge(api) -> None:
+    """same_model_eval aggregates across the panel — ONE participant judge
+    flags non-independent scoring even when the others are independent."""
+    body = _valid_body(
+        models=["judge-b"],
+        evaluator_models=["judge-a", "judge-b"],
+    )
+    del body["evaluator_model"]
+    data = _post_run(api.client, body)
+    assert data["config"]["same_model_eval"] is True
+    assert data["same_model_eval"] is True
+
+
+def test_create_run_evaluator_panel_dedupes_and_caps(api) -> None:
+    """Panel is deduped order-preserving; evaluator_model + 3 distinct
+    panel entries would make 4 judges → 422 (max is 3)."""
+    body = _valid_body(evaluator_models=["judge-a", "judge-a", "judge-b"])
+    del body["evaluator_model"]
+    data = _post_run(api.client, body)
+    assert data["config"]["evaluator_models"] == ["judge-a", "judge-b"]
+
+    resp = api.client.post(
+        "/api/runs",
+        json=_valid_body(
+            evaluator_model="judge-d",
+            evaluator_models=["judge-a", "judge-b", "judge-c"],
+        ),
+    )
+    assert resp.status_code == 422
+    assert "judge" in str(resp.json()["detail"]).lower()
+
+
+def test_create_run_no_panel_keeps_legacy_config(api) -> None:
+    """No panel submitted → config carries no evaluator_models key —
+    single-judge runs stay byte-identical to the pre-PR29 shape."""
+    data = _post_run(api.client, _valid_body())
+    assert "evaluator_models" not in data["config"]
+    assert data["config"]["evaluator_model"] == "eval-model"
+
+
+def test_delete_done_run_hard_deletes_pairwise_votes(api) -> None:
+    """PR29 — hard delete sweeps pairwise_votes rows too (no FK cascade:
+    the router deletes them explicitly before the run row)."""
+    run_id = _seed_run(api, status="done")
+    with api.session_factory() as s:
+        sb1 = Sandbox(run_id=run_id, harness_config={}, status="done")
+        sb2 = Sandbox(run_id=run_id, harness_config={}, status="done")
+        s.add_all([sb1, sb2])
+        s.flush()
+        s.add(
+            PairwiseVote(
+                run_id=run_id,
+                left_sandbox=sb1.id,
+                right_sandbox=sb2.id,
+                dimension="functional_requirements",
+                winner="left",
+            )
+        )
+        s.commit()
+
+    resp = api.client.delete(f"/api/runs/{run_id}")
+    assert resp.status_code == 200
+    with api.session_factory() as s:
+        assert s.get(Run, run_id) is None
+        assert s.execute(select(PairwiseVote)).scalars().all() == []

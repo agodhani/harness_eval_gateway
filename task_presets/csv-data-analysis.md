@@ -5,6 +5,7 @@ description: Explore a dataset in the workspace and produce a findings report wi
 category: data-analysis
 tags: [data, csv, python, analysis, report]
 suggested_adapter: miniloop
+suggested_rubric: code-default
 ---
 
 The workspace contains one or more CSV data files. Analyze the data and produce a findings report.

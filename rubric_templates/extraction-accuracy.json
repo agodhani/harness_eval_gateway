@@ -1,0 +1,49 @@
+{
+  "name": "extraction-accuracy",
+  "description": "Rubric for data/document extraction tasks — did the model pull the right fields, completely, in the requested format, without inventing values?",
+  "content": {
+    "summary": "Score the extraction output on field-level accuracy, completeness against the source document, output-format compliance, and absence of hallucinated values.",
+    "dimensions": [
+      {
+        "name": "extraction_accuracy",
+        "title": "Extraction accuracy",
+        "description": "Are the extracted values correct against the source? Every populated field must match the document verbatim or as the task's normalization rules allow.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      },
+      {
+        "name": "field_coverage",
+        "title": "Field coverage",
+        "description": "Is every field the task asked for present in the output? Missing or silently dropped fields score lower than explicit null/empty markers when the task permits them.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      },
+      {
+        "name": "format_compliance",
+        "title": "Format compliance",
+        "description": "Does the output follow the requested schema/format (JSON keys, types, array shapes, date/number formats, ordering)? Structure violations count here, not under accuracy.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      },
+      {
+        "name": "no_hallucination",
+        "title": "No hallucination",
+        "description": "Are all output values grounded in the source? Invented, guessed, or transposed values score near zero on this dimension even when the format is perfect.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      }
+    ],
+    "criteria": [
+      {
+        "id": "example",
+        "text": "Example criterion — the generator replaces these with task-specific checkable items (one per requested field or format rule).",
+        "dimension": "extraction_accuracy",
+        "weight": 1.0
+      }
+    ]
+  }
+}

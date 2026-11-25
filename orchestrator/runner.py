@@ -432,7 +432,11 @@ def _fail_run_and_sandboxes(
         sandboxes = session.execute(
             select(Sandbox).where(
                 Sandbox.run_id == run_id,
-                Sandbox.status.in_(["provisioning", "running", "terminating"]),
+                Sandbox.status.in_(
+                    # "queued" = parked on the local-provider cap — no
+                    # container exists yet, so it's just a row to retire.
+                    ["queued", "provisioning", "running", "terminating"]
+                ),
             )
         ).scalars().all()
         for sb in sandboxes:

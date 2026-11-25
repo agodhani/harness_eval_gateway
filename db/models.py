@@ -77,6 +77,10 @@ class Run(Base):
     suite_run_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("suite_runs.id"), index=True
     )
+    # PR35 share links — an unguessable token enabling the read-only
+    # ``/share/{token}`` view (results + events-lite). NULL = not shared;
+    # minted by POST /api/runs/{id}/share, revoked by DELETE.
+    share_token: Mapped[str | None] = mapped_column(String(64), unique=True)
 
     sandboxes: Mapped[list[Sandbox]] = relationship(back_populates="run")
     rubrics: Mapped[list[Rubric]] = relationship(back_populates="run")
@@ -96,7 +100,8 @@ class Sandbox(Base):
     # surfaced in timeline/results/analytics; provisioner defaults it to
     # "<adapter>-<sandbox short id>" when the submit left it blank.
     name: Mapped[str | None] = mapped_column(String(255))
-    # provisioning | running | terminating | done | failed (terminal_reason set)
+    # [queued (local-run pacing cap — no container yet) →] provisioning |
+    # running | terminating | done | failed (terminal_reason set)
     status: Mapped[str] = mapped_column(String(32), default="provisioning", index=True)
     docker_container_id: Mapped[str | None] = mapped_column(String(128))
     artifact_path: Mapped[str | None] = mapped_column(String(1024))
@@ -202,6 +207,19 @@ class Score(Base):
     dimension: Mapped[str] = mapped_column(String(128))
     score: Mapped[float] = mapped_column(Float)
     rationale: Mapped[str] = mapped_column(Text, default="")
+    # PR29 — the evaluator model that authored an ``llm`` row, stamped at
+    # insert time so a multi-judge panel keeps per-judge rows attributable
+    # (NULL predates the panel; the merge treats NULL as the run's primary
+    # evaluator model). Human/checker rows carry no model provenance.
+    judge_model: Mapped[str | None] = mapped_column(String(255))
+    # llm (judge pass) | human (POST /api/sandboxes/{id}/scores override —
+    # wins the newest-wins merge for its pair regardless of order) |
+    # checker (deterministic suite_pass rows — no model authored them).
+    source: Mapped[str] = mapped_column(
+        String(16), default="llm", server_default="llm"
+    )
+    # Optional free-text context on human overrides (why the score moved).
+    note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     sandbox: Mapped[Sandbox] = relationship(back_populates="scores")
@@ -236,10 +254,40 @@ class TaskPreset(Base):
     # keys so vendored and user presets read uniformly in PresetOut.
     suggested_adapter: Mapped[str | None] = mapped_column(String(64))
     suggested_models: Mapped[list[Any] | None] = mapped_column(JSONType)
+    # PR23 — optional rubric-generation basis: ``{"template": <name>}`` (a
+    # rubric_templates entry — vendored file or user row), ``{"hint": str}``
+    # (domain hint fed into the gen prompt), or an inline rubric fragment
+    # ``{"dimensions": [...]}`` used directly as the basis. Submit applies
+    # it only when no explicit ``rubric_template`` was submitted.
+    suggested_rubric: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class RubricTemplate(Base):
+    """PR23 — user-saved rubric template (the "user" side of the template
+    library, mirroring task_presets).
+
+    Vendored templates are ``rubric_templates/<name>.json`` files and never
+    appear here; rows are always ``source="user"`` and share the vendored
+    name namespace. ``content`` is a RubricContent-shaped dict — the
+    template acts as the rubric-generation basis when a submit selects it
+    (``runs.config.rubric_template``).
+    """
+
+    __tablename__ = "rubric_templates"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    # One name namespace with the vendored files — selection token for
+    # RunCreate.rubric_template and preset suggested_rubric {"template": ...}.
+    name: Mapped[str] = mapped_column(String(64), unique=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    content: Mapped[dict[str, Any]] = mapped_column(JSONType)
+    # "user" for every row — "vendored" is reserved for file templates.
+    source: Mapped[str] = mapped_column(String(16), default="user")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class SuiteRun(Base):
@@ -307,6 +355,46 @@ class CheckerResult(Base):
     )
 
     sandbox: Mapped[Sandbox] = relationship(back_populates="checker_results")
+
+
+class PairwiseVote(Base):
+    """PR29 — one blind A/B verdict on a pair of sandbox artifacts.
+
+    A pair session anonymizes two artifact-bearing sandboxes as labels
+    A/B (randomized order); the reviewer picks a winner per dimension
+    without seeing which config/model produced which artifact.
+    ``left_sandbox`` stores the REAL sandbox id behind label "A" — the
+    anonymization lives in the pair session, not the row. ``winner`` is
+    ``left`` | ``right`` | ``tie`` (a tied dimension is a verdict too —
+    it counts in summaries but not in win/loss rates). Votes feed the
+    results-page win-rate summary + judge-vs-human agreement stat; they
+    never replace judge scores.
+    """
+
+    __tablename__ = "pairwise_votes"
+
+    # Autoincrement pk like events.id / checker_results.id — the durable
+    # insertion order newest-wins vote merging keys on.
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("runs.id"), index=True)
+    left_sandbox: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("sandboxes.id"), index=True
+    )
+    right_sandbox: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("sandboxes.id"), index=True
+    )
+    dimension: Mapped[str] = mapped_column(String(128))
+    # left | right | tie — left is always the sandbox that wore label "A"
+    # in the pair session this vote resolved through.
+    winner: Mapped[str] = mapped_column(String(8))
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class ModelPriceRow(Base):

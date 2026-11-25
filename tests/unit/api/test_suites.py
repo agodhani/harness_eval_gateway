@@ -814,3 +814,24 @@ def test_checker_newest_wins_on_rescore(api) -> None:
     assert cell["checks"]["failed"] == 1
     by_type = {c["check"]: c for c in cell["checks"]["checks"]}
     assert by_type["file_exists"]["detail"] == "file removed in v2"
+
+
+def test_suite_run_fans_out_evaluator_panel(api) -> None:
+    """PR29 — a suite run's judge panel lands on EVERY child's config
+    (evaluator_models + primary judge), not just the batch spec."""
+    res = api.client.post(
+        "/api/suites/demo-suite/run",
+        json=_run_body(
+            evaluator_model="judge-a",
+            evaluator_models=["judge-b"],
+        ),
+    )
+    assert res.status_code == 201, res.text
+    with api.session_factory() as s:
+        children = list(
+            s.execute(select(Run).where(Run.suite_ref == "demo-suite")).scalars()
+        )
+        assert len(children) == 2
+        for run in children:
+            assert run.config["evaluator_models"] == ["judge-a", "judge-b"]
+            assert run.config["evaluator_model"] == "judge-a"

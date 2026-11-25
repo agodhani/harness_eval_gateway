@@ -12,6 +12,7 @@ import { Suspense, useEffect, useState } from "react";
 import { checkHealth } from "@/lib/api";
 
 const LINKS = [
+  { href: "/dashboard", label: "Dashboard" },
   { href: "/submit", label: "New run" },
   { href: "/presets", label: "Presets" },
   { href: "/suites", label: "Suites" },

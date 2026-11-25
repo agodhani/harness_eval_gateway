@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from db.models import Run, Sandbox
@@ -43,7 +44,10 @@ GATEWAY_INTERNAL_URL = "http://gateway:8080"
 GATEWAY_INGEST_URL = f"{GATEWAY_INTERNAL_URL}/internal/events"
 
 DEFAULT_MAX_ITERS = 50
-DEFAULT_TOKEN_BUDGET = 200_000
+# Per-run token budget default when the spec leaves it unset — bumped to
+# 500k so a real agent task fits (a 200k ceiling starved miniloop runs on
+# non-trivial tasks). Gateway-side DEFAULT_RUN_TOKEN_BUDGET matches.
+DEFAULT_TOKEN_BUDGET = 500_000
 DEFAULT_WALL_CLOCK_SECONDS = 3600
 # Cred outlives the wall-clock cap so a sandbox finishing near the deadline
 # can still emit its final events.
@@ -155,6 +159,10 @@ def budgets_for(run: Run) -> dict[str, Any]:
         ),
         "sandbox_token_budget": int(sandbox_tokens) if sandbox_tokens else None,
         "max_cost_usd": float(max_cost) if max_cost else None,
+        # Local-run pacing: when true the monitor bumps the cred once by
+        # +50% on the first budget_warning (stretch — manual extends come
+        # via POST /api/sandboxes/{id}/extend_budget).
+        "auto_extend": bool(budgets.get("auto_extend", False)),
     }
 
 
@@ -313,7 +321,11 @@ def _sandbox_name(hc: dict[str, Any], sid: uuid.UUID) -> str:
 
 
 def _insert_sandbox_row(
-    session_factory: sessionmaker[Session], run_id: uuid.UUID, hc: dict[str, Any]
+    session_factory: sessionmaker[Session],
+    run_id: uuid.UUID,
+    hc: dict[str, Any],
+    *,
+    status: str = "provisioning",
 ) -> uuid.UUID:
     """Insert the Sandbox row and COMMIT before spawn — event ingest must be
     able to reference the row as soon as the container starts emitting."""
@@ -324,9 +336,49 @@ def _insert_sandbox_row(
                 id=sid,
                 run_id=run_id,
                 harness_config=dict(hc),
-                status="provisioning",
+                status=status,
                 name=_sandbox_name(hc, sid),
             )
+        )
+        session.commit()
+    return sid
+
+
+def queue_sandbox(
+    session_factory: sessionmaker[Session],
+    run_id: uuid.UUID,
+    hc: dict[str, Any],
+    *,
+    cap: int,
+) -> uuid.UUID:
+    """Park a matrix cell BEFORE ``docker run`` on the local-provider cap.
+
+    The Sandbox row exists (``status="queued"``) so the UI/queue show the
+    cell waiting; no container is launched. ``sandbox_queued`` carries the
+    FIFO position (``ahead`` = cells already parked); the paced watcher
+    claims it via ``pacing.claim_queued_sandbox`` when a sibling's slot
+    frees. Returns the queued sandbox id.
+    """
+    sid = _insert_sandbox_row(session_factory, run_id, hc, status="queued")
+    with session_factory() as session:
+        ahead = session.execute(
+            select(func.count(Sandbox.id)).where(
+                Sandbox.run_id == run_id,
+                Sandbox.status == "queued",
+                Sandbox.id != sid,
+            )
+        ).scalar_one()
+        emit(
+            session,
+            run_id=run_id,
+            sandbox_id=sid,
+            event_type="checkpoint",
+            payload={
+                "stage": "sandbox_queued",
+                "ahead": int(ahead),
+                "cap": cap,
+                "reason": "local-provider sandbox concurrency cap",
+            },
         )
         session.commit()
     return sid
@@ -435,6 +487,35 @@ async def spawn_one(
     budgets = budgets_for(run)
 
     sid = _insert_sandbox_row(session_factory, run_id, harness_config)
+    return await _launch(
+        session_factory=session_factory,
+        runtime=runtime,
+        run=run,
+        budgets=budgets,
+        sandbox_id=sid,
+        harness_config=harness_config,
+        settings=settings,
+        seed=seed,
+    )
+
+
+async def _launch(
+    *,
+    session_factory: sessionmaker[Session],
+    runtime: SandboxRuntime,
+    run: Run,
+    budgets: dict[str, Any],
+    sandbox_id: uuid.UUID,
+    harness_config: dict[str, Any],
+    settings: Any,
+    seed: seeds.PreparedSeed | None = None,
+) -> uuid.UUID | None:
+    """The post-insert spawn pipeline shared by ``spawn_one`` and
+    ``spawn_queued``: stage packs → mem gate → cred/env/spec →
+    ``docker run`` → mark running. On failure the row lands
+    ``failed``/``error`` and None is returned — never raises."""
+    sid = sandbox_id
+    run_id = run.id
     try:
         adapter = get_adapter(str(harness_config.get("adapter") or "miniloop"))
 
@@ -538,3 +619,42 @@ async def spawn_one(
             message=f"{type(exc).__name__}: {exc}",
         )
         return None
+
+
+async def spawn_queued(
+    *,
+    session_factory: sessionmaker[Session],
+    runtime: SandboxRuntime,
+    run: Run,
+    budgets: dict[str, Any],
+    sandbox_id: uuid.UUID,
+    settings: Any,
+    seed: seeds.PreparedSeed | None = None,
+) -> uuid.UUID | None:
+    """Launch a cell parked on the local-provider cap.
+
+    ``pacing.claim_queued_sandbox`` already flipped the row
+    ``queued → provisioning`` (and emitted ``sandbox_dequeued``) — the
+    Sandbox row + harness_config persisted at queue time, so this just
+    reads them back and runs the identical launch pipeline as a
+    first-pass spawn (staging, the SPAWN_MEM_* memory gate, cred mint,
+    ``docker run``). Returns the sandbox id on success, None on failure
+    (row lands ``failed``/``error`` — the slot frees and the watcher
+    promotes the next queued cell).
+    """
+    with session_factory() as session:
+        sb = session.get(Sandbox, sandbox_id)
+        hc = dict(sb.harness_config) if sb is not None else None
+    if hc is None:
+        log.error("spawn_queued: sandbox %s not found", sandbox_id)
+        return None
+    return await _launch(
+        session_factory=session_factory,
+        runtime=runtime,
+        run=run,
+        budgets=budgets,
+        sandbox_id=sandbox_id,
+        harness_config=hc,
+        settings=settings,
+        seed=seed,
+    )

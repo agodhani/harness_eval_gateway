@@ -1,0 +1,49 @@
+{
+  "name": "summarisation-fidelity",
+  "description": "Rubric for summarisation tasks — is the summary faithful to the source, does it cover what matters, at the requested length and style?",
+  "content": {
+    "summary": "Score the summary on factual fidelity to the source, coverage of the key points, adherence to the requested length/format, and readability — penalize unsupported claims heavily.",
+    "dimensions": [
+      {
+        "name": "fidelity",
+        "title": "Fidelity",
+        "description": "Is every claim in the summary supported by the source? Contradictions, fabricated facts, and misattributed numbers score near zero — fidelity outweighs style.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      },
+      {
+        "name": "coverage",
+        "title": "Coverage",
+        "description": "Does the summary capture the source's key points, weighted by importance? Missing a central finding hurts more than dropping a detail.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      },
+      {
+        "name": "conciseness",
+        "title": "Conciseness",
+        "description": "Does the summary hit the requested length and avoid redundancy? Restatements, padding, and verbatim copies of long passages score lower.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      },
+      {
+        "name": "readability",
+        "title": "Readability",
+        "description": "Is the summary coherent and well organized in the requested register (bullets, prose, tone)? Grammar and flow matter only after fidelity and coverage.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      }
+    ],
+    "criteria": [
+      {
+        "id": "example",
+        "text": "Example criterion — the generator replaces these with task-specific checkable items (length cap, required sections, must-keep facts).",
+        "dimension": "fidelity",
+        "weight": 1.0
+      }
+    ]
+  }
+}

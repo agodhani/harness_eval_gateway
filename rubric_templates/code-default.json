@@ -1,0 +1,49 @@
+{
+  "name": "code-default",
+  "description": "Default rubric for software-engineering tasks — the four canonical dimensions (functional requirements, acceptance criteria, code quality, cyclomatic complexity).",
+  "content": {
+    "summary": "Score the submission's code against the task's functional requirements, stated acceptance criteria, implementation quality, and control-flow complexity.",
+    "dimensions": [
+      {
+        "name": "functional_requirements",
+        "title": "Functional requirements",
+        "description": "Does the artifact implement what the task prompt asked for? Every stated requirement is present and behaves as described.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      },
+      {
+        "name": "acceptance_criteria",
+        "title": "Acceptance criteria",
+        "description": "Do the prompt's stated acceptance checks pass? Each verifiable condition named in the task is met by the submission.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      },
+      {
+        "name": "code_quality",
+        "title": "Code quality",
+        "description": "Is the implementation clean, readable, and idiomatic? Naming, structure, error handling, and absence of dead or copy-pasted code.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      },
+      {
+        "name": "cyclomatic_complexity",
+        "title": "Cyclomatic complexity",
+        "description": "Is the control flow reasonably simple? Score against the measured cyclomatic complexity in ANALYSIS.md — high per-function complexity scores lower.",
+        "weight": 1.0,
+        "min_score": 0.0,
+        "max_score": 10.0
+      }
+    ],
+    "criteria": [
+      {
+        "id": "example",
+        "text": "Example criterion — the generator replaces these with task-specific checkable items.",
+        "dimension": "functional_requirements",
+        "weight": 1.0
+      }
+    ]
+  }
+}

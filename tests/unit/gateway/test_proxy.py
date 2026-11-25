@@ -1072,3 +1072,229 @@ def test_service_cred_skips_sandbox_gate(
         "/v1/chat/completions", json=_CHAT_BODY, headers=_auth(cred)
     )
     assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# F30 — budget extensions (budget_extended) + headroom warnings (budget_warning)
+# ---------------------------------------------------------------------------
+
+
+def _seed_run_and_sandbox(
+    run_id: uuid.UUID,
+    sandbox_id: uuid.UUID | None = None,
+    *,
+    events: list[dict[str, Any]] | None = None,
+) -> None:
+    """Parent rows + arbitrary events for the budget-state tests — events
+    are ``{type, payload, sandbox_id?}`` dicts (``sandbox_id`` defaults to
+    the seeded sandbox)."""
+    from db.models import Sandbox
+
+    session = get_session_factory()()
+    try:
+        session.add(Run(id=run_id, task_prompt="test", model_name="test-model"))
+        session.flush()
+        if sandbox_id is not None:
+            session.add(
+                Sandbox(
+                    id=sandbox_id,
+                    run_id=run_id,
+                    harness_config={"adapter": "miniloop"},
+                    status="running",
+                )
+            )
+            session.flush()
+        for e in events or []:
+            session.add(
+                Event(
+                    run_id=run_id,
+                    sandbox_id=e.get("sandbox_id", sandbox_id),
+                    source=e.get("source", "gateway"),
+                    type=e["type"],
+                    payload=e["payload"],
+                )
+            )
+        session.commit()
+    finally:
+        session.close()
+
+
+def _usage_event(tokens: int) -> dict[str, Any]:
+    return {"type": "llm_response", "payload": {"usage": {"total_tokens": tokens}}}
+
+
+def _extension_event(**payload: Any) -> dict[str, Any]:
+    return {
+        "type": "checkpoint",
+        "source": "orchestrator",
+        "payload": {"stage": "budget_extended", "via": "manual", **payload},
+    }
+
+
+def test_extension_widens_run_gate(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    """An extend_budget grant lands mid-flight: used=100 would 429 against
+    max_tokens=50, but a +100 grant widens the live gate — no restart."""
+    run_id, sandbox_id = uuid.uuid4(), uuid.uuid4()
+    _seed_run_and_sandbox(
+        run_id,
+        sandbox_id,
+        events=[_usage_event(100), _extension_event(added_tokens=100)],
+    )
+    cred = _cred(run_id=run_id, sandbox_id=sandbox_id, max_tokens=50)
+    resp = gw_client.post(
+        "/v1/chat/completions",
+        json=_CHAT_BODY,  # estimate 0 — 100 <= 150 post-extension
+        headers=_auth(cred),
+    )
+    assert resp.status_code == 200
+    assert len(upstream["seen"]) == 1
+
+
+def test_extension_widens_sandbox_gate(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    """Same grant widens the per-cell claim — added_tokens applies to BOTH
+    ceilings the cred passes through."""
+    run_id, sandbox_id = uuid.uuid4(), uuid.uuid4()
+    _seed_run_and_sandbox(
+        run_id,
+        sandbox_id,
+        events=[_usage_event(100), _extension_event(added_tokens=60)],
+    )
+    cred = _cred(
+        run_id=run_id,
+        sandbox_id=sandbox_id,
+        max_tokens=10_000,
+        sandbox_max_tokens=50,  # 100 > 50 alone; 100 <= 110 post-extension
+    )
+    resp = gw_client.post(
+        "/v1/chat/completions", json=_CHAT_BODY, headers=_auth(cred)
+    )
+    assert resp.status_code == 200
+    assert len(upstream["seen"]) == 1
+
+
+def test_extension_only_widens_own_cred(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    """Grants are scoped to the cell's sandbox_id — a sibling cred still
+    gates on the un-extended ceiling."""
+    run_id, mine, other = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    _seed_run_and_sandbox(
+        run_id,
+        other,  # grant lands on the OTHER sandbox's row
+        events=[_usage_event(100), _extension_event(added_tokens=100)],
+    )
+    cred = _cred(run_id=run_id, sandbox_id=mine, max_tokens=50)
+    resp = gw_client.post(
+        "/v1/chat/completions", json=_CHAT_BODY, headers=_auth(cred)
+    )
+    assert resp.status_code == 429
+    assert upstream["seen"] == []
+
+
+def test_budget_warning_emitted_past_80pct(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    """Spend ≥ ~80% of the effective cap → a one-shot budget_warning
+    checkpoint on the cell's timeline (the request itself still passes)."""
+    run_id, sandbox_id = uuid.uuid4(), uuid.uuid4()
+    _seed_run_and_sandbox(run_id, sandbox_id, events=[_usage_event(45)])
+    cred = _cred(run_id=run_id, sandbox_id=sandbox_id, max_tokens=50)
+    resp = gw_client.post(
+        "/v1/chat/completions", json=_CHAT_BODY, headers=_auth(cred)
+    )
+    assert resp.status_code == 200
+    warnings = [
+        c["payload"]
+        for c in emitted
+        if c["type"] == "checkpoint"
+        and c["payload"].get("stage") == "budget_warning"
+    ]
+    assert len(warnings) == 1
+    w = warnings[0]
+    assert w["limit"] == "run_tokens"
+    assert w["used_tokens"] == 45
+    assert w["budget"] == 50
+    assert w["pct"] == 0.9
+    assert w["remaining_tokens"] == 5
+
+
+def test_budget_warning_deduped_by_existing_event(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    """The warning rows in the DB dedup the emission — a second request
+    past the threshold (or a gateway/monitor double-write) can't spam."""
+    run_id, sandbox_id = uuid.uuid4(), uuid.uuid4()
+    _seed_run_and_sandbox(
+        run_id,
+        sandbox_id,
+        events=[
+            _usage_event(45),
+            {
+                "type": "checkpoint",
+                "payload": {
+                    "stage": "budget_warning",
+                    "limit": "run_tokens",
+                    "used_tokens": 40,
+                    "budget": 50,
+                },
+            },
+        ],
+    )
+    cred = _cred(run_id=run_id, sandbox_id=sandbox_id, max_tokens=50)
+    resp = gw_client.post(
+        "/v1/chat/completions", json=_CHAT_BODY, headers=_auth(cred)
+    )
+    assert resp.status_code == 200
+    warnings = [
+        c
+        for c in emitted
+        if c["type"] == "checkpoint"
+        and c["payload"].get("stage") == "budget_warning"
+    ]
+    assert warnings == []
+
+
+def test_no_warning_below_threshold(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    run_id, sandbox_id = uuid.uuid4(), uuid.uuid4()
+    _seed_run_and_sandbox(run_id, sandbox_id, events=[_usage_event(30)])
+    cred = _cred(run_id=run_id, sandbox_id=sandbox_id, max_tokens=50)
+    resp = gw_client.post(
+        "/v1/chat/completions", json=_CHAT_BODY, headers=_auth(cred)
+    )
+    assert resp.status_code == 200
+    assert not [
+        c
+        for c in emitted
+        if c["type"] == "checkpoint"
+        and c["payload"].get("stage") == "budget_warning"
+    ]
+
+
+def test_warning_threshold_uses_extended_cap(
+    gw_client: TestClient, upstream: Any, emitted: list
+) -> None:
+    """Extension widens the warn line too — 45 is 90% of 50 but only 30%
+    of a +100-extended 150, so no warning fires."""
+    run_id, sandbox_id = uuid.uuid4(), uuid.uuid4()
+    _seed_run_and_sandbox(
+        run_id,
+        sandbox_id,
+        events=[_usage_event(45), _extension_event(added_tokens=100)],
+    )
+    cred = _cred(run_id=run_id, sandbox_id=sandbox_id, max_tokens=50)
+    resp = gw_client.post(
+        "/v1/chat/completions", json=_CHAT_BODY, headers=_auth(cred)
+    )
+    assert resp.status_code == 200
+    assert not [
+        c
+        for c in emitted
+        if c["type"] == "checkpoint"
+        and c["payload"].get("stage") == "budget_warning"
+    ]

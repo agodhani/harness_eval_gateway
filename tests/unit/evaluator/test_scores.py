@@ -151,7 +151,7 @@ def test_parse_overall_non_numeric_ignored() -> None:
     # non-numeric overall is ignored, then synthesized from the entries
     assert parsed.overall == 5.0
     assert any("not numeric" in w for w in parsed.warnings)
-    assert any("computed as mean" in w for w in parsed.warnings)
+    assert any("computed from dimension scores" in w for w in parsed.warnings)
 
 
 def test_parse_overall_synthesized_when_missing() -> None:
@@ -166,7 +166,10 @@ def test_parse_overall_synthesized_when_missing() -> None:
     parsed = parse_scores_json(json.dumps(payload))
     assert parsed.overall == 6.0
     assert parsed.warnings == [
-        "overall missing — computed as mean of dimension scores"
+        (
+            "overall missing — computed from dimension scores "
+            "(scale-normalized to 0-10)"
+        )
     ]
 
 
@@ -174,7 +177,7 @@ def test_parse_genuine_overall_not_flagged() -> None:
     """A real `overall` is used verbatim — no synthesis warning."""
     parsed = parse_scores_json(json.dumps(GOOD))
     assert parsed.overall == 7.2
-    assert not any("computed as mean" in w for w in parsed.warnings)
+    assert not any("computed from dimension scores" in w for w in parsed.warnings)
 
 
 def test_parse_overall_synthesis_rounds_to_one_decimal() -> None:
@@ -259,7 +262,7 @@ def test_parse_salvages_bare_array_plus_truncated_object() -> None:
     # trailing object was truncated -> genuine overall lost; the mean of
     # the salvaged entries is synthesized instead (flagged in warnings)
     assert parsed.overall == 10.0
-    assert any("computed as mean" in w for w in parsed.warnings)
+    assert any("computed from dimension scores" in w for w in parsed.warnings)
 
 
 def test_parse_salvages_bare_array_plus_complete_object() -> None:
@@ -359,3 +362,92 @@ def test_parse_literal_eval_rejects_scalars() -> None:
         parse_scores_json("'just a quoted string'")
     with pytest.raises(ScoresFileError):
         parse_scores_json("(1, 2, 3)")
+
+
+# ---------------------------------------------------------------------------
+# reserved score-namespace + declared-dimension folding (PR23)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_drops_reserved_dimension_names() -> None:
+    """A judge entry under a reserved score field must never persist —
+    ``suite_pass``/``overall`` are pipeline-written pseudo-rows and
+    ``scores``/``summary``/``total`` are document fields."""
+    payload = {
+        "scores": [
+            {"dimension": "suite_pass", "score": 10},
+            {"dimension": "Overall", "score": 9},
+            {"dimension": "total", "score": 40},
+            {"dimension": "code_quality", "score": 7},
+        ]
+    }
+    parsed = parse_scores_json(json.dumps(payload))
+    assert [e.dimension for e in parsed.entries] == ["code_quality"]
+    assert sum("reserved score field" in w for w in parsed.warnings) == 3
+
+
+def test_parse_flat_map_drops_suite_pass() -> None:
+    """The flat-map form reaches the same reserved check — a ``suite_pass``
+    key is not a per-dimension score."""
+    parsed = parse_scores_json(json.dumps({"suite_pass": 10, "code_quality": 7}))
+    assert {e.dimension: e.score for e in parsed.entries} == {"code_quality": 7.0}
+
+
+def test_parse_all_reserved_entries_raises() -> None:
+    with pytest.raises(ScoresFileError):
+        parse_scores_json(
+            json.dumps({"scores": [{"dimension": "suite_pass", "score": 10}]})
+        )
+
+
+def test_parse_folds_judge_spelling_onto_declared_dimension() -> None:
+    """A judge's 'Accuracy' for a rubric declaring ``accuracy`` persists
+    under the declared (normalized) spelling, not verbatim."""
+    payload = {"scores": [{"dimension": "Accuracy", "score": 8}]}
+    scales = {"accuracy": (0.0, 10.0, 1.0)}
+    parsed = parse_scores_json(json.dumps(payload), dimension_scales=scales)
+    assert [e.dimension for e in parsed.entries] == ["accuracy"]
+
+
+def test_parse_folds_alias_spelling_onto_declared_dimension() -> None:
+    """A judge's alias spelling (``functional``, ``complexity``) for a
+    rubric declaring the canonical name persists under the declared name —
+    the same fold the authoring side applies, so the declared dimension
+    reads scored instead of a phantom column appearing."""
+    payload = {
+        "scores": [
+            {"dimension": "functional", "score": 8},
+            {"dimension": "complexity", "score": 6},
+        ]
+    }
+    scales = {
+        "functional_requirements": (0.0, 10.0, 1.0),
+        "cyclomatic_complexity": (0.0, 10.0, 1.0),
+    }
+    parsed = parse_scores_json(json.dumps(payload), dimension_scales=scales)
+    assert {e.dimension: e.score for e in parsed.entries} == {
+        "functional_requirements": 8.0,
+        "cyclomatic_complexity": 6.0,
+    }
+
+
+def test_parse_folded_duplicate_last_wins() -> None:
+    """Case variants of one declared dimension dedup after folding."""
+    payload = {
+        "scores": [
+            {"dimension": "Accuracy", "score": 3},
+            {"dimension": "accuracy", "score": 9},
+        ]
+    }
+    scales = {"accuracy": (0.0, 10.0, 1.0)}
+    parsed = parse_scores_json(json.dumps(payload), dimension_scales=scales)
+    assert [(e.dimension, e.score) for e in parsed.entries] == [("accuracy", 9.0)]
+    assert any("duplicate" in w for w in parsed.warnings)
+
+
+def test_parse_unknown_spelling_passes_through() -> None:
+    """A folded name matching no declared dimension keeps verbatim spelling."""
+    payload = {"scores": [{"dimension": "Some Custom Axis", "score": 6}]}
+    scales = {"accuracy": (0.0, 10.0, 1.0)}
+    parsed = parse_scores_json(json.dumps(payload), dimension_scales=scales)
+    assert [e.dimension for e in parsed.entries] == ["Some Custom Axis"]

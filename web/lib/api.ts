@@ -56,6 +56,9 @@ export const CANCELLABLE_RUN_STATUSES: readonly string[] = [
 ];
 
 export type SandboxStatus =
+  /** F30: parked pre-`docker run` on the local-provider concurrency cap —
+   *  the cell's row exists, no container does. Promotes to provisioning. */
+  | "queued"
   | "provisioning"
   | "running"
   | "terminating"
@@ -274,14 +277,19 @@ export interface Budgets {
   /** PR28: optional per-sandbox estimated-cost cap in USD. Only bites on
    * priced models — unpriced cells have no honest rate to bill against. */
   max_cost_usd?: number | null;
+  /** F30 stretch: on the first budget_warning the monitor grants the cell
+   * one automatic +50% extension on the warned limit (once per cell). */
+  auto_extend?: boolean;
 }
 
 export const DEFAULT_BUDGETS: Budgets = {
   max_iters: 50,
-  token_budget: 200_000,
+  // F30: bumped 200k → 500k (matches BudgetsIn/DEFAULT_RUN_TOKEN_BUDGET).
+  token_budget: 500_000,
   wall_clock_seconds: 3600,
   sandbox_token_budget: null,
   max_cost_usd: null,
+  auto_extend: false,
 };
 
 /** PR24 — task inputs seeding every sandbox workspace. Exactly one source:
@@ -308,8 +316,20 @@ export interface RunCreate {
   models?: string[] | null;
   harness_configs: HarnessConfig[];
   evaluator_model?: string | null;
+  /** PR29: ADDITIONAL judge models — the run's judge panel becomes
+   * [evaluator_model] + evaluator_models (1–3 total, deduped). Each judge
+   * scores every artifact independently; results merge to the panel mean
+   * + spread. Omit for the classic single judge. */
+  evaluator_models?: string[] | null;
   budgets?: Budgets;
   task_inputs?: TaskInputs | null;
+  /** PR23: rubric-generation steering — `rubric_template` names a template
+   * from GET /api/rubric-templates used as the generator's basis (when
+   * absent, a preset's suggested_rubric fills in); `rubric_hint` is a
+   * free-text domain hint steered into the gen prompt (a preset's
+   * category is the fallback). */
+  rubric_template?: string | null;
+  rubric_hint?: string | null;
   /** PR27: repeats per matrix cell (1–8, default 1). */
   trials?: number;
 }
@@ -319,9 +339,18 @@ export interface RunConfig {
   /** PR14: effective participant-model set persisted at submit. */
   models?: string[];
   evaluator_model?: string | null;
+  /** PR29: persisted judge panel (evaluator_model folded to panel[0]) —
+   * absent on single-judge runs, which keep the legacy shape. */
+  evaluator_models?: string[];
   budgets?: Budgets;
   same_model_eval?: boolean;
   task_inputs?: TaskInputs | null;
+  /** PR23: resolved rubric-generation basis — the template name selected
+   * (explicit or from the preset's suggested_rubric), an inline basis
+   * fragment, and/or the domain hint fed to the generator. */
+  rubric_template?: string;
+  rubric_basis?: unknown;
+  rubric_hint?: string;
   /** PR27: repeats per matrix cell persisted at submit. */
   trials?: number;
   [key: string]: unknown;
@@ -338,6 +367,23 @@ export interface UploadOut {
   uploaded_at: string;
 }
 
+/** F30 — live budget summary for one cell on the run detail payload.
+ * `used_tokens`/`limit_tokens` describe the BINDING ceiling: the cell's
+ * own `sandbox_token_budget` when set (scope="sandbox"), else the shared
+ * run ceiling (scope="run"). `limit_*` already include `budget_extended`
+ * grants. `warning` = spend ≥ ~80% of the cap or a budget_warning event. */
+export interface SandboxBudget {
+  used_tokens: number;
+  limit_tokens: number;
+  scope: "run" | "sandbox" | string;
+  pct: number;
+  warning: boolean;
+  extended_tokens: number;
+  extended_cost_usd: number;
+  /** Post-extension cost ceiling (max_cost_usd + grants); null = no cap. */
+  limit_cost_usd: number | null;
+}
+
 export interface SandboxOut {
   id: string;
   harness_config: Record<string, unknown>;
@@ -348,6 +394,9 @@ export interface SandboxOut {
   artifact_path: string | null;
   started_at: string | null;
   finished_at: string | null;
+  /** F30: live token/cost budget summary — drives the warning badge +
+   * extend affordance on run detail. */
+  budget?: SandboxBudget | null;
 }
 
 export interface RubricDimension {
@@ -413,6 +462,9 @@ export interface RunOut {
   suite_ref?: string | null;
   suite_index?: number | null;
   suite_run_id?: string | null;
+  /** PR35: the run's read-only share view path (`/share/{token}`) once a
+   * link has been minted via POST /api/runs/{id}/share — null until then. */
+  share_url?: string | null;
   sandboxes: SandboxOut[];
   rubric: RubricOut | null;
 }
@@ -447,9 +499,34 @@ export interface EventOut {
   payload: Record<string, unknown>;
 }
 
+/** PR29 — one judge's newest verdict on a dimension (panel merge). */
+export interface JudgeScore {
+  /** Model stamped on the score row — null for checker rows (suite_pass)
+   * and never model-authored entries. */
+  judge_model: string | null;
+  score: number;
+  rationale: string;
+  /** "llm" (judge pass) | "checker" (deterministic measurement). */
+  source: string;
+}
+
 export interface DimensionScore {
   score: number;
   rationale: string;
+  /** PR29 — where the displayed number came from: "llm" = per-judge
+   * newest-score mean across the panel; "human" = a POST
+   * /api/sandboxes/{id}/scores override row, which wins the pair
+   * outright; "checker" = deterministic suite_pass measurement. */
+  source?: string;
+  /** Free-text context on human overrides (why the score moved). */
+  note?: string | null;
+  /** Per-judge newest verdicts feeding the mean — rendered in the cell
+   * tooltip + the "judges said X" line under a human override. */
+  judges?: JudgeScore[];
+  /** max − min across contributing judges; null below 2 judges — the UI
+   * badges disagreement above its threshold (>2 pts). */
+  spread?: number | null;
+  judge_count?: number;
 }
 
 /** PR6 — objective scoring signals (scoring/ AnalysisReport).
@@ -570,6 +647,12 @@ export interface RunResults {
   selected_rubric_version?: number | null;
   /** PR5: every rubric version + score counts for the selector. */
   rubric_versions?: RubricVersionOut[];
+  /** PR29: the run's judge panel — panel[0] is the primary judge
+   * NULL-judge score rows resolve into. Single-judge runs report a
+   * one-element panel. */
+  evaluator_models?: string[];
+  /** PR29: blind A/B roll-up — null until the first vote lands. */
+  votes?: VotesSummary | null;
   sandboxes: SandboxResult[];
 }
 
@@ -582,6 +665,11 @@ export interface ScoreOut {
   dimension: string;
   score: number;
   rationale: string;
+  /** PR29 provenance — judge model for llm rows (null pre-panel);
+   * the row's author class (llm | human | checker); human context. */
+  judge_model?: string | null;
+  source?: string;
+  note?: string | null;
   created_at: string;
 }
 
@@ -704,6 +792,33 @@ function qs(params: Record<string, string | number | undefined | null>): string 
 
 export function createRun(body: RunCreate): Promise<RunOut> {
   return request<RunOut>("/api/runs", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** F30 — POST /api/sandboxes/{id}/extend_budget response: the grant plus
+ * the post-grant effective caps (the UI swaps `budget` in place). */
+export interface ExtendBudgetOut {
+  sandbox_id: string;
+  status: string;
+  added_tokens: number;
+  added_cost_usd: number;
+  total_added_tokens: number;
+  total_added_cost_usd: number;
+  /** Grant rows after this one (auto + manual). */
+  extensions: number;
+  budget: SandboxBudget;
+}
+
+/** F30: bump a live cell's allowance — token grants widen BOTH ceilings
+ * the cred passes through (run + per-sandbox claims) on the next call;
+ * cost grants widen the monitor's max_cost_usd check on the next poll. */
+export function extendBudget(
+  sandboxId: string,
+  body: { tokens?: number; cost_usd?: number },
+): Promise<ExtendBudgetOut> {
+  return request<ExtendBudgetOut>(`/api/sandboxes/${sandboxId}/extend_budget`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,6 +1426,77 @@ export function artifactDownloadUrl(artifactId: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// export + share (PR35 / F28)
+// ---------------------------------------------------------------------------
+
+export type RunExportFormat = "json" | "csv";
+
+/** `GET /api/runs/{id}/export` — the full run bundle (json) or the
+ * flattened per-cell sheet (csv). Served as an attachment, so plain
+ * `<a href>` download works like artifactDownloadUrl. */
+export function runExportUrl(runId: string, fmt: RunExportFormat): string {
+  return `${API_BASE}/api/runs/${encodeURIComponent(runId)}/export?fmt=${fmt}`;
+}
+
+/** The minted share link — `url` is the app-relative `/share/{token}` path. */
+export interface ShareLink {
+  run_id: string;
+  token: string;
+  url: string;
+}
+
+/** The run's spec + lifecycle stamps, as embedded in the share bundle. */
+export interface ShareRun {
+  id: string;
+  status: string;
+  task_prompt: string;
+  model_name: string;
+  models: string[];
+  evaluator_model: string | null;
+  same_model_eval: boolean | null;
+  trials: number;
+  config: RunConfig;
+  preset_ref: string | null;
+  preset_revision: number | null;
+  suite_ref: string | null;
+  suite_index: number | null;
+  suite_run_id: string | null;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+/** `GET /api/share/{token}` — the read-only bundle the /share/{token} page
+ * renders. `events` are events-lite rows (payload = scalar projection,
+ * never a transcript); `events_total`/`events_truncated` report the cap. */
+export interface ShareBundle {
+  run: ShareRun;
+  results: RunResults;
+  events: EventOut[];
+  events_total: number;
+  events_truncated: boolean;
+}
+
+/** Mint (or return) the run's share link — idempotent. */
+export function shareRun(runId: string): Promise<ShareLink> {
+  return request<ShareLink>(`/api/runs/${encodeURIComponent(runId)}/share`, {
+    method: "POST",
+  });
+}
+
+/** Revoke the share link — the token stops resolving immediately. */
+export function unshareRun(runId: string): Promise<void> {
+  return request<void>(`/api/runs/${encodeURIComponent(runId)}/share`, {
+    method: "DELETE",
+  });
+}
+
+/** Fetch a share bundle by token. 404 = unknown or revoked link. */
+export function getShareBundle(token: string): Promise<ShareBundle> {
+  return request<ShareBundle>(`/api/share/${encodeURIComponent(token)}`);
+}
+
+// ---------------------------------------------------------------------------
 // artifact preview (F12)
 // ---------------------------------------------------------------------------
 
@@ -1581,6 +1767,9 @@ export interface RunOut {
   /** Submit-time advisory warnings from run-create (e.g. "model not found
    *  on the resolved upstream") — absent on older backends. */
   warnings?: string[];
+  /** F30: the concurrent-container cap in effect for this run (all-local
+   *  models → cells park as queued sandboxes past it). null = no cap. */
+  sandbox_pacing_cap?: number | null;
 }
 
 export interface RunSummary {
@@ -1675,12 +1864,30 @@ export interface TaskPreset {
   revision: number;
   suggested_adapter: string | null;
   suggested_models: string[];
+  /** PR23: rubric basis this preset's submits fall back to when no
+   * explicit rubric_template is sent — `{"template": name}` | `{"hint": text}`
+   * | inline `{"dimensions": [...]}`. */
+  suggested_rubric?: SuggestedRubric | null;
   created_at: string | null;
   updated_at: string | null;
   /** Library browse aggregates — runs whose preset_ref matches + the
    * newest scored run's mean overall (null when unscored/none). */
   runs_count: number;
   last_run_mean: number | null;
+}
+
+/** PR23: a preset's rubric-generation suggestion — resolved in order:
+ * `template` names a rubric_templates entry; `hint` feeds the gen prompt's
+ * domain hint; `dimensions` (with optional summary/criteria) is an inline
+ * rubric fragment used as the basis directly. */
+export interface SuggestedRubric {
+  template?: string;
+  hint?: string;
+  summary?: string;
+  title?: string;
+  dimensions?: unknown[];
+  criteria?: unknown[];
+  [key: string]: unknown;
 }
 
 /** POST /api/presets/{slug} body — the slug lives in the path. */
@@ -1692,6 +1899,7 @@ export interface PresetCreate {
   tags?: string[];
   suggested_adapter?: string | null;
   suggested_models?: string[] | null;
+  suggested_rubric?: SuggestedRubric | null;
 }
 
 /** PATCH /api/presets/{slug} — partial edit; bumps revision. */
@@ -1817,6 +2025,25 @@ export function deletePreset(slug: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// PR23 — rubric template library
+// ---------------------------------------------------------------------------
+
+/** One rubric template — a vendored `rubric_templates/<name>.json` file or a
+ * user `rubric_templates` row. Selecting one at submit makes the rubric
+ * generator refine its dimensions/criteria instead of drafting freeform. */
+export interface RubricTemplate {
+  name: string;
+  description: string;
+  content: RubricContent;
+  source: "vendored" | "user" | string;
+  created_at: string | null;
+}
+
+export function listRubricTemplates(): Promise<RubricTemplate[]> {
+  return request<RubricTemplate[]>("/api/rubric-templates");
+}
+
+// ---------------------------------------------------------------------------
 // PR26 — benchmark suites + deterministic checkers
 // ---------------------------------------------------------------------------
 
@@ -1872,6 +2099,9 @@ export interface SuiteRunIn {
   models?: string[] | null;
   harness_configs: HarnessConfig[];
   evaluator_model?: string | null;
+  /** PR29: judge panel extras — every suite task's run scores against
+   * [evaluator_model] + evaluator_models. */
+  evaluator_models?: string[] | null;
   budgets?: Budgets;
   /** PR27 parity: each task's matrix multiplies by this many trials. */
   trials?: number;
@@ -2224,5 +2454,255 @@ export function getLeaderboard(
       until: filters.until,
       min_trials: filters.minTrials && filters.minTrials > 1 ? filters.minTrials : undefined,
     })}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// dashboard summary (PR36 — GET /api/analytics/summary)
+// ---------------------------------------------------------------------------
+
+/** All-time rollup for the dashboard KPI strip. `estimated_cost_usd` is
+ * null when ANY metered call was unpriced (PR21 — a partial total would
+ * read as complete); `unpriced_llm_turns` explains the gap. */
+export interface DashboardTotals {
+  runs: number;
+  sandboxes: number;
+  /** Sandbox cells carrying at least one `overall` score row. */
+  scored_sandboxes: number;
+  /** Metered llm_response events — participant + judge + run-level
+   * control-plane calls (rubric drafting) alike. */
+  llm_turns: number;
+  tokens: TokenUsage;
+  estimated_cost_usd: number | null;
+  unpriced_llm_turns: number;
+}
+
+/** One ISO-week bucket (Monday-anchored UTC), oldest first in `weeks`.
+ * `estimated_cost_usd` is null when any metered call that week was
+ * unpriced — the gap is labeled via `unpriced_llm_turns`, never
+ * zero-filled. */
+export interface DashboardWeekPoint {
+  week: string; // ISO label — "2026-W05"
+  week_start: string;
+  runs: number;
+  llm_turns: number;
+  estimated_cost_usd: number | null;
+  unpriced_llm_turns: number;
+}
+
+export interface DashboardTerminalSlice {
+  reason: string;
+  count: number;
+}
+
+/** One run shown in the queue/active card. `queue_position` is stamped
+ * only on queued entries (1-based, promotion order). */
+export interface DashboardQueueRun {
+  run_id: string;
+  status: string;
+  task_prompt: string;
+  model_name: string;
+  preset_ref: string | null;
+  queue_position: number | null;
+  created_at: string | null;
+  started_at: string | null;
+}
+
+export interface DashboardQueue {
+  /** provisioning | running | evaluating — pacing serializes to one, but
+   * a rescued/crashed state can show more; the list is the honest shape. */
+  active: DashboardQueueRun[];
+  /** `queued` runs in promotion order. */
+  queued: DashboardQueueRun[];
+  /** submitted + rubric_review — parked before the queue. */
+  awaiting_review: number;
+}
+
+export interface DashboardRecentRun {
+  run_id: string;
+  status: string;
+  task_prompt: string;
+  model_name: string;
+  preset_ref: string | null;
+  sandbox_count: number;
+  created_at: string | null;
+  finished_at: string | null;
+  mean_overall_score: number | null;
+}
+
+/** GET /api/analytics/summary — everything the /dashboard cards need that
+ * the leaderboard aggregate doesn't already serve. */
+export interface DashboardSummary {
+  generated_at: string;
+  /** The explicit `?price_model=` repricing basis, or null for per-model
+   * auto pricing (same convention as RunTrends). */
+  price_model: string | null;
+  totals: DashboardTotals;
+  /** Consecutive ISO-week buckets, oldest first, ending at the CURRENT
+   * week — `?weeks=` sets the window. */
+  weeks: DashboardWeekPoint[];
+  terminal_mix: DashboardTerminalSlice[];
+  /** Sandboxes with no terminal_reason yet — pending lanes stay visible,
+   * not dropped into the donut. */
+  terminal_pending: number;
+  queue: DashboardQueue;
+  recent_runs: DashboardRecentRun[];
+}
+
+export function getAnalyticsSummary(
+  opts: { weeks?: number; recent?: number; priceModel?: string } = {},
+): Promise<DashboardSummary> {
+  return request<DashboardSummary>(
+    `/api/analytics/summary${qs({
+      weeks: opts.weeks,
+      recent: opts.recent,
+      price_model: opts.priceModel,
+    })}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// PR29 — judge quality: human overrides + blind A/B pairwise review
+// ---------------------------------------------------------------------------
+
+/** POST /api/sandboxes/{id}/scores body — a human override verdict on one
+ * dimension. The stored row (source="human") wins the newest-wins merge
+ * for its (sandbox, dimension) pair regardless of what judge rows exist;
+ * `note` carries the "why" for the results cell. */
+export interface HumanScoreIn {
+  dimension: string;
+  score: number;
+  rationale?: string;
+  note?: string | null;
+}
+
+export function postHumanScore(
+  sandboxId: string,
+  body: HumanScoreIn,
+): Promise<ScoreOut> {
+  return request<ScoreOut>(
+    `/api/sandboxes/${encodeURIComponent(sandboxId)}/scores`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+/** One sandbox's blind-A/B tally. `win_rate` counts decided votes only
+ * (wins / (wins+losses) — ties excluded); null when undecided. */
+export interface VoteStats {
+  wins: number;
+  losses: number;
+  ties: number;
+  win_rate: number | null;
+}
+
+/** Blind A/B roll-up on RunResults.votes — `total` is the merged vote
+ * count (newest per unordered pair+dim wins); `compared`/`agreed`/
+ * `agreement_rate` measure judge-vs-human agreement over votes where
+ * both sides carry a judge mean on the voted dimension. */
+export interface VotesSummary {
+  total: number;
+  by_sandbox: Record<string, VoteStats>;
+  compared: number;
+  agreed: number;
+  agreement_rate: number | null;
+}
+
+/** POST /api/runs/{id}/pair body — optionally pin which two
+ * artifact-bearing sandboxes face off; omitted → server picks at random. */
+export interface PairCreateIn {
+  sandbox_ids?: string[] | null;
+}
+
+/** One anonymized side of a pair session — label + file listing only
+ * (no sandbox ids, model or config names; that's the blind contract). */
+export interface PairSideOut {
+  label: string; // "A" | "B"
+  /** "workspace" | "artifact" (prompt-cell: output.txt only). */
+  root: string;
+  entries: FileEntry[];
+  truncated: boolean;
+}
+
+/** 201 response to POST /api/runs/{id}/pair — pair_id is the only handle
+ * the reviewer (and the vote endpoint) needs. `dimensions` = the rubric
+ * dimension names + "overall" — the vote menu. */
+export interface PairOut {
+  pair_id: string;
+  run_id: string;
+  dimensions: string[];
+  sides: PairSideOut[];
+}
+
+/** Anonymized read of one pair-side file — `side` is the A/B label. */
+export interface PairFileOut {
+  pair_id: string;
+  side: string;
+  path: string;
+  size: number;
+  truncated: boolean;
+  binary: boolean;
+  text: string | null;
+}
+
+/** POST /api/runs/{id}/pair/{pair_id}/vote body — winner is the A/B label
+ * (or "tie"); the stored row resolves it to sandbox ids server-side. */
+export interface PairVoteIn {
+  dimension: string;
+  winner: string; // "A" | "B" | "tie"
+  note?: string | null;
+}
+
+/** One recorded blind-A/B vote — real sandbox ids, revealed post-vote. */
+export interface PairwiseVoteOut {
+  id: number;
+  run_id: string;
+  left_sandbox: string;
+  right_sandbox: string;
+  dimension: string;
+  winner: string; // left | right | tie — left := the sandbox behind "A"
+  note: string;
+  created_at: string;
+}
+
+/** Open a blind A/B pair session (201). */
+export function createPair(
+  runId: string,
+  sandboxIds?: string[],
+): Promise<PairOut> {
+  const body: PairCreateIn = sandboxIds ? { sandbox_ids: sandboxIds } : {};
+  return request<PairOut>(`/api/runs/${encodeURIComponent(runId)}/pair`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Read one file inside a pair side — 404s on expired sessions. */
+export function getPairFile(
+  runId: string,
+  pairId: string,
+  side: string,
+  path: string,
+): Promise<PairFileOut> {
+  return request<PairFileOut>(
+    `/api/runs/${encodeURIComponent(runId)}/pair/${encodeURIComponent(pairId)}/files/${encodeURIComponent(side)}/${fileUrlPath(path)}`,
+  );
+}
+
+/** Record the reviewer's verdict (201). */
+export function postPairVote(
+  runId: string,
+  pairId: string,
+  body: PairVoteIn,
+): Promise<PairwiseVoteOut> {
+  return request<PairwiseVoteOut>(
+    `/api/runs/${encodeURIComponent(runId)}/pair/${encodeURIComponent(pairId)}/vote`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+/** Every recorded pairwise vote for the run, newest first. */
+export function listPairVotes(runId: string): Promise<PairwiseVoteOut[]> {
+  return request<PairwiseVoteOut[]>(
+    `/api/runs/${encodeURIComponent(runId)}/votes`,
   );
 }

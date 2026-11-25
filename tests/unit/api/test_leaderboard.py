@@ -6,8 +6,8 @@ other tests in the process would leak into the boards. Same isolation
 pattern as test_presets.py: a tmp_path sqlite file per test +
 ``app.dependency_overrides[get_db]``.
 
-Score merge rule under test: asc (created_at, seq, id) → newest ``overall``
-wins per sandbox.
+Score merge rule under test: asc (created_at, seq, rubric_version, id) →
+newest ``overall`` wins per sandbox.
 """
 
 from __future__ import annotations

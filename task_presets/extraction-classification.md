@@ -5,6 +5,7 @@ description: Turn unstructured text inputs into validated structured output with
 category: extraction
 tags: [extraction, classification, json, data]
 suggested_adapter: miniloop
+suggested_rubric: extraction-accuracy
 ---
 
 The workspace contains unstructured text inputs (documents, messages, or records). Convert them into structured, classified output.

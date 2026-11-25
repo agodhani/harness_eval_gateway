@@ -8,6 +8,7 @@
  */
 import {
   harnessConfigLabel,
+  runModels,
   type RunAnalytics,
   type RunOut,
   type RunResults,
@@ -57,8 +58,6 @@ export function configSummary(hc: Record<string, unknown> | undefined): string {
   bits.push(label);
   const extra = String(hc?.system_prompt_extra ?? "").trim();
   if (extra) bits.push(`'${extra.length <= 32 ? extra : `${extra.slice(0, 32)}…`}'`);
-  const pin = String(hc?.model ?? "").trim();
-  if (pin && !label.includes(pin)) bits.push(`pin:${pin}`);
   const opts = hc?.model_options;
   if (opts && typeof opts === "object") {
     const keys = Object.entries(opts as Record<string, unknown>)
@@ -112,20 +111,10 @@ function budgetVal(run: RunOut, key: string): string {
   return String(v);
 }
 
-/** Participant-model set shown on the diff — persisted `config.models`
- * ([model_name] + extras), falling back to model_name alone. */
+/** Participant-model set shown on the diff — the shared `runModels` rule:
+ * [model_name] + `config.models` extras + per-config model pins. */
 export function participantModels(run: RunOut): string[] {
-  const cfg = run.config ?? {};
-  const list = Array.isArray(cfg.models)
-    ? (cfg.models as unknown[]).map(String).filter(Boolean)
-    : [];
-  const out = run.model_name ? [run.model_name] : [];
-  for (const m of list) if (m && !out.includes(m)) out.push(m);
-  for (const hc of (cfg.harness_configs ?? []) as { model?: unknown }[]) {
-    const m = String(hc?.model ?? "").trim();
-    if (m && !out.includes(m)) out.push(m);
-  }
-  return out;
+  return runModels(run.model_name, run.config?.models, run.config?.harness_configs);
 }
 
 /**
@@ -206,7 +195,9 @@ export interface AnalyticsTotals {
   tokensOut: number;
   tokensTotal: number;
   errors: number;
-  wallClockSeconds: number;
+  /** Summed per-cell participant spans — busy-time, not run elapsed:
+   * cells running in parallel count in full. */
+  busySeconds: number;
   /** Summed estimated participant cost; null when any CONTRIBUTING model
    * is unpriced — a partial total would read as complete (PR21 rule).
    * A zero-traffic unlisted model contributes a legitimate $0 and does
@@ -238,7 +229,7 @@ export function analyticsTotals(a: RunAnalytics | null | undefined): AnalyticsTo
     tokensOut: 0,
     tokensTotal: 0,
     errors: 0,
-    wallClockSeconds: 0,
+    busySeconds: 0,
     costUsd: null,
     avgTokensPerSec: null,
     ttftAvgMs: null,
@@ -264,7 +255,7 @@ export function analyticsTotals(a: RunAnalytics | null | undefined): AnalyticsTo
     t.tokensOut += m.tokens.output;
     t.tokensTotal += m.tokens.total;
     t.errors += m.errors;
-    t.wallClockSeconds += m.wall_clock_seconds;
+    t.busySeconds += m.wall_clock_seconds;
     const hasTraffic = m.llm_turns > 0 || m.tokens.total > 0;
     if (m.estimated_cost_usd == null) {
       if (hasTraffic) costKnown = false;

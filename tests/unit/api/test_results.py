@@ -129,13 +129,30 @@ def test_run_results_shape(client: TestClient, scored_run) -> None:
     assert sb1["model"] == "qwen3:8b"  # PR14: no config model → run default
     assert sb1["harness_config"]["skill_packs"] == ["superpowers"]
     assert sb1["rubric_id"] == str(scored_run["rubric_id"])
-    assert sb1["dimensions"]["functional_requirements"] == {
-        "score": 8.0, "rationale": "game loop works"
-    }
+    fr = sb1["dimensions"]["functional_requirements"]
+    assert fr["score"] == 8.0
+    assert fr["rationale"] == "game loop works"
+    # PR29 provenance fields — single-judge legacy rows merge to a
+    # one-judge cell whose judge_model resolves to the primary judge.
+    assert fr["source"] == "llm"
+    assert fr["judge_count"] == 1
+    assert fr["spread"] is None
+    assert fr["judges"] == [
+        {
+            "judge_model": "qwen3:8b",
+            "score": 8.0,
+            "rationale": "game loop works",
+            "source": "llm",
+        }
+    ]
     assert sb1["dimensions"]["code_quality"]["score"] == 6.0
     # overall pseudo-dimension surfaced separately, not inside dimensions
     assert "overall" not in sb1["dimensions"]
-    assert sb1["overall"] == {"score": 7.0, "rationale": "solid attempt"}
+    assert sb1["overall"]["score"] == 7.0
+    assert sb1["overall"]["rationale"] == "solid attempt"
+    assert sb1["overall"]["source"] == "llm"
+    assert body["evaluator_models"] == ["qwen3:8b"]
+    assert body["votes"] is None
 
     sb2 = next(s for s in body["sandboxes"] if s["sandbox_id"] == str(scored_run["sb2"]))
     assert sb2["dimensions"] == {}
@@ -1029,15 +1046,40 @@ def test_create_rubric_version_requires_terminal_run(
 def test_create_rubric_version_validates(
     client: TestClient, scored_run
 ) -> None:
-    # canonical dimensions enforced at the boundary
+    # PR23: the boundary enforces the flexible contract — an empty
+    # dimensions list 422s, as do names that collide after normalization;
+    # arbitrary dimension names (no canonical dim at all) are accepted.
     bad = _rubric_content()
-    bad["dimensions"] = bad["dimensions"][:3]
+    bad["dimensions"] = []
     assert (
         client.post(
             f"/api/runs/{scored_run['run_id']}/rubrics", json={"content": bad}
         ).status_code
         == 422
     )
+    dup = _rubric_content()
+    dup["dimensions"][1]["name"] = "functional_requirements"
+    assert (
+        client.post(
+            f"/api/runs/{scored_run['run_id']}/rubrics", json={"content": dup}
+        ).status_code
+        == 422
+    )
+    custom = _rubric_content()
+    custom["dimensions"] = [
+        {"name": "accuracy", "min_score": 0.0, "max_score": 10.0},
+        {"name": "tone", "min_score": 0.0, "max_score": 10.0},
+        {"name": "compliance", "min_score": 0.0, "max_score": 10.0},
+    ]
+    resp = client.post(
+        f"/api/runs/{scored_run['run_id']}/rubrics", json={"content": custom}
+    )
+    assert resp.status_code == 201
+    assert [d["name"] for d in resp.json()["content"]["dimensions"]] == [
+        "accuracy",
+        "tone",
+        "compliance",
+    ]
     # unknown run / unknown base
     assert (
         client.post(
@@ -1350,9 +1392,9 @@ def test_results_same_second_passes_newest_inserted_wins(
         x for x in body["sandboxes"]
         if x["sandbox_id"] == str(scored_run["sb1"])
     )
-    assert sb1["dimensions"]["functional_requirements"] == {
-        "score": 3.0, "rationale": "v1 rescore pass"
-    }
+    dim = sb1["dimensions"]["functional_requirements"]
+    assert dim["score"] == 3.0
+    assert dim["rationale"] == "v1 rescore pass"
     assert sb1["rubric_version"] == 1
 
 
@@ -1810,3 +1852,544 @@ def test_files_list_unreadable_dir_flags_truncated(
         assert body["truncated"] is True
     finally:
         locked.chmod(0o755)
+
+
+# ---------------------------------------------------------------------------
+# PR29 — judge panel merge, human override, blind A/B
+# ---------------------------------------------------------------------------
+
+
+def _panel_run(session_factory, artifact_root: Path, *, workspace: bool = True):
+    """Run (2-judge panel config) + 2 artifact-bearing sandboxes + rubric.
+
+    Artifact dirs are real on disk under the ARTIFACT_ROOT jail — each has
+    meta.json/transcript.log sidecars plus workspace/app.py (workspace=True)
+    so the pair endpoints have both a workspace side and sidecars that must
+    stay hidden. workspace=False makes prompt-cell-style dirs (output.txt
+    only, no workspace/) to exercise the artifact-root anonymized side.
+    """
+    s = session_factory()
+    try:
+        run = Run(
+            task_prompt="build 2048",
+            model_name="qwen3:8b",
+            config={
+                "evaluator_model": "judge-a",
+                "evaluator_models": ["judge-a", "judge-b"],
+                "same_model_eval": False,
+            },
+            status="done",
+        )
+        s.add(run)
+        s.flush()
+        sb_ids: list[uuid.UUID] = []
+        for name in ("sb-a", "sb-b"):
+            sb = Sandbox(
+                run_id=run.id,
+                name=name,
+                harness_config={"adapter": "miniloop"},
+                status="done",
+                terminal_reason="agent_done",
+            )
+            s.add(sb)
+            s.flush()
+            art = artifact_root / str(run.id) / str(sb.id)
+            if workspace:
+                (art / "workspace").mkdir(parents=True)
+                (art / "workspace" / "app.py").write_text(f"# {name}\n")
+            else:
+                art.mkdir(parents=True)
+                (art / "output.txt").write_text(f"response from {name}\n")
+            # harness/evaluator byproducts — must never surface in a pair view
+            (art / "meta.json").write_text('{"model": "secret"}')
+            (art / "transcript.log").write_text("log")
+            sb.artifact_path = str(art)
+            sb_ids.append(sb.id)
+        rubric = Rubric(
+            run_id=run.id, version=1, status="approved",
+            content={
+                "dimensions": [
+                    {"name": "functional_requirements"},
+                    {"name": "code_quality"},
+                ],
+            },
+        )
+        s.add(rubric)
+        s.commit()
+        return {
+            "run_id": run.id,
+            "sb_a": sb_ids[0],
+            "sb_b": sb_ids[1],
+            "rubric_id": rubric.id,
+        }
+    finally:
+        s.close()
+
+
+def _judge_score(
+    session_factory, sb_id, rubric_id, dim, val, judge, *, seq=None, version=1
+) -> None:
+    s = session_factory()
+    try:
+        s.add(
+            Score(
+                sandbox_id=sb_id,
+                rubric_id=rubric_id,
+                rubric_version=version,
+                seq=seq,
+                dimension=dim,
+                score=val,
+                rationale=f"{judge} says {val}",
+                judge_model=judge,
+            )
+        )
+        s.commit()
+    finally:
+        s.close()
+
+
+def _sandbox_result(body: dict, sb_id) -> dict:
+    return next(s for s in body["sandboxes"] if s["sandbox_id"] == str(sb_id))
+
+
+def test_results_panel_mean_and_spread(
+    client: TestClient, session_factory, artifact_root
+) -> None:
+    """PR29: per-judge rows merge to the MEAN cell — spread + per-judge
+    verdicts ride along for the tooltip; the panel lands on the response."""
+    fx = _panel_run(session_factory, artifact_root)
+    _judge_score(session_factory, fx["sb_a"], fx["rubric_id"],
+                 "functional_requirements", 8.0, "judge-a")
+    _judge_score(session_factory, fx["sb_a"], fx["rubric_id"],
+                 "functional_requirements", 4.0, "judge-b")
+
+    resp = client.get(f"/api/runs/{fx['run_id']}/results")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["evaluator_models"] == ["judge-a", "judge-b"]
+    assert body["evaluator_model"] == "judge-a"  # primary judge back-compat
+
+    cell = _sandbox_result(body, fx["sb_a"])["dimensions"]["functional_requirements"]
+    assert cell["score"] == 6.0      # (8 + 4) / 2
+    assert cell["spread"] == 4.0     # 8 − 4
+    assert cell["judge_count"] == 2
+    assert cell["source"] == "llm"
+    by_judge = {j["judge_model"]: j for j in cell["judges"]}
+    assert by_judge["judge-a"]["score"] == 8.0
+    assert by_judge["judge-b"]["score"] == 4.0
+    assert all(j["source"] == "llm" for j in cell["judges"])
+
+
+def test_results_panel_newest_per_judge_wins(
+    client: TestClient, session_factory, artifact_root
+) -> None:
+    """A judge's rescore replaces ITS bucket only — the other judge's
+    verdict survives and the mean re-derives from each judge's newest."""
+    fx = _panel_run(session_factory, artifact_root)
+    _judge_score(session_factory, fx["sb_a"], fx["rubric_id"],
+                 "functional_requirements", 8.0, "judge-a", seq=1)
+    _judge_score(session_factory, fx["sb_a"], fx["rubric_id"],
+                 "functional_requirements", 4.0, "judge-b", seq=1)
+    # judge-a's rescore pass lands at a higher seq
+    _judge_score(session_factory, fx["sb_a"], fx["rubric_id"],
+                 "functional_requirements", 9.0, "judge-a", seq=2)
+
+    body = client.get(f"/api/runs/{fx['run_id']}/results").json()
+    cell = _sandbox_result(body, fx["sb_a"])["dimensions"]["functional_requirements"]
+    assert cell["score"] == 6.5  # (9 + 4) / 2 — stale judge-a row ignored
+    by_judge = {j["judge_model"]: j for j in cell["judges"]}
+    assert by_judge["judge-a"]["score"] == 9.0
+    assert by_judge["judge-b"]["score"] == 4.0
+
+
+def test_results_checker_source_and_eval_error(
+    client: TestClient, session_factory, artifact_root
+) -> None:
+    """suite_pass merges as source='checker' (judge_model None); a
+    judge-tagged eval_failed marker names the judge in eval_error."""
+    fx = _panel_run(session_factory, artifact_root)
+    s = session_factory()
+    try:
+        s.add(
+            Score(
+                sandbox_id=fx["sb_a"],
+                rubric_id=fx["rubric_id"],
+                rubric_version=1,
+                dimension="suite_pass",
+                score=8.0,
+                rationale="3/4 checks",
+                source="checker",
+            )
+        )
+        s.commit()
+    finally:
+        s.close()
+    _error_event(
+        session_factory,
+        fx["run_id"],
+        fx["sb_b"],
+        {
+            "stage": "evaluation",
+            "phase": "eval_failed",
+            "judge_model": "judge-a",
+            "message": "judge judge-a produced no usable scores after 1 attempt(s)",
+        },
+    )
+
+    body = client.get(f"/api/runs/{fx['run_id']}/results").json()
+    sp = _sandbox_result(body, fx["sb_a"])["dimensions"]["suite_pass"]
+    assert sp["source"] == "checker"
+    assert sp["score"] == 8.0
+    assert sp["judges"][0]["judge_model"] is None
+    assert sp["judges"][0]["source"] == "checker"
+
+    sb_b = _sandbox_result(body, fx["sb_b"])
+    assert sb_b["eval_error"] is not None
+    assert "judge-a" in sb_b["eval_error"]
+
+
+def test_results_human_override_wins(
+    client: TestClient, session_factory, artifact_root
+) -> None:
+    """POST /api/sandboxes/{id}/scores lands source='human', wins its cell
+    outright (judge verdicts stay attached), and stays visible in a
+    pinned ?rubric_version= view — the correction is version-agnostic."""
+    fx = _panel_run(session_factory, artifact_root)
+    _judge_score(session_factory, fx["sb_a"], fx["rubric_id"],
+                 "functional_requirements", 8.0, "judge-a")
+    _judge_score(session_factory, fx["sb_a"], fx["rubric_id"],
+                 "functional_requirements", 4.0, "judge-b")
+
+    # v2 lands before the human post → the row stamps THAT provenance,
+    # which is exactly why the pinned-v1 view must keep it via source.
+    s = session_factory()
+    try:
+        s.add(
+            Rubric(run_id=fx["run_id"], version=2, status="approved",
+                   content={"dimensions": []})
+        )
+        s.commit()
+    finally:
+        s.close()
+
+    resp = client.post(
+        f"/api/sandboxes/{fx['sb_a']}/scores",
+        json={
+            "dimension": "functional_requirements",
+            "score": 3.0,
+            "rationale": "actually broken — output is static",
+            "note": "verified by hand in the preview",
+        },
+    )
+    assert resp.status_code == 201
+    row = resp.json()
+    assert row["source"] == "human"
+    assert row["judge_model"] is None
+    assert row["note"] == "verified by hand in the preview"
+    assert row["rubric_version"] == 2  # latest approved at post time
+
+    body = client.get(f"/api/runs/{fx['run_id']}/results").json()
+    cell = _sandbox_result(body, fx["sb_a"])["dimensions"]["functional_requirements"]
+    assert cell["source"] == "human"
+    assert cell["score"] == 3.0
+    assert cell["rationale"] == "actually broken — output is static"
+    assert cell["note"] == "verified by hand in the preview"
+    # "what judges said" stays attached under the override
+    assert cell["judge_count"] == 2
+    assert {j["judge_model"] for j in cell["judges"]} == {"judge-a", "judge-b"}
+
+    # The pinned v1 view shows v1 judge rows AND the human override —
+    # source='human' rows are version-agnostic corrections.
+    body = client.get(
+        f"/api/runs/{fx['run_id']}/results", params={"rubric_version": 1}
+    ).json()
+    cell = _sandbox_result(body, fx["sb_a"])["dimensions"]["functional_requirements"]
+    assert cell["source"] == "human"
+    assert cell["score"] == 3.0
+
+    # audit checkpoint landed
+    evs = client.get(f"/api/runs/{fx['run_id']}/events").json()
+    hs = [e for e in evs if e["payload"].get("stage") == "human_score"]
+    assert hs and hs[0]["payload"]["dimension"] == "functional_requirements"
+
+
+def test_post_human_score_errors(
+    client: TestClient, session_factory, artifact_root
+) -> None:
+    fx = _panel_run(session_factory, artifact_root)
+    resp = client.post(
+        f"/api/sandboxes/{uuid.uuid4()}/scores",
+        json={"dimension": "d", "score": 5},
+    )
+    assert resp.status_code == 404
+    resp = client.post(
+        f"/api/sandboxes/{fx['sb_a']}/scores",
+        json={"dimension": "   ", "score": 5},
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        f"/api/sandboxes/{fx['sb_a']}/scores",
+        json={"dimension": "d", "score": "not-a-number"},
+    )
+    assert resp.status_code == 422
+
+
+def test_score_out_provenance_fields(
+    client: TestClient, session_factory, artifact_root
+) -> None:
+    """GET /api/sandboxes/{id}/scores exposes the PR29 provenance columns —
+    judge_model on llm rows, source/note on human overrides."""
+    fx = _panel_run(session_factory, artifact_root)
+    _judge_score(session_factory, fx["sb_a"], fx["rubric_id"],
+                 "functional_requirements", 8.0, "judge-a")
+    client.post(
+        f"/api/sandboxes/{fx['sb_a']}/scores",
+        json={"dimension": "functional_requirements", "score": 3,
+              "note": "hand-checked"},
+    )
+
+    rows = client.get(f"/api/sandboxes/{fx['sb_a']}/scores").json()
+    by_src = {r["source"]: r for r in rows}
+    assert by_src["llm"]["judge_model"] == "judge-a"
+    assert by_src["llm"]["note"] is None
+    assert by_src["human"]["judge_model"] is None
+    assert by_src["human"]["note"] == "hand-checked"
+
+
+# --- blind A/B pairs --------------------------------------------------------
+
+
+@pytest.fixture()
+def _clean_pair_sessions():
+    results_router.reset_pair_sessions()
+    yield
+    results_router.reset_pair_sessions()
+
+
+def _pin_pair_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deterministic A/B: kill the random flip so the FIRST pinned sandbox
+    is label "A" (recorded as left_sandbox on vote rows)."""
+    monkeypatch.setattr(results_router.random, "random", lambda: 0.9)
+
+
+def test_pair_roundtrip_anonymized(
+    client: TestClient, session_factory, artifact_root, monkeypatch,
+    _clean_pair_sessions,
+) -> None:
+    """POST /pair → A/B sides + vote menu, NO sandbox ids/names/models in
+    the payload; a label vote resolves to real ids server-side."""
+    fx = _panel_run(session_factory, artifact_root)
+    _judge_score(session_factory, fx["sb_a"], fx["rubric_id"],
+                 "functional_requirements", 8.0, "judge-a")
+    _judge_score(session_factory, fx["sb_b"], fx["rubric_id"],
+                 "functional_requirements", 5.0, "judge-a")
+    _pin_pair_order(monkeypatch)
+
+    resp = client.post(
+        f"/api/runs/{fx['run_id']}/pair",
+        json={"sandbox_ids": [str(fx["sb_a"]), str(fx["sb_b"])]},
+    )
+    assert resp.status_code == 201
+    pair = resp.json()
+    # the anonymization contract — nothing identifying a side leaks
+    for sid in (fx["sb_a"], fx["sb_b"]):
+        assert str(sid) not in resp.text
+        assert sid.hex not in resp.text
+    assert "sb-a" not in resp.text and "sb-b" not in resp.text
+    assert "miniloop" not in resp.text and "qwen" not in resp.text
+
+    assert pair["dimensions"] == [
+        "functional_requirements",
+        "code_quality",
+        "overall",
+    ]
+    assert [side["label"] for side in pair["sides"]] == ["A", "B"]
+    side_a = pair["sides"][0]
+    assert side_a["root"] == "workspace"
+    names = [e["path"] for e in side_a["entries"]]
+    assert "app.py" in names
+    # artifact-root sidecars never appear in a pair listing
+    assert "meta.json" not in names and "transcript.log" not in names
+
+    # anonymized file read — workspace content resolves by label
+    f = client.get(
+        f"/api/runs/{fx['run_id']}/pair/{pair['pair_id']}/files/A/app.py"
+    )
+    assert f.status_code == 200
+    fbody = f.json()
+    assert fbody["side"] == "A"
+    assert fbody["path"] == "app.py"
+    assert "sb-a" in fbody["text"]  # candidate's own content, as-is
+
+    # vote "a" → stored winner resolves to the session's left (sb_a)
+    v = client.post(
+        f"/api/runs/{fx['run_id']}/pair/{pair['pair_id']}/vote",
+        json={
+            "dimension": "functional_requirements",
+            "winner": "a",
+            "note": "a actually runs",
+        },
+    )
+    assert v.status_code == 201
+    row = v.json()
+    assert row["left_sandbox"] == str(fx["sb_a"])
+    assert row["right_sandbox"] == str(fx["sb_b"])
+    assert row["winner"] == "left"
+
+    votes = client.get(f"/api/runs/{fx['run_id']}/votes").json()
+    assert len(votes) == 1
+    assert votes[0]["note"] == "a actually runs"
+
+    # results roll-up: sb_a gets the win; judge means agree with the pick
+    # (8 > 5 on the voted dim) → agreement_rate 1.0
+    body = client.get(f"/api/runs/{fx['run_id']}/results").json()
+    vsum = body["votes"]
+    assert vsum["total"] == 1
+    assert vsum["by_sandbox"][str(fx["sb_a"])]["wins"] == 1
+    assert vsum["by_sandbox"][str(fx["sb_a"])]["win_rate"] == 1.0
+    assert vsum["by_sandbox"][str(fx["sb_b"])]["losses"] == 1
+    assert vsum["compared"] == 1
+    assert vsum["agreed"] == 1
+    assert vsum["agreement_rate"] == 1.0
+
+    # audit checkpoint landed
+    evs = client.get(f"/api/runs/{fx['run_id']}/events").json()
+    pv = [e for e in evs if e["payload"].get("stage") == "pairwise_vote"]
+    assert pv and pv[0]["payload"]["winner"] == "left"
+
+
+def test_pair_artifact_side_only_exposes_output_txt(
+    client: TestClient, session_factory, artifact_root, monkeypatch,
+    _clean_pair_sessions,
+) -> None:
+    """Workspace-less (prompt-cell) sides: the pair exposes output.txt ONLY
+    — meta.json/transcript/traversal never resolve to the blind reviewer."""
+    fx = _panel_run(session_factory, artifact_root, workspace=False)
+    _pin_pair_order(monkeypatch)
+
+    resp = client.post(
+        f"/api/runs/{fx['run_id']}/pair",
+        json={"sandbox_ids": [str(fx["sb_a"]), str(fx["sb_b"])]},
+    )
+    assert resp.status_code == 201
+    pair = resp.json()
+    for side in pair["sides"]:
+        assert side["root"] == "artifact"
+        assert [e["path"] for e in side["entries"]] == ["output.txt"]
+
+    base = f"/api/runs/{fx['run_id']}/pair/{pair['pair_id']}/files"
+    f = client.get(f"{base}/A/output.txt")
+    assert f.status_code == 200
+    assert "response from sb-a" in f.json()["text"]
+    assert client.get(f"{base}/A/meta.json").status_code == 404
+    assert client.get(f"{base}/A/transcript.log").status_code == 404
+    assert client.get(f"{base}/A/..%2Fmeta.json").status_code == 404
+
+
+def test_pair_revote_replaces_and_ties(
+    client: TestClient, session_factory, artifact_root, monkeypatch,
+    _clean_pair_sessions,
+) -> None:
+    """Re-voting the same pair+dim replaces the earlier pick (newest-wins
+    merge), so the summary never double-counts a flip."""
+    fx = _panel_run(session_factory, artifact_root)
+    _pin_pair_order(monkeypatch)
+    pair = client.post(
+        f"/api/runs/{fx['run_id']}/pair",
+        json={"sandbox_ids": [str(fx["sb_a"]), str(fx["sb_b"])]},
+    ).json()
+    for winner in ("a", "b"):
+        resp = client.post(
+            f"/api/runs/{fx['run_id']}/pair/{pair['pair_id']}/vote",
+            json={"dimension": "functional_requirements", "winner": winner},
+        )
+        assert resp.status_code == 201
+    # a second pair over the SAME matchup votes tie on another dimension
+    pair2 = client.post(
+        f"/api/runs/{fx['run_id']}/pair",
+        json={"sandbox_ids": [str(fx["sb_a"]), str(fx["sb_b"])]},
+    ).json()
+    client.post(
+        f"/api/runs/{fx['run_id']}/pair/{pair2['pair_id']}/vote",
+        json={"dimension": "code_quality", "winner": "tie"},
+    )
+
+    body = client.get(f"/api/runs/{fx['run_id']}/results").json()
+    vsum = body["votes"]
+    # 2 merged verdicts: (pair,dim) revote collapsed + the tie
+    assert vsum["total"] == 2
+    assert vsum["by_sandbox"][str(fx["sb_a"])]["losses"] == 1
+    assert vsum["by_sandbox"][str(fx["sb_a"])]["ties"] == 1
+    assert vsum["by_sandbox"][str(fx["sb_b"])]["wins"] == 1
+    # no judge scores seeded → nothing to agree against
+    assert vsum["compared"] == 0
+    assert vsum["agreement_rate"] is None
+
+
+def test_pair_errors(
+    client: TestClient, session_factory, artifact_root, monkeypatch,
+    scored_run, _clean_pair_sessions,
+) -> None:
+    """Endpoint surface: bad pair/vote/side → 404/422/409 as designed."""
+    # scored_run: sb1 artifact_path non-null (missing on disk), sb2 None →
+    # only ONE artifact-bearing candidate → random pick 409s
+    resp = client.post(f"/api/runs/{scored_run['run_id']}/pair")
+    assert resp.status_code == 409
+
+    resp = client.post(
+        f"/api/runs/{scored_run['run_id']}/pair",
+        json={"sandbox_ids": [str(scored_run["sb1"]), str(uuid.uuid4())]},
+    )
+    assert resp.status_code == 422  # non-member
+
+    resp = client.post(
+        f"/api/runs/{scored_run['run_id']}/pair",
+        json={
+            "sandbox_ids": [str(scored_run["sb1"]), str(scored_run["sb1"])],
+        },
+    )
+    assert resp.status_code == 422  # same sandbox twice
+
+    assert client.post(f"/api/runs/{uuid.uuid4()}/pair").status_code == 404
+
+    # real pair for the session-level errors
+    fx = _panel_run(session_factory, artifact_root)
+    _pin_pair_order(monkeypatch)
+    pair = client.post(
+        f"/api/runs/{fx['run_id']}/pair",
+        json={"sandbox_ids": [str(fx["sb_a"]), str(fx["sb_b"])]},
+    ).json()
+
+    # bad winner → 422
+    v = client.post(
+        f"/api/runs/{fx['run_id']}/pair/{pair['pair_id']}/vote",
+        json={"dimension": "d", "winner": "x"},
+    )
+    assert v.status_code == 422
+    # unknown side label → 404
+    f = client.get(
+        f"/api/runs/{fx['run_id']}/pair/{pair['pair_id']}/files/C/app.py"
+    )
+    assert f.status_code == 404
+    # unknown pair id → 404 on vote + file read
+    v = client.post(
+        f"/api/runs/{fx['run_id']}/pair/nope/vote",
+        json={"dimension": "d", "winner": "a"},
+    )
+    assert v.status_code == 404
+    f = client.get(f"/api/runs/{fx['run_id']}/pair/nope/files/A/app.py")
+    assert f.status_code == 404
+    # pair bound to a DIFFERENT run → 404 (no cross-run vote smuggling)
+    v = client.post(
+        f"/api/runs/{scored_run['run_id']}/pair/{pair['pair_id']}/vote",
+        json={"dimension": "d", "winner": "a"},
+    )
+    assert v.status_code == 404
+
+    # expired session → 404 "not found or expired" — TTL clamped to -1
+    monkeypatch.setattr(results_router, "_PAIR_TTL_SECONDS", -1)
+    v = client.post(
+        f"/api/runs/{fx['run_id']}/pair/{pair['pair_id']}/vote",
+        json={"dimension": "d", "winner": "a"},
+    )
+    assert v.status_code == 404
