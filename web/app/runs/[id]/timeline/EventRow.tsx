@@ -55,12 +55,14 @@ export function summarizeEvent(ev: EventOut): ReactNode {
   const p = ev.payload ?? {};
   switch (ev.type) {
     case "llm_request": {
-      const parts = [
-        p.model ? <code key="m">{str(p.model)}</code> : null,
-        num(p.message_count) != null ? `${p.message_count} msgs` : null,
-        num(p.tool_count) != null ? `${p.tool_count} tools` : null,
-      ].filter(Boolean);
-      return <>LLM request{parts.length ? <> · {parts}</> : null}</>;
+      return (
+        <>
+          LLM request
+          {p.model ? <> · <code>{str(p.model)}</code></> : null}
+          {num(p.message_count) != null ? ` · ${p.message_count} msgs` : null}
+          {num(p.tool_count) != null ? ` · ${p.tool_count} tools` : null}
+        </>
+      );
     }
     case "llm_response": {
       const usage = (p.usage ?? {}) as Record<string, unknown>;

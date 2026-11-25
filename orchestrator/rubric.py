@@ -732,6 +732,18 @@ def _persist_draft(
         session.commit()
 
 
+def _failure_message(exc: Exception) -> str:
+    """Human-readable failure reason; surfaces the gateway's error body."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        body = exc.response.text.strip()
+        if body:
+            return (
+                f"rubric generation failed — gateway returned "
+                f"{exc.response.status_code}: {body[:500]}"
+            )
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _mark_failed(
     session_factory: sessionmaker[Session],
     run_id: uuid.UUID,
@@ -896,7 +908,7 @@ async def draft_rubric(
         log.info("draft_rubric: run %s -> rubric_review", run_id)
     except Exception as exc:
         log.exception("draft_rubric: run %s failed", run_id)
-        message = f"{type(exc).__name__}: {exc}"
+        message = _failure_message(exc)
         try:
             _mark_failed(session_factory, run_id, message)
         except Exception:
