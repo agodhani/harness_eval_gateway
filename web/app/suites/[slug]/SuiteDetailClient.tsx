@@ -111,6 +111,8 @@ function RunLauncher({
       setError(
         err instanceof ApiError ? err.detail : "Suite launch failed.",
       );
+    } finally {
+      // Reset even on success: the router restores this page on "back".
       setSubmitting(false);
     }
   }
