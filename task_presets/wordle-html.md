@@ -5,6 +5,7 @@ description: Wordle-style word-guessing game as one self-contained index.html pa
 category: game-build
 tags: [web, game, single-file, html]
 suggested_adapter: miniloop
+suggested_rubric: code-default
 ---
 
 Build a playable Wordle clone as a single self-contained `index.html` file in the workspace root (all CSS and JavaScript inline — no external assets or CDN links).

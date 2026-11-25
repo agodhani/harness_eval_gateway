@@ -95,6 +95,59 @@ CHECK_TYPES = frozenset(
 #: (``rubric_id`` NULL), the row exists even when no judge ever ran.
 SUITE_PASS_DIMENSION = "suite_pass"
 
+#: Normalized names a dimension can never take: ``overall`` and
+#: ``suite_pass`` are reserved pseudo-rows in ``scores.dimension`` (the
+#: results payload routes them to the headline / deterministic-checker
+#: slots), and ``scores``/``summary``/``total`` are the eval parser's
+#: document fields — a real dimension under one of these names loses its
+#: score or masquerades as another field. Single-sourced for both guards:
+#: ``orchestrator.rubric`` rejects them at authoring and
+#: ``evaluator.scores`` drops judge entries naming them.
+RESERVED_DIMENSION_NAMES = frozenset(
+    {"overall", "scores", "summary", "total", SUITE_PASS_DIMENSION}
+)
+
+#: LLM re-phrasings folded onto the canonical dimension names — a SOFT
+#: normalizer (arbitrary names pass through untouched), shared by the
+#: authoring fold (``orchestrator.rubric``) and the eval parser's
+#: declared-dimension match (``evaluator.scores``): a judge emitting an
+#: alias spelling lands on the declared name. Frozen rubrics can never
+#: declare an alias word — the authoring fold maps them onto canonical
+#: first — so eval-side folding can't steal a real dimension's name.
+DIMENSION_ALIASES = {
+    "functional": "functional_requirements",
+    "functional_req": "functional_requirements",
+    "functional_reqs": "functional_requirements",
+    "requirements": "functional_requirements",
+    "acceptance": "acceptance_criteria",
+    "acceptance_tests": "acceptance_criteria",
+    "code": "code_quality",
+    "implementation": "code_quality",
+    "implementation_quality": "code_quality",
+    "code_implementation": "code_quality",
+    "code_implementation_quality": "code_quality",
+    "quality": "code_quality",
+    "complexity": "cyclomatic_complexity",
+    "cyclomatic": "cyclomatic_complexity",
+}
+
+_DIM_NAME_FOLD_RE = re.compile(r"[^a-z0-9]+")
+
+
+def fold_dimension_name(name: str) -> str:
+    """Shared dimension-name fold: snake_case normalization +
+    :data:`DIMENSION_ALIASES` resolution.
+
+    ``"Functional Requirements!!"`` → ``functional_requirements``,
+    ``"complexity"`` → ``cyclomatic_complexity``; unknown names keep their
+    own folded spelling. Rubric authoring and judge-score parsing fold
+    names identically so a judge's phrasing lands on the declared
+    dimension.
+    """
+    norm = _DIM_NAME_FOLD_RE.sub("_", name.strip().lower()).strip("_")
+    return DIMENSION_ALIASES.get(norm, norm)
+
+
 #: Artifact-side measurement file: ``_run_suite_checks`` writes the raw
 #: outcomes here so the evaluator can fold them into ``analysis.json`` /
 #: ``ANALYSIS.md`` (the ``suite`` signal) without re-measuring.

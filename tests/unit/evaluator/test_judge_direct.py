@@ -379,3 +379,23 @@ def test_default_timeout_outwaits_gateway_worst_case() -> None:
         backoff_base * (2**i) for i in range(attempts - 1)
     )
     assert DEFAULT_TIMEOUT_SECONDS > worst_case
+
+
+def test_direct_prompt_pr23_domain_neutral() -> None:
+    """PR23: the system prompt no longer frames the task as coding-only and
+    carries the not-applicable rule so a rubric without code dimensions
+    still instructs the judge to emit every row."""
+    from evaluator.judge_direct import DIRECT_SYSTEM_PROMPT
+
+    assert "coding-agent benchmark" not in DIRECT_SYSTEM_PROMPT
+    assert "not applicable" in DIRECT_SYSTEM_PROMPT
+    # arbitrary rubric dims render verbatim in the user message
+    rubric = {
+        "dimensions": [
+            {"name": "accuracy", "min_score": 0, "max_score": 10},
+            {"name": "tone", "min_score": 0, "max_score": 10},
+        ]
+    }
+    prompt = build_direct_prompt(rubric)
+    assert "`accuracy`" in prompt
+    assert "`tone`" in prompt

@@ -5,6 +5,7 @@ description: Classic Snake game implemented in Python with pygame.
 category: game-build
 tags: [python, game, pygame, desktop]
 suggested_adapter: miniloop
+suggested_rubric: code-default
 ---
 
 Build the classic game Snake in Python using pygame.

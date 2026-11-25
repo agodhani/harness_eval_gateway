@@ -35,7 +35,9 @@ import {
   specFromRun,
   stageResubmit,
 } from "@/lib/resubmit";
+import { draftFromContent, validateDraft } from "@/lib/rubricEdit";
 import RunConsoleLive from "@/components/RunConsoleLive";
+import RubricEditor from "@/components/RubricEditor";
 import { SavePresetDialog } from "@/components/SavePresetDialog";
 import {
   Badge,
@@ -319,9 +321,11 @@ export default function RunDetailClient({ runId }: { runId: string }) {
   // previous run's data (and its polling status) leaking across navigation.
   const run = loadedId === runId ? runData : null;
 
-  // rubric editing state
+  // rubric editing state — `draftContent` is the working RubricContent the
+  // structured editor reports back; `draftValid` gates the save button.
   const [editing, setEditing] = useState(false);
-  const [draftJson, setDraftJson] = useState("");
+  const [draftContent, setDraftContent] = useState<RubricContent>({});
+  const [draftValid, setDraftValid] = useState(false);
   const [rubricBusy, setRubricBusy] = useState(false);
   const [rubricError, setRubricError] = useState<string | null>(null);
 
@@ -508,7 +512,12 @@ export default function RunDetailClient({ runId }: { runId: string }) {
 
   function startEdit() {
     if (!rubric) return;
-    setDraftJson(JSON.stringify(rubric.content, null, 2));
+    const content = rubric.content ?? {};
+    setDraftContent(content);
+    const v = validateDraft(draftFromContent(content));
+    setDraftValid(
+      v.errors.length === 0 && Object.keys(v.fieldErrors).length === 0,
+    );
     setRubricError(null);
     setEditing(true);
   }
@@ -516,20 +525,9 @@ export default function RunDetailClient({ runId }: { runId: string }) {
   async function saveRubric() {
     if (!rubric) return;
     setRubricError(null);
-    let parsed: RubricContent;
-    try {
-      const v: unknown = JSON.parse(draftJson);
-      if (!v || typeof v !== "object" || Array.isArray(v)) {
-        throw new Error("rubric content must be a JSON object");
-      }
-      parsed = v as RubricContent;
-    } catch (err) {
-      setRubricError(`Invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
-      return;
-    }
     setRubricBusy(true);
     try {
-      await updateRubric(runId, parsed);
+      await updateRubric(runId, draftContent);
       setEditing(false);
       setNotice("Rubric saved.");
       await refresh(true);
@@ -989,7 +987,8 @@ export default function RunDetailClient({ runId }: { runId: string }) {
                     type="button"
                     className="btn btn--sm"
                     onClick={saveRubric}
-                    disabled={rubricBusy}
+                    disabled={rubricBusy || !draftValid}
+                    title={!draftValid ? "fix the rubric errors below first" : undefined}
                   >
                     {rubricBusy ? "Saving…" : "Save rubric"}
                   </button>
@@ -1039,18 +1038,21 @@ export default function RunDetailClient({ runId }: { runId: string }) {
             )
           ) : editing ? (
             <div className="stack">
-              <p className="field__hint">
-                Edit the rubric JSON. <code>dimensions</code> must contain exactly:{" "}
-                <code>functional_requirements</code>, <code>acceptance_criteria</code>,{" "}
-                <code>code_quality</code>, <code>cyclomatic_complexity</code>.
-              </p>
-              <textarea
-                className="textarea"
-                style={{ minHeight: "320px" }}
-                value={draftJson}
-                onChange={(e) => setDraftJson(e.target.value)}
+              <RubricEditor
+                key={rubric.id}
+                content={draftContent}
+                onChange={(c, meta) => {
+                  setDraftContent(c);
+                  setDraftValid(meta.valid);
+                }}
                 disabled={rubricBusy}
-                spellCheck={false}
+                note={
+                  <>
+                    Edit the rubric — 1–12 dimensions, arbitrary snake_case
+                    names (canonical aliases normalize). Raw JSON is behind the
+                    toggle.
+                  </>
+                }
               />
               {rubricError ? <ErrorNote>{rubricError}</ErrorNote> : null}
             </div>

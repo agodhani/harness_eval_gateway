@@ -519,11 +519,28 @@ def test_get_and_update_rubric(api) -> None:
     assert resp.json()["content"]["summary"] == "human-edited rubric"
     assert resp.json()["status"] == "draft"  # still editable until approve
 
-    # canonical dimensions are enforced at the boundary
+    # PR23: the boundary enforces the flexible contract — an empty
+    # dimensions list or names colliding after normalization 422; a
+    # subset of arbitrary dims is a valid rubric.
     bad = _rubric_content()
-    bad["dimensions"] = bad["dimensions"][:3]
+    bad["dimensions"] = []
     resp = client.put(f"/api/runs/{run_id}/rubric", json={"content": bad})
     assert resp.status_code == 422
+    dup = _rubric_content()
+    dup["dimensions"][1]["name"] = "functional_requirements"
+    resp = client.put(f"/api/runs/{run_id}/rubric", json={"content": dup})
+    assert resp.status_code == 422
+    custom = _rubric_content()
+    custom["dimensions"] = [
+        {"name": "Accuracy", "min_score": 0.0, "max_score": 10.0},
+        {"name": "tone", "min_score": 0.0, "max_score": 10.0},
+    ]
+    resp = client.put(f"/api/runs/{run_id}/rubric", json={"content": custom})
+    assert resp.status_code == 200
+    assert [d["name"] for d in resp.json()["content"]["dimensions"]] == [
+        "accuracy",
+        "tone",
+    ]
 
 
 def test_approve_freezes_rubric_and_starts_lifecycle(api) -> None:

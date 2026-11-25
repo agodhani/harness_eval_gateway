@@ -1029,15 +1029,40 @@ def test_create_rubric_version_requires_terminal_run(
 def test_create_rubric_version_validates(
     client: TestClient, scored_run
 ) -> None:
-    # canonical dimensions enforced at the boundary
+    # PR23: the boundary enforces the flexible contract — an empty
+    # dimensions list 422s, as do names that collide after normalization;
+    # arbitrary dimension names (no canonical dim at all) are accepted.
     bad = _rubric_content()
-    bad["dimensions"] = bad["dimensions"][:3]
+    bad["dimensions"] = []
     assert (
         client.post(
             f"/api/runs/{scored_run['run_id']}/rubrics", json={"content": bad}
         ).status_code
         == 422
     )
+    dup = _rubric_content()
+    dup["dimensions"][1]["name"] = "functional_requirements"
+    assert (
+        client.post(
+            f"/api/runs/{scored_run['run_id']}/rubrics", json={"content": dup}
+        ).status_code
+        == 422
+    )
+    custom = _rubric_content()
+    custom["dimensions"] = [
+        {"name": "accuracy", "min_score": 0.0, "max_score": 10.0},
+        {"name": "tone", "min_score": 0.0, "max_score": 10.0},
+        {"name": "compliance", "min_score": 0.0, "max_score": 10.0},
+    ]
+    resp = client.post(
+        f"/api/runs/{scored_run['run_id']}/rubrics", json={"content": custom}
+    )
+    assert resp.status_code == 201
+    assert [d["name"] for d in resp.json()["content"]["dimensions"]] == [
+        "accuracy",
+        "tone",
+        "compliance",
+    ]
     # unknown run / unknown base
     assert (
         client.post(

@@ -318,6 +318,13 @@ export interface RunCreate {
   evaluator_model?: string | null;
   budgets?: Budgets;
   task_inputs?: TaskInputs | null;
+  /** PR23: rubric-generation steering — `rubric_template` names a template
+   * from GET /api/rubric-templates used as the generator's basis (when
+   * absent, a preset's suggested_rubric fills in); `rubric_hint` is a
+   * free-text domain hint steered into the gen prompt (a preset's
+   * category is the fallback). */
+  rubric_template?: string | null;
+  rubric_hint?: string | null;
   /** PR27: repeats per matrix cell (1–8, default 1). */
   trials?: number;
 }
@@ -330,6 +337,12 @@ export interface RunConfig {
   budgets?: Budgets;
   same_model_eval?: boolean;
   task_inputs?: TaskInputs | null;
+  /** PR23: resolved rubric-generation basis — the template name selected
+   * (explicit or from the preset's suggested_rubric), an inline basis
+   * fragment, and/or the domain hint fed to the generator. */
+  rubric_template?: string;
+  rubric_basis?: unknown;
+  rubric_hint?: string;
   /** PR27: repeats per matrix cell persisted at submit. */
   trials?: number;
   [key: string]: unknown;
@@ -1807,12 +1820,30 @@ export interface TaskPreset {
   revision: number;
   suggested_adapter: string | null;
   suggested_models: string[];
+  /** PR23: rubric basis this preset's submits fall back to when no
+   * explicit rubric_template is sent — `{"template": name}` | `{"hint": text}`
+   * | inline `{"dimensions": [...]}`. */
+  suggested_rubric?: SuggestedRubric | null;
   created_at: string | null;
   updated_at: string | null;
   /** Library browse aggregates — runs whose preset_ref matches + the
    * newest scored run's mean overall (null when unscored/none). */
   runs_count: number;
   last_run_mean: number | null;
+}
+
+/** PR23: a preset's rubric-generation suggestion — resolved in order:
+ * `template` names a rubric_templates entry; `hint` feeds the gen prompt's
+ * domain hint; `dimensions` (with optional summary/criteria) is an inline
+ * rubric fragment used as the basis directly. */
+export interface SuggestedRubric {
+  template?: string;
+  hint?: string;
+  summary?: string;
+  title?: string;
+  dimensions?: unknown[];
+  criteria?: unknown[];
+  [key: string]: unknown;
 }
 
 /** POST /api/presets/{slug} body — the slug lives in the path. */
@@ -1824,6 +1855,7 @@ export interface PresetCreate {
   tags?: string[];
   suggested_adapter?: string | null;
   suggested_models?: string[] | null;
+  suggested_rubric?: SuggestedRubric | null;
 }
 
 /** PATCH /api/presets/{slug} — partial edit; bumps revision. */
@@ -1946,6 +1978,25 @@ export function deletePreset(slug: string): Promise<void> {
   return request<void>(`/api/presets/${encodeURIComponent(slug)}`, {
     method: "DELETE",
   });
+}
+
+// ---------------------------------------------------------------------------
+// PR23 — rubric template library
+// ---------------------------------------------------------------------------
+
+/** One rubric template — a vendored `rubric_templates/<name>.json` file or a
+ * user `rubric_templates` row. Selecting one at submit makes the rubric
+ * generator refine its dimensions/criteria instead of drafting freeform. */
+export interface RubricTemplate {
+  name: string;
+  description: string;
+  content: RubricContent;
+  source: "vendored" | "user" | string;
+  created_at: string | null;
+}
+
+export function listRubricTemplates(): Promise<RubricTemplate[]> {
+  return request<RubricTemplate[]>("/api/rubric-templates");
 }
 
 // ---------------------------------------------------------------------------

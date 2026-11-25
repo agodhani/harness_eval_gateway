@@ -6,6 +6,7 @@ docs). Run-spec schemas (F1) and results schemas (F8) land with their routers.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from datetime import datetime
@@ -386,6 +387,19 @@ class RunCreate(BaseModel):
     # PR24 — seed every sandbox workspace from a repo or uploaded archive.
     # None = the historical empty-workspace behavior.
     task_inputs: TaskInputsIn | None = None
+    # PR23 — optional rubric-generation steering:
+    # ``rubric_template`` names a template from the merged library (vendored
+    # ``rubric_templates/*.json`` + user ``rubric_templates`` rows) used as
+    # the generator's basis instead of freeform drafting; when absent, a
+    # resolved preset's ``suggested_rubric`` fills in. ``rubric_hint`` is a
+    # free-text domain hint fed into the gen prompt so non-coding tasks get
+    # fitting dimensions (a resolved preset's category is the fallback).
+    rubric_template: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, max_length=64
+    )
+    rubric_hint: Annotated[str, StringConstraints(strip_whitespace=True)] | None = Field(
+        default=None, max_length=2000
+    )
     # PR27 — repeats per matrix cell: every effective config × model cell
     # spawns this many sandboxes (``trial_index`` 1..N stamped on each) so
     # results report mean ± sd instead of single samples. 1 = pre-PR27.
@@ -400,6 +414,10 @@ class RunCreate(BaseModel):
         post-trial sandbox count."""
         if self.preset_ref is not None and not self.preset_ref:
             self.preset_ref = None
+        if self.rubric_template is not None and not self.rubric_template:
+            self.rubric_template = None
+        if self.rubric_hint is not None and not self.rubric_hint:
+            self.rubric_hint = None
         if self.models is not None:
             seen = {self.model_name}
             cleaned: list[str] = []
@@ -945,6 +963,95 @@ class RunTrends(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+#: Serialized-size cap on the inline rubric basis a preset's
+#: ``suggested_rubric`` can declare — ``_persist_run`` carries the
+#: ``summary``/``title``/``dimensions``/``criteria`` fragment verbatim into
+#: ``config.rubric_basis``, which ``_user_prompt`` JSON-dumps into the
+#: rubric-gen message. Vendored templates run ~2KB; this bound stays far
+#: past a legitimate basis and far under ``task_prompt``'s 100K.
+_SUGGESTED_RUBRIC_BASIS_MAX_CHARS = 32_000
+
+
+def _validate_suggested_rubric(v: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Shared shape check for a preset's ``suggested_rubric`` (PR23).
+
+    Accepted forms — the submit flow reads them in this order when no
+    explicit ``rubric_template`` was submitted:
+
+    - ``{"template": "<name>"}`` — a rubric_templates library name
+      (vendored file or user row) resolved as the generation basis.
+    - ``{"hint": "<text>"}`` — a domain hint fed into the gen prompt.
+    - ``{"dimensions": [...]}`` — an inline rubric fragment used as the
+      basis directly (may also carry summary/title/criteria keys).
+
+    Any combination of those keys is accepted; anything else 422s.
+    """
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise ValueError(  # noqa: TRY004 — ValueError maps to a 422 in a pydantic validator
+            "suggested_rubric must be an object — "
+            '{"template": name}, {"hint": text}, or {"dimensions": [...]}'
+        )
+    allowed = {"template", "hint", "dimensions", "summary", "criteria", "title"}
+    unknown = sorted(set(v) - allowed)
+    if unknown:
+        raise ValueError(f"suggested_rubric: unknown keys {unknown}")
+    if "template" in v and (
+        not isinstance(v.get("template"), str) or not v["template"].strip()
+    ):
+        raise ValueError("suggested_rubric.template must be a non-empty name")
+    if "hint" in v and (
+        not isinstance(v.get("hint"), str) or not v["hint"].strip()
+    ):
+        raise ValueError("suggested_rubric.hint must be non-empty text")
+    # These strings reach the rubric-gen prompt verbatim (hint as the
+    # domain-hint line, summary/title inside the basis JSON), so they're
+    # capped like the item lists. ``hint`` shares ``RunCreate.rubric_hint``'s
+    # bound; ``title`` shares ``PresetCreate.title``'s.
+    for key, cap in (("hint", 2000), ("summary", 2000), ("title", 255)):
+        if key not in v:
+            continue
+        if not isinstance(v[key], str):
+            raise ValueError(  # noqa: TRY004 — ValueError maps to a 422
+                f"suggested_rubric.{key} must be text"
+            )
+        if len(v[key]) > cap:
+            raise ValueError(
+                f"suggested_rubric.{key} allows at most {cap} chars"
+            )
+    for key in ("dimensions", "criteria"):
+        items = v.get(key)
+        if items is None:
+            continue
+        if not isinstance(items, list):
+            raise ValueError(  # noqa: TRY004 — ValueError maps to a 422
+                f"suggested_rubric.{key} must be a list"
+            )
+        if len(items) > 24:
+            raise ValueError(
+                f"suggested_rubric.{key} allows at most 24 items"
+            )
+        if not all(isinstance(item, dict) for item in items):
+            raise ValueError(f"suggested_rubric.{key} items must be objects")
+    basis = {
+        k: v[k] for k in ("summary", "title", "dimensions", "criteria") if k in v
+    }
+    if basis and (
+        len(json.dumps(basis, ensure_ascii=False, default=str))
+        > _SUGGESTED_RUBRIC_BASIS_MAX_CHARS
+    ):
+        raise ValueError(
+            "suggested_rubric basis exceeds "
+            f"{_SUGGESTED_RUBRIC_BASIS_MAX_CHARS} serialized chars"
+        )
+    if not v.get("template") and not v.get("hint") and not v.get("dimensions"):
+        raise ValueError(
+            "suggested_rubric must declare template, hint, or dimensions"
+        )
+    return v
+
+
 class PresetOut(BaseModel):
     """One task preset — a vendored ``task_presets/<slug>.md`` file or a
     user-saved ``task_presets`` row. Both sources read identically; ``source``
@@ -965,6 +1072,10 @@ class PresetOut(BaseModel):
     revision: int = 1
     suggested_adapter: str | None = None
     suggested_models: list[str] = Field(default_factory=list)
+    # PR23 — rubric-generation basis a preset-submit falls back to when no
+    # explicit ``rubric_template`` was sent (``{"template"|"hint"|
+    # "dimensions"}`` — see _validate_suggested_rubric).
+    suggested_rubric: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     # Library-browse aggregates — every run whose preset_ref matches the
@@ -1004,6 +1115,8 @@ class PresetCreate(BaseModel):
     suggested_models: list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]] | None = Field(
         default=None, max_length=8
     )
+    # PR23 — optional rubric basis the preset's submits fall back to.
+    suggested_rubric: dict[str, Any] | None = None
 
     @field_validator("tags", "suggested_models", mode="after")
     @classmethod
@@ -1011,6 +1124,11 @@ class PresetCreate(BaseModel):
         if isinstance(v, list):
             return [t for t in v if t]
         return v
+
+    @field_validator("suggested_rubric", mode="after")
+    @classmethod
+    def _suggested_rubric_shape(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        return _validate_suggested_rubric(v)
 
 
 class PresetUpdate(BaseModel):
@@ -1042,6 +1160,8 @@ class PresetUpdate(BaseModel):
     suggested_models: list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]] | None = Field(
         default=None, max_length=8
     )
+    # PR23 — explicit null clears the suggestion; omit keeps it.
+    suggested_rubric: dict[str, Any] | None = None
 
     @field_validator("tags", "suggested_models", mode="after")
     @classmethod
@@ -1049,6 +1169,11 @@ class PresetUpdate(BaseModel):
         if isinstance(v, list):
             return [t for t in v if t]
         return v
+
+    @field_validator("suggested_rubric", mode="after")
+    @classmethod
+    def _suggested_rubric_shape(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        return _validate_suggested_rubric(v)
 
 
 class PresetRunPoint(BaseModel):
@@ -1105,6 +1230,24 @@ class PresetAnalytics(BaseModel):
     mean_overall_score: float | None = None
     n_scored: int = 0
     trend: list[PresetTrendPoint] = Field(default_factory=list)  # oldest first
+
+
+# ---------------------------------------------------------------------------
+# PR23 — rubric template library (api/routers/rubric_templates.py)
+# ---------------------------------------------------------------------------
+
+
+class RubricTemplateOut(BaseModel):
+    """One rubric template — a vendored ``rubric_templates/<name>.json``
+    file or a user ``rubric_templates`` row. ``content`` is a validated
+    RubricContent-shaped dict the generator refines when the template is
+    the run's ``rubric_template`` basis."""
+
+    name: str
+    description: str = ""
+    content: dict[str, Any] = Field(default_factory=dict)
+    source: str = "user"  # "vendored" | "user"
+    created_at: datetime | None = None
 
 
 # ---------------------------------------------------------------------------

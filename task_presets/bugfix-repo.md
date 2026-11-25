@@ -5,6 +5,7 @@ description: Diagnose a failing behaviour in the seeded repository and fix it wi
 category: bugfix
 tags: [python, debugging, repo, tests]
 suggested_adapter: miniloop
+suggested_rubric: code-default
 ---
 
 The workspace contains a small Python project with a real (but planted) bug — one public behaviour is wrong, and there is a failing or missing test that would have caught it.

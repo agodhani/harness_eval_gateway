@@ -31,6 +31,15 @@ export interface ResubmitSpec {
    * restore as an already-staged upload id (the staged bytes persist
    * server-side under data/uploads). */
   task_inputs?: TaskInputs | null;
+  /** PR23: the run's resolved rubric template name + domain hint ride
+   * along as explicit submit values, so a preset-attached resubmit
+   * regenerates with the ORIGINALLY-resolved basis — frozen rather than
+   * re-resolved from the preset's CURRENT suggested_rubric (config can't
+   * distinguish an explicit pick from a suggestion-derived value). Only
+   * the never-persisted inline `rubric_basis` re-resolves like preset_ref
+   * semantics — it isn't carried. */
+  rubric_template?: string | null;
+  rubric_hint?: string | null;
   /** PR27: repeats per matrix cell (undefined = the form's default 1). */
   trials?: number;
 }
@@ -67,6 +76,10 @@ export function specFromRun(run: RunOut): ResubmitSpec {
     })),
     budgets: cfg.budgets ?? null,
     task_inputs: (cfg.task_inputs as TaskInputs | null | undefined) ?? null,
+    // PR23: resolved rubric basis + hint persist on config — carry them so
+    // a resubmit regenerates the same kind of rubric.
+    rubric_template: (cfg.rubric_template as string | null | undefined) ?? null,
+    rubric_hint: (cfg.rubric_hint as string | null | undefined) ?? null,
     // PR27: repeats ride along — the stored column first, then the config
     // copy (specs written before the column existed), defaulting to 1.
     trials: run.trials ?? (cfg.trials as number | undefined) ?? 1,
@@ -100,6 +113,9 @@ export function consumeResubmit(): ResubmitSpec | null {
       !spec.models.every((m) => typeof m === "string") ||
       (spec.evaluator_model != null &&
         typeof spec.evaluator_model !== "string") ||
+      (spec.rubric_template != null &&
+        typeof spec.rubric_template !== "string") ||
+      (spec.rubric_hint != null && typeof spec.rubric_hint !== "string") ||
       !Array.isArray(spec.harness_configs) ||
       !spec.harness_configs.every(
         (c) =>

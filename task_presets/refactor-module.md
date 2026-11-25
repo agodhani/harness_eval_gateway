@@ -5,6 +5,7 @@ description: Restructure a hard-to-read module for clarity without changing beha
 category: refactor
 tags: [python, refactoring, code-quality]
 suggested_adapter: miniloop
+suggested_rubric: code-default
 ---
 
 The workspace contains a working Python module (or small app) that is functionally correct but hard to read: long functions, unclear names, duplicated logic, and/or deep nesting.

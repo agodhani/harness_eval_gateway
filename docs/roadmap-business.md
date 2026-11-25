@@ -168,7 +168,7 @@ heatmap, output browser.
 - **Verify:** run submitted from preset carries `preset_ref`; same-preset
   runs group on `/presets/[slug]`; save-as-preset round-trips.
 
-### PR23 — Custom rubric dimensions + rubric templates
+### PR23 — Custom rubric dimensions + rubric templates ✅ shipped
 - **Scope:** unlock `CANONICAL_DIMENSIONS`. `RubricContent` accepts 1–12
   arbitrary dimensions (normalized names, dedup, min/max scale kept);
   evaluator `EVAL_PROMPT` + `scores` table already take arbitrary names —
