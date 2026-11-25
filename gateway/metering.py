@@ -106,6 +106,111 @@ def sandbox_token_budget(claims: CredClaims) -> int | None:
     return claims.sandbox_max_tokens
 
 
+#: Fraction of the (post-extension) allowance that triggers the one-shot
+#: ``budget_warning`` checkpoint — spec target "~80%".
+BUDGET_WARN_FRACTION = 0.8
+
+#: Checkpoint stages the budget-resilience machinery reads back:
+#: ``budget_extended`` rows ARE the extension store (append-only events —
+#: no table), ``budget_warning`` rows dedup the once-per-limit warning.
+_BUDGET_STATE_STAGES = ("budget_extended", "budget_warning")
+
+
+def _budget_state_from_payloads(payloads: list[Any]) -> dict[str, Any]:
+    """Fold one sandbox's budget-extended/warning payloads into state."""
+    added_tokens = 0
+    added_cost_usd = 0.0
+    extensions = 0
+    warned: set[str] = set()
+    for p in payloads:
+        if not isinstance(p, dict):
+            continue
+        stage = p.get("stage")
+        if stage == "budget_extended":
+            extensions += 1
+            added_tokens += _to_int(p.get("added_tokens"))
+            try:
+                added_cost_usd += float(p.get("added_cost_usd") or 0)
+            except (TypeError, ValueError):
+                pass
+        elif stage == "budget_warning" and p.get("limit"):
+            warned.add(str(p["limit"]))
+    return {
+        "added_tokens": added_tokens,
+        "added_cost_usd": added_cost_usd,
+        "extensions": extensions,
+        "warned": warned,
+    }
+
+
+def budget_state(
+    session: Session,
+    run_id: uuid.UUID,
+    sandbox_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Budget-resilience state for one sandbox.
+
+    Returns ``{added_tokens, added_cost_usd, extensions, warned}`` — the
+    summed manual/auto ``extend_budget`` grants and the set of limit
+    kinds (``run_tokens``/``sandbox_tokens``/``cost``) that already
+    emitted a ``budget_warning``. Extensions take effect on the next read
+    — this is what makes a control-plane bump live without restarting
+    the in-flight cell.
+    """
+    payloads = (
+        session.execute(
+            select(Event.payload).where(
+                Event.run_id == run_id,
+                Event.sandbox_id == sandbox_id,
+                Event.type == "checkpoint",
+                Event.payload["stage"].as_string().in_(_BUDGET_STATE_STAGES),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return _budget_state_from_payloads(list(payloads))
+
+
+def budget_states(
+    session: Session, run_id: uuid.UUID
+) -> dict[uuid.UUID, dict[str, Any]]:
+    """``budget_state`` for every sandbox of a run in ONE query — the run
+    detail endpoint builds per-sandbox budget summaries without N reads."""
+    rows = session.execute(
+        select(Event.sandbox_id, Event.payload).where(
+            Event.run_id == run_id,
+            Event.sandbox_id.is_not(None),
+            Event.type == "checkpoint",
+            Event.payload["stage"].as_string().in_(_BUDGET_STATE_STAGES),
+        )
+    ).all()
+    grouped: dict[uuid.UUID, list[Any]] = {}
+    for sid, payload in rows:
+        grouped.setdefault(sid, []).append(payload)
+    return {sid: _budget_state_from_payloads(ps) for sid, ps in grouped.items()}
+
+
+def usage_by_sandbox(
+    session: Session, run_id: uuid.UUID
+) -> dict[uuid.UUID | None, int]:
+    """``total_tokens`` summed per sandbox_id for a run's ``llm_response``
+    events — one grouped query. The ``None`` key totals sandbox-less
+    traffic (service creds); the dict's sum is the run total."""
+    col = func.coalesce(
+        func.sum(
+            cast(Event.payload["usage"]["total_tokens"].as_string(), BigInteger)
+        ),
+        0,
+    )
+    rows = session.execute(
+        select(Event.sandbox_id, col)
+        .where(Event.run_id == run_id, Event.type == "llm_response")
+        .group_by(Event.sandbox_id)
+    ).all()
+    return {sid: int(total or 0) for sid, total in rows}
+
+
 def max_tokens_estimate(body: dict[str, Any]) -> int:
     """Best-effort token estimate: ``max_tokens`` (chat/Anthropic) or
     ``max_output_tokens`` (OpenAI Responses API).

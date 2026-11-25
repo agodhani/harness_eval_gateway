@@ -601,23 +601,30 @@ def _budget_cap_detail(
     """
     if call.terminal_reason != "harness_complete":
         return None
+    # F30: a control-plane extend_budget landing mid-call widens the caps —
+    # same extension store the monitor poll consults.
+    bstate = monitor._budget_state(session_factory, run.id, sandbox_id)
+    ext_tokens = int(bstate["added_tokens"])
+    ext_cost = float(bstate["added_cost_usd"])
     if run_budget := budgets.get("token_budget"):
+        run_limit = int(run_budget) + ext_tokens
         used = monitor._run_tokens_used(session_factory, run.id)
-        if used >= int(run_budget):
+        if used >= run_limit:
             return {
                 "limit": "run_tokens",
                 "used_tokens": used,
-                "budget": int(run_budget),
+                "budget": run_limit,
             }
     if sandbox_budget := budgets.get("sandbox_token_budget"):
+        sb_limit = int(sandbox_budget) + ext_tokens
         used = monitor._sandbox_tokens_used(
             session_factory, run.id, sandbox_id
         )
-        if used >= int(sandbox_budget):
+        if used >= sb_limit:
             return {
                 "limit": "sandbox_tokens",
                 "used_tokens": used,
-                "budget": int(sandbox_budget),
+                "budget": sb_limit,
             }
     max_cost = budgets.get("max_cost_usd")
     if not max_cost:
@@ -626,12 +633,13 @@ def _budget_cap_detail(
     if sb is None:
         return None
     est = monitor._sandbox_estimated_cost_usd(session_factory, run, sb)
-    if est is None or est < float(max_cost):
+    cost_limit = float(max_cost) + ext_cost
+    if est is None or est < cost_limit:
         return None
     return {
         "limit": "cost",
         "estimated_cost_usd": round(est, 6),
-        "budget_usd": float(max_cost),
+        "budget_usd": cost_limit,
     }
 
 

@@ -670,3 +670,198 @@ async def test_cost_budget_unpriced_model_cannot_trip(
         budgets={"wall_clock_seconds": 3600, "max_cost_usd": 0.000001},
     )
     assert reason == "agent_done"
+
+
+# ---------------------------------------------------------------------------
+# F30 — budget extensions + headroom warnings + auto_extend
+# ---------------------------------------------------------------------------
+
+
+def _seed_extension(session_factory, run_id, sandbox_id, **payload):
+    """A control-plane extend_budget grant — same rows POST .../extend_budget
+    and auto_extend write."""
+    _add_event(
+        session_factory,
+        run_id,
+        sandbox_id,
+        "checkpoint",
+        {"stage": "budget_extended", "via": "manual", **payload},
+    )
+
+
+async def test_extension_defers_run_token_cap(
+    session_factory, settings, fake_runtime
+) -> None:
+    """600 used > 500 cap would terminate budget_exceeded — a +200 grant
+    widens the live cap (700) and the cell finishes normally."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    _add_event(
+        session_factory, run.id, sb.id, "llm_response",
+        {"usage": {"total_tokens": 600}},
+    )
+    _seed_extension(session_factory, run.id, sb.id, added_tokens=200)
+    states = iter(
+        [{"status": "running", "exit_code": None}, {"status": "exited", "exit_code": 0}]
+    )
+    fake_runtime.status_map[str(sb.id)] = lambda: next(states)
+    fake_runtime.logs_map[str(sb.id)] = RESULT_LINE("agent_done") + "\n"
+
+    reason = await _watch(
+        session_factory, settings, fake_runtime, run.id, sb.id,
+        budgets={"wall_clock_seconds": 3600, "token_budget": 500},
+    )
+    assert reason == "agent_done"
+    terminates = [
+        p for p in _checkpoint_payloads(session_factory, sb.id)
+        if p.get("stage") == "terminate"
+    ]
+    assert terminates == []
+
+
+async def test_monitor_emits_budget_warning_once(
+    session_factory, settings, fake_runtime
+) -> None:
+    """The gateway emits budget_warning on the request path; the monitor's
+    poll is the backstop for cells that stop calling — one row per limit."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    _add_event(
+        session_factory, run.id, sb.id, "llm_response",
+        {"usage": {"total_tokens": 450}},  # 90% of 500
+    )
+    # stay running for a few polls so dedup is exercised, then exit
+    calls = {"n": 0}
+
+    def _status():
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            return {"status": "running", "exit_code": None}
+        return {"status": "exited", "exit_code": 0}
+
+    fake_runtime.status_map[str(sb.id)] = _status
+    fake_runtime.logs_map[str(sb.id)] = RESULT_LINE("agent_done") + "\n"
+
+    reason = await _watch(
+        session_factory, settings, fake_runtime, run.id, sb.id,
+        budgets={"wall_clock_seconds": 3600, "token_budget": 500},
+    )
+    assert reason == "agent_done"
+    warnings = [
+        p for p in _checkpoint_payloads(session_factory, sb.id)
+        if p.get("stage") == "budget_warning"
+    ]
+    assert len(warnings) == 1  # deduped across polls
+    w = warnings[0]
+    assert w["limit"] == "run_tokens"
+    assert w["used_tokens"] == 450
+    assert w["budget"] == 500.0
+    assert w["remaining_tokens"] == 50
+    assert w["pct"] == 0.9
+
+
+async def test_auto_extend_grants_once_on_warning(
+    session_factory, settings, fake_runtime
+) -> None:
+    """budgets.auto_extend → the first warn-condition poll emits a
+    budget_extended via="auto" (+50% of the warned cap) — once per cell."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    _add_event(
+        session_factory, run.id, sb.id, "llm_response",
+        {"usage": {"total_tokens": 450}},  # 90% of 500 → warning path
+    )
+    calls = {"n": 0}
+
+    def _status():
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            return {"status": "running", "exit_code": None}
+        return {"status": "exited", "exit_code": 0}
+
+    fake_runtime.status_map[str(sb.id)] = _status
+    fake_runtime.logs_map[str(sb.id)] = RESULT_LINE("agent_done") + "\n"
+
+    reason = await _watch(
+        session_factory, settings, fake_runtime, run.id, sb.id,
+        budgets={
+            "wall_clock_seconds": 3600,
+            "token_budget": 500,
+            "auto_extend": True,
+        },
+    )
+    assert reason == "agent_done"
+    grants = [
+        p for p in _checkpoint_payloads(session_factory, sb.id)
+        if p.get("stage") == "budget_extended"
+    ]
+    assert len(grants) == 1  # once only, across every poll
+    assert grants[0]["via"] == "auto"
+    assert grants[0]["added_tokens"] == 250  # +50% of the 500 cap
+
+
+async def test_no_auto_extend_without_flag(
+    session_factory, settings, fake_runtime
+) -> None:
+    """Same warn condition with auto_extend unset → warning only, no grant."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    _add_event(
+        session_factory, run.id, sb.id, "llm_response",
+        {"usage": {"total_tokens": 450}},
+    )
+    states = iter(
+        [{"status": "running", "exit_code": None}, {"status": "exited", "exit_code": 0}]
+    )
+    fake_runtime.status_map[str(sb.id)] = lambda: next(states)
+    fake_runtime.logs_map[str(sb.id)] = RESULT_LINE("agent_done") + "\n"
+
+    reason = await _watch(
+        session_factory, settings, fake_runtime, run.id, sb.id,
+        budgets={"wall_clock_seconds": 3600, "token_budget": 500},
+    )
+    assert reason == "agent_done"
+    grants = [
+        p for p in _checkpoint_payloads(session_factory, sb.id)
+        if p.get("stage") == "budget_extended"
+    ]
+    assert grants == []
+
+
+async def test_auto_extend_skips_when_manually_extended(
+    session_factory, settings, fake_runtime
+) -> None:
+    """Any prior grant (manual or auto) satisfies the once-only rule."""
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(session_factory, run.id, status="running")
+    _add_event(
+        session_factory, run.id, sb.id, "llm_response",
+        {"usage": {"total_tokens": 900}},
+    )
+    _seed_extension(session_factory, run.id, sb.id, added_tokens=600)
+    calls = {"n": 0}
+
+    def _status():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return {"status": "running", "exit_code": None}
+        return {"status": "exited", "exit_code": 0}
+
+    fake_runtime.status_map[str(sb.id)] = _status
+    fake_runtime.logs_map[str(sb.id)] = RESULT_LINE("agent_done") + "\n"
+
+    reason = await _watch(
+        session_factory, settings, fake_runtime, run.id, sb.id,
+        budgets={
+            "wall_clock_seconds": 3600,
+            "token_budget": 500,
+            "auto_extend": True,
+        },
+    )
+    assert reason == "agent_done"
+    grants = [
+        p for p in _checkpoint_payloads(session_factory, sb.id)
+        if p.get("stage") == "budget_extended"
+    ]
+    assert len(grants) == 1  # only the seeded manual grant — no auto pile-on
+    assert grants[0]["via"] == "manual"

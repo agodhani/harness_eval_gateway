@@ -223,11 +223,19 @@ class BudgetsIn(BaseModel):
     """
 
     max_iters: int = Field(default=50, ge=1, le=1000)
-    token_budget: int = Field(default=200_000, ge=1_000)
+    # F30: bumped 200k → 500k — a real agentic task routinely burns past
+    # 200k on retries alone; the budget exists to stop runaways, not to
+    # starve honest work.
+    token_budget: int = Field(default=500_000, ge=1_000)
     wall_clock_seconds: int = Field(default=3600, ge=60, le=86_400)
     # PR28: per-sandbox/per-cell caps; None = unset (no per-cell limit).
     sandbox_token_budget: int | None = Field(default=None, ge=1_000)
     max_cost_usd: float | None = Field(default=None, gt=0)
+    # F30 stretch: on the first ``budget_warning`` the monitor grants the
+    # cell one automatic +50% extension on the warning limit (append-only
+    # ``budget_extended`` event, via="auto") — the same store a manual
+    # POST /api/sandboxes/{id}/extend_budget writes.
+    auto_extend: bool = False
 
 
 #: PR14 — sanity cap on the expanded comparison matrix (configs × models);
@@ -414,6 +422,28 @@ class RunCreate(BaseModel):
         return self
 
 
+class SandboxBudgetOut(BaseModel):
+    """F30 — live budget summary for one cell on the run detail payload.
+
+    ``used_tokens``/``limit_tokens`` describe the BINDING token ceiling:
+    the cell's own ``sandbox_token_budget`` when set (scope="sandbox"),
+    else the shared run ceiling (scope="run"). ``limit_*`` values already
+    include ``budget_extended`` grants, so the UI can show post-extension
+    headroom. ``warning`` flips when spend crosses the ~80% warn fraction
+    or a ``budget_warning`` checkpoint exists (gateway- or monitor-side).
+    """
+
+    used_tokens: int
+    limit_tokens: int
+    scope: str  # "run" | "sandbox"
+    pct: float
+    warning: bool = False
+    extended_tokens: int = 0
+    extended_cost_usd: float = 0.0
+    # Post-extension cost ceiling (max_cost_usd + grants); None = no cap.
+    limit_cost_usd: float | None = None
+
+
 class SandboxOut(BaseModel):
     """One sandbox row as embedded in run responses."""
 
@@ -429,6 +459,10 @@ class SandboxOut(BaseModel):
     # Optional config label (PR1) — ``<adapter>-<shortid>`` default assigned
     # at provisioning; NULL on sandboxes that predate the column.
     name: str | None = None
+    # F30: live token/cost budget summary — powers the warning badge +
+    # extend affordance on run detail. Not an ORM attr; populated by
+    # ``_run_out`` from metered usage + extension events.
+    budget: SandboxBudgetOut | None = None
 
 
 class RubricOut(BaseModel):
@@ -479,6 +513,10 @@ class RunOut(BaseModel):
     # PR35: the run's read-only share view path (``/share/{token}``) when a
     # link has been minted — null until POST /api/runs/{id}/share runs.
     share_url: str | None = None
+    # F30 local-run pacing: the concurrent-container cap in effect for this
+    # run (all models resolve to a local provider → cells park as queued
+    # sandboxes past it). Null = no cap (remote models, or disabled).
+    sandbox_pacing_cap: int | None = None
     # Submit-time advisory warnings from the model-catalog check (e.g.
     # "model not in provider catalog") — populated on POST /api/runs only;
     # empty on reads (warnings are advisory, not persisted state).

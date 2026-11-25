@@ -83,6 +83,10 @@ services:
       # UPSTREAM_TIMEOUT_SECONDS + retry backoff, ~915s by default) so agents
       # never abandon calls the gateway is still paying for upstream.
       MINILOOP_LLM_TIMEOUT_SECONDS: ${MINILOOP_LLM_TIMEOUT_SECONDS:-}
+      # F30 local-run sandbox pacing: all-local runs cap concurrent
+      # containers at this many (extras park as queued cells until a slot
+      # frees); 0 disables. Typed int — keep the :-2 default, never blank.
+      SANDBOX_MAX_CONCURRENT_LOCAL: ${SANDBOX_MAX_CONCURRENT_LOCAL:-2}
       # --- Objective scoring (PR7) ---
       # Exec signal: candidate build/tests/coverage inside the locked
       # heg-exec container. 0 disables; the image is repo-built, never pulled.
@@ -157,7 +161,7 @@ services:
       API_INGEST_URL: http://api:8000
       INGEST_TOKEN: dev-ingest-token
       GATEWAY_CRED_SECRET: dev-secret-change-me
-      DEFAULT_RUN_TOKEN_BUDGET: "200000"
+      DEFAULT_RUN_TOKEN_BUDGET: "500000"
       # Whole-request timeout per upstream attempt (seconds) — congested
       # local providers queue calls server-side, so keep it comfortably
       # above the slowest expected generation; raise for big/slow models.

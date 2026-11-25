@@ -1923,6 +1923,23 @@ export default function SubmitPage() {
                   </span>
                   {fieldErrors.max_cost_usd ? <span className="field__error">{fieldErrors.max_cost_usd}</span> : null}
                 </div>
+                <div className="field">
+                  <label className="check-item" style={{ marginTop: "1.7rem" }}>
+                    <input
+                      type="checkbox"
+                      checked={budgets.auto_extend ?? false}
+                      onChange={(e) =>
+                        setBudgets({ ...budgets, auto_extend: e.target.checked })
+                      }
+                      disabled={submitting}
+                    />
+                    Auto-extend budgets <span className="faint">(once)</span>
+                  </label>
+                  <span className="dim-desc">
+                    F30: when a cell crosses ~80% of a cap, grant it +50% on
+                    that limit automatically — one bump per cell.
+                  </span>
+                </div>
               </div>
             </div>
           </details>

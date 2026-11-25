@@ -56,6 +56,9 @@ export const CANCELLABLE_RUN_STATUSES: readonly string[] = [
 ];
 
 export type SandboxStatus =
+  /** F30: parked pre-`docker run` on the local-provider concurrency cap —
+   *  the cell's row exists, no container does. Promotes to provisioning. */
+  | "queued"
   | "provisioning"
   | "running"
   | "terminating"
@@ -274,14 +277,19 @@ export interface Budgets {
   /** PR28: optional per-sandbox estimated-cost cap in USD. Only bites on
    * priced models — unpriced cells have no honest rate to bill against. */
   max_cost_usd?: number | null;
+  /** F30 stretch: on the first budget_warning the monitor grants the cell
+   * one automatic +50% extension on the warned limit (once per cell). */
+  auto_extend?: boolean;
 }
 
 export const DEFAULT_BUDGETS: Budgets = {
   max_iters: 50,
-  token_budget: 200_000,
+  // F30: bumped 200k → 500k (matches BudgetsIn/DEFAULT_RUN_TOKEN_BUDGET).
+  token_budget: 500_000,
   wall_clock_seconds: 3600,
   sandbox_token_budget: null,
   max_cost_usd: null,
+  auto_extend: false,
 };
 
 /** PR24 — task inputs seeding every sandbox workspace. Exactly one source:
@@ -338,6 +346,23 @@ export interface UploadOut {
   uploaded_at: string;
 }
 
+/** F30 — live budget summary for one cell on the run detail payload.
+ * `used_tokens`/`limit_tokens` describe the BINDING ceiling: the cell's
+ * own `sandbox_token_budget` when set (scope="sandbox"), else the shared
+ * run ceiling (scope="run"). `limit_*` already include `budget_extended`
+ * grants. `warning` = spend ≥ ~80% of the cap or a budget_warning event. */
+export interface SandboxBudget {
+  used_tokens: number;
+  limit_tokens: number;
+  scope: "run" | "sandbox" | string;
+  pct: number;
+  warning: boolean;
+  extended_tokens: number;
+  extended_cost_usd: number;
+  /** Post-extension cost ceiling (max_cost_usd + grants); null = no cap. */
+  limit_cost_usd: number | null;
+}
+
 export interface SandboxOut {
   id: string;
   harness_config: Record<string, unknown>;
@@ -348,6 +373,9 @@ export interface SandboxOut {
   artifact_path: string | null;
   started_at: string | null;
   finished_at: string | null;
+  /** F30: live token/cost budget summary — drives the warning badge +
+   * extend affordance on run detail. */
+  budget?: SandboxBudget | null;
 }
 
 export interface RubricDimension {
@@ -707,6 +735,33 @@ function qs(params: Record<string, string | number | undefined | null>): string 
 
 export function createRun(body: RunCreate): Promise<RunOut> {
   return request<RunOut>("/api/runs", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** F30 — POST /api/sandboxes/{id}/extend_budget response: the grant plus
+ * the post-grant effective caps (the UI swaps `budget` in place). */
+export interface ExtendBudgetOut {
+  sandbox_id: string;
+  status: string;
+  added_tokens: number;
+  added_cost_usd: number;
+  total_added_tokens: number;
+  total_added_cost_usd: number;
+  /** Grant rows after this one (auto + manual). */
+  extensions: number;
+  budget: SandboxBudget;
+}
+
+/** F30: bump a live cell's allowance — token grants widen BOTH ceilings
+ * the cred passes through (run + per-sandbox claims) on the next call;
+ * cost grants widen the monitor's max_cost_usd check on the next poll. */
+export function extendBudget(
+  sandboxId: string,
+  body: { tokens?: number; cost_usd?: number },
+): Promise<ExtendBudgetOut> {
+  return request<ExtendBudgetOut>(`/api/sandboxes/${sandboxId}/extend_budget`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1655,6 +1710,9 @@ export interface RunOut {
   /** Submit-time advisory warnings from run-create (e.g. "model not found
    *  on the resolved upstream") — absent on older backends. */
   warnings?: string[];
+  /** F30: the concurrent-container cap in effect for this run (all-local
+   *  models → cells park as queued sandboxes past it). null = no cap. */
+  sandbox_pacing_cap?: number | null;
 }
 
 export interface RunSummary {

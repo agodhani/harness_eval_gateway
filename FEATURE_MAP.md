@@ -41,6 +41,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F27 | Cross-run compare + leaderboards (global model + config-family rankings w/ filters, `/compare` two-run diff, preset-embedded board) | ✅ | `api/routers/analytics.py` (`GET /api/analytics/leaderboard`), `api/schemas.py` (`Leaderboard`/`LeaderboardEntry`), `web/app/leaderboard/`, `web/app/compare/`, `web/components/LeaderboardBoards.tsx`, `web/lib/compareRuns.ts`, `web/lib/api.ts`, `web/app/presets/[slug]/PresetDetailClient.tsx` | `tests/unit/api/test_leaderboard.py`, `web/lib/compareRuns.test.ts` |
 | F28 | Run export + share links (`?fmt=json|csv` bundle — spec, rubrics, matrix, analytics, events-lite; `runs.share_token` + read-only `/share/{token}` results+timeline view) | ✅ | `api/routers/results.py` (`/export`, `/share` mint/revoke + `GET /api/share/{token}`), `db/models.py` (`Run.share_token`), `db/migrations/versions/c5f9a2b8d4e7_runs_share_token.py`, `web/lib/api.ts`, `web/components/ExportButtons.tsx`, `web/app/share/[token]/` | `tests/unit/api/test_export.py`, `tests/unit/db/test_migrations.py`, `web/lib/api.test.ts` |
 | F29 | Dashboard home (`/dashboard`: summary aggregate — KPI strip, weekly spend + runs charts, terminal-mix donut, queue lane, top-5 boards, recent runs) | ✅ | `api/routers/analytics.py` (`GET /api/analytics/summary`), `api/schemas.py` (`DashboardSummary`/`DashboardTotals`/`DashboardWeekPoint`/`DashboardQueue*`/`DashboardTerminalSlice`/`DashboardRecentRun`), `web/app/dashboard/`, `web/lib/dashboard.ts`, `web/lib/api.ts`, `web/components/SiteHeader.tsx`, `web/components/landing/Hero.tsx` | `tests/unit/api/test_summary.py`, `web/lib/dashboard.test.ts` |
+| F30 | Local-run sandbox pacing + budget resilience (queued sandbox status for all-local runs, live `extend_budget`/auto_extend via append-only events, ~80% budget warnings, 500k default budget) | ✅ | `orchestrator/pacing.py` (`local_sandbox_cap`, `claim_queued_sandbox`), `orchestrator/provision.py` (`queue_sandbox`, `spawn_queued`, `_launch`), `orchestrator/lifecycle.py` (`_watch_cells_paced`), `gateway/metering.py` (`budget_state*`, `usage_by_sandbox`), `gateway/main.py` (`_budget_gate`), `orchestrator/monitor.py`, `api/routers/sandboxes.py`, `api/routers/runs.py` (`sandbox_pacing_cap`, per-cell `budget`), `web/app/runs/[id]/RunDetailClient.tsx` | `tests/unit/orchestrator/test_sandbox_pacing.py`, `test_monitor.py` (F30 section), `tests/unit/gateway/test_proxy.py` (F30 section), `tests/unit/api/test_sandboxes.py` |
 | F31 | Timeline compare-mode clock toggle (absolute wall clock vs per-cell relative t+0 — progress-rate comparison across staggered starts) | ✅ | `web/lib/timelineModes.ts`, `web/app/runs/[id]/timeline/{TimelineClient,EventRow,SplitTimeline}.tsx`, `web/components/RunConsoleLive.tsx`, `web/app/globals.css` (`.evc-ev__t`) | `web/lib/timelineModes.test.ts` |
 
 ## Feature details
@@ -2124,6 +2125,93 @@ rigged before it starts.
 - **Depends on:** F9/F13 (analytics + chart conventions), F21 (pricing
   honesty semantics), F27 (leaderboard endpoint + shared boards),
   F15 pacing (queue position semantics from `started_at` ordering).
+
+### F30 — Local-run sandbox pacing + budget resilience ✅
+
+Two related resilience layers: **queued sandboxes** pace concurrent
+containers on local providers, and **live budget controls** let a cell
+gain headroom (or warn) instead of dying at a hard cap.
+
+- **Sandbox `queued` status** (`orchestrator/state_machine.py`,
+  `db/models.py` comment): a real row status — `queued → provisioning |
+  failed`. `pacing.ACTIVE_SANDBOX_STATES` (provisioning/running/
+  terminating) excludes it; `runner.startup_sweep` fails parked cells
+  with their run (no container exists to leak). No migration.
+- **Local-provider cap** (`orchestrator/pacing.py::local_sandbox_cap`):
+  `SANDBOX_MAX_CONCURRENT_LOCAL` (api Settings, default 2, 0 disables)
+  applies only when EVERY participant model resolves to a local
+  provider — `pacing.provider_for_model`/`_provider_routes` mirror the
+  gateway's `PROVIDER_ROUTES` glob + `UPSTREAM_PROVIDER` fallback against
+  `LOCAL_PROVIDERS = {ollama}` (the api can't import gateway settings).
+  One remote model = mixed contention = no cap.
+- **Queue/claim/spawn** (`provision.queue_sandbox`,
+  `pacing.claim_queued_sandbox`, `provision.spawn_queued`): the provision
+  loop spawns until `active_sandbox_count >= cap`, then parks the rest —
+  `sandbox_queued` checkpoint carries `ahead`/`cap`; promotion flips
+  `queued → provisioning` (the flip IS the claim, one committed session)
+  and emits `sandbox_dequeued` with `queued_seconds`. The promoted cell
+  runs the identical `_launch` pipeline as a first-pass spawn (pack
+  staging → `SPAWN_*` mem gate → cred/env/spec → `docker run` →
+  `_mark_spawned`). A failed spawn frees the slot — only active states
+  count. Prompt cells hold no slot.
+- **Paced scheduler** (`lifecycle._watch_cells_paced`): one task per
+  cell — `watch_sandbox` for spawned cells, `spawn_queued`+watch for
+  claimed ones; claims run synchronously between `asyncio.wait`
+  completions so FIFO order is deterministic. Uncapped runs keep plain
+  `asyncio.gather`.
+- **Extension store** (`gateway/metering.py::budget_state` /
+  `budget_states` / `usage_by_sandbox`): `budget_extended` and
+  `budget_warning` checkpoints ARE the store — summed per read, so a
+  control-plane bump takes effect on the gateway's next request and the
+  monitor's next poll without restarting the cell. `added_tokens`
+  widens BOTH ceilings the cred passes through (run `max_tokens` +
+  `sandbox_max_tokens` claims); `added_cost_usd` widens `max_cost_usd`.
+- **Warnings** (`BUDGET_WARN_FRACTION = 0.8`): spend ≥ ~80% of the
+  EFFECTIVE cap emits `budget_warning` once per (sandbox, limit kind) —
+  dedup by reading the same checkpoint rows back; the gateway emits on
+  the request path, the monitor poll backstops stopped-calling cells
+  (including the `cost` limit, which only the monitor can compute).
+- **auto_extend** (`budgets.auto_extend`, submit checkbox): on the
+  first warn condition the monitor grants +50% of the warned limit as a
+  `budget_extended` `via="auto"` row — once per cell (any prior grant,
+  manual or auto, satisfies it).
+- **API** (`api/routers/sandboxes.py`):
+  `POST /api/sandboxes/{id}/extend_budget` — `{tokens ≥ 1000?,
+  cost_usd > 0?}` (at least one), 404 unknown / 409 terminal / 422
+  empty; response echoes post-grant `SandboxBudgetOut` so the UI swaps
+  it in place. `RunOut.sandbox_pacing_cap` (cap in effect or null) +
+  `SandboxOut.budget` (`SandboxBudgetOut`: used/limit/scope/pct/
+  warning/extended/limit_cost — binding limit = per-cell cap when set,
+  else the shared run ceiling; two grouped queries, no per-row fanout).
+- **Defaults**: `BudgetsIn.token_budget`,
+  `gateway DEFAULT_RUN_TOKEN_BUDGET`, `.env.example`, docker-compose
+  and `DEFAULT_BUDGETS` moved 200k → 500k — budgets stop runaways, not
+  honest work.
+- **Web** (`web/lib/api.ts`, `RunDetailClient.tsx`, `submit/page.tsx`):
+  `SandboxStatus` gains `"queued"`; run detail shows a "local pacing ·
+  max N" note + "pacing queue" hint on queued cells, a per-cell Budget
+  column (pct, `near cap` amber badge, `+extended` teal badge), `+50%`/
+  `+100%` extend buttons on live cells near cap, and a
+  `resubmit ×2 budget` button on `budget_exceeded` cells (doubles the
+  BINDING limit — scope-aware). Submit page gains the `auto_extend`
+  checkbox.
+- **Verify:**
+  - Unit: `tests/unit/orchestrator/test_sandbox_pacing.py` (cap policy,
+    queue/claim FIFO, paced lifecycle incl. gated-runtime promotion and
+    failed-spawn slot semantics); `test_monitor.py` F30 section
+    (extension defers cap, warning once, auto_extend once/off/manual-
+    skip); `tests/unit/gateway/test_proxy.py` F30 section (extension
+    widens both gates, warning emit/dedup/threshold);
+    `tests/unit/api/test_sandboxes.py` (extend 404/409/422/200, scope,
+    accumulation, run-detail budget block).
+  - Web: `eslint` + `next build` clean.
+  - Manual: an all-ollama 3+ cell run with `SANDBOX_MAX_CONCURRENT_LOCAL=2`
+    shows 2 running + N queued cells; near a small budget the cell shows
+    `near cap` + extend buttons, and the grant appears as a
+    `budget_extended` timeline event.
+- **Depends on:** F2 (orchestrator + monitor), F3 (gateway budget gate
+  + cred claims), PR15 (run-pacing pattern this mirrors), F21 (per-cell
+  budgets this extends), F8 (run detail surface).
 
 ## Implementation sequence
 

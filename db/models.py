@@ -100,7 +100,8 @@ class Sandbox(Base):
     # surfaced in timeline/results/analytics; provisioner defaults it to
     # "<adapter>-<sandbox short id>" when the submit left it blank.
     name: Mapped[str | None] = mapped_column(String(255))
-    # provisioning | running | terminating | done | failed (terminal_reason set)
+    # [queued (local-run pacing cap — no container yet) →] provisioning |
+    # running | terminating | done | failed (terminal_reason set)
     status: Mapped[str] = mapped_column(String(32), default="provisioning", index=True)
     docker_container_id: Mapped[str | None] = mapped_column(String(128))
     artifact_path: Mapped[str | None] = mapped_column(String(1024))

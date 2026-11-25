@@ -51,7 +51,14 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from api import pricing
 from db.models import Artifact, Event, Run, Sandbox
-from gateway.metering import llm_usage_totals, tokens_used
+from gateway import metering
+from gateway.metering import (
+    budget_state as metering_budget_state,
+)
+from gateway.metering import (
+    llm_usage_totals,
+    tokens_used,
+)
 from sandbox.runtime import SandboxRuntime
 
 from . import state_machine
@@ -171,6 +178,113 @@ def _run_tokens_used(
 ) -> int:
     with session_factory() as session:
         return tokens_used(session, run_id)
+
+
+def _budget_state(
+    session_factory: sessionmaker[Session],
+    run_id: uuid.UUID,
+    sandbox_id: uuid.UUID,
+) -> dict[str, Any]:
+    """F30 extension store + warning dedup for one cell — read fresh each
+    poll so ``POST .../extend_budget`` widens the live caps mid-watch."""
+    with session_factory() as session:
+        return metering_budget_state(session, run_id, sandbox_id)
+
+
+def _maybe_budget_warning(
+    session_factory: sessionmaker[Session],
+    *,
+    run_id: uuid.UUID,
+    sandbox_id: uuid.UUID,
+    limit: str,
+    used_tokens: int | None,
+    estimated_cost_usd: float | None,
+    budget: float,
+    warned: set[str],
+) -> bool:
+    """Emit ``budget_warning`` once per (sandbox, limit kind) when spend
+    crosses ~80% of the effective cap — the gateway's own request-path
+    warning is the same checkpoint, so either writer dedups the other.
+
+    Returns True iff the warn CONDITION holds this poll (the caller needs
+    it for auto_extend even when the event was already emitted)."""
+    if used_tokens is None and estimated_cost_usd is None:
+        return False
+    used = used_tokens if used_tokens is not None else estimated_cost_usd
+    assert used is not None  # for the type checker; guarded above
+    if float(used) < metering.BUDGET_WARN_FRACTION * budget:
+        return False
+    if limit in warned:
+        return True  # condition holds; the row was already written
+    payload: dict[str, Any] = {
+        "stage": "budget_warning",
+        "limit": limit,
+        "budget": budget,
+        "pct": round(float(used) / budget, 3),
+    }
+    if used_tokens is not None:
+        payload["used_tokens"] = used_tokens
+        payload["remaining_tokens"] = int(budget) - used_tokens
+    else:
+        payload["estimated_cost_usd"] = round(float(estimated_cost_usd or 0), 6)
+        payload["remaining_cost_usd"] = round(
+            budget - float(estimated_cost_usd or 0), 6
+        )
+    with session_factory() as session:
+        emit(
+            session,
+            run_id=run_id,
+            sandbox_id=sandbox_id,
+            event_type="checkpoint",
+            payload=payload,
+        )
+        session.commit()
+    warned.add(limit)
+    return True
+
+
+def _maybe_auto_extend(
+    session_factory: sessionmaker[Session],
+    *,
+    run_id: uuid.UUID,
+    sandbox_id: uuid.UUID,
+    budgets: dict[str, Any],
+    warn_conditions: dict[str, bool],
+    extensions: int,
+) -> None:
+    """Stretch goal: ``budgets.auto_extend`` bumps the cred once by +50% of
+    the first limit whose warn condition holds — an append-only
+    ``budget_extended`` checkpoint, so the same store a manual
+    extend_budget writes. ``extensions`` is the count of prior grant rows;
+    any extension (manual or auto) satisfies the once-only rule."""
+    if not budgets.get("auto_extend") or extensions:
+        return
+    payload: dict[str, Any] = {"stage": "budget_extended", "via": "auto"}
+    if warn_conditions.get("run_tokens") and budgets.get("token_budget"):
+        payload["added_tokens"] = max(
+            1, int(0.5 * int(budgets["token_budget"]))
+        )
+    elif warn_conditions.get("sandbox_tokens") and budgets.get(
+        "sandbox_token_budget"
+    ):
+        payload["added_tokens"] = max(
+            1, int(0.5 * int(budgets["sandbox_token_budget"]))
+        )
+    if warn_conditions.get("cost") and budgets.get("max_cost_usd"):
+        payload["added_cost_usd"] = 0.5 * float(budgets["max_cost_usd"])
+    if "added_tokens" not in payload and "added_cost_usd" not in payload:
+        return
+    payload["reason"] = "auto_extend on budget_warning (+50%, once)"
+    with session_factory() as session:
+        emit(
+            session,
+            run_id=run_id,
+            sandbox_id=sandbox_id,
+            event_type="checkpoint",
+            payload=payload,
+        )
+        session.commit()
+    log.info("auto_extend granted for sandbox %s: %s", sandbox_id, payload)
 
 
 def _sandbox_tokens_used(
@@ -561,9 +675,19 @@ async def watch_sandbox(
                     reason=reason,
                     detail=detail,
                 )
+            # F30: extension store + warning dedup, fresh each poll — a
+            # control-plane extend_budget (or this poll's auto_extend grant)
+            # widens the effective caps below without restarting the cell.
+            bstate = _budget_state(session_factory, run_id, sandbox_id)
+            ext_tokens = int(bstate["added_tokens"])
+            ext_cost = float(bstate["added_cost_usd"])
+            warned: set[str] = bstate["warned"]
+            warn_conditions: dict[str, bool] = {}
+
             if token_budget:
                 used = _run_tokens_used(session_factory, run_id)
-                if used >= int(token_budget):
+                run_limit = int(token_budget) + ext_tokens
+                if used >= run_limit:
                     return await _terminate(
                         session_factory=session_factory,
                         runtime=runtime,
@@ -573,15 +697,26 @@ async def watch_sandbox(
                         detail={
                             "limit": "run_tokens",
                             "used_tokens": used,
-                            "budget": int(token_budget),
+                            "budget": run_limit,
                         },
                     )
+                warn_conditions["run_tokens"] = _maybe_budget_warning(
+                    session_factory,
+                    run_id=run_id,
+                    sandbox_id=sandbox_id,
+                    limit="run_tokens",
+                    used_tokens=used,
+                    estimated_cost_usd=None,
+                    budget=float(run_limit),
+                    warned=warned,
+                )
             # PR28 per-sandbox token cap — the gateway claim enforces it
             # per request; this poll is the backstop that terminates the
             # cell when only its OWN total crosses the line.
             if sandbox_token_budget:
                 sb_used = _sandbox_tokens_used(session_factory, run_id, sandbox_id)
-                if sb_used >= int(sandbox_token_budget):
+                sb_limit = int(sandbox_token_budget) + ext_tokens
+                if sb_used >= sb_limit:
                     return await _terminate(
                         session_factory=session_factory,
                         runtime=runtime,
@@ -591,14 +726,25 @@ async def watch_sandbox(
                         detail={
                             "limit": "sandbox_tokens",
                             "used_tokens": sb_used,
-                            "budget": int(sandbox_token_budget),
+                            "budget": sb_limit,
                         },
                     )
+                warn_conditions["sandbox_tokens"] = _maybe_budget_warning(
+                    session_factory,
+                    run_id=run_id,
+                    sandbox_id=sandbox_id,
+                    limit="sandbox_tokens",
+                    used_tokens=sb_used,
+                    estimated_cost_usd=None,
+                    budget=float(sb_limit),
+                    warned=warned,
+                )
             # PR28 per-sandbox cost cap — layered-price estimate each poll;
             # unpriced cells get None and can't trip the cap (PR21 honesty).
             if max_cost_usd and run is not None:
+                cost_limit = float(max_cost_usd) + ext_cost
                 est = _sandbox_estimated_cost_usd(session_factory, run, sb)
-                if est is not None and est >= float(max_cost_usd):
+                if est is not None and est >= cost_limit:
                     return await _terminate(
                         session_factory=session_factory,
                         runtime=runtime,
@@ -608,9 +754,27 @@ async def watch_sandbox(
                         detail={
                             "limit": "cost",
                             "estimated_cost_usd": round(est, 6),
-                            "budget_usd": float(max_cost_usd),
+                            "budget_usd": cost_limit,
                         },
                     )
+                warn_conditions["cost"] = _maybe_budget_warning(
+                    session_factory,
+                    run_id=run_id,
+                    sandbox_id=sandbox_id,
+                    limit="cost",
+                    used_tokens=None,
+                    estimated_cost_usd=est,
+                    budget=cost_limit,
+                    warned=warned,
+                )
+            _maybe_auto_extend(
+                session_factory,
+                run_id=run_id,
+                sandbox_id=sandbox_id,
+                budgets=budgets,
+                warn_conditions=warn_conditions,
+                extensions=int(bstate["extensions"]),
+            )
 
             # 3) container state
             status = await asyncio.to_thread(runtime.status, sid)

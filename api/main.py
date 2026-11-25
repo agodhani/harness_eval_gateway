@@ -27,6 +27,7 @@ from api.routers import (
     prices,
     results,
     runs,
+    sandboxes,
     skillpacks,
     suites,
     uploads,
@@ -61,6 +62,7 @@ def create_app() -> FastAPI:
     app.include_router(models.router)
     app.include_router(events.router)
     app.include_router(runs.router)
+    app.include_router(sandboxes.router)
     app.include_router(results.router)
     app.include_router(analytics.router)
     app.include_router(prices.router)
