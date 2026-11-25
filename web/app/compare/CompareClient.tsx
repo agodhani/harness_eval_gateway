@@ -472,7 +472,7 @@ export default function CompareClient() {
       { label: "tokens in", a: totalsA.tokensIn, b: totalsB.tokensIn, fmt: num, lowerBetter: true },
       { label: "tokens out", a: totalsA.tokensOut, b: totalsB.tokensOut, fmt: num, lowerBetter: true },
       { label: "tokens total", a: totalsA.tokensTotal, b: totalsB.tokensTotal, fmt: num, lowerBetter: true },
-      { label: "wall clock", a: totalsA.wallClockSeconds, b: totalsB.wallClockSeconds, fmt: sec, lowerBetter: true },
+      { label: "participant busy time", a: totalsA.busySeconds, b: totalsB.busySeconds, fmt: sec, lowerBetter: true },
       { label: "est. cost", a: totalsA.costUsd, b: totalsB.costUsd, fmt: usd, nullText: "unpriced", lowerBetter: true },
       { label: "avg tok/s", a: totalsA.avgTokensPerSec, b: totalsB.avgTokensPerSec, fmt: (v) => v.toFixed(1) },
       { label: "avg ttft", a: totalsA.ttftAvgMs, b: totalsB.ttftAvgMs, fmt: ms, lowerBetter: true },
@@ -631,7 +631,7 @@ export default function CompareClient() {
                             const abs = Math.abs(d);
                             dCell = (
                               <span className={cls}>
-                                {d > 0 ? "+" : "−"}
+                                {d >= 0 ? "+" : "−"}
                                 {r.fmt(abs)}
                               </span>
                             );
@@ -654,7 +654,9 @@ export default function CompareClient() {
                   </div>
                   <p className="faint" style={{ marginTop: "0.6rem", fontSize: "0.72rem" }}>
                     participant-phase totals only (judge traffic reported separately
-                    under eval rows) · green Δ = better for B · cost is the summed
+                    under eval rows) · busy time sums each cell&apos;s participant
+                    span — parallel cells count in full, it isn&apos;t run elapsed ·
+                    green Δ = better for B · cost is the summed
                     per-model estimate — <b>unpriced</b> when any contributing model
                     has no price-table rate (never a partial total)
                   </p>

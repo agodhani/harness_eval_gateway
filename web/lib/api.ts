@@ -2226,3 +2226,107 @@ export function getLeaderboard(
     })}`,
   );
 }
+
+// ---------------------------------------------------------------------------
+// dashboard summary (PR36 — GET /api/analytics/summary)
+// ---------------------------------------------------------------------------
+
+/** All-time rollup for the dashboard KPI strip. `estimated_cost_usd` is
+ * null when ANY metered call was unpriced (PR21 — a partial total would
+ * read as complete); `unpriced_llm_turns` explains the gap. */
+export interface DashboardTotals {
+  runs: number;
+  sandboxes: number;
+  /** Sandbox cells carrying at least one `overall` score row. */
+  scored_sandboxes: number;
+  /** Metered llm_response events — participant + judge + run-level
+   * control-plane calls (rubric drafting) alike. */
+  llm_turns: number;
+  tokens: TokenUsage;
+  estimated_cost_usd: number | null;
+  unpriced_llm_turns: number;
+}
+
+/** One ISO-week bucket (Monday-anchored UTC), oldest first in `weeks`.
+ * `estimated_cost_usd` is null when any metered call that week was
+ * unpriced — the gap is labeled via `unpriced_llm_turns`, never
+ * zero-filled. */
+export interface DashboardWeekPoint {
+  week: string; // ISO label — "2026-W05"
+  week_start: string;
+  runs: number;
+  llm_turns: number;
+  estimated_cost_usd: number | null;
+  unpriced_llm_turns: number;
+}
+
+export interface DashboardTerminalSlice {
+  reason: string;
+  count: number;
+}
+
+/** One run shown in the queue/active card. `queue_position` is stamped
+ * only on queued entries (1-based, promotion order). */
+export interface DashboardQueueRun {
+  run_id: string;
+  status: string;
+  task_prompt: string;
+  model_name: string;
+  preset_ref: string | null;
+  queue_position: number | null;
+  created_at: string | null;
+  started_at: string | null;
+}
+
+export interface DashboardQueue {
+  /** provisioning | running | evaluating — pacing serializes to one, but
+   * a rescued/crashed state can show more; the list is the honest shape. */
+  active: DashboardQueueRun[];
+  /** `queued` runs in promotion order. */
+  queued: DashboardQueueRun[];
+  /** submitted + rubric_review — parked before the queue. */
+  awaiting_review: number;
+}
+
+export interface DashboardRecentRun {
+  run_id: string;
+  status: string;
+  task_prompt: string;
+  model_name: string;
+  preset_ref: string | null;
+  sandbox_count: number;
+  created_at: string | null;
+  finished_at: string | null;
+  mean_overall_score: number | null;
+}
+
+/** GET /api/analytics/summary — everything the /dashboard cards need that
+ * the leaderboard aggregate doesn't already serve. */
+export interface DashboardSummary {
+  generated_at: string;
+  /** The explicit `?price_model=` repricing basis, or null for per-model
+   * auto pricing (same convention as RunTrends). */
+  price_model: string | null;
+  totals: DashboardTotals;
+  /** Consecutive ISO-week buckets, oldest first, ending at the CURRENT
+   * week — `?weeks=` sets the window. */
+  weeks: DashboardWeekPoint[];
+  terminal_mix: DashboardTerminalSlice[];
+  /** Sandboxes with no terminal_reason yet — pending lanes stay visible,
+   * not dropped into the donut. */
+  terminal_pending: number;
+  queue: DashboardQueue;
+  recent_runs: DashboardRecentRun[];
+}
+
+export function getAnalyticsSummary(
+  opts: { weeks?: number; recent?: number; priceModel?: string } = {},
+): Promise<DashboardSummary> {
+  return request<DashboardSummary>(
+    `/api/analytics/summary${qs({
+      weeks: opts.weeks,
+      recent: opts.recent,
+      price_model: opts.priceModel,
+    })}`,
+  );
+}

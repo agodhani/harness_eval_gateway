@@ -44,7 +44,7 @@ scoring/       objective signal collectors (static + exec/coverage) (F7)
 skillpacks/    vendored default packs                        (F5)
 task_presets/  vendored task presets                         (F24)
 benchmark_suites/  vendored suite.yaml task lists + checks   (F25)
-web/           Next.js app (incl. /compare + /leaderboard)   (F1/F6/F8/F27)
+web/           Next.js app (incl. /dashboard, /compare + /leaderboard)  (F1/F6/F8/F27/F29)
 data/artifacts/  run outputs (gitignored)
 tests/         pytest
 ```

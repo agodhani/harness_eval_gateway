@@ -1326,3 +1326,114 @@ class Leaderboard(BaseModel):
     n_scored: int = 0  # cells carrying a latest ``overall`` score
     by_model: list[LeaderboardEntry] = Field(default_factory=list)
     by_config: list[LeaderboardEntry] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# PR36 — dashboard summary (api/routers/analytics.py GET /api/analytics/summary)
+# ---------------------------------------------------------------------------
+
+
+class DashboardTotals(BaseModel):
+    """All-time rollup for the dashboard KPI strip."""
+
+    runs: int = 0
+    sandboxes: int = 0
+    # Sandbox cells carrying at least one ``overall`` score row.
+    scored_sandboxes: int = 0
+    # Metered llm_response events — participant, judge, and run-level
+    # control-plane calls (rubric drafting) alike.
+    llm_turns: int = 0
+    tokens: TokenUsage = Field(default_factory=TokenUsage)
+    # Estimated spend over priced traffic. None when ANY metered call was
+    # unpriced (PR21 convention — a partial total would read as complete).
+    estimated_cost_usd: float | None = None
+    # Metered calls with no resolvable rate — explains a null total.
+    unpriced_llm_turns: int = 0
+
+
+class DashboardWeekPoint(BaseModel):
+    """One ISO-week bucket (Monday-anchored, UTC) — runs created + metered
+    traffic + est. spend for the spend/runs-per-week cards."""
+
+    week: str  # ISO label — "2026-W05"
+    week_start: datetime
+    runs: int = 0  # runs created inside the bucket
+    llm_turns: int = 0
+    # Same honesty rule as the totals: null when any metered call in the
+    # week was unpriced — the gap is labeled, never zero-filled.
+    estimated_cost_usd: float | None = None
+    unpriced_llm_turns: int = 0
+
+
+class DashboardTerminalSlice(BaseModel):
+    """One terminal-reason count for the outcome donut."""
+
+    reason: str
+    count: int
+
+
+class DashboardQueueRun(BaseModel):
+    """One run shown in the queue/active card."""
+
+    run_id: uuid.UUID
+    status: str
+    task_prompt: str  # truncated server-side
+    model_name: str
+    preset_ref: str | None = None
+    # 1-based position among ``queued`` runs (pacing order) — only on
+    # queued entries.
+    queue_position: int | None = None
+    created_at: datetime | None = None
+    started_at: datetime | None = None  # approval/queue-entry time
+
+
+class DashboardQueue(BaseModel):
+    """Live lane: in-flight runs, the pacing queue, and runs parked before
+    the queue (awaiting a rubric decision)."""
+
+    # provisioning | running | evaluating — pacing serializes to one, but a
+    # rescued/crashed state can show more; the list is the honest shape.
+    active: list[DashboardQueueRun] = Field(default_factory=list)
+    # ``queued`` runs in promotion order, queue_position stamped.
+    queued: list[DashboardQueueRun] = Field(default_factory=list)
+    # submitted + rubric_review — submitted but not yet in the queue.
+    awaiting_review: int = 0
+
+
+class DashboardRecentRun(BaseModel):
+    """One row of the recent-runs table — the runs-list shape plus the
+    mean-overall column (newest-wins per sandbox, then averaged)."""
+
+    run_id: uuid.UUID
+    status: str
+    task_prompt: str  # truncated server-side
+    model_name: str
+    preset_ref: str | None = None
+    sandbox_count: int = 0
+    created_at: datetime | None = None
+    finished_at: datetime | None = None
+    # Mean of the run's latest ``overall`` scores; null when unscored.
+    mean_overall_score: float | None = None
+
+
+class DashboardSummary(BaseModel):
+    """GET /api/analytics/summary response — everything the /dashboard cards
+    need that isn't already served by the leaderboard aggregate."""
+
+    generated_at: datetime
+    # The explicit ``?price_model=`` repricing basis, or null for per-model
+    # auto pricing (same convention as RunTrends).
+    price_model: str | None = None
+    totals: DashboardTotals = Field(default_factory=DashboardTotals)
+    # Consecutive ISO-week buckets, oldest first, ending at the CURRENT
+    # week — ``?weeks=`` sets the window (zero-filled weeks are honest
+    # zeros: no runs, no traffic).
+    weeks: list[DashboardWeekPoint] = Field(default_factory=list)
+    # All-time terminal-reason histogram over sandboxes that reached a
+    # terminal state, count-desc.
+    terminal_mix: list[DashboardTerminalSlice] = Field(default_factory=list)
+    # Sandboxes with no terminal_reason yet — pending lanes stay visible,
+    # not dropped into the donut.
+    terminal_pending: int = 0
+    queue: DashboardQueue = Field(default_factory=DashboardQueue)
+    recent_runs: list[DashboardRecentRun] = Field(default_factory=list)

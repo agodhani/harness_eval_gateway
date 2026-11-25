@@ -39,6 +39,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 | F24 | Task preset library (vendored md + user presets, preset_ref on runs, /presets browse + detail) | ✅ | `task_presets/`, `api/presets.py`, `api/routers/presets.py`, `api/routers/runs.py` (preset_ref), `db/models.py` (`TaskPreset`, `Run.preset_*`), `web/app/presets/`, `web/components/SavePresetDialog.tsx`, `web/app/submit/page.tsx` | `tests/unit/api/test_presets.py`, `tests/unit/db/test_migrations.py`, `web/lib/resubmit.test.ts` |
 | F25 | Benchmark suites + deterministic checkers (vendored suite.yaml fan-out, objective pass/fail beside judge scores, batch aggregation) | ✅ | `benchmark_suites/`, `api/suites.py`, `api/routers/suites.py`, `scoring/checkers.py`, `db/models.py` (`SuiteRun`, `CheckerResult`, `Run.suite_*`), `orchestrator/lifecycle.py`, `web/app/suites/`, `web/app/suite-runs/` | `tests/unit/api/test_suites.py`, `tests/unit/scoring/test_checkers.py`, `tests/unit/orchestrator/test_lifecycle_suites.py`, `tests/unit/evaluator/test_suite_signal.py`, `tests/unit/db/test_migrations.py` |
 | F27 | Cross-run compare + leaderboards (global model + config-family rankings w/ filters, `/compare` two-run diff, preset-embedded board) | ✅ | `api/routers/analytics.py` (`GET /api/analytics/leaderboard`), `api/schemas.py` (`Leaderboard`/`LeaderboardEntry`), `web/app/leaderboard/`, `web/app/compare/`, `web/components/LeaderboardBoards.tsx`, `web/lib/compareRuns.ts`, `web/lib/api.ts`, `web/app/presets/[slug]/PresetDetailClient.tsx` | `tests/unit/api/test_leaderboard.py`, `web/lib/compareRuns.test.ts` |
+| F29 | Dashboard home (`/dashboard`: summary aggregate — KPI strip, weekly spend + runs charts, terminal-mix donut, queue lane, top-5 boards, recent runs) | ✅ | `api/routers/analytics.py` (`GET /api/analytics/summary`), `api/schemas.py` (`DashboardSummary`/`DashboardTotals`/`DashboardWeekPoint`/`DashboardQueue*`/`DashboardTerminalSlice`/`DashboardRecentRun`), `web/app/dashboard/`, `web/lib/dashboard.ts`, `web/lib/api.ts`, `web/components/SiteHeader.tsx`, `web/components/landing/Hero.tsx` | `tests/unit/api/test_summary.py`, `web/lib/dashboard.test.ts` |
 | F31 | Timeline compare-mode clock toggle (absolute wall clock vs per-cell relative t+0 — progress-rate comparison across staggered starts) | ✅ | `web/lib/timelineModes.ts`, `web/app/runs/[id]/timeline/{TimelineClient,EventRow,SplitTimeline}.tsx`, `web/components/RunConsoleLive.tsx`, `web/app/globals.css` (`.evc-ev__t`) | `web/lib/timelineModes.test.ts` |
 
 ## Feature details
@@ -922,7 +923,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     denormalized `rubric_version` (stamped at write time, survives rubric
     lookups). `GET /api/runs/{id}/results?rubric_version=N` filters the
     matrix to one version's scores; the default view is per-sandbox
-    newest-wins (created_at, seq insertion-order tiebreak). `GET
+    newest-wins (asc created_at, seq, rubric_version, id → last row
+    wins). `GET
     /api/runs/{id}/rubrics`
     lists versions + score counts; `GET /api/rubrics/{id}` returns one
     version incl. content (prefills the editor).
@@ -1714,9 +1716,11 @@ rigged before it starts.
   `preset_ref`/`preset_revision`.
 - **Web:** `/presets` index (search + category chips, runs count +
   last-run mean columns, "run →" submit link); `/presets/[slug]` detail
-  (prompt, KPI strip, trend chart via the analysis recharts theme,
-  per-model + per-config leaderboards, run history, edit/delete for user
-  presets); submit page custom|preset toggle + scrollable picker
+  (prompt, KPI strip + loading hints from the local analytics
+  aggregates, trend chart via the analysis recharts theme, the
+  preset-filtered global leaderboard boards — F27 embed, run history,
+  edit/delete for user presets); submit page custom|preset toggle +
+  scrollable picker
   (`.preset-pick`), `?preset=` prefill, "edit as custom copy" detach,
   suggested adapter/model "apply to empty fields", "save as preset"
   dialog (`SavePresetDialog` — shared, also edit mode); run detail shows
@@ -1949,9 +1953,10 @@ rigged before it starts.
   `delta` (null-propagating).
 - **Shared boards** (`web/components/LeaderboardBoards.tsx`): rank,
   label (+shared family name), adapter badge, mean ± sd, n/sandboxes,
-  runs — used by `/leaderboard` AND `/presets/[slug]`, which now embeds
-  the preset-filtered global board (with a synthesised fallback from
-  the preset-local aggregates when the endpoint isn't there).
+  runs — used by `/leaderboard` AND `/presets/[slug]`, which embeds
+  the preset-filtered global board (a failed fetch renders an inline
+  error; while loading, the preset-local aggregates' scored counts
+  hint what's coming).
 - **Where:** `api/routers/analytics.py`, `api/schemas.py`,
   `tests/unit/api/test_leaderboard.py`, `web/lib/api.ts`,
   `web/lib/compareRuns.ts` + `.test.ts`, `web/components/
@@ -1959,7 +1964,7 @@ rigged before it starts.
   `web/app/presets/[slug]/PresetDetailClient.tsx`,
   `web/components/SiteHeader.tsx` (nav gains Compare + Leaderboard).
 - **Verify:**
-  - Unit: `tests/unit/api/test_leaderboard.py` (8 tests — model/config
+  - Unit: `tests/unit/api/test_leaderboard.py` (10 tests — model/config
     ranking + sample sd, n vs sandboxes coverage, preset/date/min-trials
     filters, newest-wins, empty scope) against per-test file-backed
     SQLite (the shared :memory: engine leaks rows across tests).
@@ -1971,6 +1976,77 @@ rigged before it starts.
 - **Depends on:** F8/F9 (results + analytics shapes it reuses), F20
   (trials axis for min_trials), F24 (preset_ref filter), F22 (mean±sd
   + pricing-honesty conventions), F25 (suite provenance on the diff).
+
+### F29 — Dashboard home (PR36) ✅
+
+- **What:** the home surface — one page answering "what did I spend,
+  what's running, who's winning, what happened lately" instead of
+  hunting across /runs, /leaderboard, and per-run analysis.
+- **`GET /api/analytics/summary`** (`api/routers/analytics.py`) —
+  server-side aggregate so the page isn't five client-composed
+  fetches. One scan over runs + sandboxes + `llm_response` events
+  produces: **totals** (runs, sandboxes, scored cells, metered turns,
+  token rollup, estimated cost, unpriced-turn count), a **weekly
+  series** (`?weeks=` ISO-Monday buckets ending at the current week —
+  runs created, turns, spend per week), **terminal mix** (counts per
+  terminal_reason + a separate pending count), **queue** (active
+  provisioning/running/evaluating runs + queued runs stamped with
+  1-based promotion-order position + an awaiting-review count for
+  submitted/rubric_review), and **recent runs** (`?recent=`, newest
+  first, each with sandbox count + newest-wins mean `overall`).
+  `?price_model=` reprices every call at one rate — same convention as
+  the trends endpoint, echoed back so the card can label the basis.
+  Run-level metered events (rubric drafting — `sandbox_id` null) are
+  priced on the payload's `model` field; sandbox events after the
+  first evaluator-source event price at the run's `evaluator_model`
+  (same participant/judge boundary as per-run analytics). Empty DB →
+  zeroed totals + all-zero weeks, never a crash.
+- **Honest cost (PR21 carried forward):** a metered call whose model
+  has no rate poisons its week's total to `null` (a partial sum would
+  read as complete) and increments `unpriced_llm_turns`; the grand
+  total follows the same rule. Zero traffic is an honest `0.0` — only
+  *unpriced* traffic is `null`. The card renders `unpriced` with the
+  call count, and weeks with unpriced traffic leave gaps in the bar
+  series (named in the legend), never fabricated $0 bars.
+- **`/dashboard`** (`web/app/dashboard/`) — KPI strip (runs, sandboxes
+  + scored coverage, turns + tokens, est. spend with pricing basis,
+  queue headline), spend/week + runs/week bar charts (shared `C`
+  palette + `ChartFrame`/`ChartTip`/`SeriesChips` conventions),
+  terminal-mix donut (terminated count centered; pending lanes kept
+  out of the donut and named beside it), queue/active table (lane,
+  run link, task, model; queued rows show promotion position),
+  top-5 `BoardTable`s from `GET /api/analytics/leaderboard` (PR32
+  aggregate reused — one failure hides the boards, not the page),
+  recent-runs table (preset link, status badge, cell count, mean
+  overall). Polls every 15 s only while the lane is busy (active,
+  queued, or awaiting-review runs). Zero-run DB renders a single
+  honest empty state with a submit CTA.
+- **Transforms** (`web/lib/dashboard.ts`, node-tested): `weekLabel`
+  (ISO week_start → `MM-DD` tick, TZ-free string slice),
+  `weekRows`/`unpricedWeeks` (chart rows preserving null costs),
+  `donutData` (slices + shares over terminated + pending, count-desc
+  tie-alpha sort), `queueHeadline` ("1 running · 2 queued · 3
+  awaiting review" / "idle").
+- **Where:** `api/routers/analytics.py`, `api/schemas.py`,
+  `tests/unit/api/test_summary.py`, `web/lib/api.ts`
+  (`getAnalyticsSummary` + `Dashboard*` types), `web/lib/dashboard.ts`
+  + `.test.ts`, `web/app/dashboard/` (`page.tsx` Suspense wrapper +
+  `DashboardClient.tsx`), `web/components/SiteHeader.tsx` (Dashboard
+  first in nav), `web/components/landing/Hero.tsx` (dashboard CTA).
+- **Verify:**
+  - Unit: `tests/unit/api/test_summary.py` (7 tests — empty scope,
+    week buckets + totals incl. eval-boundary + run-level pricing,
+    terminal mix + queue positions, recent-runs mean score,
+    unpriced → null + `?price_model=` rescue, window params) on
+    per-test file-backed SQLite.
+  - Web: `lib/dashboard.test.ts` (11 tests); eslint + `next build`
+    clean (`/dashboard` prerenders static).
+  - Manual: run a few evaluations → `/dashboard` fills in; submit a
+    run and watch the queue card tick; an unpriced model's run shows
+    `unpriced` spend, never `$0`.
+- **Depends on:** F9/F13 (analytics + chart conventions), F21 (pricing
+  honesty semantics), F27 (leaderboard endpoint + shared boards),
+  F15 pacing (queue position semantics from `started_at` ordering).
 
 ## Implementation sequence
 
