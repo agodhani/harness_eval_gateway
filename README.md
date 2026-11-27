@@ -99,7 +99,9 @@ The model catalog should include `qwen2.5-coder:3b`; the retry gives the
 gateway time to start on the first boot.
 
 Use the Compose API for end-to-end runs. For API-only development with hot
-reload, stop the Compose API and gateway to free port 8001. With [`uv`](https://docs.astral.sh/uv/)
+reload, run `docker compose stop api` to free port 8001. Keep the Compose
+gateway running on port 8081 so endpoints such as `/api/models` still work.
+With [`uv`](https://docs.astral.sh/uv/)
 installed, run `uv sync` and `uv run uvicorn api.main:app --reload --port 8001`
 from the repo root. If Ollama is bound to the Docker bridge, set
 `OLLAMA_BASE_URL="http://$OLLAMA_HOST"` in the API environment as well.
