@@ -931,7 +931,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     matrix to one version's scores; the default view is per-sandbox
     newest-wins (asc created_at, seq, rubric_version, id → last row
     wins). The matrix hides judge dimensions outside their source rubric
-    and dimensions outside the rubric being displayed. `GET
+    without discarding valid scores from earlier versions on partial
+    rescoring. Human overrides remain visible across versions. `GET
     /api/runs/{id}/rubrics`
     lists versions + score counts; `GET /api/rubrics/{id}` returns one
     version incl. content (prefills the editor).

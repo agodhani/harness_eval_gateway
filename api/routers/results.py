@@ -1136,7 +1136,6 @@ def get_run_results(
         analysis = _load_analysis(jail, sb)
         rubric_id: UUID | None = None
         sb_rubric_version: int | None = None
-        judge_rubric_version: int | None = None
         sb_scores = by_sandbox.get(sb.id, [])
         for sc in sb_scores:
             if sc.rubric_id is not None:
@@ -1144,19 +1143,13 @@ def get_run_results(
             row_version = score_version(sc)
             if row_version is not None:
                 sb_rubric_version = row_version
-                if sc.source == "llm":
-                    judge_rubric_version = row_version
-        active_version = rubric_version or judge_rubric_version or sb_rubric_version
-        active_dimensions = rubric_dimensions.get(active_version or 0)
         visible_scores: list[Score] = []
         for sc in sb_scores:
-            if sc.source != "human" and sc.dimension not in {
+            if sc.source == "llm" and sc.dimension not in {
                 OVERALL_DIMENSION, SUITE_PASS_DIMENSION,
             }:
-                if active_dimensions and sc.dimension not in active_dimensions:
-                    continue
                 original_dimensions = rubric_dimensions.get(score_version(sc) or 0)
-                if sc.source == "llm" and original_dimensions and sc.dimension not in original_dimensions:
+                if original_dimensions and sc.dimension not in original_dimensions:
                     continue
             visible_scores.append(sc)
         # PR29 — per-(source,judge) buckets: human wins its pair; llm

@@ -1298,6 +1298,10 @@ def test_results_rubric_version_filter(
                 sandbox_id=scored_run["sb1"], rubric_id=v2.id, rubric_version=2,
                 dimension="overall", score=9.0, rationale="better",
             ),
+            Score(
+                sandbox_id=scored_run["sb2"], rubric_id=v1.id, rubric_version=1,
+                dimension="code_quality", score=5.0,
+            ),
         ])
         s.commit()
         v2_id = v2.id
@@ -1308,12 +1312,14 @@ def test_results_rubric_version_filter(
     body = client.get(f"/api/runs/{scored_run['run_id']}/results").json()
     sb1 = next(x for x in body["sandboxes"] if x["sandbox_id"] == str(scored_run["sb1"]))
     assert sb1["dimensions"]["functional_requirements"]["score"] == 9.5
-    assert set(sb1["dimensions"]) == {"functional_requirements"}
+    assert sb1["dimensions"]["code_quality"]["score"] == 6.0
+    sb2 = _sandbox_result(body, scored_run["sb2"])
+    assert sb2["dimensions"]["code_quality"]["score"] == 5.0
     assert sb1["overall"]["score"] == 9.0
     assert sb1["rubric_version"] == 2
     assert body["selected_rubric_version"] is None
     versions = {v["version"]: v for v in body["rubric_versions"]}
-    assert versions[1]["score_count"] == 3
+    assert versions[1]["score_count"] == 4
     assert versions[2]["score_count"] == 2
     assert versions[1]["status"] == "superseded"
 
@@ -1327,6 +1333,13 @@ def test_results_rubric_version_filter(
     assert sb1["overall"]["score"] == 7.0
     assert sb1["rubric_version"] == 1
     assert body["selected_rubric_version"] == 1
+
+    body = client.get(
+        f"/api/runs/{scored_run['run_id']}/results", params={"rubric_version": 2}
+    ).json()
+    assert set(_sandbox_result(body, scored_run["sb1"])["dimensions"]) == {
+        "functional_requirements",
+    }
 
     # version with no scores → empty dimensions but no error
     s = session_factory()
