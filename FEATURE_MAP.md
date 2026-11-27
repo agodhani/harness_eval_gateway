@@ -66,6 +66,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   replay in `web/lib/sim.ts`), plain CSS, no framework.
 - **Verify:**
   - `docker compose up -d` → `curl localhost:8001/health` + `/health/db` ok
+  - Compose waits for the gateway listener before booting the API, so startup
+    recovery can dispatch pending rubric drafts. The smoke tests verify the
+    configured probe requests port 8080 at `/health`; with Docker, they also
+    check that the first API request reaches a delayed gateway.
   - `DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5433/harness_eval alembic upgrade head` → all tables present
   - `uv run pytest` + `uv run ruff check .` green
   - `cd web && npm run lint && npm run build` green

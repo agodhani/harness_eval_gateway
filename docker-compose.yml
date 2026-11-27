@@ -6,7 +6,7 @@
 # Agent sandboxes (F4) will get their OWN internal network later — only the
 # AI gateway will be reachable from them (egress lockdown).
 #
-#   docker compose up -d        # postgres + api
+#   docker compose up -d        # postgres + gateway + api
 #   docker compose down -v      # stop + wipe pgdata
 #
 # Published host ports are offset to avoid conflicts with other local
@@ -131,6 +131,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      gateway:
+        condition: service_healthy
     networks:
       - internal
 
@@ -182,8 +184,17 @@ services:
       - ./data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health', timeout=3).status == 200 else 1)\"",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 10
     depends_on:
-      api:
+      postgres:
         condition: service_healthy
     networks:
       - internal
