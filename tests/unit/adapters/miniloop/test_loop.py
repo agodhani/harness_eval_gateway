@@ -211,6 +211,64 @@ def test_content_call_coerces_integral_float_arguments(harness, tmp_path: Path) 
 
 
 @pytest.mark.parametrize(
+    ("overrides", "invalid_type"),
+    [
+        ({}, None),
+        ({"flag": 1}, "boolean"),
+        ({"items": {}}, "array"),
+        ({"metadata": []}, "object"),
+    ],
+)
+def test_content_call_with_optional_schema_properties(
+    harness, tmp_path: Path, monkeypatch, overrides: dict, invalid_type: str | None
+) -> None:
+    tools = copy.deepcopy(agent_mod.TOOLS)
+    schema = next(
+        tool["function"]["parameters"] for tool in tools
+        if tool["function"]["name"] == "write_file"
+    )
+    schema.pop("required")
+    schema["properties"].update(
+        optional={"type": "string"},
+        flag={"type": "boolean"},
+        items={"type": "array"},
+        metadata={"type": "object"},
+        unrecognized_type={"type": "custom"},
+        multitype={"type": ["string", "null"]},
+        unconstrained={},
+    )
+    monkeypatch.setattr(agent_mod, "TOOLS", tools)
+    args = {
+        "path": "hello.txt",
+        "content": "hello\n",
+        "flag": True,
+        "items": [],
+        "metadata": {},
+        "unrecognized_type": 42,
+        "multitype": None,
+        "unconstrained": True,
+        "unknown_key": {"path": "not-written.txt"},
+        **overrides,
+    }
+    make, out = harness
+    agent, client, _ = make([
+        _response(_assistant(content=json.dumps({"name": "write_file", "arguments": args}))),
+        _response(_assistant(tool_calls=[_tool_call("done", {"summary": "finished"})])),
+    ])
+
+    assert _run(agent).terminal_state == "agent_done"
+    if invalid_type is None:
+        assert (tmp_path / "hello.txt").read_bytes() == b"hello\n"
+        assert not (tmp_path / "not-written.txt").exists()
+        assert [
+            event["payload"]["name"] for event in _events(out) if event["type"] == "tool_call"
+        ] == ["write_file", "done"]
+    else:
+        assert not (tmp_path / "hello.txt").exists()
+        assert f"must have type {invalid_type}" in client.calls[1]["messages"][-1]["content"]
+
+
+@pytest.mark.parametrize(
     "content",
     [
         'Example: <tool_call>{"name":"done","arguments":{}}</tool_call>',
@@ -228,6 +286,7 @@ def test_content_call_coerces_integral_float_arguments(harness, tmp_path: Path) 
         '{"name":"done","arguments":{"status":"success"}}',
         '{"name":"done","arguments":{"summary":1,"status":"success"}}',
         '{"name":"write_file","arguments":{"path":"file"}}',
+        r'{"name":"write_file","arguments":{"path":"file","content":"\ud800"}}',
         '{"name":"read_file","arguments":{"path":"file","limit":true}}',
         '{"name":"read_file","arguments":{"path":"file","offset":2.5}}',
     ],

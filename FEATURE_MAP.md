@@ -267,11 +267,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `MINILOOP_RESULT` terminator line; skill packs vendored under `skillpacks/`
   (51 SKILL.md: superpowers 14, mattpocock-skills 28, spec-kit 9 generated);
   progressive-disclosure catalog in system prompt. When there are no
-  structured calls, a standalone JSON call with a declared tool name and
-  schema-valid arguments, optionally wrapped in `<tool_call>` or in a
-  standalone Markdown JSON fence, is dispatched as a structured reply.
-  Other tool-less assistant
-  replies get `MINILOOP_NUDGE_RETRIES` corrective nudges (default 2,
+  structured calls, a standalone JSON call to a declared tool can be
+  dispatched as a structured reply. The fallback accepts bare JSON,
+  `<tool_call>` wrappers, or standalone Markdown JSON fences and checks
+  required arguments, supported property types, and enum values.
+  Other tool-less assistant replies get `MINILOOP_NUDGE_RETRIES` corrective nudges (default 2,
   `stage="agent_nudge"` checkpoints) before counting toward the text-only
   `stuck_loop` streak; rejected content calls get targeted argument
   feedback in these nudges. Per model-call timeout

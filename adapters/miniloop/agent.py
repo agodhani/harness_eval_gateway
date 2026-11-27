@@ -339,22 +339,32 @@ TOOLS: list[dict[str, Any]] = [
 
 
 def _content_argument_problem(args: dict[str, Any], schema: dict[str, Any]) -> str | None:
-    types = {"string": (str,), "integer": (int,), "number": (int, float)}
-    for key, prop in schema["properties"].items():
+    types = {
+        "string": (str,),
+        "integer": (int,),
+        "number": (int, float),
+        "boolean": (bool,),
+        "array": (list,),
+        "object": (dict,),
+    }
+    required = schema.get("required", [])
+    for key, prop in schema.get("properties", {}).items():
         choices = prop.get("enum")
         allowed = ", ".join(map(str, choices)) if choices else ""
         if key not in args:
-            if key in schema["required"]:
+            if key in required:
                 note = f" (allowed values: {allowed})" if choices else ""
                 return f"missing required argument '{key}'{note}"
             continue
         value = args[key]
-        if prop["type"] == "integer" and type(value) is float and value.is_integer():
+        prop_type = prop.get("type")
+        if prop_type == "integer" and type(value) is float and value.is_integer():
             args[key] = value = int(value)
         if choices and value not in choices:
             return f"argument '{key}' must be one of: {allowed}"
-        if type(value) not in types[prop["type"]]:
-            return f"argument '{key}' must have type {prop['type']}"
+        expected_types = types.get(prop_type) if isinstance(prop_type, str) else None
+        if expected_types is not None and type(value) not in expected_types:
+            return f"argument '{key}' must have type {prop_type}"
     return None
 
 
@@ -389,7 +399,8 @@ def _content_tool_call(content: Any, call_id: str) -> tuple[dict[str, Any] | Non
     if problem is not None:
         return None, f" The {name} tool call was invalid: {problem}."
     try:
-        arguments = json.dumps(args, allow_nan=False)
+        arguments = json.dumps(args, allow_nan=False, ensure_ascii=False)
+        arguments.encode("utf-8")
     except (ValueError, RecursionError):
         return None, ""
     return {
