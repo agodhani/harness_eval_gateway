@@ -36,6 +36,10 @@ def test_compose_api_waits_for_gateway_to_listen() -> None:
 @pytest.mark.docker
 def test_compose_api_can_reach_delayed_gateway(tmp_path: Path) -> None:
     if not shutil.which("docker") or subprocess.run(
+        ["docker", "info"], capture_output=True, timeout=30, check=False
+    ).returncode:
+        pytest.skip("Docker daemon unavailable")
+    if subprocess.run(
         ["docker", "compose", "version"], capture_output=True, timeout=10, check=False
     ).returncode:
         pytest.skip("Docker Compose unavailable")
