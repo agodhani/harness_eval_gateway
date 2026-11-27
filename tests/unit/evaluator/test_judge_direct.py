@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -344,14 +345,16 @@ async def test_http_error_drains_body_and_reports_bounded_detail(
 
 
 @pytest.mark.parametrize("slow", [False, True])
-async def test_streamed_4xx_retries_after_bounded_error_drain(eval_ws, monkeypatch, slow):
+async def test_streamed_4xx_retries_after_bounded_error_drain(
+    eval_ws: Path, monkeypatch: pytest.MonkeyPatch, slow: bool
+) -> None:
     if slow:
         monkeypatch.setattr(judge_direct_mod, "_ERROR_DRAIN_SECONDS", 0.01)
     closed = False
     calls = 0
 
     class ErrorStream(httpx.AsyncByteStream):
-        async def __aiter__(self):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
             yield b"unsupported response format"
             if slow:
                 await asyncio.Event().wait()
@@ -359,11 +362,11 @@ async def test_streamed_4xx_retries_after_bounded_error_drain(eval_ws, monkeypat
                 yield b"x" * (64 * 1024)
             pytest.fail("read beyond the error drain limit")
 
-        async def aclose(self):
+        async def aclose(self) -> None:
             nonlocal closed
             closed = True
 
-    def handler(request):
+    def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
         if calls == 1:
