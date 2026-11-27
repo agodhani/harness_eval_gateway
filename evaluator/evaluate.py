@@ -524,6 +524,8 @@ async def _wait_for_exit(
 async def _direct_judge_fallback(
     *,
     eval_ws: Path,
+    submission_workspace: Path,
+    seed_dir: Path | None,
     rubric: dict[str, Any],
     model: str,
     gateway_base_url: str,
@@ -558,6 +560,8 @@ async def _direct_judge_fallback(
         parsed = await asyncio.wait_for(
             judge_direct(
                 eval_workspace=eval_ws,
+                submission_workspace=submission_workspace if seed_dir is not None else None,
+                seed_dir=seed_dir,
                 rubric=rubric,
                 gateway_base_url=gateway_base_url,
                 cred=cred,
@@ -990,6 +994,8 @@ async def evaluate_sandbox(
         prior_parts = [p for p in (prior_error, f"{reason}: {exc}") if p]
         parsed, fallback_detail = await _direct_judge_fallback(
             eval_ws=eval_ws,
+            submission_workspace=ws_path,
+            seed_dir=seed_dir,
             rubric=rubric,
             model=model_name,
             gateway_base_url=gateway_base_url,

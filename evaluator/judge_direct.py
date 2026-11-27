@@ -55,7 +55,7 @@ from evaluator.scores import (
     parse_scores_json,
     rubric_dimension_scales,
 )
-from evaluator.submission import submission_files
+from evaluator.submission import submission_files, submission_files_with_changes
 from evaluator.testgen import (
     _env_float,
     _env_int,
@@ -106,7 +106,7 @@ def direct_fallback_enabled(default: bool = True) -> bool:
 
 
 def _gather_sources(
-    workspace: Path, *, budget_bytes: int
+    workspace: Path, *, budget_bytes: int, seed_dir: Path | None = None
 ) -> str:
     """Render source evidence, including headings and omissions, under one byte cap."""
     heading = b"# Submission files\n\n"
@@ -115,11 +115,18 @@ def _gather_sources(
     budget = max(0, budget_bytes - len(heading))
     omit_budget = min(_OMITTED_LIST_BYTE_LIMIT, max(180, budget // 4), budget)
     source_budget = budget - omit_budget
+    files = (
+        submission_files_with_changes(workspace, seed_dir)
+        if seed_dir is not None
+        else ((True, size, path) for size, path in submission_files(workspace))
+    )
     candidates = sorted(
-        submission_files(workspace),
+        files,
         key=lambda entry: (
-            not _DEPENDENCY_DIRS.isdisjoint(entry[1].relative_to(workspace).parts[:-1]),
-            *entry,
+            not entry[0],
+            not _DEPENDENCY_DIRS.isdisjoint(entry[2].relative_to(workspace).parts[:-1]),
+            entry[1],
+            entry[2],
         ),
     )
     sources = bytearray()
@@ -141,7 +148,7 @@ def _gather_sources(
 
     footer = b"\n```\n\n"
     truncated = "\n# ... [truncated — source budget]".encode()
-    for size, path in candidates:
+    for _, size, path in candidates:
         rel = path.relative_to(workspace).as_posix()
         header = f"### FILE: {rel}\n```\n".encode(errors="replace")
         remaining = source_budget - len(sources) - len(header) - len(footer)
@@ -394,6 +401,8 @@ async def _request_scores(
 async def judge_direct(
     *,
     eval_workspace: Path | str,
+    submission_workspace: Path | None = None,
+    seed_dir: Path | None = None,
     rubric: dict[str, Any],
     gateway_base_url: str,
     cred: str,
@@ -409,7 +418,8 @@ async def judge_direct(
 
     ``eval_workspace`` is the STAGED eval workspace — it holds the candidate
     copy plus ``ANALYSIS.md``/``EVAL_TRANSCRIPT.log`` (gathered into the
-    prompt); the broken ``scores.json`` (when present) is left out.
+    prompt); the broken ``scores.json`` (when present) is left out. For seeded
+    runs, compare the unmodified artifact snapshot with the seed.
     """
     ws = Path(eval_workspace)
     if not cred:
@@ -424,7 +434,9 @@ async def judge_direct(
 
     analysis_md = _read_text_capped(ws / ANALYSIS_MD_FILENAME, ANALYSIS_BUDGET_CHARS)
     transcript_tail = _read_tail(ws / "EVAL_TRANSCRIPT.log", TRANSCRIPT_TAIL_BYTES)
-    source_evidence = await asyncio.to_thread(_gather_sources, ws, budget_bytes=budget)
+    source_evidence = await asyncio.to_thread(
+        _gather_sources, submission_workspace or ws, budget_bytes=budget, seed_dir=seed_dir
+    )
     prompt = build_direct_prompt(
         rubric,
         analysis_md=analysis_md,

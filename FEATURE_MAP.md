@@ -353,7 +353,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `fallback_detail` to `eval_scores_failed`). Its prompt names binary and
   over-budget files without including their contents; the compact omission
   list caps path count and shares the byte budget with source content.
-  It reports how many paths were unlisted.
+  It reports how many paths were unlisted. For seeded runs, additions and
+  changes in the artifact come before unchanged starter files, with
+  first-party paths ahead of dependencies within each group.
   **Objective signals (PR6+PR7):** before staging, the candidate workspace
   is measured by the `scoring` package's signal collectors —
   `static_analysis` runs lizard (multi-language, parse-only, no code
@@ -424,6 +426,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `empty_submission` is the evaluator's preflight rejection, including
   missing or blank prompt-cell output; it creates no judge scores and
   does not retry the panel.
+  A non-empty submission missing a file named only in rubric prose is
+  still judged. The rubric has no machine-readable primary deliverable;
+  zero for that case is not enforced by preflight.
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
   `prompts.py`, `judge_direct.py` — direct-completion fallback,
   `submission.py` — shared `submission_files` discovery and seed comparison,
@@ -455,6 +460,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     (incl. `test_target` mount/env), result file/sentinel parsing,
     timeout/missing-image paths; `tests/unit/sandbox/test_exec_runner.py`
     — in-image helpers (junit failed names, target staging, discovery)
+  - Direct fallback: `test_seeded_direct_fallback_prioritizes_patch_over_starter_files`
+    in `tests/unit/evaluator/test_evaluate.py` checks the outbound prompt
+    retains a vendored patch ahead of unchanged starter sources.
   - Exec integration: `tests/integration/test_exec_scoring.py`
     (`@pytest.mark.docker`) — real `heg-exec` container executes a trivial
     artifact: build ok, 2/2 tests pass, coverage measured, container

@@ -740,6 +740,41 @@ async def test_direct_fallback_scores_when_agent_fails(
     assert "scores_missing" in user
 
 
+async def test_seeded_direct_fallback_prioritizes_patch_over_starter_files(
+    seeded, session_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = seeded["workspace"]
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    for path in workspace.iterdir():
+        (seed / path.name).write_bytes(path.read_bytes())
+    for directory in (seed, workspace):
+        dependencies = directory / "vendor" / "pkg"
+        dependencies.mkdir(parents=True)
+        (dependencies / "patched.js").write_text("return false;\n" * 12)
+        (dependencies / "untouched.js").write_text("x")
+        for index in range(40):
+            (directory / f"starter-{index:02}.txt").write_text("starter contents\n")
+    patch = "return  true;\n" * 12
+    (workspace / "vendor" / "pkg" / "patched.js").write_text(patch)
+    (workspace / ".github").mkdir()
+    (workspace / ".github" / "settings.yml").write_text("name: edited\n")
+    monkeypatch.setenv("EVAL_DIRECT_SOURCE_BUDGET_BYTES", "700")
+    client = _FakeClient()
+
+    rows = await _eval(
+        seeded, session_factory, FakeRuntime(scores_obj=None), direct_client=client, seed_dir=seed
+    )
+
+    assert len(rows) == 3
+    user = client.calls[0]["json"]["messages"][1]["content"]
+    first_party = user.index("### FILE: .github/settings.yml")
+    vendored_patch = user.index(f"### FILE: vendor/pkg/patched.js\n```\n{patch.rstrip()}\n```")
+    starter = user.index("### FILE: hello.txt")
+    assert first_party < vendored_patch < starter
+    assert "### FILE: vendor/pkg/untouched.js" not in user
+
+
 async def test_direct_fallback_failure_emits_fallback_detail(
     seeded, session_factory
 ) -> None:

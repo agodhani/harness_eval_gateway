@@ -79,9 +79,9 @@ def _matches_seed(left: Path, right: Path, *, allow_aider_append: bool) -> bool:
         return {line.strip() for line in tail.splitlines() if line.strip()} == {b".aider*"}
 
 
-def has_submission(workspace: Path, seed_dir: Path | None = None) -> bool:
-    if seed_dir is None:
-        return next(submission_files(workspace), None) is not None
+def submission_files_with_changes(
+    workspace: Path, seed_dir: Path
+) -> Iterator[tuple[bool, int, Path]]:
     if not seed_dir.is_dir():
         raise FileNotFoundError("run seed is unavailable for submission comparison")
     seed_sizes = {path.relative_to(seed_dir): size for size, path in submission_files(seed_dir)}
@@ -94,10 +94,17 @@ def has_submission(workspace: Path, seed_dir: Path | None = None) -> bool:
             and 0 < size - seed_size <= _AIDER_IGNORE_BYTES
         )
         if seed_size is None or (seed_size != size and not allow_aider_append):
-            return True
+            yield True, size, path
+            continue
         seed_path = seed_dir / rel
-        if stat.S_IMODE(path.lstat().st_mode) != stat.S_IMODE(seed_path.lstat().st_mode):
-            return True
-        if not _matches_seed(path, seed_path, allow_aider_append=allow_aider_append):
-            return True
-    return False
+        mode_changed = stat.S_IMODE(path.lstat().st_mode) != stat.S_IMODE(seed_path.lstat().st_mode)
+        changed = mode_changed or not _matches_seed(
+            path, seed_path, allow_aider_append=allow_aider_append
+        )
+        yield changed, size, path
+
+
+def has_submission(workspace: Path, seed_dir: Path | None = None) -> bool:
+    if seed_dir is None:
+        return next(submission_files(workspace), None) is not None
+    return any(changed for changed, _, _ in submission_files_with_changes(workspace, seed_dir))
