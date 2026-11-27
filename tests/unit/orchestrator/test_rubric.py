@@ -355,6 +355,33 @@ async def test_ollama_rubric_retries_truncated_stream_and_joins_content(
         assert stored.content["summary"] == "Test rubric"
 
 
+async def test_ollama_rubric_stops_reading_after_done(session_factory) -> None:
+    run = make_run(session_factory, status="submitted", task_prompt="extract apples")
+    attempts = 0
+    frame = {"choices": [{"delta": {"content": json.dumps(_valid_rubric_payload())}}]}
+
+    class LateReadError(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield f"data: {json.dumps(frame)}\n\ndata: [DONE]\n\n".encode()
+            raise httpx.ReadError("read attempted after DONE")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=LateReadError()
+        )
+
+    async with _mock_client(handler) as client:
+        await rubric_mod.draft_rubric(
+            run.id, session_factory=session_factory, settings=SETTINGS, client=client,
+        )
+
+    assert attempts == 1
+    with session_factory() as s:
+        assert s.get(Run, run.id).status == "rubric_review"
+
+
 async def test_draft_rubric_uses_rubric_model_override(session_factory) -> None:
     run = make_run(session_factory, status="submitted")
     seen = {}

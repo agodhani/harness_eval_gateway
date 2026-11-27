@@ -519,14 +519,12 @@ async def _request_rubric_content(
             return _message_content(response.json())
 
         parts: list[str] = []
-        done = False
         async for line in response.aiter_lines():
-            if done or not line.startswith("data:"):
+            if not line.startswith("data:"):
                 continue
             data = line.removeprefix("data:").strip()
             if data == "[DONE]":
-                done = True
-                continue
+                break
             frame = json.loads(data)
             if not isinstance(frame, dict):
                 raise RubricParseError("invalid chat response frame")
@@ -538,7 +536,7 @@ async def _request_rubric_content(
                 content = (choice.get("delta") or {}).get("content")
                 if isinstance(content, str):
                     parts.append(content)
-        if not done:
+        else:
             raise httpx.RemoteProtocolError("upstream rubric stream ended before [DONE]")
         content = "".join(parts)
         if not content.strip():
