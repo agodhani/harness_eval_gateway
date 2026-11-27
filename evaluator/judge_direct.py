@@ -82,6 +82,10 @@ _BINARY_SNIFF_BYTES = 8_192
 
 _OMITTED_PATH_LIMIT = 50
 _OMITTED_LIST_BYTE_LIMIT = 3_000
+_DEPENDENCY_DIRS = frozenset({
+    "node_modules", "bower_components", "vendor", "vendors", ".venv", "venv",
+    ".tox", ".nox", "site-packages", "dist-packages", "Pods",
+})
 
 
 class DirectJudgeError(Exception):
@@ -111,7 +115,13 @@ def _gather_sources(
     budget = max(0, budget_bytes - len(heading))
     omit_budget = min(_OMITTED_LIST_BYTE_LIMIT, max(180, budget // 4), budget)
     source_budget = budget - omit_budget
-    candidates = sorted(submission_files(workspace))
+    candidates = sorted(
+        submission_files(workspace),
+        key=lambda entry: (
+            not _DEPENDENCY_DIRS.isdisjoint(entry[1].relative_to(workspace).parts[:-1]),
+            *entry,
+        ),
+    )
     sources = bytearray()
     omitted = bytearray()
     listed = 0

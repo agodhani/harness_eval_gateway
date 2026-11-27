@@ -219,6 +219,25 @@ def test_workflow_only_workspace_is_not_empty(tmp_path):
     assert not monitor._workspace_is_empty(tmp_path)
 
 
+@pytest.mark.parametrize("seed_contents", ["hi\n", "different\n"])
+async def test_seeded_workspace_warning_requires_no_changes(
+    session_factory, settings, fake_runtime, seed_contents: str
+) -> None:
+    run = make_run(session_factory, status="running", config=run_config())
+    sb = make_sandbox(
+        session_factory, run.id, harness_config={"adapter": "miniloop", "seed_sha": "seed"}
+    )
+    seed = fake_runtime.state_dir.parent / "seeds" / str(run.id) / "content"
+    seed.mkdir(parents=True)
+    (seed / "hello.txt").write_text(seed_contents)
+    fake_runtime.logs_map[str(sb.id)] = RESULT_LINE("agent_done") + "\n"
+
+    assert await _watch(session_factory, settings, fake_runtime, run.id, sb.id) == "agent_done"
+
+    payloads = _checkpoint_payloads(session_factory, sb.id)
+    assert any(p.get("stage") == "empty_workspace" for p in payloads) == (seed_contents == "hi\n")
+
+
 async def test_empty_workspace_error_reason_no_warning(
     session_factory, settings, fake_runtime
 ) -> None:

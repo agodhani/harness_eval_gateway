@@ -423,6 +423,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `empty_submission` without creating score rows or retrying the panel.
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
   `prompts.py`, `judge_direct.py` — direct-completion fallback,
+  `submission.py` — shared `submission_files` discovery and seed comparison,
   `testgen.py` — PR8 suite generation + exec orchestration),
   `scoring/` (`models.py` — analysis.json/API pydantic
   contract, `collectors.py` — SignalCollector protocol + registry,

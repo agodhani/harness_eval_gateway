@@ -19,6 +19,7 @@ EVALUATOR_FILES = frozenset({
     GENERATED_TESTS_DIRNAME,
 })
 _VCS_INTERNALS = {".git", ".hg", ".svn"}
+_AIDER_IGNORE_BYTES = 1024
 _AIDER_FILES = {
     ".aider.conf.yml",
     ".aider.chat.history.md",
@@ -28,7 +29,7 @@ _AIDER_FILES = {
 
 
 def _is_aider_ignore(path: Path, size: int) -> bool:
-    if size > 1024:
+    if size > _AIDER_IGNORE_BYTES:
         return False
     with path.open("rb") as fh:
         raw = fh.read(size + 1)
@@ -61,12 +62,21 @@ def submission_files(workspace: Path) -> Iterator[tuple[int, Path]]:
             yield info.st_size, path
 
 
-def _identical_file(left: Path, right: Path) -> bool:
+def _matches_seed(left: Path, right: Path, *, allow_aider_append: bool) -> bool:
     with left.open("rb") as actual, right.open("rb") as original:
-        while chunk := actual.read(64 * 1024):
-            if chunk != original.read(len(chunk)):
+        ends_at_line_boundary = True
+        while chunk := original.read(64 * 1024):
+            if actual.read(len(chunk)) != chunk:
                 return False
-        return not original.read(1)
+            ends_at_line_boundary = chunk.endswith(b"\n")
+        if not allow_aider_append:
+            return not actual.read(1)
+        tail = actual.read(_AIDER_IGNORE_BYTES + 1)
+        if len(tail) > _AIDER_IGNORE_BYTES:
+            return False
+        if not ends_at_line_boundary and not tail.startswith((b"\n", b"\r\n")):
+            return False
+        return {line.strip() for line in tail.splitlines() if line.strip()} == {b".aider*"}
 
 
 def has_submission(workspace: Path, seed_dir: Path | None = None) -> bool:
@@ -77,6 +87,17 @@ def has_submission(workspace: Path, seed_dir: Path | None = None) -> bool:
     seed_sizes = {path.relative_to(seed_dir): size for size, path in submission_files(seed_dir)}
     for size, path in submission_files(workspace):
         rel = path.relative_to(workspace)
-        if seed_sizes.get(rel) != size or not _identical_file(path, seed_dir / rel):
+        seed_size = seed_sizes.get(rel)
+        allow_aider_append = (
+            rel == Path(".gitignore")
+            and seed_size is not None
+            and 0 < size - seed_size <= _AIDER_IGNORE_BYTES
+        )
+        if seed_size is None or (seed_size != size and not allow_aider_append):
+            return True
+        seed_path = seed_dir / rel
+        if stat.S_IMODE(path.lstat().st_mode) != stat.S_IMODE(seed_path.lstat().st_mode):
+            return True
+        if not _matches_seed(path, seed_path, allow_aider_append=allow_aider_append):
             return True
     return False

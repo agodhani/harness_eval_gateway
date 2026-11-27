@@ -414,8 +414,8 @@ def _snapshot_sizes(snapshot: Any) -> dict[str, int]:
     }
 
 
-def _workspace_is_empty(path: Path) -> bool:
-    return not has_submission(path)
+def _workspace_is_empty(path: Path, seed_dir: Path | None = None) -> bool:
+    return not has_submission(path, seed_dir)
 
 
 def _finalize_db(
@@ -491,7 +491,7 @@ def _finalize_db(
                     "terminal_reason": reason,
                     "detail": (
                         f"{reason} but the snapshotted workspace has no "
-                        "files (nothing, or only dot-entries)"
+                        "non-empty submission files added or changed"
                     ),
                 },
             )
@@ -524,8 +524,12 @@ async def finalize_sandbox(
         except Exception:
             log.warning("finalize: artifact sizing failed for %s", sid, exc_info=True)
         try:
+            sb = _load_sandbox(session_factory, sandbox_id)
+            seed_dir = None
+            if sb is not None and (sb.harness_config or {}).get("seed_sha"):
+                seed_dir = Path(runtime.state_dir).parent / "seeds" / str(run_id) / "content"
             empty_workspace = await asyncio.to_thread(
-                _workspace_is_empty, Path(snapshot.workspace_dir)
+                _workspace_is_empty, Path(snapshot.workspace_dir), seed_dir
             )
         except Exception:
             log.warning(

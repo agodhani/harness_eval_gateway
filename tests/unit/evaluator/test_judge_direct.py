@@ -375,6 +375,20 @@ async def test_many_over_budget_paths_have_a_compact_bounded_listing(eval_ws):
     assert "candidate-1000.txt" not in omitted
 
 
+async def test_dependencies_do_not_crowd_out_submission_sources(eval_ws: Path) -> None:
+    for directory in ("node_modules/package", "vendor/lib", ".venv/lib/site-packages"):
+        path = eval_ws / directory
+        path.mkdir(parents=True)
+        for index in range(30):
+            (path / f"{index}.py").write_text("x")
+    client = _FakeClient()
+    await _judge(eval_ws, client=client, source_budget_bytes=700)
+    user = client.calls[0]["json"]["messages"][1]["content"]
+    assert "### FILE: main.py" in user
+    assert user.index("### FILE: main.py") < user.index("### FILE: .venv/")
+    assert "(source budget)" in user
+
+
 # ----------------------------------------------------------------------
 # build_direct_prompt — pure builder unit tests
 # ----------------------------------------------------------------------

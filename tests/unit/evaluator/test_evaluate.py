@@ -1038,7 +1038,7 @@ async def test_evaluate_workspace_with_only_hidden_deliverable(
     assert (Path(fake.specs[0].workspace_host_path) / path).read_text() == "submission\n"
 
 
-@pytest.mark.parametrize("change", [None, "add", "modify"])
+@pytest.mark.parametrize("change", [None, "add", "modify", "mode", "aider", "aider-and-rule"])
 async def test_seed_only_workspace_never_reaches_judges_or_score_parser(
     seeded, session_factory, tmp_path, monkeypatch, change
 ) -> None:
@@ -1050,9 +1050,18 @@ async def test_seed_only_workspace_never_reaches_judges_or_score_parser(
     seed.mkdir()
     (seed / "README.md").write_text(starter)
     (workspace / "README.md").write_text(starter)
+    if change == "mode":
+        for directory in (seed, workspace):
+            (directory / "run.sh").write_text("#!/bin/sh\n")
+            (directory / "run.sh").chmod(0o644)
+        (workspace / "run.sh").chmod(0o755)
+    if change in ("aider", "aider-and-rule"):
+        (seed / ".gitignore").write_text("build/")
+        suffix = "\ndist/" if change == "aider-and-rule" else ""
+        (workspace / ".gitignore").write_text(f"build/\n\n.aider*{suffix}\n")
     fake = FakeRuntime()
 
-    if change is None:
+    if change in (None, "aider"):
         def unexpected(*args, **kwargs):
             pytest.fail("empty submission reached judging or score parsing")
 
@@ -1065,7 +1074,7 @@ async def test_seed_only_workspace_never_reaches_judges_or_score_parser(
         return
     if change == "modify":
         (workspace / "README.md").write_text(starter.replace("Starter", "Changed"))
-    else:
+    elif change == "add":
         (workspace / ".deliverable").write_text("new work")
     assert len(await _eval(seeded, session_factory, fake, seed_dir=seed)) == 3
 
