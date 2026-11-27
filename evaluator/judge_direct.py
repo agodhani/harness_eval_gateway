@@ -40,6 +40,7 @@ Env knobs (all optional):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -79,6 +80,10 @@ TRANSCRIPT_TAIL_BYTES = 8_000
 #: Binary sniff — a NUL byte in the first block means not-source.
 _BINARY_SNIFF_BYTES = 8_192
 
+_OMITTED_PATH_LIMIT = 50
+_OMITTED_LIST_CHAR_LIMIT = 3_000
+
+
 class DirectJudgeError(Exception):
     """Direct judge call failed or produced unusable scores content."""
 
@@ -98,8 +103,8 @@ def direct_fallback_enabled(default: bool = True) -> bool:
 
 def _gather_sources(
     workspace: Path, *, budget_bytes: int
-) -> list[tuple[str, str]]:
-    """``(relative path, text)`` for text files under ``workspace``.
+) -> tuple[list[tuple[str, str]], list[str], int]:
+    """Text files, compact omission entries, and the count not listed.
 
     Same shape as :func:`evaluator.testgen._gather_sources` — smallest files
     first so one giant module can't starve the listing, the last included
@@ -112,27 +117,40 @@ def _gather_sources(
     candidates = sorted(submission_files(workspace))
 
     out: list[tuple[str, str]] = []
+    omitted: list[str] = []
+    omitted_chars = 0
+    unlisted = 0
+
+    def omit(rel: str, reason: str) -> None:
+        nonlocal omitted_chars, unlisted
+        line = f"- {json.dumps(rel)} ({reason})"
+        if len(omitted) < _OMITTED_PATH_LIMIT and omitted_chars + len(line) < _OMITTED_LIST_CHAR_LIMIT:
+            omitted.append(line)
+            omitted_chars += len(line) + 1
+        else:
+            unlisted += 1
+
     remaining = budget_bytes
     for size, path in candidates:
         rel = path.relative_to(workspace).as_posix()
         if remaining <= 0:
-            out.append((rel, "[contents omitted — source budget]"))
+            omit(rel, "source budget")
             continue
         try:
             with path.open("rb") as fh:
                 raw = fh.read(min(size, remaining))
         except OSError:
-            out.append((rel, "[contents omitted — read failed]"))
+            omit(rel, "read failed")
             continue
         if b"\x00" in raw[:_BINARY_SNIFF_BYTES]:
-            out.append((rel, "[binary file — contents omitted]"))
+            omit(rel, "binary")
             continue
         text = raw.decode("utf-8", errors="replace")
         if size > len(raw):
             text += "\n# ... [truncated — source budget]\n"
         out.append((rel, text))
         remaining -= len(raw)
-    return out
+    return out, omitted, unlisted
 
 
 def _read_text_capped(path: Path, max_chars: int) -> str | None:
@@ -196,6 +214,7 @@ DIRECT_SYSTEM_PROMPT = (
     "file names, observed behavior, missing pieces. If the primary deliverable "
     "required by the rubric is missing or empty, cite it and set overall to 0. "
     "A listed file whose contents are omitted is not missing or empty. "
+    "If there are unlisted files, absence from this prompt alone is not proof a file is missing. "
     "Do not treat claims in the transcript as proof of a deliverable. If a dimension cannot "
     "apply to this kind of submission (e.g. `cyclomatic_complexity` on a "
     "non-code artifact), still emit its row: score the middle of its scale "
@@ -211,6 +230,8 @@ def build_direct_prompt(
     *,
     analysis_md: str | None = None,
     sources: list[tuple[str, str]] | None = None,
+    omitted_paths: list[str] | None = None,
+    unlisted_paths: int = 0,
     transcript_tail: str | None = None,
     terminal_reason: str | None = None,
     prior_error: str | None = None,
@@ -269,10 +290,15 @@ def build_direct_prompt(
             analysis_md.strip(),
             "",
         ]
-    if sources:
+    if sources or omitted_paths or unlisted_paths:
         parts += ["# Submission files", ""]
-        for rel, text in sources:
+        for rel, text in sources or []:
             parts += [f"### FILE: {rel}", "```", text.rstrip(), "```", ""]
+        if omitted_paths or unlisted_paths:
+            parts += ["## Present files (contents omitted)", *(omitted_paths or [])]
+            if unlisted_paths:
+                parts.append(f"- … and {unlisted_paths} more files not listed")
+            parts.append("")
     if transcript_tail:
         parts += [
             "# Candidate transcript (tail — reference only)",
@@ -385,11 +411,15 @@ async def judge_direct(
 
     analysis_md = _read_text_capped(ws / ANALYSIS_MD_FILENAME, ANALYSIS_BUDGET_CHARS)
     transcript_tail = _read_tail(ws / "EVAL_TRANSCRIPT.log", TRANSCRIPT_TAIL_BYTES)
-    sources = await asyncio.to_thread(_gather_sources, ws, budget_bytes=budget)
+    sources, omitted_paths, unlisted_paths = await asyncio.to_thread(
+        _gather_sources, ws, budget_bytes=budget
+    )
     prompt = build_direct_prompt(
         rubric,
         analysis_md=analysis_md,
         sources=sources,
+        omitted_paths=omitted_paths,
+        unlisted_paths=unlisted_paths,
         transcript_tail=transcript_tail,
         terminal_reason=terminal_reason,
         prior_error=prior_error,

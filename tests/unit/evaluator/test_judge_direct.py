@@ -187,7 +187,7 @@ async def test_binary_path_listed_without_contents_and_generated_tests_skipped(
     client = _FakeClient()
     await _judge(eval_ws, client=client)
     user = client.calls[0]["json"]["messages"][1]["content"]
-    assert "### FILE: blob.bin\n```\n[binary file — contents omitted]" in user
+    assert '- "blob.bin" (binary)' in user
     assert "\x00\x01\x02binary" not in user
     assert "test_x.py" not in user
 
@@ -356,8 +356,22 @@ async def test_source_budget_bounds_prompt(eval_ws: Path, monkeypatch) -> None:
     assert "[truncated" in user
     # every source still represented
     assert "main.py" in user and "big.py" in user
-    assert "### FILE: biggest.py\n```\n[contents omitted — source budget]" in user
+    assert '- "biggest.py" (source budget)' in user
     assert "z" * 100 not in user
+
+
+async def test_many_over_budget_paths_have_a_compact_bounded_listing(eval_ws):
+    for i in range(80):
+        (eval_ws / f"omitted-{i:02}.txt").write_text("a" * 100)
+    client = _FakeClient()
+    await _judge(eval_ws, client=client, source_budget_bytes=20)
+    user = client.calls[0]["json"]["messages"][1]["content"]
+    contents, omitted = user.split("## Present files (contents omitted)")
+    assert contents.count("### FILE:") == 2
+    assert omitted.count("(source budget)") == 50
+    assert '- "omitted-00.txt" (source budget)' in omitted
+    assert "and 30 more files not listed" in omitted
+    assert "omitted-79.txt" not in omitted
 
 
 # ----------------------------------------------------------------------
