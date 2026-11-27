@@ -9,6 +9,7 @@ to ``DirectJudgeError``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from typing import Any
 import httpx
 import pytest
 
+import evaluator.judge_direct as judge_direct_mod
 from evaluator.judge_direct import (
     DirectJudgeError,
     build_direct_prompt,
@@ -339,6 +341,43 @@ async def test_http_error_drains_body_and_reports_bounded_detail(
     assert drained
     assert "end of body" not in str(exc.value)
     assert str(exc.value).endswith("provider was unavailable" + "x" * 476)
+
+
+@pytest.mark.parametrize("slow", [False, True])
+async def test_streamed_4xx_retries_after_bounded_error_drain(eval_ws, monkeypatch, slow):
+    if slow:
+        monkeypatch.setattr(judge_direct_mod, "_ERROR_DRAIN_SECONDS", 0.01)
+    closed = False
+    calls = 0
+
+    class ErrorStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"unsupported response format"
+            if slow:
+                await asyncio.Event().wait()
+            else:
+                yield b"x" * (64 * 1024)
+            pytest.fail("read beyond the error drain limit")
+
+        async def aclose(self):
+            nonlocal closed
+            closed = True
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert "response_format" in json.loads(request.content)
+            return httpx.Response(400, stream=ErrorStream())
+        assert closed
+        assert "response_format" not in json.loads(request.content)
+        frame = {"choices": [{"delta": {"content": json.dumps(SCORES_OBJ)}}]}
+        return httpx.Response(200, text=f"data: {json.dumps(frame)}\n\ndata: [DONE]\n\n")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await asyncio.wait_for(_judge(eval_ws, client=client, stream=True), 1)
+    assert result.overall == 7
+    assert calls == 2
 
 
 async def test_empty_choices_raises(eval_ws: Path) -> None:

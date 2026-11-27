@@ -335,16 +335,26 @@ def _message_content(resp_json: dict[str, Any]) -> str:
     return content
 
 
+_ERROR_DRAIN_BYTES = 64 * 1024
+_ERROR_DRAIN_SECONDS = 2
+_ERROR_PREVIEW_BYTES = 500
+
+
 async def _raise_for_status(response: httpx.Response) -> None:
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         detail = bytearray()
+        drained = 0
         try:
-            async for chunk in exc.response.aiter_bytes():
-                if len(detail) < 500:
-                    detail.extend(chunk[: 500 - len(detail)])
-        except httpx.RequestError:
+            async with asyncio.timeout(_ERROR_DRAIN_SECONDS):
+                async for chunk in exc.response.aiter_bytes():
+                    if len(detail) < _ERROR_PREVIEW_BYTES:
+                        detail.extend(chunk[: _ERROR_PREVIEW_BYTES - len(detail)])
+                    drained += len(chunk)
+                    if drained >= _ERROR_DRAIN_BYTES:
+                        break
+        except (httpx.RequestError, TimeoutError):
             pass
         preview = detail.decode("utf-8", errors="replace").strip()
         if preview:
