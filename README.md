@@ -74,8 +74,15 @@ native Linux so the Ollama CLI can reach the server, then download the model:
 ollama pull qwen2.5-coder:3b
 ```
 
-From the repository root, start Postgres, apply migrations, build the images
-used by the default run, and start the API and gateway:
+From the repository root, use the default Compose project name
+`harness_eval_gateway`. The sandbox runtime uses it to find
+`harness_eval_gateway-gateway-1`; if your checkout directory has a different
+name, use `docker compose -p harness_eval_gateway` for each command below.
+For a different project name, set `GATEWAY_CONTAINER` to the actual gateway
+container name in the API service's environment via a Compose override.
+
+Start Postgres, apply migrations, build the images used by the default run,
+and start the API and gateway:
 
 ```bash
 docker compose up -d --wait postgres
