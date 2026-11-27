@@ -2097,10 +2097,12 @@ rigged before it starts.
 
 ### F28 — Run export + share links (PR35) ✅
 
-- **`GET /api/runs/{id}/export?fmt=json|csv`** (`api/routers/results.py`)
+- **`GET /api/runs/{id}/export?format=json|csv`** (`api/routers/results.py`)
   — the full run bundle as a download (`Content-Disposition: attachment`,
-  `heg-run-<uuid>.{json,csv}`):
-  - `fmt=json` → `RunExport` (`format: "heg-run-export"`,
+  `heg-run-<uuid>.{json,csv}`). The legacy `fmt` query still works.
+  Malformed run IDs return a clean 404 on run detail, export, and share
+  mint/revoke.
+  - `format=json` → `RunExport` (`format: "heg-run-export"`,
     `format_version: 1`): `spec` (`RunSpecOut` — task, models, trials,
     verbatim config, preset/suite provenance, lifecycle stamps), `rubrics`
     (EVERY version incl. content — score provenance needs it), `results`
@@ -2112,7 +2114,7 @@ rigged before it starts.
     the small `usage` token dict verbatim; message bodies/tool args/diffs
     dropped — a summary index, not a transcript. Bounded at 50k rows with
     `events_total`/`events_truncated` reporting the true stream length.
-  - `fmt=csv` → the flattened sheet: **one row per sandbox × score
+  - `format=csv` → the flattened sheet: **one row per sandbox × score
     dimension** (`dimension`/`score`/`rationale`), the judge `overall`
     emitted as a last dimension row per sandbox, and one empty-dimension
     row per unscored sandbox so the sheet covers the whole matrix.
@@ -2156,7 +2158,7 @@ rigged before it starts.
   `web/components/ExportButtons.tsx`, `web/app/share/[token]/`,
   `web/app/runs/[id]/{results,analysis}/`.
 - **Verify:**
-  - Unit: `tests/unit/api/test_export.py` (14 tests — JSON round-trip
+  - Unit: `tests/unit/api/test_export.py` (JSON round-trip
     through `RunExport.model_validate`, events-lite projection, CSV
     shape/BOM/empty-run header + legacy `harness` config key, 404/422,
     share mint/idempotent/revoke/unknown-token 404 + fs-ref scrub,

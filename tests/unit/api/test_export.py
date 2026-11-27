@@ -210,6 +210,21 @@ def test_export_bad_fmt(client, scored_run) -> None:
     assert resp.status_code == 422
 
 
+def test_export_bad_format(client, scored_run) -> None:
+    resp = client.get(f"/api/runs/{scored_run['run_id']}/export?format=yaml")
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("method", "suffix"),
+    [("GET", ""), ("GET", "/export"), ("POST", "/share"), ("DELETE", "/share")],
+)
+def test_malformed_run_id_returns_clean_404(client, method, suffix) -> None:
+    resp = client.request(method, f"/api/runs/not-a-uuid{suffix}")
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "run not found"}
+
+
 # ---------------------------------------------------------------------------
 # GET /api/runs/{run_id}/export?fmt=csv
 # ---------------------------------------------------------------------------
@@ -221,12 +236,13 @@ def _csv_rows(body: str) -> list[dict[str, str]]:
     return list(csv.DictReader(io.StringIO(text)))
 
 
-def test_export_csv(client, scored_run) -> None:
+@pytest.mark.parametrize("query", ["fmt=csv", "format=csv", "format=csv&fmt=json"])
+def test_export_csv(client, scored_run, query) -> None:
     """One row per sandbox×dimension — scored sandbox contributes its dims
     + an ``overall`` row; the unscored sandbox still contributes one row so
     the sheet covers the full matrix."""
     run_id = scored_run["run_id"]
-    resp = client.get(f"/api/runs/{run_id}/export?fmt=csv")
+    resp = client.get(f"/api/runs/{run_id}/export?{query}")
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/csv")
     assert "attachment" in resp.headers["content-disposition"]

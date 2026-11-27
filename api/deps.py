@@ -1,9 +1,12 @@
-"""Shared FastAPI dependencies — currently just the DB session."""
+"""Shared FastAPI dependencies."""
 
 from __future__ import annotations
 
 from collections.abc import Iterator
+from typing import Annotated
+from uuid import UUID
 
+from fastapi import Depends, HTTPException, status
 from sqlalchemy.orm import Session, sessionmaker
 
 from api.config import get_settings
@@ -11,6 +14,18 @@ from db.session import make_engine
 
 _engine = None
 _session_factory: sessionmaker[Session] | None = None
+
+
+def parse_run_id(run_id: str) -> UUID:
+    try:
+        return UUID(run_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="run not found"
+        ) from None
+
+
+RunPathId = Annotated[UUID, Depends(parse_run_id)]
 
 
 def get_session_factory() -> sessionmaker[Session]:
