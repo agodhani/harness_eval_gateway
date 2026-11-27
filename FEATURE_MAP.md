@@ -256,8 +256,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `images/done`, `images/testapp/`), `data/artifacts/`, `data/sandboxes/`
 - **Verify:**
   - Workspace ownership from Compose: `tests/unit/sandbox/test_runtime.py`
-  - Integration: `tests/integration/test_sandbox.py` (`@pytest.mark.docker`,
-    6 pass 1 skip) — incl. egress-lockdown proof
+  - Integration: `tests/integration/test_sandbox.py` (`@pytest.mark.docker`)
+    — egress lockdown and non-root edits to a Compose-mounted seed
   - M2 e2e proven: real miniloop sandbox completed task + artifact
 - **Depends on:** F0; integrates with F3, F5
 
