@@ -419,8 +419,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   evaluator-reserved files do not. A workspace without non-empty submission
   files or a prompt cell without a non-blank reply is not sent to either judge.
   On seeded workspace runs, only new or changed files count as deliverables.
-  Results report
-  `empty_submission` without creating score rows or retrying the panel.
+  `empty_workspace` is the monitor's snapshot flag and clean-exit warning
+  (seed-aware when the run's prepared seed is available).
+  `empty_submission` is the evaluator's preflight rejection, including
+  missing or blank prompt-cell output; it creates no judge scores and
+  does not retry the panel.
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
   `prompts.py`, `judge_direct.py` — direct-completion fallback,
   `submission.py` — shared `submission_files` discovery and seed comparison,

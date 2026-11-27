@@ -389,6 +389,26 @@ async def test_dependencies_do_not_crowd_out_submission_sources(eval_ws: Path) -
     assert "(source budget)" in user
 
 
+async def test_primary_source_survives_400_small_node_modules_files(tmp_path: Path) -> None:
+    primary = "export const primaryDeliverable = true;\n" * 40
+    (tmp_path / "main.js").write_text(primary)
+    modules = tmp_path / "node_modules" / "package"
+    modules.mkdir(parents=True)
+    for index in range(400):
+        (modules / f"dep-{index:03}.js").write_text("// dependency\n" * 6)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        evidence = json.loads(request.content)["messages"][1]["content"]
+        assert f"### FILE: main.js\n```\n{primary.rstrip()}\n```" in evidence
+        assert evidence.index("### FILE: main.js") < evidence.index("### FILE: node_modules/")
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": json.dumps(SCORES_OBJ)}}]}
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert (await _judge(tmp_path, client=client)).overall == 7
+
+
 # ----------------------------------------------------------------------
 # build_direct_prompt — pure builder unit tests
 # ----------------------------------------------------------------------
