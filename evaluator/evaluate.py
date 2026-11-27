@@ -568,6 +568,7 @@ async def _direct_judge_fallback(
                 terminal_reason=terminal_reason,
                 prior_error=prior_error,
                 client=client,
+                rubric_only=True,
             ),
             timeout=time_budget_seconds,
         )
@@ -985,6 +986,7 @@ async def evaluate_sandbox(
             load_scores_file,
             scores_path,
             dimension_scales=rubric_dimension_scales(rubric),
+            rubric_only=True,
         )
     except ScoresFileError as exc:
         reason = "scores_missing" if not scores_path.exists() else "scores_invalid"

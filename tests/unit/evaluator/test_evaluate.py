@@ -698,6 +698,37 @@ async def test_judge_fifo_scores_is_rejected(seeded, session_factory) -> None:
     assert err[0].payload["reason"] == "scores_invalid"
 
 
+@pytest.mark.parametrize("direct", [False, True])
+async def test_evaluate_persists_only_rubric_dimensions(
+    seeded, session_factory, direct
+) -> None:
+    scores = {
+        "scores": [
+            {"dimension": "Functional", "score": 8},
+            {"dimension": "Code Quality", "score": 6},
+            {"dimension": "exec", "score": 0},
+        ],
+    }
+    fake = FakeRuntime(scores_obj=None if direct else scores)
+    client = _FakeClient(text=json.dumps(scores)) if direct else None
+    await _eval(seeded, session_factory, fake, direct_client=client)
+
+    assert {row.dimension: row.score for row in _scores_in_db(session_factory)} == {
+        "functional_requirements": 8,
+        "code_quality": 6,
+        "overall": 7,
+    }
+    scored = next(
+        e for e in _events_in_db(session_factory)
+        if e.payload.get("phase") == "eval_scored"
+    )
+    assert scored.payload["mode"] == ("direct_fallback" if direct else "agentic")
+    assert (
+        "scores[2] ('exec') is not a rubric dimension — dropped"
+        in scored.payload["warnings"]
+    )
+
+
 # ---------------------------------------------------------------------------
 # direct-judge fallback (evaluator/judge_direct.py wiring)
 # ---------------------------------------------------------------------------

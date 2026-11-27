@@ -392,6 +392,7 @@ async def judge_direct(
     source_budget_bytes: int | None = None,
     max_tokens: int | None = None,
     timeout_seconds: float | None = None,
+    rubric_only: bool = False,
 ) -> ParsedScores:
     """Direct judge completion → parsed scores. Raises ``DirectJudgeError``.
 
@@ -446,7 +447,9 @@ async def judge_direct(
 
     try:
         return parse_scores_json(
-            raw, dimension_scales=rubric_dimension_scales(rubric)
+            raw,
+            dimension_scales=rubric_dimension_scales(rubric),
+            rubric_only=rubric_only,
         )
     except ScoresFileError as exc:
         raise DirectJudgeError(f"direct judge output unusable: {exc}") from exc

@@ -334,7 +334,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   per-sandbox cred); writes score + rationale per rubric dimension
   (functional requirements, acceptance criteria, code quality, cyclomatic
   complexity); `scores.json` parsed into `Score` rows with salvage-mode
-  parsing (incl. flat `{dimension: score}` normalization); `EVAL_TRANSCRIPT.log`
+  parsing (incl. flat `{dimension: score}` normalization); both judge paths
+  drop dimension rows outside the frozen rubric. `EVAL_TRANSCRIPT.log` is
   written for evidence. Bounded retry: a judge run that produces zero Score
   rows is re-spawned up to `EVAL_SCORE_RETRIES` times (default 1) with a fresh
   cred, emitting an `eval_retry` checkpoint — covers small-model flake modes

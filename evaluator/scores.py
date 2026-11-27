@@ -314,6 +314,7 @@ def parse_scores_json(
     text: str,
     *,
     dimension_scales: dict[str, tuple[float, float, float]] | None = None,
+    rubric_only: bool = False,
 ) -> ParsedScores:
     """Parse scores.json content into :class:`ParsedScores`.
 
@@ -323,7 +324,8 @@ def parse_scores_json(
     warning) — a null headline score is never emitted for a usable
     document. ``dimension_scales`` (see :func:`rubric_dimension_scales`)
     gives each dimension's declared scale so the synthesized ``overall``
-    stays a 0-10 score on custom-scale rubrics.
+    stays a 0-10 score on custom-scale rubrics. With ``rubric_only``,
+    drop entries not defined by the rubric when usable dimensions exist.
     """
     obj = _loads_lenient(text)
     if obj is None:
@@ -361,6 +363,11 @@ def parse_scores_json(
                 f"scores[{i}] ({dim!r}) names a reserved score field — dropped"
             )
             continue
+        if rubric_only and dimension_scales and folded not in dimension_scales:
+            parsed.warnings.append(
+                f"scores[{i}] ({dim!r}) is not a rubric dimension — dropped"
+            )
+            continue
         score = _as_float(item.get("score"))
         if score is None:
             parsed.warnings.append(
@@ -388,6 +395,11 @@ def parse_scores_json(
         )
 
     if not parsed.entries:
+        if rubric_only and dimension_scales and parsed.warnings:
+            raise ScoresFileError(
+                "scores.json contains no valid rubric score entries: "
+                + parsed.warnings[0]
+            )
         raise ScoresFileError("scores.json contains no valid score entries")
 
     overall = _as_float(obj.get("overall"))
@@ -417,6 +429,7 @@ def load_scores_file(
     path: Path,
     *,
     dimension_scales: dict[str, tuple[float, float, float]] | None = None,
+    rubric_only: bool = False,
 ) -> ParsedScores:
     """Read + parse ``path``; raises :class:`ScoresFileError` on any failure.
 
@@ -435,5 +448,7 @@ def load_scores_file(
     if len(raw) > SCORES_FILE_MAX_BYTES:
         raise ScoresFileError(f"{path} exceeds {SCORES_FILE_MAX_BYTES} bytes")
     return parse_scores_json(
-        raw.decode("utf-8", errors="replace"), dimension_scales=dimension_scales
+        raw.decode("utf-8", errors="replace"),
+        dimension_scales=dimension_scales,
+        rubric_only=rubric_only,
     )
