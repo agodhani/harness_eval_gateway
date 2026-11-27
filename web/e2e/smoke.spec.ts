@@ -16,4 +16,17 @@ test.describe("smoke", () => {
     await expect(heading).toContainText("harness_eval_gateway");
     await expect(heading).toContainText("harness");
   });
+
+  test("landing quickstart builds the sandbox images and uses the Compose API", async ({ page }) => {
+    await page.goto("/");
+
+    const quickstart = page.locator("#start");
+    await expect(quickstart).toContainText("docker compose run --rm --build api alembic upgrade head");
+    await expect(quickstart).toContainText("-t heg-sandbox:latest");
+    await expect(quickstart).toContainText("-t heg-exec:latest");
+    await expect(quickstart).not.toContainText("uvicorn");
+    await expect(quickstart.getByRole("link", { name: /native Linux Ollama/ })).toHaveAttribute(
+      "href", "https://github.com/agodhani/harness_eval_gateway#quickstart",
+    );
+  });
 });
