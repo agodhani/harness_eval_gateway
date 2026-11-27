@@ -1015,6 +1015,24 @@ async def test_evaluate_workspace_with_only_empty_files_and_scaffolding_is_not_s
     assert not _scores_in_db(session_factory)
 
 
+@pytest.mark.parametrize("path", [".gitignore", ".github/workflows/ci.yml"])
+async def test_evaluate_workspace_with_only_hidden_deliverable(
+    seeded, session_factory, path
+) -> None:
+    workspace = seeded["workspace"]
+    (workspace / "main.py").unlink()
+    (workspace / "hello.txt").unlink()
+    deliverable = workspace / path
+    deliverable.parent.mkdir(parents=True, exist_ok=True)
+    deliverable.write_text("submission\n")
+
+    fake = FakeRuntime()
+    rows = await _eval(seeded, session_factory, fake)
+
+    assert len(rows) == 3
+    assert (Path(fake.specs[0].workspace_host_path) / path).read_text() == "submission\n"
+
+
 async def test_evaluate_prompt_output_analysis_persists(
     seeded_prompt, session_factory
 ) -> None:

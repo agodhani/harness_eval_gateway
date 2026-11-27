@@ -393,9 +393,9 @@ def _workspace_has_submission(workspace: Path) -> bool:
     for root, dirs, files in os.walk(workspace):
         path = Path(root)
         reserved = _EVALUATOR_FILES if path == workspace else ()
-        dirs[:] = [name for name in dirs if not name.startswith(".") and name not in reserved]
+        dirs[:] = [name for name in dirs if name != ".git" and name not in reserved]
         for name in files:
-            if name.startswith(".") or name in reserved:
+            if name == ".git" or name in reserved:
                 continue
             try:
                 info = (path / name).lstat()
