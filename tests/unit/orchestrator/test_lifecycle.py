@@ -937,6 +937,7 @@ async def test_lifecycle_judge_panel_scores_every_artifact(
     run = make_run(session_factory, status="provisioning", config=cfg)
     _approved_rubric(session_factory, run.id)
     settings.EVAL_SCORE_RETRIES = 0
+    settings.PROVIDER_ROUTES = '{"judge-b": "openrouter"}'
 
     fake = FakeRuntime(artifact_root=artifact_root, default_logs=RESULT_DONE)
     calls: list = []
@@ -967,6 +968,7 @@ async def test_lifecycle_judge_panel_scores_every_artifact(
 
     # 1 sandbox × 2 judges — panel order preserved, one fresh mint each
     assert [c["model"] for c in calls] == ["judge-a", "judge-b"]
+    assert [c["local_judge"] for c in calls] == [True, False]
     assert len(mints) == 2
     with session_factory() as s:
         assert s.get(type(run), run.id).status == "done"

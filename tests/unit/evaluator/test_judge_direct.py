@@ -281,6 +281,40 @@ async def test_transport_failure_raises(eval_ws: Path) -> None:
         await _judge(eval_ws, client=client)
 
 
+@pytest.mark.parametrize("complete", [True, False])
+async def test_local_direct_judge_retries_connect_and_reassembles_stream(
+    eval_ws: Path, complete: bool
+) -> None:
+    payload = json.dumps(SCORES_OBJ)
+    frames = [
+        {"choices": [{"delta": {"content": payload[:31]}}]},
+        {"choices": [{"delta": {"content": payload[31:]}}]},
+        {"choices": [], "usage": {"completion_tokens": 100}},
+    ]
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        body = json.loads(request.content)
+        assert body["stream"] is True
+        if calls == 1:
+            raise httpx.ConnectError("refused", request=request)
+        text = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+        if complete:
+            text += "data: [DONE]\n\n"
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=text)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        if complete:
+            parsed = await _judge(eval_ws, client=client, stream=True)
+            assert parsed.overall == 7.0
+        else:
+            with pytest.raises(DirectJudgeError, match=r"before \[DONE\]"):
+                await _judge(eval_ws, client=client, stream=True)
+    assert calls == 2
+
+
 async def test_empty_choices_raises(eval_ws: Path) -> None:
     class EmptyClient(_FakeClient):
         async def post(self, url, json=None, headers=None):

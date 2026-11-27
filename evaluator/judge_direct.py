@@ -40,6 +40,7 @@ Env knobs (all optional):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -334,6 +335,42 @@ def _message_content(resp_json: dict[str, Any]) -> str:
     return content
 
 
+async def _chat_content(
+    client: httpx.AsyncClient, url: str, body: dict[str, Any], headers: dict[str, str]
+) -> str:
+    if not body["stream"]:
+        response = await client.post(url, json=body, headers=headers)
+        response.raise_for_status()
+        return _message_content(response.json())
+
+    async with client.stream("POST", url, json=body, headers=headers) as response:
+        response.raise_for_status()
+        parts: list[str] = []
+        done = False
+        async for line in response.aiter_lines():
+            if done or not line.startswith("data:"):
+                continue
+            data = line.removeprefix("data:").strip()
+            if data == "[DONE]":
+                done = True
+                continue
+            frame = json.loads(data)
+            if not isinstance(frame, dict) or frame.get("error"):
+                raise DirectJudgeError("upstream judge stream returned an invalid frame")
+            for choice in frame.get("choices") or []:
+                if choice.get("index", 0) != 0:
+                    continue
+                content = (choice.get("delta") or {}).get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+        if not done:
+            raise DirectJudgeError("upstream judge stream ended before [DONE]")
+        content = "".join(parts)
+        if not content.strip():
+            raise DirectJudgeError("chat response message content is empty")
+        return content
+
+
 async def _request_scores(
     client: httpx.AsyncClient,
     *,
@@ -342,12 +379,14 @@ async def _request_scores(
     model: str,
     user_prompt: str,
     max_tokens: int,
+    stream: bool,
 ) -> str:
-    """One chat-completions call → raw assistant content.
+    """Get raw assistant content, streaming on the local Ollama path.
 
     ``response_format=json_object`` rides the body verbatim to the upstream
     (Ollama's OpenAI endpoint honors it); a 4xx rejection — a provider that
-    doesn't know the field — retries ONCE without it.
+    doesn't know the field — retries ONCE without it. A local connection
+    failure retries once before any request has reached the gateway.
     """
     url = f"{gateway_base_url.rstrip('/')}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {cred}"}
@@ -355,23 +394,26 @@ async def _request_scores(
         "model": model,
         "temperature": 0.0,
         "max_tokens": max_tokens,
-        "stream": False,
+        "stream": stream,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": DIRECT_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
     }
-    try:
-        resp = await client.post(url, json=body, headers=headers)
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        if not 400 <= exc.response.status_code < 500:
-            raise
-        body.pop("response_format", None)
-        resp = await client.post(url, json=body, headers=headers)
-        resp.raise_for_status()
-    return _message_content(resp.json())
+    retried_connect = False
+    while True:
+        try:
+            return await _chat_content(client, url, body, headers)
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            if not stream or retried_connect:
+                raise
+            retried_connect = True
+            await asyncio.sleep(1)
+        except httpx.HTTPStatusError as exc:
+            if "response_format" not in body or not 400 <= exc.response.status_code < 500:
+                raise
+            body.pop("response_format")
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +434,7 @@ async def judge_direct(
     source_budget_bytes: int | None = None,
     max_tokens: int | None = None,
     timeout_seconds: float | None = None,
+    stream: bool = False,
 ) -> ParsedScores:
     """Direct judge completion → parsed scores. Raises ``DirectJudgeError``.
 
@@ -433,6 +476,7 @@ async def judge_direct(
             model=model,
             user_prompt=prompt,
             max_tokens=tok_cap,
+            stream=stream,
         )
     except DirectJudgeError:
         raise

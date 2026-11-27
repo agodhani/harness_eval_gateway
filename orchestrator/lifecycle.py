@@ -628,6 +628,7 @@ async def _evaluate_all(
         # others' scores, so baselines and failure markers are per judge.
         for judge in judges:
             kwargs["model"] = judge
+            kwargs["local_judge"] = pacing.provider_for_model(settings, judge) in pacing.LOCAL_PROVIDERS
             # Baseline BEFORE the first attempt: a re-score can target an
             # already-judged sandbox, so "any Score rows" ≠ "this pass
             # scored". Retry progress is measured by the DELTA — otherwise
