@@ -930,7 +930,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     lookups). `GET /api/runs/{id}/results?rubric_version=N` filters the
     matrix to one version's scores; the default view is per-sandbox
     newest-wins (asc created_at, seq, rubric_version, id → last row
-    wins). The matrix hides judge dimensions outside their source rubric
+    wins). The matrix folds historical aliases into the declared rubric
+    names and hides judge dimensions outside their source rubric
     without discarding valid scores from earlier versions on partial
     rescoring. Human overrides remain visible across versions. `GET
     /api/runs/{id}/rubrics`

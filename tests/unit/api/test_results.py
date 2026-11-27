@@ -2020,6 +2020,38 @@ def test_results_hide_persisted_off_rubric_judge_rows(
     }
 
 
+def test_results_merge_historical_rubric_aliases(
+    client: TestClient, session_factory, artifact_root, monkeypatch,
+    _clean_pair_sessions,
+) -> None:
+    fx = _panel_run(session_factory, artifact_root)
+    sid = fx["sb_a"]
+    _judge_score(session_factory, sid, fx["rubric_id"], "Code Quality", 8.0, "judge-a")
+    _judge_score(session_factory, sid, fx["rubric_id"], "code_quality", 4.0, "judge-b")
+    _judge_score(session_factory, fx["sb_b"], fx["rubric_id"], "Quality", 2.0, "judge-a")
+    _pin_pair_order(monkeypatch)
+    run_path = f"/api/runs/{fx['run_id']}"
+    pair = client.post(
+        run_path + "/pair", json={"sandbox_ids": [str(sid), str(fx["sb_b"])]},
+    ).json()
+    for dim, winner in (("Code Quality", "b"), ("code_quality", "a")):
+        response = client.post(
+            run_path + f"/pair/{pair['pair_id']}/vote",
+            json={"dimension": dim, "winner": winner},
+        )
+        assert response.status_code == 201
+    path = f"/api/runs/{fx['run_id']}/results"
+    body = client.get(path, params={"rubric_version": 1}).json()
+    dims = _sandbox_result(body, sid)["dimensions"]
+    assert set(dims) == {"code_quality"}
+    assert dims["code_quality"]["score"] == 6.0
+    assert dims["code_quality"]["judge_count"] == 2
+    assert (body["votes"]["total"], body["votes"]["agreed"]) == (1, 1)
+
+    raw = client.get(f"/api/sandboxes/{sid}/scores").json()
+    assert {row["dimension"] for row in raw} == {"Code Quality", "code_quality"}
+
+
 def test_results_panel_newest_per_judge_wins(
     client: TestClient, session_factory, artifact_root
 ) -> None:
