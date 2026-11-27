@@ -542,6 +542,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - UI: results page → "Analytics" card → switch price model → cost updates;
     timeline page → strip shows per-sandbox stats live → click a chip →
     stream filters to that sandbox (merged) / chip assigns a split lane
+  - Playwright: `web/e2e/results-analytics.spec.ts` verifies the price picker
+    stays inside the card and updates both trial costs at 390px, the Analytics
+    matrix scrolls to the last trial column, and the trial rollup remains usable.
 - **Depends on:** F6 (events), F8 (results page)
 
 ### F10 — Multi-harness adapters ✅

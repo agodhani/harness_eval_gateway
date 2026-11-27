@@ -315,7 +315,7 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
   return (
     <Card
       title="Analytics"
-      className="card--flush"
+      className="card--flush results-analytics"
       actions={
         <div className="row" style={{ gap: "0.6rem", flexWrap: "wrap" }}>
           {multiModel ? (
@@ -366,7 +366,7 @@ export default function AnalyticsSection({ runId }: { runId: string }) {
               </button>
             </div>
           ) : null}
-          <label className="row" style={{ gap: "0.4rem", fontSize: "0.8rem" }}>
+          <label className="row results-analytics__pricing" style={{ gap: "0.4rem", fontSize: "0.8rem" }}>
             <span className="faint">Estimated cost at:</span>
             <select
               className="select"

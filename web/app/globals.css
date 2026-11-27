@@ -1639,6 +1639,19 @@ table.table {
 .matrix-wrap {
   overflow-x: auto;
 }
+.results-analytics .card__header {
+  flex-wrap: wrap;
+}
+.results-analytics .card__actions,
+.results-analytics .card__actions > .row,
+.results-analytics__pricing {
+  min-width: 0;
+  max-width: 100%;
+}
+.results-analytics__pricing .select {
+  min-width: 0;
+  max-width: 100%;
+}
 table.matrix {
   border-collapse: collapse;
   font-size: 0.85rem;
