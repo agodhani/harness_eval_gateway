@@ -4,13 +4,22 @@ import { ArrowUpRight, GithubMark } from "./icons";
 
 const CMDS: [string, string][] = [
   ["git clone https://github.com/agodhani/harness_eval_gateway && cd harness_eval_gateway", ""],
-  ["docker compose up -d", "# postgres :5433 · api :8001"],
-  ["uv sync && uv run alembic upgrade head", "# schema"],
-  ["uv run uvicorn api.main:app --reload --port 8001", "# control plane"],
-  ["cd web && npm install && npm run dev", "# ui → localhost:3000"],
+  [
+    "bridge_ip=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')",
+    "# native Linux only: run both bridge commands in the server and CLI terminals",
+  ],
+  ['export OLLAMA_HOST="${bridge_ip}:11434"', "# native Linux only: required before starting Ollama"],
+  ["ollama serve", "# leave running in a separate terminal"],
+  ["ollama pull qwen2.5-coder:3b", "# in the CLI terminal"],
+  ["docker compose up -d --wait postgres", "# postgres :5433"],
+  ["docker compose run --rm --build api alembic upgrade head", "# schema"],
+  ["docker build -f sandbox/images/miniloop.Dockerfile -t heg-sandbox:latest .", ""],
+  ["docker build -f sandbox/images/exec.Dockerfile -t heg-exec:latest .", ""],
+  ["docker compose up -d --wait", "# api :8001 · gateway :8081"],
+  ["cd web && npm ci && npm run dev", "# ui → localhost:3000"],
 ];
 
-const PREREQS = ["uv", "docker", "node 20+", "ollama · qwen2.5-coder:3b"];
+const PREREQS = ["docker + compose", "node 22.18+", "ollama · qwen2.5-coder:3b"];
 
 export default function Quickstart() {
   return (
@@ -64,6 +73,17 @@ export default function Quickstart() {
                 <span key={p}>{p}</span>
               ))}
             </div>
+            <p>
+              If Ollama is already managed as a service on native Linux, set the same
+              OLLAMA_HOST on the service and restart it before pulling the model.
+            </p>
+            <a
+              href="https://github.com/agodhani/harness_eval_gateway#quickstart"
+              className="lp-repolink"
+            >
+              Full setup, including native Linux Ollama
+              <ArrowUpRight className="icon-sm" />
+            </a>
           </Reveal>
           <Reveal delay={140} className="lp-side-note">
             <span className="kicker">verify</span>
@@ -77,8 +97,8 @@ export default function Quickstart() {
                 <span className="lp-t-signal">{`{"ok":true}`}</span>
               </div>
               <div>
-                <span className="lp-t-faint">uv run pytest</span>
-                <span className="lp-t-signal">green</span>
+                <span className="lp-t-faint">GET :8001/api/models</span>
+                <span className="lp-t-signal">qwen2.5-coder:3b</span>
               </div>
             </div>
             <a

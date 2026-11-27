@@ -52,25 +52,67 @@ tests/         pytest
 
 ## Quickstart
 
-Prereqs: `uv`, `docker` (compose), Node 20+, host **Ollama**
-(`brew install ollama && ollama serve`, then `ollama pull qwen2.5-coder:3b`).
+Prereqs: Docker with Compose, Node 22.18+ (also used by the web tests),
+and [Ollama](https://ollama.com/download) on the host. The API and gateway
+connect to `host.docker.internal:11434`. With Docker Desktop, start Ollama
+normally. On native Linux Docker Engine, start Ollama on the Docker bridge
+address instead of loopback; Compose already maps `host.docker.internal`
+to the host gateway:
 
 ```bash
-# 1. Infra: Postgres (+ api container, optional)
-docker compose up -d            # postgres on :5433, api on :8001
-
-# 2. Backend (local dev, hot reload)
-uv sync
-uv run alembic upgrade head     # create schema
-uv run uvicorn api.main:app --reload --port 8001   # http://localhost:8001/health
-
-# 3. Frontend
-cd web && npm install && npm run dev   # http://localhost:3000
+bridge_ip=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+export OLLAMA_HOST="${bridge_ip}:11434"
+ollama serve
 ```
 
-Checks: `curl localhost:8001/health` → `{"status":"ok"}`,
-`curl localhost:8001/health/db` → `{"ok":true}`,
-`uv run pytest` → smoke tests green.
+If Ollama is already running as a service, set that service's `OLLAMA_HOST`
+and restart it instead. Binding to the bridge address avoids listening on
+all host interfaces. In a second terminal, set the same `OLLAMA_HOST` on
+native Linux so the Ollama CLI can reach the server, then download the model:
+
+```bash
+ollama pull qwen2.5-coder:3b
+```
+
+From the repository root, use the default Compose project name
+`harness_eval_gateway`. The sandbox runtime uses it to find
+`harness_eval_gateway-gateway-1`; if your checkout directory has a different
+name, use `docker compose -p harness_eval_gateway` for each command below.
+For a different project name, set `GATEWAY_CONTAINER` to the actual gateway
+container name in the API service's environment via a Compose override.
+
+Start Postgres, apply migrations, build the images used by the default run,
+and start the API and gateway:
+
+```bash
+docker compose up -d --wait postgres
+docker compose run --rm --build api alembic upgrade head
+docker build -f sandbox/images/miniloop.Dockerfile -t heg-sandbox:latest .
+docker build -f sandbox/images/exec.Dockerfile -t heg-exec:latest .
+docker compose up -d --wait       # API :8001, gateway :8081, Postgres :5433
+```
+
+For other sandboxed adapters, build the image using the command at the top of
+its Dockerfile in [`sandbox/images/`](sandbox/images).
+
+```bash
+curl -fsS http://localhost:8001/health       # {"status":"ok"}
+curl -fsS http://localhost:8001/health/db    # {"ok":true}
+curl -fsS --retry 10 --retry-all-errors --retry-delay 1 http://localhost:8001/api/models
+cd web && npm ci && npm run dev              # http://localhost:3000
+```
+
+The model catalog should include `qwen2.5-coder:3b`; the retry gives the
+gateway time to start on the first boot.
+
+Use the Compose API for end-to-end runs. For API-only development with hot
+reload, run `docker compose stop api` to free port 8001. Keep the Compose
+gateway running on port 8081 so endpoints such as `/api/models` still work.
+With [`uv`](https://docs.astral.sh/uv/)
+installed, run `uv sync` and `uv run uvicorn api.main:app --reload --port 8001`
+from the repo root. If Ollama is bound to the Docker bridge, set
+`OLLAMA_BASE_URL="http://$OLLAMA_HOST"` in the API environment as well.
+Run backend tests with `uv run pytest`.
 
 ## Database migrations
 

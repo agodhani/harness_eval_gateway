@@ -1138,10 +1138,20 @@ or tests change.
   land.
 - **Update `FEATURE_MAP.md`** whenever a feature's code paths, UI surface, or
   tests change — it's part of the definition of done.
-- Dev environment: `docker compose up -d` (api :8001, postgres :5433,
-  gateway :8081); `uv run pytest`; `uv run ruff check .`; web dev
-  `cd web && npm run dev` (use `-p 3002` if :3000 is taken);
-  e2e `cd web && E2E_PORT=3100 npm run test:e2e`.
+- Dev environment: follow [README Quickstart](README.md#quickstart) from
+  the repo root with Compose project `harness_eval_gateway`. On native Linux,
+  set `OLLAMA_HOST` to the Docker bridge address before starting Ollama and
+  use the same address for `ollama pull qwen2.5-coder:3b`. Then run:
+  ```sh
+  docker compose up -d --wait postgres
+  docker compose run --rm --build api alembic upgrade head
+  docker build -f sandbox/images/miniloop.Dockerfile -t heg-sandbox:latest .
+  docker build -f sandbox/images/exec.Dockerfile -t heg-exec:latest .
+  docker compose up -d --wait  # API :8001, Postgres :5433, gateway :8081
+  ```
+  Backend checks: `uv run pytest`, `uv run ruff check .`. Web dev:
+  `cd web && npm ci && npm run dev` (use `-p 3002` if :3000 is taken).
+  E2E: `cd web && E2E_PORT=3100 npm run test:e2e`.
 - `GET /api/runs/{id}/analytics?price_model=` (F9) serves per-sandbox metrics
   + estimated cost; price resolution runs through the layered
   `api/pricing.py::PriceBook` (`model_prices` glob rows over the static
