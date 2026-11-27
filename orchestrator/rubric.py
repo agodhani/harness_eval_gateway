@@ -457,9 +457,9 @@ def _extract_json(text: str) -> str:
         stripped = "\n".join(lines).strip()
     start = stripped.find("{")
     end = stripped.rfind("}")
-    if start == -1 or end == -1 or end <= start:
+    if start == -1:
         raise RubricParseError("no JSON object found in model output")
-    return stripped[start : end + 1]
+    return stripped[start : end + 1] if end > start else stripped[start:]
 
 
 def parse_rubric_json(text: str) -> RubricContent:

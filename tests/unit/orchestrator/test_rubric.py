@@ -534,6 +534,7 @@ async def test_draft_rubric_failure_saves_capped_gateway_body(
             "draft: {malformed}",
             "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)",
         ),
+        ('{"summary":', "Expecting value: line 1 column 12 (char 11)"),
     ],
 )
 async def test_draft_rubric_double_failure_marks_failed(
