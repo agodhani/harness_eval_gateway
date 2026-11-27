@@ -2156,10 +2156,11 @@ rigged before it starts.
   `web/components/ExportButtons.tsx`, `web/app/share/[token]/`,
   `web/app/runs/[id]/{results,analysis}/`.
 - **Verify:**
-  - Unit: `tests/unit/api/test_export.py` (14 tests — JSON round-trip
+  - Unit: `tests/unit/api/test_export.py` (15 tests — JSON round-trip
     through `RunExport.model_validate`, events-lite projection, CSV
     shape/BOM/empty-run header + legacy `harness` config key, 404/422,
     share mint/idempotent/revoke/unknown-token 404 + fs-ref scrub,
+    `test_run_export_and_share_recompute_stale_same_model_flag`,
     events_total bounds); migration tests cover the new head + unique index +
     downgrade.
   - Web: `api.test.ts` `runExportUrl` describe; eslint + `next build`
