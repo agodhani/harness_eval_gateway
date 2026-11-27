@@ -18,11 +18,15 @@ _session_factory: sessionmaker[Session] | None = None
 
 def parse_run_id(run_id: str) -> UUID:
     try:
-        return UUID(run_id)
+        parsed = UUID(run_id)
     except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="run not found"
-        ) from None
+        pass
+    else:
+        if str(parsed) == run_id.lower():
+            return parsed
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND, detail="run not found"
+    )
 
 
 RunPathId = Annotated[UUID, Depends(parse_run_id)]

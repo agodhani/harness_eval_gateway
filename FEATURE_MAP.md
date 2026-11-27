@@ -2100,8 +2100,8 @@ rigged before it starts.
 - **`GET /api/runs/{id}/export?format=json|csv`** (`api/routers/results.py`)
   — the full run bundle as a download (`Content-Disposition: attachment`,
   `heg-run-<uuid>.{json,csv}`). The legacy `fmt` query still works.
-  Malformed run IDs return a clean 404 on run detail, export, and share
-  mint/revoke.
+  Run detail, export, and share mint/revoke accept only canonical
+  hyphenated UUIDs (case-insensitive); other spellings return a clean 404.
   - `format=json` → `RunExport` (`format: "heg-run-export"`,
     `format_version: 1`): `spec` (`RunSpecOut` — task, models, trials,
     verbatim config, preset/suite provenance, lifecycle stamps), `rubrics`

@@ -225,6 +225,31 @@ def test_malformed_run_id_returns_clean_404(client, method, suffix) -> None:
     assert resp.json() == {"detail": "run not found"}
 
 
+@pytest.mark.parametrize(
+    "spelling", ["extra-hyphen", "compact", "braces", "urn"]
+)
+def test_noncanonical_spelling_of_existing_run_returns_404(
+    client, scored_run, spelling
+) -> None:
+    run_id = str(scored_run["run_id"])
+    noncanonical = {
+        "extra-hyphen": f"{run_id[:-5]}-{run_id[-5:]}",
+        "compact": run_id.replace("-", ""),
+        "braces": f"{{{run_id}}}",
+        "urn": f"urn:uuid:{run_id}",
+    }[spelling]
+    resp = client.get(f"/api/runs/{noncanonical}")
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "run not found"}
+
+
+def test_uppercase_canonical_run_id_is_accepted(client, scored_run) -> None:
+    run_id = str(scored_run["run_id"])
+    resp = client.get(f"/api/runs/{run_id.upper()}")
+    assert resp.status_code == 200
+    assert resp.json()["id"] == run_id
+
+
 # ---------------------------------------------------------------------------
 # GET /api/runs/{run_id}/export?fmt=csv
 # ---------------------------------------------------------------------------
