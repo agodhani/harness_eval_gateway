@@ -214,8 +214,7 @@ async def _call_gateway(
 
     ``deadline`` (monotonic) is the cell's wall-clock cap, the same
     ``started_at + wall_clock_seconds`` bound the monitor applies to
-    containers: an attempt still in flight at the deadline is cancelled —
-    the orphaned upstream call mirrors a container being killed — and an
+    containers: an attempt still in flight at the deadline is cancelled, and an
     already-elapsed deadline skips any remaining retry; either way the
     cell ends ``timeout`` rather than the httpx timeout's own verdicts.
     """

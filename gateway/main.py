@@ -80,6 +80,7 @@ from fastapi import APIRouter, Body, Depends, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.requests import ClientDisconnect
 from starlette.types import Send
 
 from api.schemas import EventSource, EventType
@@ -364,7 +365,8 @@ async def _upstream_post(
                 finally:
                     # Deterministic release — a mid-body transport error
                     # skips aiter_raw's own end-of-stream close.
-                    await resp.aclose()
+                    with anyio.CancelScope(shield=True):
+                        await resp.aclose()
         except httpx.HTTPError as exc:
             if isinstance(exc, _RETRYABLE_UPSTREAM_ERRORS) and attempt < max_tries:
                 delay = backoff_base * (2 ** (attempt - 1))
@@ -471,6 +473,12 @@ def _cache_hit_headers(content_type: str) -> dict[str, str]:
     return {"content-type": content_type, "x-heg-cache": "hit"}
 
 
+async def _cancel_on_disconnect(request: Request, scope: anyio.CancelScope) -> None:
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
+    scope.cancel()
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
@@ -562,19 +570,27 @@ async def chat_completions(
     started = time.monotonic()
     # PR30: first-body-byte timing lands in ``timing`` (see _upstream_post).
     timing: dict[str, int] = {}
+    result = None
     try:
-        result = await _upstream_post(
-            upstream=upstream,
-            path="/v1/chat/completions",
-            body=out,
-            claims=claims,
-            provider=provider,
-            request_headers=request.headers,
-            stream=False,
-            started=started,
-            timing=timing,
-        )
-    except asyncio.CancelledError:
+        async with anyio.create_task_group() as group:
+            group.start_soon(_cancel_on_disconnect, request, group.cancel_scope)
+            try:
+                result = await _upstream_post(
+                    upstream=upstream,
+                    path="/v1/chat/completions",
+                    body=out,
+                    claims=claims,
+                    provider=provider,
+                    request_headers=request.headers,
+                    stream=False,
+                    started=started,
+                    timing=timing,
+                )
+            finally:
+                group.cancel_scope.cancel()
+        if result is None:
+            raise ClientDisconnect
+    except (asyncio.CancelledError, ClientDisconnect) as exc:
         await _emit_client_disconnected(
             claims,
             meter=True,
@@ -582,6 +598,8 @@ async def chat_completions(
             latency_ms=int((time.monotonic() - started) * 1000),
             message="client disconnected while awaiting upstream response",
         )
+        if isinstance(exc, ClientDisconnect):
+            return Response(status_code=499)
         raise
     if isinstance(result, JSONResponse):
         return result
