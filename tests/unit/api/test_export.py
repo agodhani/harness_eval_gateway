@@ -184,6 +184,36 @@ def test_export_json_roundtrip(client, scored_run) -> None:
     assert len(bundle.events) == 2
 
 
+def test_run_export_and_share_recompute_stale_same_model_flag(
+    client, scored_run, session_factory
+) -> None:
+    run_id = scored_run["run_id"]
+    path = f"/api/runs/{run_id}"
+    with session_factory() as s:
+        run = s.get(Run, run_id)
+        run.config = {
+            **run.config,
+            "harness_configs": [{"adapter": "miniloop", "model": "other-model"}],
+        }
+        assert run.config["same_model_eval"] is True
+        s.commit()
+
+    detail = client.get(path).json()
+    results = client.get(f"{path}/results").json()
+    bundle = client.get(f"{path}/export").json()
+    token = client.post(f"{path}/share").json()["token"]
+    shared = client.get(f"/api/share/{token}").json()
+
+    for spec in (detail, bundle["spec"], shared["run"]):
+        assert spec["same_model_eval"] is False
+        assert spec["config"]["same_model_eval"] is False
+        assert spec["config"]["harness_configs"][0]["model"] == "other-model"
+    for matrix in (results, bundle["results"], shared["results"]):
+        assert matrix["same_model_eval"] is False
+    with session_factory() as s:
+        assert s.get(Run, run_id).config["same_model_eval"] is True
+
+
 def test_export_json_events_lite_projection(client, scored_run) -> None:
     """Events-lite keeps scalar fields + the usage dict; nested content is
     dropped and long strings capped — never a transcript."""

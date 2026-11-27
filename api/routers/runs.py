@@ -170,14 +170,15 @@ def _run_out(
         s_out = SandboxOut.model_validate(s)
         s_out.budget = budget_map.get(s.id)
         sandbox_outs.append(s_out)
+    overlap = same_model_eval(run.config, run.model_name)
     return RunOut(
         id=run.id,
         status=run.status,
         task_prompt=run.task_prompt,
         model_name=run.model_name,
         trials=run.trials or 1,
-        config=run.config or {},
-        same_model_eval=same_model_eval(run.config, run.model_name),
+        config={**(run.config or {}), "same_model_eval": overlap},
+        same_model_eval=overlap,
         created_at=run.created_at,
         updated_at=run.updated_at,
         started_at=run.started_at,
