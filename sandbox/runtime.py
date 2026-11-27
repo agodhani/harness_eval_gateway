@@ -365,6 +365,9 @@ class SandboxRuntime:
         """Give the image user ownership of a workspace staged by the Compose API."""
         if self.host_data_root is None or os.geteuid() != 0:
             return
+        local = self._docker(["image", "inspect", image], check=False, timeout=30)
+        if local.returncode != 0:
+            self._docker(["pull", image], timeout=180)
         proc = self._docker(
             [
                 "run", "--rm", "--pull", "never", "--network", "none",

@@ -9,7 +9,8 @@ from sandbox.spec import SandboxSpec
 
 
 @pytest.mark.parametrize("uid", [1000, 1001])
-def test_compose_spawn_gives_image_user_the_seeded_workspace(tmp_path, monkeypatch, uid):
+@pytest.mark.parametrize("cached", [True, False])
+def test_compose_spawn_gives_image_user_the_seeded_workspace(tmp_path, monkeypatch, uid, cached):
     runtime = SandboxRuntime(
         artifact_root=tmp_path / "artifacts",
         host_data_root=tmp_path,
@@ -31,6 +32,10 @@ def test_compose_spawn_gives_image_user_the_seeded_workspace(tmp_path, monkeypat
 
     def docker(args, **_kwargs):
         commands.append(args)
+        if args[:2] == ["image", "inspect"]:
+            return CompletedProcess(args, 0 if cached else 1, "", "")
+        if args[0] == "pull":
+            return CompletedProcess(args, 0, "", "")
         if args[1] == "--rm":
             return CompletedProcess(args, 0, f"uid={uid}(agent) gid={uid}(agent)", "")
         assert set(changes) == {
@@ -56,9 +61,13 @@ def test_compose_spawn_gives_image_user_the_seeded_workspace(tmp_path, monkeypat
     ))
 
     assert result.seed_sha
-    assert commands[0] == [
+    assert commands[0] == ["image", "inspect", "heg-sandbox:test"]
+    owner_probe = 1 if cached else 2
+    if not cached:
+        assert commands[1] == ["pull", "heg-sandbox:test"]
+    assert commands[owner_probe] == [
         "run", "--rm", "--pull", "never", "--network", "none",
         "--entrypoint", "id", "heg-sandbox:test",
     ]
-    assert commands[1][0:2] == ["run", "-d"]
+    assert commands[owner_probe + 1][0:2] == ["run", "-d"]
     assert (workspace / "src" / "example.txt").read_text() == "hello"
