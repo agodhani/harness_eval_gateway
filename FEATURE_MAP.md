@@ -543,7 +543,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     timeline page → strip shows per-sandbox stats live → click a chip →
     stream filters to that sandbox (merged) / chip assigns a split lane
   - Playwright: `web/e2e/results-analytics.spec.ts` verifies the price picker
-    stays inside the card at 390px and the trial rollup remains usable.
+    stays inside the card at 390px, the Analytics matrix scrolls horizontally
+    to its last trial column, and the trial rollup remains usable.
 - **Depends on:** F6 (events), F8 (results page)
 
 ### F10 — Multi-harness adapters ✅
