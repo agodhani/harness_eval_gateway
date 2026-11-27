@@ -732,9 +732,11 @@ def _persist_draft(
         session.commit()
 
 
-def _failure_message(exc: Exception) -> str:
+def _failure_message(exc: Exception, *, rubric_model: str = "") -> str:
     """Human-readable failure reason; surfaces the gateway's error body."""
     if isinstance(exc, RubricParseError):
+        if rubric_model:
+            return "Rubric draft was invalid. Set RUBRIC_MODEL to a stronger model."
         return (
             "Rubric draft was invalid. Use a stronger run model to draft it "
             "and pin the participant model separately in the API."
@@ -913,7 +915,7 @@ async def draft_rubric(
         log.info("draft_rubric: run %s -> rubric_review", run_id)
     except Exception as exc:
         log.exception("draft_rubric: run %s failed", run_id)
-        message = _failure_message(exc)
+        message = _failure_message(exc, rubric_model=settings.RUBRIC_MODEL)
         try:
             _mark_failed(session_factory, run_id, message)
         except Exception:

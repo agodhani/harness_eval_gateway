@@ -539,6 +539,28 @@ async def test_draft_rubric_double_failure_marks_failed(session_factory) -> None
         assert "pin the participant model" in error.payload["message"]
 
 
+async def test_invalid_draft_recommends_changing_configured_rubric_model(session_factory) -> None:
+    run = make_run(session_factory, status="submitted")
+    settings = SimpleNamespace(**{**vars(SETTINGS), "RUBRIC_MODEL": "cheap-model"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["model"] == settings.RUBRIC_MODEL
+        return _chat_response("still not json")
+
+    async with _mock_client(handler) as client:
+        await rubric_mod.draft_rubric(
+            run.id, session_factory=session_factory, settings=settings, client=client
+        )
+    with session_factory() as s:
+        assert s.get(Run, run.id).status == "failed"
+        error = s.execute(
+            select(Event).where(Event.run_id == run.id, Event.type == "error")
+        ).scalar_one()
+        assert error.payload["message"] == (
+            "Rubric draft was invalid. Set RUBRIC_MODEL to a stronger model."
+        )
+
+
 async def test_draft_rubric_missing_run_is_noop(session_factory) -> None:
     client = _mock_client(lambda r: _chat_response("{}"))
     await rubric_mod.draft_rubric(uuid.uuid4(), session_factory=session_factory, settings=SETTINGS, client=client)

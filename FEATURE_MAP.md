@@ -120,8 +120,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (`RUBRIC_GEN_RETRIES`, default 2) cover transient upstream errors +
   validation failures (error fed back into the prompt), and lenient
   normalization coerces scalar `generated_by` + numeric-string fields.
-  An unparseable final draft directs the user to a stronger drafting model
-  and a separate participant pin in the API.
+  An unparseable final draft directs the user to update `RUBRIC_MODEL`
+  when configured, or use a stronger run model and a separate participant
+  pin in the API.
   Drafting is serialized process-wide (`RUBRIC_GEN_CONCURRENCY`, default
   1) so parallel submits can't thrash a single-model provider; a run
   parked on the semaphore stays `submitted` (pre-queue) and emits a
