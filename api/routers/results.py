@@ -1184,8 +1184,8 @@ def get_run_results(
                     # judge verdict — it must not mask "judge failed".
                     None
                     if any(
-                        sc.dimension != SUITE_PASS_DIMENSION
-                        for sc in visible_scores
+                        dim != SUITE_PASS_DIMENSION
+                        for dim, _ in visible_scores
                     )
                     else eval_failures.get(sb.id)
                 ),
