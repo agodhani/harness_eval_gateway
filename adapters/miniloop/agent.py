@@ -365,6 +365,10 @@ def _content_tool_call(content: Any, call_id: str) -> tuple[dict[str, Any] | Non
     prefix, suffix = "<tool_call>", "</tool_call>"
     if text.startswith(prefix) and text.endswith(suffix):
         text = text[len(prefix):-len(suffix)]
+    else:
+        opener, _, body = text.partition("\n")
+        if opener.rstrip("\r") == "```json" and body.endswith("\n```"):
+            text = body[:-len("\n```")]
     try:
         call = json.loads(text)
     except (ValueError, RecursionError):

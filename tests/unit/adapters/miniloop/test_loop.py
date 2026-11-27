@@ -124,7 +124,7 @@ def test_done_terminates_agent_done(harness, tmp_path: Path) -> None:
     assert term["payload"]["terminal_state"] == "agent_done"
 
 
-@pytest.mark.parametrize("wrapper", ["{}", "<tool_call>{}</tool_call>"])
+@pytest.mark.parametrize("wrapper", ["{}", "<tool_call>{}</tool_call>", "```json\n{}\n```"])
 def test_content_tool_call_dispatch_and_replay(harness, tmp_path: Path, wrapper: str) -> None:
     make, out = harness
     args = {"path": "hi.txt", "content": "hi"}
@@ -204,6 +204,9 @@ def test_content_call_coerces_integral_float_arguments(harness, tmp_path: Path) 
     "content",
     [
         'Example: <tool_call>{"name":"done","arguments":{}}</tool_call>',
+        'Example:\n```json\n{"name":"done","arguments":{"summary":"finished","status":"success"}}\n```',
+        '```json\n{"name":"done","arguments":{"summary":"finished","status":"success"}}\n```\nMore text',
+        '```json\n{"name":"done","arguments":{"summary":"finished"}}\n```',
         '{"name":"unknown","arguments":{}}',
         '{"name":"done","arguments":"{}"}',
         '<tool_call>{"name":"done","arguments":',

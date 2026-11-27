@@ -268,8 +268,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (51 SKILL.md: superpowers 14, mattpocock-skills 28, spec-kit 9 generated);
   progressive-disclosure catalog in system prompt. When there are no
   structured calls, a standalone JSON call with a declared tool name and
-  schema-valid arguments, optionally wrapped in `<tool_call>`, is dispatched
-  as a structured reply. Other tool-less assistant
+  schema-valid arguments, optionally wrapped in `<tool_call>` or in a
+  standalone Markdown JSON fence, is dispatched as a structured reply.
+  Other tool-less assistant
   replies get `MINILOOP_NUDGE_RETRIES` corrective nudges (default 2,
   `stage="agent_nudge"` checkpoints) before counting toward the text-only
   `stuck_loop` streak; rejected content calls get targeted argument
