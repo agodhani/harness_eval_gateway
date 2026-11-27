@@ -120,13 +120,17 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   (`RUBRIC_GEN_RETRIES`, default 2) cover transient upstream errors +
   validation failures (error fed back into the prompt), and lenient
   normalization coerces scalar `generated_by` + numeric-string fields.
+  Streamed draft retries bypass the gateway replay cache so an incomplete
+  cached stream cannot exhaust the retry budget.
   Drafting is serialized process-wide (`RUBRIC_GEN_CONCURRENCY`, default
   1) so parallel submits can't thrash a single-model provider; a run
   parked on the semaphore stays `submitted` (pre-queue) and emits a
   `rubric_queued` checkpoint. The draft call's per-attempt HTTP timeout
   (`RUBRIC_GEN_TIMEOUT_SECONDS`, default 960) out-waits the gateway's
   worst-case upstream hold (~915s) so a congested draft can't abandon a
-  call its retry would then overlap.
+  call its retry would then overlap. Ollama drafts stream through the
+  gateway so generated chunks keep the upstream read timeout from
+  expiring during slow generation; incomplete streams retry.
 - **Per-cell budgets (PR28):** the monitor enforces the run spec's
   optional `sandbox_token_budget` (sandbox's own metered total) and
   `max_cost_usd` (its estimated spend at the layered price table —
