@@ -338,6 +338,7 @@ def _message_content(resp_json: dict[str, Any]) -> str:
 _ERROR_DRAIN_BYTES = 64 * 1024
 _ERROR_DRAIN_SECONDS = 2
 _ERROR_PREVIEW_BYTES = 500
+_POST_DONE_DRAIN_SECONDS = 5.0
 
 
 async def _raise_for_status(response: httpx.Response) -> None:
@@ -376,22 +377,28 @@ async def _chat_content(
         await _raise_for_status(response)
         parts: list[str] = []
         done = False
-        async for line in response.aiter_lines():
-            if done or not line.startswith("data:"):
-                continue
-            data = line.removeprefix("data:").strip()
-            if data == "[DONE]":
-                done = True
-                continue
-            frame = json.loads(data)
-            if not isinstance(frame, dict) or frame.get("error"):
-                raise DirectJudgeError("upstream judge stream returned an invalid frame")
-            for choice in frame.get("choices") or []:
-                if choice.get("index", 0) != 0:
-                    continue
-                content = (choice.get("delta") or {}).get("content")
-                if isinstance(content, str):
-                    parts.append(content)
+        try:
+            async with asyncio.timeout(None) as drain:
+                async for line in response.aiter_lines():
+                    if done or not line.startswith("data:"):
+                        continue
+                    data = line.removeprefix("data:").strip()
+                    if data == "[DONE]":
+                        done = True
+                        drain.reschedule(asyncio.get_running_loop().time() + _POST_DONE_DRAIN_SECONDS)
+                        continue
+                    frame = json.loads(data)
+                    if not isinstance(frame, dict) or frame.get("error"):
+                        raise DirectJudgeError("upstream judge stream returned an invalid frame")
+                    for choice in frame.get("choices") or []:
+                        if choice.get("index", 0) != 0:
+                            continue
+                        content = (choice.get("delta") or {}).get("content")
+                        if isinstance(content, str):
+                            parts.append(content)
+        except (httpx.RequestError, TimeoutError):
+            if not done:
+                raise
         if not done:
             raise DirectJudgeError("upstream judge stream ended before [DONE]")
         content = "".join(parts)

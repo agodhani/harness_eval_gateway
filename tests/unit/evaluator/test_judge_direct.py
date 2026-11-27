@@ -318,6 +318,35 @@ async def test_local_direct_judge_retries_connect_and_reassembles_stream(
     assert calls == 2
 
 
+@pytest.mark.parametrize("late_error", [False, True])
+async def test_complete_judge_stream_survives_slow_or_failed_teardown(
+    eval_ws: Path, monkeypatch: pytest.MonkeyPatch, late_error: bool
+) -> None:
+    monkeypatch.setattr(judge_direct_mod, "_POST_DONE_DRAIN_SECONDS", 0.01)
+    closed = False
+
+    class JudgeStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            frame = {"choices": [{"delta": {"content": json.dumps(SCORES_OBJ)}}]}
+            yield f"data: {json.dumps(frame)}\n\ndata: [DONE]\n\n".encode()
+            yield b"data: ignored after DONE\n\n"
+            if late_error:
+                raise httpx.ReadError("lost connection after complete scores")
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed = True
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=JudgeStream())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        parsed = await asyncio.wait_for(_judge(eval_ws, client=client, stream=True), 1)
+    assert parsed.overall == 7.0
+    assert closed
+
+
 @pytest.mark.parametrize("stream", [False, True])
 async def test_http_error_drains_body_and_reports_bounded_detail(
     eval_ws: Path, stream: bool

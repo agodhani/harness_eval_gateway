@@ -352,7 +352,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   the normal path with `eval_scored` `mode="direct_fallback"` (failures add
   `fallback_detail` to `eval_scores_failed`). Ollama fallbacks consume a
   complete SSE stream so slow generation can outlast the gateway's idle
-  read timeout, and retry one API-to-gateway connection failure.
+  read timeout, and retry one API-to-gateway connection failure. After
+  `[DONE]`, a bounded drain preserves completed scores if the stream stalls
+  or fails to close cleanly.
   **Objective signals (PR6+PR7):** before staging, the candidate workspace
   is measured by the `scoring` package's signal collectors —
   `static_analysis` runs lizard (multi-language, parse-only, no code
