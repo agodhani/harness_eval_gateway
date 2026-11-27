@@ -76,7 +76,10 @@ def scored_run(session_factory: sessionmaker[Session]):
         s.flush()
         rubric = Rubric(
             run_id=run.id, version=1, status="approved",
-            content={"dimensions": [{"name": "functional_requirements"}]},
+            content={"dimensions": [
+                {"name": "functional_requirements"},
+                {"name": "code_quality"},
+            ]},
         )
         s.add(rubric)
         s.flush()
@@ -1305,6 +1308,7 @@ def test_results_rubric_version_filter(
     body = client.get(f"/api/runs/{scored_run['run_id']}/results").json()
     sb1 = next(x for x in body["sandboxes"] if x["sandbox_id"] == str(scored_run["sb1"]))
     assert sb1["dimensions"]["functional_requirements"]["score"] == 9.5
+    assert set(sb1["dimensions"]) == {"functional_requirements"}
     assert sb1["overall"]["score"] == 9.0
     assert sb1["rubric_version"] == 2
     assert body["selected_rubric_version"] is None
@@ -1319,6 +1323,7 @@ def test_results_rubric_version_filter(
     ).json()
     sb1 = next(x for x in body["sandboxes"] if x["sandbox_id"] == str(scored_run["sb1"]))
     assert sb1["dimensions"]["functional_requirements"]["score"] == 8.0
+    assert set(sb1["dimensions"]) == {"functional_requirements", "code_quality"}
     assert sb1["overall"]["score"] == 7.0
     assert sb1["rubric_version"] == 1
     assert body["selected_rubric_version"] == 1
@@ -1978,6 +1983,28 @@ def test_results_panel_mean_and_spread(
     assert by_judge["judge-a"]["score"] == 8.0
     assert by_judge["judge-b"]["score"] == 4.0
     assert all(j["source"] == "llm" for j in cell["judges"])
+
+
+def test_results_hide_persisted_off_rubric_judge_rows(
+    client: TestClient, session_factory, artifact_root
+) -> None:
+    fx = _panel_run(session_factory, artifact_root)
+    _judge_score(session_factory, fx["sb_a"], fx["rubric_id"],
+                 "functional_requirements", 8.0, "judge-a")
+    _judge_score(session_factory, fx["sb_a"], fx["rubric_id"],
+                 "generated_tests", 2.0, "judge-a")
+
+    path = f"/api/runs/{fx['run_id']}/results"
+    for params in ({}, {"rubric_version": 1}):
+        response = client.get(path, params=params)
+        assert response.status_code == 200
+        assert set(_sandbox_result(response.json(), fx["sb_a"])["dimensions"]) == {
+            "functional_requirements",
+        }
+    raw = client.get(f"/api/sandboxes/{fx['sb_a']}/scores").json()
+    assert {row["dimension"] for row in raw} == {
+        "functional_requirements", "generated_tests",
+    }
 
 
 def test_results_panel_newest_per_judge_wins(

@@ -930,7 +930,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     lookups). `GET /api/runs/{id}/results?rubric_version=N` filters the
     matrix to one version's scores; the default view is per-sandbox
     newest-wins (asc created_at, seq, rubric_version, id → last row
-    wins). `GET
+    wins). The matrix hides judge dimensions outside their source rubric
+    and dimensions outside the rubric being displayed. `GET
     /api/runs/{id}/rubrics`
     lists versions + score counts; `GET /api/rubrics/{id}` returns one
     version incl. content (prefills the editor).

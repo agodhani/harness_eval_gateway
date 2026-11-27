@@ -104,7 +104,7 @@ from db.models import (
     Sandbox,
     Score,
 )
-from evaluator.scores import OVERALL_DIMENSION
+from evaluator.scores import OVERALL_DIMENSION, rubric_dimension_scales
 from orchestrator import events as orch_events
 from orchestrator import prompt_cell, runner, state_machine
 from orchestrator.matrix import (
@@ -972,6 +972,14 @@ def get_run_results(
     # rubric_id -> version map for provenance display + filter fallbacks.
     rubrics = _rubric_rows(session, run_id)
     version_of: dict[UUID, int] = {r.id: r.version for r in rubrics}
+    rubric_dimensions = {
+        r.version: set(rubric_dimension_scales(r.content)) for r in rubrics
+    }
+
+    def score_version(score: Score) -> int | None:
+        if score.rubric_version is not None:
+            return score.rubric_version
+        return version_of.get(score.rubric_id) if score.rubric_id is not None else None
 
     sandboxes = (
         session.execute(
@@ -1128,18 +1136,30 @@ def get_run_results(
         analysis = _load_analysis(jail, sb)
         rubric_id: UUID | None = None
         sb_rubric_version: int | None = None
+        judge_rubric_version: int | None = None
         sb_scores = by_sandbox.get(sb.id, [])
         for sc in sb_scores:
             if sc.rubric_id is not None:
                 rubric_id = sc.rubric_id  # rows ordered asc -> newest wins
-            row_version = sc.rubric_version or (
-                version_of.get(sc.rubric_id) if sc.rubric_id is not None else None
-            )
+            row_version = score_version(sc)
             if row_version is not None:
                 sb_rubric_version = row_version
+                if sc.source == "llm":
+                    judge_rubric_version = row_version
+        active_version = rubric_version or judge_rubric_version or sb_rubric_version
+        active_dimensions = rubric_dimensions.get(active_version or 0)
+        visible_scores: list[Score] = []
+        for sc in sb_scores:
+            if sc.dimension not in {OVERALL_DIMENSION, SUITE_PASS_DIMENSION}:
+                if active_dimensions and sc.dimension not in active_dimensions:
+                    continue
+                original_dimensions = rubric_dimensions.get(score_version(sc) or 0)
+                if sc.source == "llm" and original_dimensions and sc.dimension not in original_dimensions:
+                    continue
+            visible_scores.append(sc)
         # PR29 — per-(source,judge) buckets: human wins its pair; llm
         # buckets merge to the panel mean + spread.
-        merged = _merge_dimensions(sb_scores, primary_judge=primary_judge)
+        merged = _merge_dimensions(visible_scores, primary_judge=primary_judge)
         judge_means_by_sandbox[sb.id] = merged.judge_means
         suite_pass_score = merged.suite_pass
         suite_block = suite_by_sandbox.get(sb.id)
@@ -1164,7 +1184,7 @@ def get_run_results(
                     None
                     if any(
                         sc.dimension != SUITE_PASS_DIMENSION
-                        for sc in sb_scores
+                        for sc in visible_scores
                     )
                     else eval_failures.get(sb.id)
                 ),
