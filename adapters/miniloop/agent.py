@@ -338,26 +338,29 @@ TOOLS: list[dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 
 
-def _content_arguments_match(args: dict[str, Any], schema: dict[str, Any]) -> bool:
-    if not all(key in args for key in schema["required"]):
-        return False
+def _content_argument_problem(args: dict[str, Any], schema: dict[str, Any]) -> str | None:
     types = {"string": (str,), "integer": (int,), "number": (int, float)}
     for key, prop in schema["properties"].items():
+        choices = prop.get("enum")
+        allowed = ", ".join(map(str, choices)) if choices else ""
         if key not in args:
+            if key in schema["required"]:
+                note = f" (allowed values: {allowed})" if choices else ""
+                return f"missing required argument '{key}'{note}"
             continue
         value = args[key]
         if prop["type"] == "integer" and type(value) is float and value.is_integer():
             args[key] = value = int(value)
+        if choices and value not in choices:
+            return f"argument '{key}' must be one of: {allowed}"
         if type(value) not in types[prop["type"]]:
-            return False
-        if "enum" in prop and value not in prop["enum"]:
-            return False
-    return True
+            return f"argument '{key}' must have type {prop['type']}"
+    return None
 
 
-def _content_tool_call(content: Any, call_id: str) -> dict[str, Any] | None:
+def _content_tool_call(content: Any, call_id: str) -> tuple[dict[str, Any] | None, str]:
     if not isinstance(content, str):
-        return None
+        return None, ""
     text = content.strip()
     prefix, suffix = "<tool_call>", "</tool_call>"
     if text.startswith(prefix) and text.endswith(suffix):
@@ -365,27 +368,30 @@ def _content_tool_call(content: Any, call_id: str) -> dict[str, Any] | None:
     try:
         call = json.loads(text)
     except (ValueError, RecursionError):
-        return None
+        return None, ""
     if not isinstance(call, dict) or call.keys() != {"name", "arguments"}:
-        return None
+        return None, ""
     name, args = call["name"], call["arguments"]
     if not isinstance(name, str) or not isinstance(args, dict):
-        return None
+        return None, ""
     schema = next(
         (tool["function"]["parameters"] for tool in TOOLS if tool["function"]["name"] == name),
         None,
     )
-    if schema is None or not _content_arguments_match(args, schema):
-        return None
+    if schema is None:
+        return None, ""
+    problem = _content_argument_problem(args, schema)
+    if problem is not None:
+        return None, f" The {name} tool call was invalid: {problem}."
     try:
         arguments = json.dumps(args, allow_nan=False)
     except (ValueError, RecursionError):
-        return None
+        return None, ""
     return {
         "id": call_id,
         "type": "function",
         "function": {"name": name, "arguments": arguments},
-    }
+    }, ""
 
 
 def _tool_signature(tool_calls: list[dict[str, Any]]) -> str:
@@ -512,8 +518,11 @@ class Agent:
                 usage["total_tokens"] += tt or (pt + ct)
 
                 tool_calls = msg.get("tool_calls") or []
+                feedback = ""
                 if not tool_calls:
-                    fallback = _content_tool_call(msg.get("content"), f"call_content_{iters}")
+                    fallback, feedback = _content_tool_call(
+                        msg.get("content"), f"call_content_{iters}"
+                    )
                     if fallback is not None:
                         tool_calls = [fallback]
                         msg = {**msg, "content": None, "tool_calls": tool_calls}
@@ -534,7 +543,7 @@ class Agent:
                                 "nudge": nudges_used,
                             },
                         )
-                        messages.append({"role": "user", "content": AGENT_NUDGE})
+                        messages.append({"role": "user", "content": AGENT_NUDGE + feedback})
                         continue
                     no_tool_streak += 1
                     if no_tool_streak >= TEXT_ONLY_STREAK:
@@ -548,7 +557,7 @@ class Agent:
                             if no_tool_streak == 2
                             else NUDGE_TEXT_STREAK_3
                         )
-                        messages.append({"role": "user", "content": nudge})
+                        messages.append({"role": "user", "content": nudge + feedback})
                     continue
 
                 no_tool_streak = 0

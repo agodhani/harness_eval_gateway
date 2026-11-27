@@ -197,7 +197,7 @@ def test_content_call_coerces_integral_float_arguments(harness, tmp_path: Path) 
     args = json.loads(assistant["tool_calls"][0]["function"]["arguments"])
     assert type(args["offset"]) is int and args["offset"] == 2
     assert type(args["limit"]) is int and args["limit"] == 1
-    assert "two" in tool["content"]
+    assert json.loads(tool["content"])["content"] == "two"
 
 
 @pytest.mark.parametrize(
@@ -225,6 +225,43 @@ def test_invalid_content_tool_call_stays_text_only(harness, content: str) -> Non
     assert not any(e["type"] == "tool_call" for e in _events(out))
     assert not any(e["type"] == "done_signal" for e in _events(out))
     assert any(e["payload"].get("stage") == "agent_nudge" for e in _events(out))
+
+
+@pytest.mark.parametrize(
+    ("args", "feedback"),
+    [
+        (
+            {"summary": "finished"},
+            "missing required argument 'status' (allowed values: success, blocked)",
+        ),
+        (
+            {"summary": "finished", "status": "done"},
+            "argument 'status' must be one of: success, blocked",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("nudge_retries", "num_rejections", "nudge"),
+    [(2, 1, AGENT_NUDGE), (0, 2, NUDGE_TEXT_STREAK_2)],
+)
+def test_rejected_content_call_nudge_names_invalid_argument(
+    harness, args: dict, feedback: str, nudge_retries: int, num_rejections: int, nudge: str
+) -> None:
+    make, out = harness
+    invalid = json.dumps({"name": "done", "arguments": args})
+    valid = json.dumps({"name": "done", "arguments": {"summary": "finished", "status": "success"}})
+    agent, client, _ = make(
+        [_response(_assistant(content=invalid))] * num_rejections
+        + [_response(_assistant(content=valid))],
+        nudge_retries=nudge_retries,
+    )
+
+    assert _run(agent).done_status == "success"
+    reply, user = client.calls[-1]["messages"][-2:]
+    assert reply["content"] == invalid
+    assert nudge in user["content"]
+    assert feedback in user["content"]
+    assert len([e for e in _events(out) if e["type"] == "done_signal"]) == 1
 
 
 def test_identical_tool_calls_three_times_stuck(harness) -> None:
