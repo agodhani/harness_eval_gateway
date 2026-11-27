@@ -178,6 +178,28 @@ def test_content_done_with_declared_status(harness) -> None:
     assert result.done_status == "blocked"
 
 
+def test_content_call_coerces_integral_float_arguments(harness, tmp_path: Path) -> None:
+    make, _ = harness
+    (tmp_path / "file.txt").write_text("one\ntwo\n")
+    content = json.dumps({
+        "name": "read_file",
+        "arguments": {"path": "file.txt", "offset": 2.0, "limit": 1.0},
+    })
+    agent, client, _ = make(
+        [
+            _response(_assistant(content=content)),
+            _response(_assistant(tool_calls=[_tool_call("done", {"summary": "read file"})])),
+        ]
+    )
+
+    assert _run(agent).terminal_state == "agent_done"
+    assistant, tool = client.calls[1]["messages"][-2:]
+    args = json.loads(assistant["tool_calls"][0]["function"]["arguments"])
+    assert type(args["offset"]) is int and args["offset"] == 2
+    assert type(args["limit"]) is int and args["limit"] == 1
+    assert "two" in tool["content"]
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -192,6 +214,7 @@ def test_content_done_with_declared_status(harness) -> None:
         '{"name":"done","arguments":{"summary":1,"status":"success"}}',
         '{"name":"write_file","arguments":{"path":"file"}}',
         '{"name":"read_file","arguments":{"path":"file","limit":true}}',
+        '{"name":"read_file","arguments":{"path":"file","offset":2.5}}',
     ],
 )
 def test_invalid_content_tool_call_stays_text_only(harness, content: str) -> None:

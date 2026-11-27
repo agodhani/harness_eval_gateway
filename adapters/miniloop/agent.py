@@ -346,6 +346,8 @@ def _content_arguments_match(args: dict[str, Any], schema: dict[str, Any]) -> bo
         if key not in args:
             continue
         value = args[key]
+        if prop["type"] == "integer" and type(value) is float and value.is_integer():
+            args[key] = value = int(value)
         if type(value) not in types[prop["type"]]:
             return False
         if "enum" in prop and value not in prop["enum"]:
