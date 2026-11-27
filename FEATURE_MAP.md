@@ -1473,6 +1473,10 @@ configurable per cell (e.g. temperature sweeps).
   nonzero rate (the pickers render "local — $0"), so free rows can't
   silently bill. A bare (no `/`) glob never
   matches `vendor/model` ids — write `openai/*` deliberately.
+  The static fallback includes the local Ollama tags `llama3.1:8b`,
+  `qwen2.5-coder:3b`, `qwen2.5-coder:7b`, `qwen2.5vl:3b`,
+  `qwen2.5vl:7b`, `qwen3:8b`, and `smollm2:135m` as zero-cost
+  rates. Other unlisted tags still need an explicit price row.
 - **`POST /api/prices/sync`** — pulls the OpenRouter `/models` catalog
   THROUGH the gateway (`x-heg-provider: openrouter` service-cred
   override; the api never talks to providers). `pricing.*` USD-per-token

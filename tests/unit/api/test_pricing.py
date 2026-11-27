@@ -119,6 +119,19 @@ def test_local_row_marks_free() -> None:
     assert price.local is True
 
 
+@pytest.mark.parametrize("model", [
+    "llama3.1:8b", "qwen2.5-coder:3b", "qwen2.5-coder:7b",
+    "qwen2.5vl:3b", "qwen2.5vl:7b", "smollm2:135m",
+])
+def test_local_ollama_tags_resolve_zero_cost(model: str) -> None:
+    book = PriceBook([])
+    assert book.key_for(model) == model
+    price = book.price_for(model)
+    assert price.local is True
+    assert estimate_cost_usd(price, input_tokens=100, output_tokens=50) == 0.0
+    assert book.key_for(f"vendor/{model}") is None
+
+
 def test_table_merges_rows_over_static() -> None:
     book = PriceBook([_row("gpt-4o", inp=99.0), _row("custom-*", inp=4.0)])
     merged = book.table()
