@@ -734,6 +734,11 @@ def _persist_draft(
 
 def _failure_message(exc: Exception) -> str:
     """Human-readable failure reason; surfaces the gateway's error body."""
+    if isinstance(exc, RubricParseError):
+        return (
+            "Rubric draft was invalid. Use a stronger run model to draft it "
+            "and pin the participant model separately in the API."
+        )
     if isinstance(exc, httpx.HTTPStatusError):
         body = exc.response.text.strip()
         if body:

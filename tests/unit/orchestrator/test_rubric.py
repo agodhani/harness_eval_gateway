@@ -531,6 +531,12 @@ async def test_draft_rubric_double_failure_marks_failed(session_factory) -> None
     await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=SETTINGS, client=client)
     with session_factory() as s:
         assert s.get(Run, run.id).status == "failed"
+        error = s.execute(
+            select(Event).where(Event.run_id == run.id, Event.type == "error")
+        ).scalar_one()
+        assert error.payload["stage"] == "rubric_generation"
+        assert "Rubric draft was invalid" in error.payload["message"]
+        assert "pin the participant model" in error.payload["message"]
 
 
 async def test_draft_rubric_missing_run_is_noop(session_factory) -> None:
