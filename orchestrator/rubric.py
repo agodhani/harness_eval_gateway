@@ -57,7 +57,7 @@ from gateway.creds import mint_cred
 from gateway.metering import tokens_used
 from scoring.checkers import RESERVED_DIMENSION_NAMES, fold_dimension_name
 
-from . import state_machine
+from . import pacing, state_machine
 from .events import emit
 
 if TYPE_CHECKING:  # avoid a runtime api.* import cycle; settings is duck-typed
@@ -501,6 +501,51 @@ def _is_transient_call_error(exc: Exception) -> bool:
     return isinstance(exc, httpx.TransportError)
 
 
+async def _request_rubric_content(
+    client: httpx.AsyncClient, url: str, body: dict[str, Any], headers: dict[str, str]
+) -> str:
+    if not body["stream"]:
+        response = await client.post(url, json=body, headers=headers)
+        response.raise_for_status()
+        return _message_content(response.json())
+
+    async with client.stream("POST", url, json=body, headers=headers) as response:
+        if not response.is_success:
+            await response.aread()
+            response.raise_for_status()
+        content_type = response.headers.get("content-type", "").split(";", 1)[0]
+        if content_type != "text/event-stream":
+            await response.aread()
+            return _message_content(response.json())
+
+        parts: list[str] = []
+        done = False
+        async for line in response.aiter_lines():
+            if done or not line.startswith("data:"):
+                continue
+            data = line.removeprefix("data:").strip()
+            if data == "[DONE]":
+                done = True
+                continue
+            frame = json.loads(data)
+            if not isinstance(frame, dict):
+                raise RubricParseError("invalid chat response frame")
+            if frame.get("error"):
+                raise httpx.RemoteProtocolError("upstream rubric stream returned an error")
+            for choice in frame.get("choices") or []:
+                if choice.get("index", 0) != 0:
+                    continue
+                content = (choice.get("delta") or {}).get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+        if not done:
+            raise httpx.RemoteProtocolError("upstream rubric stream ended before [DONE]")
+        content = "".join(parts)
+        if not content.strip():
+            raise RubricParseError("chat response message content is empty")
+        return content
+
+
 async def _request_rubric(
     client: httpx.AsyncClient,
     *,
@@ -509,6 +554,7 @@ async def _request_rubric(
     model: str,
     task_prompt: str,
     max_tokens: int,
+    stream: bool = False,
     retries: int | None = None,
     rubric_basis: dict[str, Any] | None = None,
     domain_hint: str | None = None,
@@ -559,20 +605,19 @@ async def _request_rubric(
         # Thinking models spend output tokens on <think> blocks before the
         # JSON — a small cap truncates the document into unparseable JSON.
         "max_tokens": max_tokens,
-        "stream": False,
+        "stream": stream,
     }
     headers = {"Authorization": f"Bearer {cred}"}
 
     last_error: Exception | None = None
     for attempt in range(attempts):
         try:
-            resp = await client.post(
+            content = await _request_rubric_content(
+                client,
                 _chat_url(gateway_url),
-                json={**body_base, "messages": messages},
-                headers=headers,
+                {**body_base, "messages": messages},
+                headers,
             )
-            resp.raise_for_status()
-            content = _message_content(resp.json())
             return parse_rubric_json(content)
         except ValueError as exc:
             # RubricParseError, JSONDecodeError, and pydantic ValidationError
@@ -901,6 +946,7 @@ async def draft_rubric(
                 model=model,
                 task_prompt=run.task_prompt,
                 max_tokens=int(settings.RUBRIC_MAX_TOKENS),
+                stream=pacing.provider_for_model(settings, model) in pacing.LOCAL_PROVIDERS,
                 rubric_basis=rubric_basis,
                 domain_hint=domain_hint,
             )

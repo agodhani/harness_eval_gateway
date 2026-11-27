@@ -288,7 +288,8 @@ async def test_draft_rubric_success(session_factory) -> None:
         return _chat_response(json.dumps(_valid_rubric_payload()))
 
     client = _mock_client(handler)
-    await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=SETTINGS, client=client)
+    settings = SimpleNamespace(**vars(SETTINGS), UPSTREAM_PROVIDER="openrouter")
+    await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=settings, client=client)
 
     assert seen["url"] == "http://gateway.test:8080/v1/chat/completions"
     assert seen["auth"].startswith("Bearer heg.")
@@ -317,6 +318,40 @@ async def test_draft_rubric_success(session_factory) -> None:
             for e in s.execute(select(Event).where(Event.run_id == run.id)).scalars()
         ]
         assert "checkpoint" in types
+
+
+async def test_ollama_rubric_retries_truncated_stream_and_joins_content(
+    session_factory, monkeypatch
+) -> None:
+    run = make_run(session_factory, status="submitted", task_prompt="extract apples")
+    monkeypatch.setattr(rubric_mod, "_RETRY_BACKOFF_SECONDS", 0)
+    attempts = 0
+    payload = json.dumps(_valid_rubric_payload())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        assert json.loads(request.content)["stream"] is True
+        frames = [
+            {"choices": [{"delta": {"role": "assistant"}}]},
+            {"choices": [{"delta": {"content": payload[:20]}}]},
+            {"choices": [{"delta": {"content": payload[20:]}}]},
+            {"choices": [], "usage": {"completion_tokens": 100}},
+        ]
+        text = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+        if attempts > 1:
+            text += "data: [DONE]\n\n"
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=text)
+
+    async with _mock_client(handler) as client:
+        await rubric_mod.draft_rubric(
+            run.id, session_factory=session_factory, settings=SETTINGS, client=client,
+        )
+    assert attempts == 2
+    with session_factory() as s:
+        assert s.get(Run, run.id).status == "rubric_review"
+        stored = s.scalar(select(Rubric).where(Rubric.run_id == run.id))
+        assert stored.content["summary"] == "Test rubric"
 
 
 async def test_draft_rubric_uses_rubric_model_override(session_factory) -> None:
