@@ -467,12 +467,15 @@ def parse_rubric_json(text: str) -> RubricContent:
 
     Tolerates ``` fences and leading/trailing prose, plus the small
     coercions in :func:`_normalize_rubric_dict`. Raises
-    :class:`RubricParseError` (no JSON) or pydantic ``ValidationError``
+    :class:`RubricParseError` (missing or malformed JSON) or pydantic ``ValidationError``
     (schema violations — incl. the 1–12 dimension bounds and
     duplicate-after-normalization) — the caller retries on either with the
     failure fed back into the prompt.
     """
-    data = json.loads(_extract_json(text))
+    try:
+        data = json.loads(_extract_json(text))
+    except json.JSONDecodeError as exc:
+        raise RubricParseError(f"invalid rubric JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise RubricParseError("rubric JSON is not an object")
     return RubricContent.model_validate(_normalize_rubric_dict(data))

@@ -96,6 +96,11 @@ def test_parse_no_json_raises() -> None:
         parse_rubric_json("sorry, I cannot help with that")
 
 
+def test_parse_malformed_json_raises_rubric_parse_error() -> None:
+    with pytest.raises(RubricParseError, match="invalid rubric JSON: Expecting property name"):
+        parse_rubric_json("draft: {malformed}")
+
+
 def test_parse_invalid_schema_raises_validation_error() -> None:
     payload = _valid_rubric_payload()
     payload["dimensions"] = []  # below the 1-dimension minimum (PR23)
@@ -521,11 +526,12 @@ async def test_draft_rubric_failure_saves_capped_gateway_body(
         assert len(message) < 600
 
 
-async def test_draft_rubric_double_failure_marks_failed(session_factory) -> None:
+@pytest.mark.parametrize("output", ["still not json", "draft: {malformed}"])
+async def test_draft_rubric_double_failure_marks_failed(session_factory, output) -> None:
     run = make_run(session_factory, status="submitted")
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return _chat_response("still not json")
+        return _chat_response(output)
 
     client = _mock_client(handler)
     await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=SETTINGS, client=client)
