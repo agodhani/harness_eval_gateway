@@ -480,8 +480,8 @@ def test_messages_stream_retried_emits_one_llm_response(
 # ---------------------------------------------------------------------------
 
 
-def _messages_scope(cred: str) -> dict[str, Any]:
-    """Minimal POST /v1/messages ASGI scope at spec 2.3 (uvicorn's level —
+def _messages_scope(cred: str, path: str = "/v1/messages") -> dict[str, Any]:
+    """Minimal POST ASGI scope at spec 2.3 (uvicorn's level —
     Starlette then disconnects via a collapsing task group)."""
     return {
         "type": "http",
@@ -489,8 +489,8 @@ def _messages_scope(cred: str) -> dict[str, Any]:
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
-        "path": "/v1/messages",
-        "raw_path": b"/v1/messages",
+        "path": path,
+        "raw_path": path.encode(),
         "query_string": b"",
         "root_path": "",
         "headers": [
@@ -668,6 +668,72 @@ def test_disconnect_during_upstream_wait_emits_error(
     # disconnect error; llm_response stays reserved for real responses.
     assert types == ["llm_request", "error"]
     assert calls[1]["payload"]["stage"] == "client_disconnected"
+
+
+@pytest.mark.parametrize("phase", ["headers", "body"])
+def test_buffered_chat_disconnect_cancels_upstream(
+    monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    calls: list[dict[str, Any]] = []
+    _checkpointing_emit(monkeypatch, calls)
+    upstream_waiting = asyncio.Event()
+    upstream_cancelled = False
+    stream_closed = False
+
+    async def wait_for_cancellation() -> None:
+        nonlocal upstream_cancelled
+        upstream_waiting.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            upstream_cancelled = True
+            raise
+
+    class PendingBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"{"
+            await wait_for_cancellation()
+
+        async def aclose(self) -> None:
+            nonlocal stream_closed
+            await checkpoint()
+            stream_closed = True
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        if phase == "headers":
+            await wait_for_cancellation()
+        return httpx.Response(200, stream=PendingBody())
+
+    async def dep():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://upstream.test"
+        ) as client:
+            yield client
+
+    app.dependency_overrides[get_upstream_client] = dep
+    received_body = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal received_body
+        if not received_body:
+            received_body = True
+            return {"type": "http.request", "body": json.dumps(_CHAT_BODY).encode()}
+        await upstream_waiting.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(_message: dict[str, Any]) -> None:
+        pass
+
+    try:
+        scope = _messages_scope(_cred(), path="/v1/chat/completions")
+        asyncio.run(asyncio.wait_for(app(scope, receive, send), timeout=2))
+    finally:
+        app.dependency_overrides.pop(get_upstream_client, None)
+
+    assert upstream_cancelled
+    assert stream_closed == (phase == "body")
+    assert [event["type"] for event in calls] == ["llm_request", "error"]
+    assert calls[-1]["payload"]["stage"] == "client_disconnected"
 
 
 def test_disconnect_at_response_start_emits_terminal_events(

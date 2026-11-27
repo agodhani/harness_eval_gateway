@@ -182,10 +182,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   since PR28, a `sandbox_max_tokens` per-cell claim metered against only
   that sandbox's own usage; emits `llm_request`/`llm_response`/`error`
   events carrying the resolved upstream provider — every metered call is
-  terminally accounted, so a client disconnect mid-stream or while the
-  upstream request is in flight still lands `llm_response` (partial /
-  `usage_estimated`) plus `error` `stage="client_disconnected"` under a
-  shielded cancel scope; upstream calls bound by
+  terminally accounted. Disconnecting from a buffered chat completion
+  cancels the in-flight upstream request and emits an
+  `error` with `stage="client_disconnected"`; a mid-stream disconnect
+  also records partial or estimated usage. Upstream calls are bound by
   `UPSTREAM_TIMEOUT_SECONDS` (default 300). `/internal/events`
   (harness-event proxy, cred or ingest-token auth) + `/internal/done`
   (done_signal) for sandbox egress.
