@@ -211,6 +211,7 @@ DEFAULT_GEN_CONCURRENCY = 1
 DEFAULT_GEN_TIMEOUT_SECONDS = 960.0
 #: Base seconds of the linear backoff between transient-failure retries.
 _RETRY_BACKOFF_SECONDS = 1.0
+_POST_DONE_DRAIN_SECONDS = 5.0
 #: Cap on the validation-error detail echoed back into the retry prompt —
 #: the same bound the judge's ``prior_error`` feedback uses.
 _RETRY_ERROR_CAP = 300
@@ -521,25 +522,27 @@ async def _request_rubric_content(
         parts: list[str] = []
         done = False
         try:
-            async for line in response.aiter_lines():
-                if done or not line.startswith("data:"):
-                    continue
-                data = line.removeprefix("data:").strip()
-                if data == "[DONE]":
-                    done = True
-                    continue
-                frame = json.loads(data)
-                if not isinstance(frame, dict):
-                    raise RubricParseError("invalid chat response frame")
-                if frame.get("error"):
-                    raise httpx.RemoteProtocolError("upstream rubric stream returned an error")
-                for choice in frame.get("choices") or []:
-                    if choice.get("index", 0) != 0:
+            async with asyncio.timeout(None) as drain:
+                async for line in response.aiter_lines():
+                    if done or not line.startswith("data:"):
                         continue
-                    content = (choice.get("delta") or {}).get("content")
-                    if isinstance(content, str):
-                        parts.append(content)
-        except httpx.RequestError:
+                    data = line.removeprefix("data:").strip()
+                    if data == "[DONE]":
+                        done = True
+                        drain.reschedule(asyncio.get_running_loop().time() + _POST_DONE_DRAIN_SECONDS)
+                        continue
+                    frame = json.loads(data)
+                    if not isinstance(frame, dict):
+                        raise RubricParseError("invalid chat response frame")
+                    if frame.get("error"):
+                        raise httpx.RemoteProtocolError("upstream rubric stream returned an error")
+                    for choice in frame.get("choices") or []:
+                        if choice.get("index", 0) != 0:
+                            continue
+                        content = (choice.get("delta") or {}).get("content")
+                        if isinstance(content, str):
+                            parts.append(content)
+        except (httpx.RequestError, TimeoutError):
             if not done:
                 raise
         if not done:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 
 import httpx
@@ -387,6 +388,39 @@ async def test_ollama_rubric_drains_after_done_without_retry(session_factory, re
     assert drained
     with session_factory() as s:
         assert s.get(Run, run.id).status == "rubric_review"
+
+
+async def test_rubric_stream_that_never_closes_releases_the_draft_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rubric_mod, "_POST_DONE_DRAIN_SECONDS", 0.01)
+    closed = False
+
+    class OpenStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b'data: {"choices":[{"delta":{"content":"rubric"}}]}\n\ndata: [DONE]\n\n'
+            while True:
+                await asyncio.sleep(0)
+                yield b": keepalive\n\n"
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed = True
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=OpenStream()
+        )
+
+    async with _mock_client(handler) as client:
+        content = await asyncio.wait_for(
+            rubric_mod._request_rubric_content(
+                client, "http://gateway.test/v1/chat/completions", {"stream": True}, {}
+            ),
+            timeout=1,
+        )
+    assert content == "rubric"
+    assert closed
 
 
 async def test_draft_rubric_uses_rubric_model_override(session_factory) -> None:
