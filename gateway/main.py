@@ -508,7 +508,7 @@ async def chat_completions(
             upstream=upstream,
             provider=provider,
             request_headers=request.headers,
-            cache=cache,
+            cache=None if request.headers.get("cache-control") == "no-store" else cache,
         )
 
     # --- budget gate (before any upstream traffic) ---

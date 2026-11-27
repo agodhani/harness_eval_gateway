@@ -458,6 +458,30 @@ def test_streaming_hit_replays_sse_verbatim(
     }
 
 
+def test_streaming_no_store_bypasses_cached_incomplete_response(
+    gw_client: TestClient, upstream: Any, cache: ResponseCache
+) -> None:
+    incomplete = _CHAT_SSE.replace("data: [DONE]\n\n", "")
+    assert incomplete != _CHAT_SSE
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        text = incomplete if len(upstream["seen"]) == 1 else _CHAT_SSE
+        return httpx.Response(200, text=text, headers={"content-type": "text/event-stream"})
+
+    upstream["handler"] = handler
+    cred = _cred()
+    assert _post_chat(gw_client, cred, stream=True).text == incomplete
+    retry = gw_client.post(
+        "/v1/chat/completions",
+        json={**_CHAT_BODY, "stream": True},
+        headers={**_auth(cred), "Cache-Control": "no-store"},
+    )
+    assert retry.text == _CHAT_SSE
+    assert "x-heg-cache" not in retry.headers
+    assert len(upstream["seen"]) == 2
+    assert len(cache) == 1
+
+
 def test_stream_and_buffered_variants_have_distinct_keys(
     gw_client: TestClient, upstream: Any, emitted: list, cache: ResponseCache
 ) -> None:

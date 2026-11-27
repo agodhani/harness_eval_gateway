@@ -616,7 +616,7 @@ async def _request_rubric(
                 client,
                 _chat_url(gateway_url),
                 {**body_base, "messages": messages},
-                headers,
+                {**headers, "Cache-Control": "no-store"} if stream and attempt else headers,
             )
             return parse_rubric_json(content)
         except ValueError as exc:

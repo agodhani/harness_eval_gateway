@@ -332,6 +332,7 @@ async def test_ollama_rubric_retries_truncated_stream_and_joins_content(
         nonlocal attempts
         attempts += 1
         assert json.loads(request.content)["stream"] is True
+        assert request.headers.get("cache-control") == ("no-store" if attempts > 1 else None)
         frames = [
             {"choices": [{"delta": {"role": "assistant"}}]},
             {"choices": [{"delta": {"content": payload[:20]}}]},
