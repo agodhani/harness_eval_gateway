@@ -535,6 +535,7 @@ async def _direct_judge_fallback(
     prior_error: str | None,
     client: httpx.AsyncClient | None,
     time_budget_seconds: float,
+    stream: bool,
 ) -> tuple[ParsedScores | None, str | None]:
     """Control-plane last resort: ONE direct chat call for the scores doc.
 
@@ -568,6 +569,7 @@ async def _direct_judge_fallback(
                 terminal_reason=terminal_reason,
                 prior_error=prior_error,
                 client=client,
+                stream=stream,
             ),
             timeout=time_budget_seconds,
         )
@@ -638,6 +640,7 @@ async def evaluate_sandbox(
     poll_interval_seconds: float = 2.0,
     image: str = DEFAULT_IMAGE,
     direct_client: httpx.AsyncClient | None = None,
+    local_judge: bool = False,
 ) -> list[Score]:
     """Score one sandbox's artifact with a sandboxed judge agent.
 
@@ -1002,6 +1005,7 @@ async def evaluate_sandbox(
             terminal_reason=terminal_reason,
             prior_error="\n".join(prior_parts) or None,
             client=direct_client,
+            stream=local_judge,
             time_budget_seconds=(
                 attempt_started
                 + float(timeout_seconds)

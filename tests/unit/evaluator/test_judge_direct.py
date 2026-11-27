@@ -9,13 +9,16 @@ to ``DirectJudgeError``.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+import evaluator.judge_direct as judge_direct_mod
 from evaluator.judge_direct import (
     DirectJudgeError,
     build_direct_prompt,
@@ -279,6 +282,134 @@ async def test_transport_failure_raises(eval_ws: Path) -> None:
     client = _FakeClient(exc=httpx.ConnectError("refused"))
     with pytest.raises(DirectJudgeError, match="refused"):
         await _judge(eval_ws, client=client)
+
+
+@pytest.mark.parametrize("complete", [True, False])
+async def test_local_direct_judge_retries_connect_and_reassembles_stream(
+    eval_ws: Path, complete: bool
+) -> None:
+    payload = json.dumps(SCORES_OBJ)
+    frames = [
+        {"choices": [{"delta": {"content": payload[:31]}}]},
+        {"choices": [{"delta": {"content": payload[31:]}}]},
+        {"choices": [], "usage": {"completion_tokens": 100}},
+    ]
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        body = json.loads(request.content)
+        assert body["stream"] is True
+        if calls == 1:
+            raise httpx.ConnectError("refused", request=request)
+        text = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+        if complete:
+            text += "data: [DONE]\n\n"
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=text)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        if complete:
+            parsed = await _judge(eval_ws, client=client, stream=True)
+            assert parsed.overall == 7.0
+        else:
+            with pytest.raises(DirectJudgeError, match=r"before \[DONE\]"):
+                await _judge(eval_ws, client=client, stream=True)
+    assert calls == 2
+
+
+@pytest.mark.parametrize("late_error", [False, True])
+async def test_complete_judge_stream_survives_slow_or_failed_teardown(
+    eval_ws: Path, monkeypatch: pytest.MonkeyPatch, late_error: bool
+) -> None:
+    monkeypatch.setattr(judge_direct_mod, "_POST_DONE_DRAIN_SECONDS", 0.01)
+    closed = False
+
+    class JudgeStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            frame = {"choices": [{"delta": {"content": json.dumps(SCORES_OBJ)}}]}
+            yield f"data: {json.dumps(frame)}\n\ndata: [DONE]\n\n".encode()
+            yield b"data: ignored after DONE\n\n"
+            if late_error:
+                raise httpx.ReadError("lost connection after complete scores")
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed = True
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=JudgeStream())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        parsed = await asyncio.wait_for(_judge(eval_ws, client=client, stream=True), 1)
+    assert parsed.overall == 7.0
+    assert closed
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_http_error_drains_body_and_reports_bounded_detail(
+    eval_ws: Path, stream: bool
+) -> None:
+    drained = False
+
+    class ErrorStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            nonlocal drained
+            yield b"provider was unavailable"
+            yield b"x" * 600
+            yield b"end of body"
+            drained = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["stream"] is stream
+        return httpx.Response(502, stream=ErrorStream())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(DirectJudgeError, match="(?s)502.*provider was unavailable") as exc:
+            await _judge(eval_ws, client=client, stream=stream)
+    assert drained
+    assert "end of body" not in str(exc.value)
+    assert str(exc.value).endswith("provider was unavailable" + "x" * 476)
+
+
+@pytest.mark.parametrize("slow", [False, True])
+async def test_streamed_4xx_retries_after_bounded_error_drain(
+    eval_ws: Path, monkeypatch: pytest.MonkeyPatch, slow: bool
+) -> None:
+    if slow:
+        monkeypatch.setattr(judge_direct_mod, "_ERROR_DRAIN_SECONDS", 0.01)
+    closed = False
+    calls = 0
+
+    class ErrorStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b"unsupported response format"
+            if slow:
+                await asyncio.Event().wait()
+            else:
+                yield b"x" * (64 * 1024)
+            pytest.fail("read beyond the error drain limit")
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert "response_format" in json.loads(request.content)
+            return httpx.Response(400, stream=ErrorStream())
+        assert closed
+        assert "response_format" not in json.loads(request.content)
+        frame = {"choices": [{"delta": {"content": json.dumps(SCORES_OBJ)}}]}
+        return httpx.Response(200, text=f"data: {json.dumps(frame)}\n\ndata: [DONE]\n\n")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await asyncio.wait_for(_judge(eval_ws, client=client, stream=True), 1)
+    assert result.overall == 7
+    assert calls == 2
 
 
 async def test_empty_choices_raises(eval_ws: Path) -> None:

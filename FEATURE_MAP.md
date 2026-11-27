@@ -350,7 +350,11 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `response_format=json_object`, `EVAL_DIRECT_MAX_TOKENS` 4096,
   `EVAL_DIRECT_FALLBACK=0` disables) writes scores back and lands through
   the normal path with `eval_scored` `mode="direct_fallback"` (failures add
-  `fallback_detail` to `eval_scores_failed`).
+  `fallback_detail` to `eval_scores_failed`). Ollama fallbacks consume a
+  complete SSE stream so slow generation can outlast the gateway's idle
+  read timeout, and retry one API-to-gateway connection failure. After
+  `[DONE]`, a bounded drain preserves completed scores if the stream stalls
+  or fails to close cleanly.
   **Objective signals (PR6+PR7):** before staging, the candidate workspace
   is measured by the `scoring` package's signal collectors —
   `static_analysis` runs lizard (multi-language, parse-only, no code
@@ -428,7 +432,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     `test_prompts.py`) — mocked runtime; staging, timeout salvage, malformed
     scores covered; `tests/unit/evaluator/test_judge_direct.py` — fake
     gateway client: request contract, 4xx response_format retry, bounded
-    prompt gather, error mapping; `tests/unit/evaluator/test_testgen.py` — fake gateway
+    prompt gather, error mapping, and bounded detail from drained HTTP
+    errors; `tests/unit/evaluator/test_testgen.py` — fake gateway
     client + fake exec runner: skip/error semantics, deterministic
     containment of bad output (fences/markers/syntax/no-test rejection),
     provenance layout, pass-rate metrics, cap knobs;
