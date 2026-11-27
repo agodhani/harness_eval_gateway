@@ -1780,8 +1780,13 @@ rigged before it starts.
   `py_test`, `output_grep` (artifact/workspace oriented) plus the
   case/output types `exact`, `contains`, `regex`, `json_schema`,
   `numeric_tol`. All artifact paths are jailed + byte-capped;
-  `py_test` runs candidate tests inside the locked `heg-exec`
-  container only (`ExecRunner` — never on the host). Statuses:
+  `py_test` runs vendored tests against the candidate inside the locked
+  `heg-exec` container (`ExecRunner` — never on the host), including
+  HTML-only workspaces. Container-local suite files stage under the
+  shared data root for the read-only Docker mount. An older exec image
+  that reports no pytest phase is an unmeasured error with a rebuild hint.
+  A test mount that cannot be staged is also unmeasured; an empty, readable
+  test target is a measured failure. Statuses:
   `pass`/`fail` are measured outcomes; `skipped` = infrastructure
   absent (no Docker/image); `error` = checker misconfig/crash.
 - **Lifecycle** (`orchestrator/lifecycle.py`): post-artifact, pre-judge
@@ -1857,6 +1862,8 @@ rigged before it starts.
     surfacing, rescore append-only); `tests/unit/evaluator/
     test_suite_signal.py`; `tests/unit/db/test_migrations.py`
     (new head + table round-trips).
+  - Docker: `tests/integration/test_exec_scoring.py` runs the vendored
+    Wordle tests against an HTML-only artifact using Compose-style mounts.
   - Web: `eslint` + `next build` clean (routes `/suites`,
     `/suites/[slug]`, `/suite-runs/[id]` prerender).
   - Manual: `/suites` → `starter-regression` → launch →

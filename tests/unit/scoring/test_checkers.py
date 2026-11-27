@@ -266,6 +266,40 @@ def test_py_test_fail_on_red_suite(artifact: Path, suite_dir: Path) -> None:
     assert "test_bad" in out.detail
 
 
+def test_py_test_empty_suite_is_measured_failure(artifact: Path, suite_dir: Path) -> None:
+    outcome = _exec_outcome(tests={"detected": False})
+    (out,) = checkers.run_checks(
+        [{"check": "py_test", "path": "tests"}],
+        artifact_dir=artifact,
+        suite_dir=suite_dir,
+        runner=FakeRunner(outcome),
+    )
+    assert out.status == "fail"
+    assert out.detail == "no tests collected from the suite dir"
+    assert out.test_summary and out.test_summary["collected"] == 0
+
+
+@pytest.mark.parametrize("result", [
+    {"version": 1, "phases": {"scan": {"python_files": 0}}},
+    {"version": 2, "phases": {"tests": None}},
+    {"phases": {"tests": None}},
+])
+def test_py_test_stale_runner_without_test_phase_is_unmeasured(
+    artifact: Path, suite_dir: Path, result: dict
+) -> None:
+    outcome = _exec_outcome(tests=None)
+    outcome.result = result
+    (out,) = checkers.run_checks(
+        [{"check": "py_test", "path": "tests"}],
+        artifact_dir=artifact,
+        suite_dir=suite_dir,
+        runner=FakeRunner(outcome),
+    )
+    assert out.status == "error"
+    assert "rebuild the exec image" in out.detail
+    assert out.test_summary is None
+
+
 def test_py_test_unavailable_exec_is_skipped(artifact: Path, suite_dir: Path) -> None:
     """No docker / no heg-exec image → honest 'skipped', never fail/error."""
     runner = FakeRunner(

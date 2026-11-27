@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 
 from sandbox.exec import EXEC_IMAGE, ExecRunner
+from sandbox.runtime import SandboxRuntime
+from scoring.checkers import run_checks
 from scoring.collectors import COLLECTORS, collect_signals
 from scoring.exec import ExecSandboxCollector
 from scoring.models import AnalysisReport
@@ -252,3 +254,55 @@ def test_exec_with_test_target_records_failures(
     assert tests.get("failed") == 1
     assert tests.get("ok") is False
     assert "test_gen_calc::test_mul_wrong" in (tests.get("failed_tests") or [])
+
+
+def test_vendored_pytest_checks_html_workspace(tmp_path: Path, exec_image: str) -> None:
+    data = tmp_path / "data"
+    artifact = data / "artifacts" / "wordle"
+    workspace = artifact / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "index.html").write_text("<!DOCTYPE html><html><script></script></html>")
+    host_data = tmp_path / "host-data"
+    host_data.symlink_to(data, target_is_directory=True)
+    runtime = SandboxRuntime(artifact_root=data / "artifacts", host_data_root=host_data)
+    suite = REPO_ROOT / "benchmark_suites" / "starter-regression"
+
+    (result,) = run_checks(
+        [{"check": "py_test", "path": "tests/wordle"}],
+        artifact_dir=artifact,
+        suite_dir=suite,
+        runner=ExecRunner(image=exec_image, runtime=runtime),
+    )
+
+    assert result.status == "pass", result.detail
+    assert result.detail == "3/3 tests passed"
+
+
+@pytest.mark.parametrize("broken_target", [False, True])
+def test_vendored_pytest_distinguishes_empty_and_unreadable_targets(
+    tmp_path: Path, exec_image: str, broken_target: bool
+) -> None:
+    artifact = tmp_path / "artifact"
+    (artifact / "workspace").mkdir(parents=True)
+    suite = tmp_path / "suite"
+    target = suite / "tests"
+    target.mkdir(parents=True)
+    if broken_target:
+        (target / "test_example.py").write_text("def test_example(): pass\n")
+        (target / "fixture.json").symlink_to("missing-fixture.json")
+
+    (result,) = run_checks(
+        [{"check": "py_test", "path": "tests"}],
+        artifact_dir=artifact,
+        suite_dir=suite,
+        runner=ExecRunner(image=exec_image, runtime=SandboxRuntime(artifact_root=artifact)),
+    )
+
+    if broken_target:
+        assert result.status == "error", result.detail
+        assert "test target copy failed" in result.detail
+        assert result.test_summary is None
+    else:
+        assert result.status == "fail", result.detail
+        assert result.detail == "no tests collected from the suite dir"
+        assert result.test_summary and result.test_summary["collected"] == 0

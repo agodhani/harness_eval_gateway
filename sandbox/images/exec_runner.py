@@ -357,7 +357,7 @@ def main() -> int:
         return 1
     warnings: list[str] = []
     result: dict[str, Any] = {
-        "version": 1,
+        "version": 3,
         "language": "python",
         "phases": {},
         "warnings": warnings,
@@ -387,20 +387,24 @@ def main() -> int:
     if TEST_TARGET_SRC is not None:
         result["test_target"] = str(TEST_TARGET_SRC)
         tests_root = _stage_test_target(TEST_TARGET_SRC, warnings)
+        if tests_root is None:
+            result["error"] = warnings[-1]
+            _emit(result)
+            return 1
 
-    if not py_files:
+    if not py_files and TEST_TARGET_SRC is None:
         warnings.append("no python sources found after copy — nothing to run")
         _emit(result)
         return 0
 
     # -- build: byte-compile everything -------------------------------------
-    build = _run(
-        [sys.executable, "-m", "compileall", "-q", "-f", str(WORK)],
-        BUILD_TIMEOUT,
-    )
-    phases["build"] = build
+    if py_files:
+        phases["build"] = _run(
+            [sys.executable, "-m", "compileall", "-q", "-f", str(WORK)],
+            BUILD_TIMEOUT,
+        )
 
-    # -- tests: coverage-wrapped pytest when test files exist ---------------
+    # -- tests: pytest (with coverage for Python candidates) ----------------
     # Default: the workspace's own test_*.py under /work. With a test target
     # the suite comes from the staged copy instead — pytest is pointed at the
     # dir explicitly (its basedir insertion covers sibling test modules;
@@ -412,17 +416,21 @@ def main() -> int:
     if not test_files:
         if TEST_TARGET_SRC is not None:
             warnings.append("EXEC_TEST_TARGET produced no test_*.py files")
-        phases["tests"] = None
+        phases["tests"] = {"detected": False} if TEST_TARGET_SRC is not None else None
     else:
         pytest_target = str(tests_root) if tests_root is not None else "."
-        run = _run(
-            [
-                sys.executable,
+        pytest_prefix = [sys.executable]
+        if py_files:
+            pytest_prefix += [
                 "-m",
                 "coverage",
                 "run",
                 f"--source={WORK}",
                 f"--data-file={COVERAGE_DATA}",
+            ]
+        run = _run(
+            [
+                *pytest_prefix,
                 "-m",
                 "pytest",
                 "-q",
@@ -485,7 +493,7 @@ def main() -> int:
         phases["tests"] = tests
 
         # -- coverage totals (only meaningful when tests actually ran) ------
-        if tests.get("collected"):
+        if py_files and tests.get("collected"):
             cov_run = _run(
                 [
                     sys.executable,

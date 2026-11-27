@@ -619,7 +619,20 @@ def _check_py_test(
             "error",
             outcome.error or "exec produced no result payload",
         )
-    tests = (outcome.result or {}).get("phases", {}).get("tests")
+    result = outcome.result or {}
+    phases = result.get("phases") or {}
+    tests = phases.get("tests") or {}
+    version = result.get("version")
+    if not tests:
+        detail = "exec image did not report a pytest phase for the supplied test target"
+        if not isinstance(version, int) or version < 3:
+            detail = f"exec image {outcome.image!r} did not report a pytest phase; rebuild the exec image"
+        return _outcome(
+            "py_test",
+            spec,
+            "error",
+            detail,
+        )
     summary = {
         "collected": int(tests.get("collected") or 0),
         "passed": int(tests.get("passed") or 0),
@@ -627,9 +640,9 @@ def _check_py_test(
         "errors": int(tests.get("errors") or 0),
         "skipped": int(tests.get("skipped") or 0),
         "duration_seconds": tests.get("duration_seconds"),
-        "ok": bool(tests.get("ok")) if tests else False,
+        "ok": bool(tests.get("ok")),
     }
-    if not tests or not tests.get("detected"):
+    if not tests.get("detected"):
         return _outcome(
             "py_test",
             spec,
