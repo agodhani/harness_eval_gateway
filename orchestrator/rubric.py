@@ -739,11 +739,15 @@ def _failure_message(exc: Exception, *, rubric_model: str = "") -> str:
     """Human-readable failure reason; surfaces the gateway's error body."""
     if isinstance(exc, RubricParseError):
         if rubric_model:
-            return "Rubric draft was invalid. Set RUBRIC_MODEL to a stronger model."
-        return (
-            "Rubric draft was invalid. Use a stronger run model to draft it "
-            "and pin the participant model separately in the API."
-        )
+            message = "Rubric draft was invalid. Set RUBRIC_MODEL to a stronger model."
+        else:
+            message = (
+                "Rubric draft was invalid. Use a stronger run model to draft it "
+                "and pin the participant model separately in the API."
+            )
+        if isinstance(exc.__cause__, json.JSONDecodeError):
+            message += f" JSON error: {exc.__cause__}"
+        return message
     if isinstance(exc, httpx.HTTPStatusError):
         body = exc.response.text.strip()
         if body:
