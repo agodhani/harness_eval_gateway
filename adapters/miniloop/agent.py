@@ -338,6 +338,21 @@ TOOLS: list[dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 
 
+def _content_arguments_match(args: dict[str, Any], schema: dict[str, Any]) -> bool:
+    if not all(key in args for key in schema["required"]):
+        return False
+    types = {"string": (str,), "integer": (int,), "number": (int, float)}
+    for key, prop in schema["properties"].items():
+        if key not in args:
+            continue
+        value = args[key]
+        if type(value) not in types[prop["type"]]:
+            return False
+        if "enum" in prop and value not in prop["enum"]:
+            return False
+    return True
+
+
 def _content_tool_call(content: Any, call_id: str) -> dict[str, Any] | None:
     if not isinstance(content, str):
         return None
@@ -354,7 +369,11 @@ def _content_tool_call(content: Any, call_id: str) -> dict[str, Any] | None:
     name, args = call["name"], call["arguments"]
     if not isinstance(name, str) or not isinstance(args, dict):
         return None
-    if not any(tool["function"]["name"] == name for tool in TOOLS):
+    schema = next(
+        (tool["function"]["parameters"] for tool in TOOLS if tool["function"]["name"] == name),
+        None,
+    )
+    if schema is None or not _content_arguments_match(args, schema):
         return None
     try:
         arguments = json.dumps(args, allow_nan=False)

@@ -167,6 +167,17 @@ def test_structured_tool_call_takes_precedence_over_content(harness, tmp_path: P
     assert not (tmp_path / "ignored.txt").exists()
 
 
+def test_content_done_with_declared_status(harness) -> None:
+    make, _ = harness
+    content = '{"name":"done","arguments":{"summary":"awaiting input","status":"blocked"}}'
+    agent, _, _ = make([_response(_assistant(content=content))])
+
+    result = _run(agent)
+
+    assert result.terminal_state == "agent_done"
+    assert result.done_status == "blocked"
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -175,6 +186,12 @@ def test_structured_tool_call_takes_precedence_over_content(harness, tmp_path: P
         '{"name":"done","arguments":"{}"}',
         '<tool_call>{"name":"done","arguments":',
         '{"name":"done","arguments":{},"example":true}',
+        '{"name":"done","arguments":{"summary":"finished"}}',
+        '{"name":"done","arguments":{"summary":"finished","status":"done"}}',
+        '{"name":"done","arguments":{"status":"success"}}',
+        '{"name":"done","arguments":{"summary":1,"status":"success"}}',
+        '{"name":"write_file","arguments":{"path":"file"}}',
+        '{"name":"read_file","arguments":{"path":"file","limit":true}}',
     ],
 )
 def test_invalid_content_tool_call_stays_text_only(harness, content: str) -> None:
@@ -183,6 +200,7 @@ def test_invalid_content_tool_call_stays_text_only(harness, content: str) -> Non
 
     assert _run(agent).terminal_state == "harness_complete"
     assert not any(e["type"] == "tool_call" for e in _events(out))
+    assert not any(e["type"] == "done_signal" for e in _events(out))
     assert any(e["payload"].get("stage") == "agent_nudge" for e in _events(out))
 
 
