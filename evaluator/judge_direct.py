@@ -335,16 +335,35 @@ def _message_content(resp_json: dict[str, Any]) -> str:
     return content
 
 
+async def _raise_for_status(response: httpx.Response) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = bytearray()
+        try:
+            async for chunk in exc.response.aiter_bytes():
+                if len(detail) < 500:
+                    detail.extend(chunk[: 500 - len(detail)])
+        except httpx.RequestError:
+            pass
+        preview = detail.decode("utf-8", errors="replace").strip()
+        if preview:
+            raise httpx.HTTPStatusError(
+                f"{exc}: {preview}", request=exc.request, response=exc.response
+            ) from exc
+        raise
+
+
 async def _chat_content(
     client: httpx.AsyncClient, url: str, body: dict[str, Any], headers: dict[str, str]
 ) -> str:
     if not body["stream"]:
         response = await client.post(url, json=body, headers=headers)
-        response.raise_for_status()
+        await _raise_for_status(response)
         return _message_content(response.json())
 
     async with client.stream("POST", url, json=body, headers=headers) as response:
-        response.raise_for_status()
+        await _raise_for_status(response)
         parts: list[str] = []
         done = False
         async for line in response.aiter_lines():

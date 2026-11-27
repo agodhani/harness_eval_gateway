@@ -430,7 +430,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     `test_prompts.py`) — mocked runtime; staging, timeout salvage, malformed
     scores covered; `tests/unit/evaluator/test_judge_direct.py` — fake
     gateway client: request contract, 4xx response_format retry, bounded
-    prompt gather, error mapping; `tests/unit/evaluator/test_testgen.py` — fake gateway
+    prompt gather, error mapping, and bounded detail from drained HTTP
+    errors; `tests/unit/evaluator/test_testgen.py` — fake gateway
     client + fake exec runner: skip/error semantics, deterministic
     containment of bad output (fences/markers/syntax/no-test rejection),
     provenance layout, pass-rate metrics, cap knobs;

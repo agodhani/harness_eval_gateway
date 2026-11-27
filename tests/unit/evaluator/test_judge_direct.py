@@ -315,6 +315,32 @@ async def test_local_direct_judge_retries_connect_and_reassembles_stream(
     assert calls == 2
 
 
+@pytest.mark.parametrize("stream", [False, True])
+async def test_http_error_drains_body_and_reports_bounded_detail(
+    eval_ws: Path, stream: bool
+) -> None:
+    drained = False
+
+    class ErrorStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            nonlocal drained
+            yield b"provider was unavailable"
+            yield b"x" * 600
+            yield b"end of body"
+            drained = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["stream"] is stream
+        return httpx.Response(502, stream=ErrorStream())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(DirectJudgeError, match="(?s)502.*provider was unavailable") as exc:
+            await _judge(eval_ws, client=client, stream=stream)
+    assert drained
+    assert "end of body" not in str(exc.value)
+    assert str(exc.value).endswith("provider was unavailable" + "x" * 476)
+
+
 async def test_empty_choices_raises(eval_ws: Path) -> None:
     class EmptyClient(_FakeClient):
         async def post(self, url, json=None, headers=None):
