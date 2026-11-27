@@ -81,7 +81,7 @@ TRANSCRIPT_TAIL_BYTES = 8_000
 _BINARY_SNIFF_BYTES = 8_192
 
 _OMITTED_PATH_LIMIT = 50
-_OMITTED_LIST_CHAR_LIMIT = 3_000
+_OMITTED_LIST_BYTE_LIMIT = 3_000
 
 
 class DirectJudgeError(Exception):
@@ -103,36 +103,38 @@ def direct_fallback_enabled(default: bool = True) -> bool:
 
 def _gather_sources(
     workspace: Path, *, budget_bytes: int
-) -> tuple[list[tuple[str, str]], list[str], int]:
-    """Text files, compact omission entries, and the count not listed.
-
-    Same shape as :func:`evaluator.testgen._gather_sources` — smallest files
-    first so one giant module can't starve the listing, the last included
-    file truncated to the remaining budget — but extension-agnostic (eval
-    submissions aren't only Python) and skipping evaluator-staged files,
-    and ``generated_tests/``. Binary and over-budget files are listed
-    without their contents. Reads are capped at the remaining budget — a
-    100MB artifact never costs a 100MB read.
-    """
+) -> str:
+    """Render source evidence, including headings and omissions, under one byte cap."""
+    heading = b"# Submission files\n\n"
+    omitted_heading = b"## Present files (contents omitted)\n"
+    summary_reserve = 64
+    budget = max(0, budget_bytes - len(heading))
+    omit_budget = min(_OMITTED_LIST_BYTE_LIMIT, max(180, budget // 4), budget)
+    source_budget = budget - omit_budget
     candidates = sorted(submission_files(workspace))
-
-    out: list[tuple[str, str]] = []
-    omitted: list[str] = []
-    omitted_chars = 0
+    sources = bytearray()
+    omitted = bytearray()
+    listed = 0
     unlisted = 0
 
     def omit(rel: str, reason: str) -> None:
-        nonlocal omitted_chars, unlisted
-        line = f"- {json.dumps(rel)} ({reason})"
-        if len(omitted) < _OMITTED_PATH_LIMIT and omitted_chars + len(line) < _OMITTED_LIST_CHAR_LIMIT:
-            omitted.append(line)
-            omitted_chars += len(line) + 1
+        nonlocal listed, unlisted
+        line = f"- {json.dumps(rel)} ({reason})\n".encode()
+        if (
+            listed < _OMITTED_PATH_LIMIT
+            and len(omitted) + len(line) + len(omitted_heading) + summary_reserve <= omit_budget
+        ):
+            omitted.extend(line)
+            listed += 1
         else:
             unlisted += 1
 
-    remaining = budget_bytes
+    footer = b"\n```\n\n"
+    truncated = "\n# ... [truncated — source budget]".encode()
     for size, path in candidates:
         rel = path.relative_to(workspace).as_posix()
+        header = f"### FILE: {rel}\n```\n".encode(errors="replace")
+        remaining = source_budget - len(sources) - len(header) - len(footer)
         if remaining <= 0:
             omit(rel, "source budget")
             continue
@@ -145,12 +147,22 @@ def _gather_sources(
         if b"\x00" in raw[:_BINARY_SNIFF_BYTES]:
             omit(rel, "binary")
             continue
-        text = raw.decode("utf-8", errors="replace")
-        if size > len(raw):
-            text += "\n# ... [truncated — source budget]\n"
-        out.append((rel, text))
-        remaining -= len(raw)
-    return out, omitted, unlisted
+        text = raw.decode("utf-8", errors="replace").rstrip().encode()
+        if size > len(raw) or len(text) > remaining:
+            if remaining <= len(truncated):
+                omit(rel, "source budget")
+                continue
+            text = text[: remaining - len(truncated)].decode(errors="ignore").encode()
+            text += truncated
+        sources.extend(header + text + footer)
+    if listed or unlisted:
+        summary = f"- … and {unlisted} more files not listed\n".encode() if unlisted else b""
+        inventory = omitted_heading + omitted + summary
+        if len(inventory) <= omit_budget:
+            sources.extend(inventory)
+        elif len(summary) <= omit_budget:
+            sources.extend(summary)
+    return (heading + sources).decode().rstrip() if sources else ""
 
 
 def _read_text_capped(path: Path, max_chars: int) -> str | None:
@@ -229,9 +241,7 @@ def build_direct_prompt(
     rubric: dict[str, Any] | None,
     *,
     analysis_md: str | None = None,
-    sources: list[tuple[str, str]] | None = None,
-    omitted_paths: list[str] | None = None,
-    unlisted_paths: int = 0,
+    source_evidence: str = "",
     transcript_tail: str | None = None,
     terminal_reason: str | None = None,
     prior_error: str | None = None,
@@ -290,15 +300,8 @@ def build_direct_prompt(
             analysis_md.strip(),
             "",
         ]
-    if sources or omitted_paths or unlisted_paths:
-        parts += ["# Submission files", ""]
-        for rel, text in sources or []:
-            parts += [f"### FILE: {rel}", "```", text.rstrip(), "```", ""]
-        if omitted_paths or unlisted_paths:
-            parts += ["## Present files (contents omitted)", *(omitted_paths or [])]
-            if unlisted_paths:
-                parts.append(f"- … and {unlisted_paths} more files not listed")
-            parts.append("")
+    if source_evidence:
+        parts += [source_evidence, ""]
     if transcript_tail:
         parts += [
             "# Candidate transcript (tail — reference only)",
@@ -411,15 +414,11 @@ async def judge_direct(
 
     analysis_md = _read_text_capped(ws / ANALYSIS_MD_FILENAME, ANALYSIS_BUDGET_CHARS)
     transcript_tail = _read_tail(ws / "EVAL_TRANSCRIPT.log", TRANSCRIPT_TAIL_BYTES)
-    sources, omitted_paths, unlisted_paths = await asyncio.to_thread(
-        _gather_sources, ws, budget_bytes=budget
-    )
+    source_evidence = await asyncio.to_thread(_gather_sources, ws, budget_bytes=budget)
     prompt = build_direct_prompt(
         rubric,
         analysis_md=analysis_md,
-        sources=sources,
-        omitted_paths=omitted_paths,
-        unlisted_paths=unlisted_paths,
+        source_evidence=source_evidence,
         transcript_tail=transcript_tail,
         terminal_reason=terminal_reason,
         prior_error=prior_error,

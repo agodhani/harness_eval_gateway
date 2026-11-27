@@ -351,7 +351,7 @@ async def test_source_budget_bounds_prompt(eval_ws: Path, monkeypatch) -> None:
     (eval_ws / "big.py").write_text("x = '" + "y" * 5000 + "'\n")
     (eval_ws / "biggest.py").write_text("z" * 6000)
     client = _FakeClient()
-    await _judge(eval_ws, client=client, source_budget_bytes=100)
+    await _judge(eval_ws, client=client, source_budget_bytes=400)
     user = client.calls[0]["json"]["messages"][1]["content"]
     assert "[truncated" in user
     # every source still represented
@@ -361,17 +361,18 @@ async def test_source_budget_bounds_prompt(eval_ws: Path, monkeypatch) -> None:
 
 
 async def test_many_over_budget_paths_have_a_compact_bounded_listing(eval_ws):
-    for i in range(80):
-        (eval_ws / f"omitted-{i:02}.txt").write_text("a" * 100)
+    for i in range(1001):
+        (eval_ws / f"candidate-{i:04}.txt").write_text("a" * 100)
     client = _FakeClient()
-    await _judge(eval_ws, client=client, source_budget_bytes=20)
+    await _judge(eval_ws, client=client, source_budget_bytes=24_000)
     user = client.calls[0]["json"]["messages"][1]["content"]
-    contents, omitted = user.split("## Present files (contents omitted)")
-    assert contents.count("### FILE:") == 2
+    section = user.split("# Submission files", 1)[1].split("# Candidate transcript", 1)[0]
+    contents, omitted = section.split("## Present files (contents omitted)")
+    assert len(("# Submission files" + section).encode()) <= 24_000
     assert omitted.count("(source budget)") == 50
-    assert '- "omitted-00.txt" (source budget)' in omitted
-    assert "and 30 more files not listed" in omitted
-    assert "omitted-79.txt" not in omitted
+    unlisted = 1001 - contents.count("### FILE: candidate-") - 50
+    assert f"and {unlisted} more files not listed" in omitted
+    assert "candidate-1000.txt" not in omitted
 
 
 # ----------------------------------------------------------------------
