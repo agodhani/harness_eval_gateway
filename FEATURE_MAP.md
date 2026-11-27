@@ -352,7 +352,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   the normal path with `eval_scored` `mode="direct_fallback"` (failures add
   `fallback_detail` to `eval_scores_failed`). Its prompt names binary and
   over-budget files without including their contents; the compact omission
-  list caps path count and length, then reports how many paths were unlisted.
+  list caps path count and shares the byte budget with source content.
+  It reports how many paths were unlisted.
   **Objective signals (PR6+PR7):** before staging, the candidate workspace
   is measured by the `scoring` package's signal collectors —
   `static_analysis` runs lizard (multi-language, parse-only, no code
@@ -416,7 +417,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   The monitor and both judge paths share one submission file check. Hidden
   deliverables count; VCS internals, known Aider scaffolding and
   evaluator-reserved files do not. A workspace without non-empty submission
-  files or a prompt cell without a non-blank reply is not sent to either judge. Results report
+  files or a prompt cell without a non-blank reply is not sent to either judge.
+  On seeded workspace runs, only new or changed files count as deliverables.
+  Results report
   `empty_submission` without creating score rows or retrying the panel.
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
   `prompts.py`, `judge_direct.py` — direct-completion fallback,

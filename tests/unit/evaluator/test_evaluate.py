@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from db.models import Base, Event, Rubric, Run, Sandbox, Score
+from evaluator import evaluate as evaluate_mod
 from evaluator.evaluate import evaluate_sandbox
 from evaluator.sandbox_spec import eval_sandbox_id, sandbox_gateway_url
 from sandbox.runtime import SandboxRuntime, SpawnResult
@@ -1035,6 +1036,38 @@ async def test_evaluate_workspace_with_only_hidden_deliverable(
 
     assert len(rows) == 3
     assert (Path(fake.specs[0].workspace_host_path) / path).read_text() == "submission\n"
+
+
+@pytest.mark.parametrize("change", [None, "add", "modify"])
+async def test_seed_only_workspace_never_reaches_judges_or_score_parser(
+    seeded, session_factory, tmp_path, monkeypatch, change
+) -> None:
+    workspace = seeded["workspace"]
+    (workspace / "main.py").unlink()
+    (workspace / "hello.txt").unlink()
+    starter = "Starter README\n"
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / "README.md").write_text(starter)
+    (workspace / "README.md").write_text(starter)
+    fake = FakeRuntime()
+
+    if change is None:
+        def unexpected(*args, **kwargs):
+            pytest.fail("empty submission reached judging or score parsing")
+
+        monkeypatch.setattr(evaluate_mod, "judge_direct", unexpected)
+        monkeypatch.setattr(evaluate_mod, "load_scores_file", unexpected)
+        with pytest.raises(FileNotFoundError, match="no non-empty submission files"):
+            await _eval(seeded, session_factory, fake, seed_dir=seed)
+        assert not fake.specs
+        assert not _scores_in_db(session_factory)
+        return
+    if change == "modify":
+        (workspace / "README.md").write_text(starter.replace("Starter", "Changed"))
+    else:
+        (workspace / ".deliverable").write_text("new work")
+    assert len(await _eval(seeded, session_factory, fake, seed_dir=seed)) == 3
 
 
 async def test_evaluate_prompt_output_analysis_persists(

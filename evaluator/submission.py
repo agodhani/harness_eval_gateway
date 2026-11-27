@@ -61,5 +61,22 @@ def submission_files(workspace: Path) -> Iterator[tuple[int, Path]]:
             yield info.st_size, path
 
 
-def has_submission(workspace: Path) -> bool:
-    return next(submission_files(workspace), None) is not None
+def _identical_file(left: Path, right: Path) -> bool:
+    with left.open("rb") as actual, right.open("rb") as original:
+        while chunk := actual.read(64 * 1024):
+            if chunk != original.read(len(chunk)):
+                return False
+        return not original.read(1)
+
+
+def has_submission(workspace: Path, seed_dir: Path | None = None) -> bool:
+    if seed_dir is None:
+        return next(submission_files(workspace), None) is not None
+    if not seed_dir.is_dir():
+        raise FileNotFoundError("run seed is unavailable for submission comparison")
+    seed_sizes = {path.relative_to(seed_dir): size for size, path in submission_files(seed_dir)}
+    for size, path in submission_files(workspace):
+        rel = path.relative_to(workspace)
+        if seed_sizes.get(rel) != size or not _identical_file(path, seed_dir / rel):
+            return True
+    return False

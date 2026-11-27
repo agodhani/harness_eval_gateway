@@ -581,6 +581,7 @@ async def _evaluate_all(
     check_entries, check_suite_dir = _suite_check_specs(run, settings)
     for sb in sandboxes:
         artifact_dir = Path(sb.artifact_path)  # type: ignore[arg-type]
+        is_prompt_cell = prompt_cell.is_prompt_config(sb.harness_config)
         if check_entries:
             # Post-artifact step — measured before the judge runs so the
             # objective verdict is persisted even if eval later fails.
@@ -605,7 +606,7 @@ async def _evaluate_all(
             # (ignored for container cells).
             "prompt_output_path": (
                 artifact_dir / prompt_cell.OUTPUT_FILENAME
-                if prompt_cell.is_prompt_config(sb.harness_config)
+                if is_prompt_cell
                 else None
             ),
             "transcript_path": artifact_dir / "transcript.log",
@@ -624,6 +625,8 @@ async def _evaluate_all(
             # reasoning before scores.json; the 4096 default truncates.
             "judge_max_tokens": int(settings.EVAL_JUDGE_MAX_TOKENS),
         }
+        if not is_prompt_cell and (sb.harness_config or {}).get("seed_sha"):
+            kwargs["seed_dir"] = Path(runtime.state_dir).parent / "seeds" / str(run.id) / "content"
         # One judge at a time (sequential — the eval sandbox id + staged
         # workspace are per-sandbox, not per-judge). Each judge gets its
         # own cred + retry budget; one judge's failure mustn't zero the

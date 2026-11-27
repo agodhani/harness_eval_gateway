@@ -618,6 +618,7 @@ async def evaluate_sandbox(
     rubric: dict[str, Any] | None = None,
     artifact_dir: Path | str | None = None,
     workspace_dir: Path | str | None = None,
+    seed_dir: Path | None = None,
     prompt_output_path: Path | str | None = None,
     transcript_path: Path | str | None = None,
     terminal_reason: str | None = None,
@@ -710,8 +711,8 @@ async def evaluate_sandbox(
             )
         ws_path = Path(ws_dir)
         art_path = art_dir if art_dir is not None else ws_path.parent
-        if not await asyncio.to_thread(has_submission, ws_path):
-            raise EmptySubmissionError("workspace has no non-empty submission files")
+        if not await asyncio.to_thread(has_submission, ws_path, seed_dir):
+            raise EmptySubmissionError("workspace has no non-empty submission files added or changed")
     transcript = (
         Path(transcript_path)
         if transcript_path is not None
