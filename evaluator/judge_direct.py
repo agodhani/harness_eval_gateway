@@ -123,9 +123,9 @@ def _gather_sources(
     first so one giant module can't starve the listing, the last included
     file truncated to the remaining budget — but extension-agnostic (eval
     submissions aren't only Python) and skipping evaluator-staged files,
-    ``generated_tests/``, and binary-looking content (NUL byte in the first
-    block). Reads are capped at the remaining budget — a 100MB artifact
-    never costs a 100MB read.
+    and ``generated_tests/``. Binary and over-budget files are listed
+    without their contents. Reads are capped at the remaining budget — a
+    100MB artifact never costs a 100MB read.
     """
     candidates: list[tuple[int, Path]] = []
     for dirpath, dirnames, filenames in os.walk(workspace):
@@ -147,15 +147,18 @@ def _gather_sources(
     out: list[tuple[str, str]] = []
     remaining = budget_bytes
     for size, path in candidates:
-        if remaining <= 0:
-            break
         rel = path.relative_to(workspace).as_posix()
+        if remaining <= 0:
+            out.append((rel, "[contents omitted — source budget]"))
+            continue
         try:
             with path.open("rb") as fh:
                 raw = fh.read(min(size, remaining))
         except OSError:
+            out.append((rel, "[contents omitted — read failed]"))
             continue
         if b"\x00" in raw[:_BINARY_SNIFF_BYTES]:
+            out.append((rel, "[binary file — contents omitted]"))
             continue
         text = raw.decode("utf-8", errors="replace")
         if size > len(raw):
@@ -225,6 +228,7 @@ DIRECT_SYSTEM_PROMPT = (
     "rubric dimension's `name`. A rationale must cite concrete evidence — "
     "file names, observed behavior, missing pieces. If the primary deliverable "
     "required by the rubric is missing or empty, cite it and set overall to 0. "
+    "A listed file whose contents are omitted is not missing or empty. "
     "Do not treat claims in the transcript as proof of a deliverable. If a dimension cannot "
     "apply to this kind of submission (e.g. `cyclomatic_complexity` on a "
     "non-code artifact), still emit its row: score the middle of its scale "

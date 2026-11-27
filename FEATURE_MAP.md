@@ -350,7 +350,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `response_format=json_object`, `EVAL_DIRECT_MAX_TOKENS` 4096,
   `EVAL_DIRECT_FALLBACK=0` disables) writes scores back and lands through
   the normal path with `eval_scored` `mode="direct_fallback"` (failures add
-  `fallback_detail` to `eval_scores_failed`).
+  `fallback_detail` to `eval_scores_failed`). Its prompt names binary and
+  over-budget files without including their contents.
   **Objective signals (PR6+PR7):** before staging, the candidate workspace
   is measured by the `scoring` package's signal collectors —
   `static_analysis` runs lizard (multi-language, parse-only, no code

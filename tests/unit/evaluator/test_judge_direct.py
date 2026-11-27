@@ -177,7 +177,9 @@ async def test_analysis_and_transcript_included(eval_ws: Path) -> None:
     assert "tail-line" in user
 
 
-async def test_binary_and_generated_tests_skipped(eval_ws: Path) -> None:
+async def test_binary_path_listed_without_contents_and_generated_tests_skipped(
+    eval_ws: Path,
+) -> None:
     (eval_ws / "blob.bin").write_bytes(b"\x00\x01\x02binary")
     gen = eval_ws / "generated_tests"
     gen.mkdir()
@@ -185,7 +187,8 @@ async def test_binary_and_generated_tests_skipped(eval_ws: Path) -> None:
     client = _FakeClient()
     await _judge(eval_ws, client=client)
     user = client.calls[0]["json"]["messages"][1]["content"]
-    assert "blob.bin" not in user
+    assert "### FILE: blob.bin\n```\n[binary file — contents omitted]" in user
+    assert "\x00\x01\x02binary" not in user
     assert "test_x.py" not in user
 
 
@@ -332,12 +335,15 @@ async def test_max_tokens_env_knob(eval_ws: Path, monkeypatch) -> None:
 
 async def test_source_budget_bounds_prompt(eval_ws: Path, monkeypatch) -> None:
     (eval_ws / "big.py").write_text("x = '" + "y" * 5000 + "'\n")
+    (eval_ws / "biggest.py").write_text("z" * 6000)
     client = _FakeClient()
     await _judge(eval_ws, client=client, source_budget_bytes=100)
     user = client.calls[0]["json"]["messages"][1]["content"]
     assert "[truncated" in user
     # every source still represented
     assert "main.py" in user and "big.py" in user
+    assert "### FILE: biggest.py\n```\n[contents omitted — source budget]" in user
+    assert "z" * 100 not in user
 
 
 # ----------------------------------------------------------------------
