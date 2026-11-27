@@ -37,12 +37,12 @@ PR34 adds the artifact file browser + side-by-side diff:
 
 PR35 adds run export + share links (F28):
 
-- ``GET /api/runs/{run_id}/export?fmt=json|csv`` — the full run bundle as a
+- ``GET /api/runs/{run_id}/export?format=json|csv`` — the full run bundle as a
   download: submitted spec, every rubric version (content included), the
   score matrix (:class:`RunResults`, same payload the results page reads),
   the analytics rollup (:class:`RunAnalytics`), and events-lite — summary
   event rows with payloads projected to scalar fields, NOT full bodies.
-  ``fmt=csv`` instead flattens to one row per sandbox × score dimension
+  ``format=csv`` instead flattens to one row per sandbox × score dimension
   (see :func:`_export_csv` for the column doctrine).
 - ``POST /api/runs/{run_id}/share`` / ``DELETE .../share`` — mint / revoke
   the run's ``share_token`` (unguessable; idempotent mint).
@@ -86,7 +86,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from api.config import get_settings
-from api.deps import get_db
+from api.deps import RunPathId, get_db
 from api.routers.analytics import get_run_analytics
 from api.schemas import (
     AnalysisReport,
@@ -2041,7 +2041,7 @@ class RunSpecOut(BaseModel):
 
 
 class RunExport(BaseModel):
-    """``GET /api/runs/{id}/export?fmt=json`` — the full run bundle.
+    """``GET /api/runs/{id}/export?format=json`` — the full run bundle.
 
     Self-contained snapshot: the submitted spec, every rubric version
     (content included — score provenance is meaningless without it), the
@@ -2317,21 +2317,23 @@ def _run_or_404(session: Session, run_id: UUID) -> Run:
 
 @router.get("/api/runs/{run_id}/export")
 def export_run(
-    run_id: UUID,
+    run_id: RunPathId,
     session: DbSession,
-    fmt: Literal["json", "csv"] = "json",
+    fmt: Literal["json", "csv"] | None = None,
+    export_format: Annotated[Literal["json", "csv"] | None, Query(alias="format")] = None,
 ) -> Response:
     """PR35 — the full run bundle as a download.
 
-    ``fmt=json`` (default) → :class:`RunExport` (spec, rubrics, score
-    matrix, analytics, events-lite). ``fmt=csv`` → the flattened sheet:
+    ``format=json`` (default) → :class:`RunExport` (spec, rubrics, score
+    matrix, analytics, events-lite). ``format=csv`` → the flattened sheet:
     one row per sandbox × score dimension (see :func:`_export_csv`).
+    ``fmt`` remains a legacy alias.
     """
     run = _run_or_404(session, run_id)
     results = get_run_results(run_id, session)
     analytics = get_run_analytics(run_id, session)
 
-    if fmt == "csv":
+    if (export_format or fmt) == "csv":
         body = _export_csv(run_id, results, analytics)
         return Response(
             content=body.encode("utf-8"),
@@ -2391,7 +2393,7 @@ _SHARE_FS_KEYS = frozenset(
 
 
 @router.post("/api/runs/{run_id}/share", response_model=ShareLinkOut)
-def create_share_link(run_id: UUID, session: DbSession) -> ShareLinkOut:
+def create_share_link(run_id: RunPathId, session: DbSession) -> ShareLinkOut:
     """Mint (or return) the run's share token — idempotent.
 
     ``secrets.token_urlsafe(16)`` = 128 bits of entropy — the token is the
@@ -2442,7 +2444,7 @@ def create_share_link(run_id: UUID, session: DbSession) -> ShareLinkOut:
 
 
 @router.delete("/api/runs/{run_id}/share", status_code=status.HTTP_204_NO_CONTENT)
-def delete_share_link(run_id: UUID, session: DbSession) -> None:
+def delete_share_link(run_id: RunPathId, session: DbSession) -> None:
     """Revoke the share link — the token stops resolving immediately."""
     run = _run_or_404(session, run_id)
     if run.share_token is not None:

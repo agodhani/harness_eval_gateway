@@ -27,7 +27,7 @@ from api import modelcheck
 from api import presets as preset_store
 from api import rubric_templates as template_store
 from api.config import get_settings
-from api.deps import get_db
+from api.deps import RunPathId, get_db
 from api.schemas import (
     RubricOut,
     RunCreate,
@@ -544,7 +544,7 @@ async def list_runs(
 
 
 @router.get("/{run_id}")
-async def get_run(run_id: uuid.UUID, session: DbSession) -> RunOut:
+async def get_run(run_id: RunPathId, session: DbSession) -> RunOut:
     return _run_out(session, _get_run_or_404(session, run_id))
 
 
