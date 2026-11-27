@@ -124,6 +124,68 @@ def test_done_terminates_agent_done(harness, tmp_path: Path) -> None:
     assert term["payload"]["terminal_state"] == "agent_done"
 
 
+@pytest.mark.parametrize("wrapper", ["{}", "<tool_call>{}</tool_call>"])
+def test_content_tool_call_dispatch_and_replay(harness, tmp_path: Path, wrapper: str) -> None:
+    make, out = harness
+    args = {"path": "hi.txt", "content": "hi"}
+    content = wrapper.format(json.dumps({"name": "write_file", "arguments": args}))
+    agent, client, _ = make(
+        [
+            _response(_assistant(content=content, tool_calls=[])),
+            _response(_assistant(tool_calls=[_tool_call("done", {"summary": "wrote file"})])),
+        ]
+    )
+
+    assert _run(agent).terminal_state == "agent_done"
+    assert (tmp_path / "hi.txt").read_text() == "hi"
+    assistant, tool = client.calls[1]["messages"][-2:]
+    assert assistant["content"] is None
+    (call,) = assistant["tool_calls"]
+    assert call["function"]["name"] == "write_file"
+    assert json.loads(call["function"]["arguments"]) == args
+    assert tool["role"] == "tool"
+    assert tool["tool_call_id"] == call["id"]
+    assert [e["payload"]["name"] for e in _events(out) if e["type"] == "tool_call"] == [
+        "write_file", "done",
+    ]
+
+
+def test_structured_tool_call_takes_precedence_over_content(harness, tmp_path: Path) -> None:
+    make, _ = harness
+    agent, _, _ = make(
+        [
+            _response(
+                _assistant(
+                    content='{"name":"write_file","arguments":{"path":"ignored.txt","content":"hi"}}',
+                    tool_calls=[_tool_call("done", {"summary": "finished"})],
+                )
+            ),
+        ]
+    )
+
+    assert _run(agent).terminal_state == "agent_done"
+    assert not (tmp_path / "ignored.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'Example: <tool_call>{"name":"done","arguments":{}}</tool_call>',
+        '{"name":"unknown","arguments":{}}',
+        '{"name":"done","arguments":"{}"}',
+        '<tool_call>{"name":"done","arguments":',
+        '{"name":"done","arguments":{},"example":true}',
+    ],
+)
+def test_invalid_content_tool_call_stays_text_only(harness, content: str) -> None:
+    make, out = harness
+    agent, _, _ = make([_response(_assistant(content=content))], max_iters=1)
+
+    assert _run(agent).terminal_state == "harness_complete"
+    assert not any(e["type"] == "tool_call" for e in _events(out))
+    assert any(e["payload"].get("stage") == "agent_nudge" for e in _events(out))
+
+
 def test_identical_tool_calls_three_times_stuck(harness) -> None:
     make, _ = harness
     same = _tool_call("shell", {"command": "ls"}, "c1")

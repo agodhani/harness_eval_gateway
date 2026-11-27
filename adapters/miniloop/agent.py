@@ -338,6 +338,35 @@ TOOLS: list[dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 
 
+def _content_tool_call(content: Any, call_id: str) -> dict[str, Any] | None:
+    if not isinstance(content, str):
+        return None
+    text = content.strip()
+    prefix, suffix = "<tool_call>", "</tool_call>"
+    if text.startswith(prefix) and text.endswith(suffix):
+        text = text[len(prefix):-len(suffix)]
+    try:
+        call = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(call, dict) or call.keys() != {"name", "arguments"}:
+        return None
+    name, args = call["name"], call["arguments"]
+    if not isinstance(name, str) or not isinstance(args, dict):
+        return None
+    if not any(tool["function"]["name"] == name for tool in TOOLS):
+        return None
+    try:
+        arguments = json.dumps(args, allow_nan=False)
+    except (ValueError, RecursionError):
+        return None
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }
+
+
 def _tool_signature(tool_calls: list[dict[str, Any]]) -> str:
     """Canonical signature of an assistant message's tool calls — used for
     stuck-loop detection (3 consecutive identical signatures → stuck_loop)."""
@@ -461,9 +490,13 @@ class Agent:
                 usage["completion_tokens"] += ct
                 usage["total_tokens"] += tt or (pt + ct)
 
-                # Append the assistant message verbatim (content + tool_calls).
-                messages.append(msg)
                 tool_calls = msg.get("tool_calls") or []
+                if not tool_calls:
+                    fallback = _content_tool_call(msg.get("content"), f"call_content_{iters}")
+                    if fallback is not None:
+                        tool_calls = [fallback]
+                        msg = {**msg, "content": None, "tool_calls": tool_calls}
+                messages.append(msg)
 
                 if not tool_calls:
                     # First defense: bounded corrective nudges demanding a
