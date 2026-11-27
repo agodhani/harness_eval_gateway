@@ -104,7 +104,7 @@ from db.models import (
     Sandbox,
     Score,
 )
-from evaluator.scores import OVERALL_DIMENSION
+from evaluator.scores import OVERALL_DIMENSION, rubric_dimension_scales
 from orchestrator import events as orch_events
 from orchestrator import prompt_cell, runner, state_machine
 from orchestrator.matrix import (
@@ -120,7 +120,7 @@ from sandbox.preview import (
     resolve_workspace_dir,
 )
 from sandbox.thumbnails import THUMB_FILENAME, THUMB_META_FILENAME
-from scoring.checkers import SUITE_PASS_DIMENSION
+from scoring.checkers import SUITE_PASS_DIMENSION, fold_dimension_name
 from scoring.exec import exec_summary_dict
 from scoring.render import ANALYSIS_JSON_FILENAME
 
@@ -889,22 +889,22 @@ class _MergedScores(NamedTuple):
 
 
 def _merge_dimensions(
-    rows: list[Score], *, primary_judge: str | None
+    rows: list[tuple[str, Score]], *, primary_judge: str | None
 ) -> _MergedScores:
     """Newest-wins-per-bucket merge of one sandbox's score rows.
 
-    ``rows`` arrive ordered newest-last (created_at, seq, rubric_version,
-    id — the durable insertion order). Per dimension, the last row per
+    ``rows`` carry the display dimension and arrive ordered newest-last
+    (created_at, seq, rubric_version, id). Per dimension, the last row per
     (source, judge) bucket survives; the cell then resolves as human >
     judge-mean (see ``_dimension_entry``).
     """
     dims: dict[str, dict[tuple[str, str | None], Score]] = {}
     newest_of: dict[str, Score] = {}
-    for sc in rows:
-        dims.setdefault(sc.dimension, {})[_score_bucket(sc, primary_judge)] = sc
+    for dim, sc in rows:
+        dims.setdefault(dim, {})[_score_bucket(sc, primary_judge)] = sc
         # Every row overwrites its own bucket, so the dimension's last
         # row is always one of the surviving winners.
-        newest_of[sc.dimension] = sc
+        newest_of[dim] = sc
     dimensions: dict[str, DimensionScore] = {}
     overall: DimensionScore | None = None
     suite_pass: float | None = None
@@ -972,6 +972,15 @@ def get_run_results(
     # rubric_id -> version map for provenance display + filter fallbacks.
     rubrics = _rubric_rows(session, run_id)
     version_of: dict[UUID, int] = {r.id: r.version for r in rubrics}
+    rubric_dimensions = {
+        r.version: set(rubric_dimension_scales(r.content)) for r in rubrics
+    }
+    declared_dimensions = set().union(*rubric_dimensions.values())
+
+    def score_version(score: Score) -> int | None:
+        if score.rubric_version is not None:
+            return score.rubric_version
+        return version_of.get(score.rubric_id) if score.rubric_id is not None else None
 
     sandboxes = (
         session.execute(
@@ -1132,14 +1141,26 @@ def get_run_results(
         for sc in sb_scores:
             if sc.rubric_id is not None:
                 rubric_id = sc.rubric_id  # rows ordered asc -> newest wins
-            row_version = sc.rubric_version or (
-                version_of.get(sc.rubric_id) if sc.rubric_id is not None else None
-            )
+            row_version = score_version(sc)
             if row_version is not None:
                 sb_rubric_version = row_version
+        visible_scores: list[tuple[str, Score]] = []
+        for sc in sb_scores:
+            dim = sc.dimension
+            if dim not in {OVERALL_DIMENSION, SUITE_PASS_DIMENSION}:
+                folded = fold_dimension_name(dim)
+                if sc.source == "llm":
+                    original_dimensions = rubric_dimensions.get(score_version(sc) or 0)
+                    if original_dimensions:
+                        if folded not in original_dimensions:
+                            continue
+                        dim = folded
+                elif sc.source == "human" and folded in declared_dimensions:
+                    dim = folded
+            visible_scores.append((dim, sc))
         # PR29 — per-(source,judge) buckets: human wins its pair; llm
         # buckets merge to the panel mean + spread.
-        merged = _merge_dimensions(sb_scores, primary_judge=primary_judge)
+        merged = _merge_dimensions(visible_scores, primary_judge=primary_judge)
         judge_means_by_sandbox[sb.id] = merged.judge_means
         suite_pass_score = merged.suite_pass
         suite_block = suite_by_sandbox.get(sb.id)
@@ -1163,8 +1184,8 @@ def get_run_results(
                     # judge verdict — it must not mask "judge failed".
                     None
                     if any(
-                        sc.dimension != SUITE_PASS_DIMENSION
-                        for sc in sb_scores
+                        dim != SUITE_PASS_DIMENSION
+                        for dim, _ in visible_scores
                     )
                     else eval_failures.get(sb.id)
                 ),
@@ -1228,7 +1249,7 @@ def get_run_results(
             )
             for r in rubrics
         ],
-        votes=_votes_summary(session, run_id, judge_means_by_sandbox),
+        votes=_votes_summary(session, run_id, judge_means_by_sandbox, declared_dimensions),
         sandboxes=results,
     )
 
@@ -2507,6 +2528,7 @@ def _votes_summary(
     session: Session,
     run_id: UUID,
     judge_means_by_sandbox: dict[UUID, dict[str, float]],
+    declared_dimensions: set[str],
 ) -> VotesSummary | None:
     """Pairwise-vote roll-up for the results page.
 
@@ -2530,16 +2552,17 @@ def _votes_summary(
         return None
     latest: dict[tuple[tuple[UUID, UUID], str], PairwiseVote] = {}
     for v in rows:
+        folded = fold_dimension_name(v.dimension)
         key = (
             tuple(sorted((v.left_sandbox, v.right_sandbox), key=str)),
-            v.dimension,
+            folded if folded in declared_dimensions else v.dimension,
         )
         latest[key] = v
 
     stats: dict[UUID, VoteStats] = {}
     compared = 0
     agreed = 0
-    for v in latest.values():
+    for (_, dimension), v in latest.items():
         if v.winner == "tie":
             stats.setdefault(v.left_sandbox, VoteStats()).ties += 1
             stats.setdefault(v.right_sandbox, VoteStats()).ties += 1
@@ -2549,12 +2572,8 @@ def _votes_summary(
         elif v.winner == "right":
             stats.setdefault(v.right_sandbox, VoteStats()).wins += 1
             stats.setdefault(v.left_sandbox, VoteStats()).losses += 1
-        left_mean = (judge_means_by_sandbox.get(v.left_sandbox) or {}).get(
-            v.dimension
-        )
-        right_mean = (judge_means_by_sandbox.get(v.right_sandbox) or {}).get(
-            v.dimension
-        )
+        left_mean = judge_means_by_sandbox.get(v.left_sandbox, {}).get(dimension)
+        right_mean = judge_means_by_sandbox.get(v.right_sandbox, {}).get(dimension)
         if left_mean is None or right_mean is None:
             continue
         compared += 1

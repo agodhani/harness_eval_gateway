@@ -70,7 +70,10 @@ def scored_run(session_factory: sessionmaker[Session]) -> dict:
             run_id=run.id,
             version=1,
             status="approved",
-            content={"dimensions": [{"name": "functional_requirements"}]},
+            content={"dimensions": [
+                {"name": "functional_requirements"},
+                {"name": "code_quality"},
+            ]},
         )
         s.add(rubric)
         s.flush()
@@ -163,7 +166,8 @@ def test_export_json_roundtrip(client, scored_run) -> None:
     # rubric versions incl. content
     assert len(bundle.rubrics) == 1
     assert bundle.rubrics[0].content["dimensions"] == [
-        {"name": "functional_requirements"}
+        {"name": "functional_requirements"},
+        {"name": "code_quality"},
     ]
     # score matrix — same shape the results page reads
     assert len(bundle.results.sandboxes) == 2

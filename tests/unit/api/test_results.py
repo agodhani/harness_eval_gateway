@@ -76,7 +76,10 @@ def scored_run(session_factory: sessionmaker[Session]):
         s.flush()
         rubric = Rubric(
             run_id=run.id, version=1, status="approved",
-            content={"dimensions": [{"name": "functional_requirements"}]},
+            content={"dimensions": [
+                {"name": "functional_requirements"},
+                {"name": "code_quality"},
+            ]},
         )
         s.add(rubric)
         s.flush()
@@ -1295,6 +1298,10 @@ def test_results_rubric_version_filter(
                 sandbox_id=scored_run["sb1"], rubric_id=v2.id, rubric_version=2,
                 dimension="overall", score=9.0, rationale="better",
             ),
+            Score(
+                sandbox_id=scored_run["sb2"], rubric_id=v1.id, rubric_version=1,
+                dimension="code_quality", score=5.0,
+            ),
         ])
         s.commit()
         v2_id = v2.id
@@ -1305,11 +1312,14 @@ def test_results_rubric_version_filter(
     body = client.get(f"/api/runs/{scored_run['run_id']}/results").json()
     sb1 = next(x for x in body["sandboxes"] if x["sandbox_id"] == str(scored_run["sb1"]))
     assert sb1["dimensions"]["functional_requirements"]["score"] == 9.5
+    assert sb1["dimensions"]["code_quality"]["score"] == 6.0
+    sb2 = _sandbox_result(body, scored_run["sb2"])
+    assert sb2["dimensions"]["code_quality"]["score"] == 5.0
     assert sb1["overall"]["score"] == 9.0
     assert sb1["rubric_version"] == 2
     assert body["selected_rubric_version"] is None
     versions = {v["version"]: v for v in body["rubric_versions"]}
-    assert versions[1]["score_count"] == 3
+    assert versions[1]["score_count"] == 4
     assert versions[2]["score_count"] == 2
     assert versions[1]["status"] == "superseded"
 
@@ -1319,9 +1329,17 @@ def test_results_rubric_version_filter(
     ).json()
     sb1 = next(x for x in body["sandboxes"] if x["sandbox_id"] == str(scored_run["sb1"]))
     assert sb1["dimensions"]["functional_requirements"]["score"] == 8.0
+    assert set(sb1["dimensions"]) == {"functional_requirements", "code_quality"}
     assert sb1["overall"]["score"] == 7.0
     assert sb1["rubric_version"] == 1
     assert body["selected_rubric_version"] == 1
+
+    body = client.get(
+        f"/api/runs/{scored_run['run_id']}/results", params={"rubric_version": 2}
+    ).json()
+    assert set(_sandbox_result(body, scored_run["sb1"])["dimensions"]) == {
+        "functional_requirements",
+    }
 
     # version with no scores → empty dimensions but no error
     s = session_factory()
@@ -1980,6 +1998,60 @@ def test_results_panel_mean_and_spread(
     assert all(j["source"] == "llm" for j in cell["judges"])
 
 
+def test_results_hide_persisted_off_rubric_judge_rows(
+    client: TestClient, session_factory, artifact_root
+) -> None:
+    fx = _panel_run(session_factory, artifact_root)
+    _judge_score(session_factory, fx["sb_a"], fx["rubric_id"],
+                 "functional_requirements", 8.0, "judge-a")
+    _judge_score(session_factory, fx["sb_a"], fx["rubric_id"],
+                 "generated_tests", 2.0, "judge-a")
+
+    path = f"/api/runs/{fx['run_id']}/results"
+    for params in ({}, {"rubric_version": 1}):
+        response = client.get(path, params=params)
+        assert response.status_code == 200
+        assert set(_sandbox_result(response.json(), fx["sb_a"])["dimensions"]) == {
+            "functional_requirements",
+        }
+    raw = client.get(f"/api/sandboxes/{fx['sb_a']}/scores").json()
+    assert {row["dimension"] for row in raw} == {
+        "functional_requirements", "generated_tests",
+    }
+
+
+def test_results_merge_historical_rubric_aliases(
+    client: TestClient, session_factory, artifact_root, monkeypatch,
+    _clean_pair_sessions,
+) -> None:
+    fx = _panel_run(session_factory, artifact_root)
+    sid = fx["sb_a"]
+    _judge_score(session_factory, sid, fx["rubric_id"], "Code Quality", 8.0, "judge-a")
+    _judge_score(session_factory, sid, fx["rubric_id"], "code_quality", 4.0, "judge-b")
+    _judge_score(session_factory, fx["sb_b"], fx["rubric_id"], "Quality", 2.0, "judge-a")
+    _pin_pair_order(monkeypatch)
+    run_path = f"/api/runs/{fx['run_id']}"
+    pair = client.post(
+        run_path + "/pair", json={"sandbox_ids": [str(sid), str(fx["sb_b"])]},
+    ).json()
+    for dim, winner in (("Code Quality", "b"), ("code_quality", "a")):
+        response = client.post(
+            run_path + f"/pair/{pair['pair_id']}/vote",
+            json={"dimension": dim, "winner": winner},
+        )
+        assert response.status_code == 201
+    path = f"/api/runs/{fx['run_id']}/results"
+    body = client.get(path, params={"rubric_version": 1}).json()
+    dims = _sandbox_result(body, sid)["dimensions"]
+    assert set(dims) == {"code_quality"}
+    assert dims["code_quality"]["score"] == 6.0
+    assert dims["code_quality"]["judge_count"] == 2
+    assert (body["votes"]["total"], body["votes"]["agreed"]) == (1, 1)
+
+    raw = client.get(f"/api/sandboxes/{sid}/scores").json()
+    assert {row["dimension"] for row in raw} == {"Code Quality", "code_quality"}
+
+
 def test_results_panel_newest_per_judge_wins(
     client: TestClient, session_factory, artifact_root
 ) -> None:
@@ -2046,6 +2118,29 @@ def test_results_checker_source_and_eval_error(
     sb_b = _sandbox_result(body, fx["sb_b"])
     assert sb_b["eval_error"] is not None
     assert "judge-a" in sb_b["eval_error"]
+
+
+def test_results_keep_human_override_outside_selected_rubric(
+    client: TestClient, session_factory, artifact_root
+) -> None:
+    fx = _panel_run(session_factory, artifact_root)
+    sid = fx["sb_a"]
+    override = client.post(
+        f"/api/sandboxes/{sid}/scores",
+        json={"dimension": "code_quality", "score": 7, "note": "Reviewed"},
+    )
+    assert override.status_code == 201
+    with session_factory() as s:
+        s.add(Rubric(
+            run_id=fx["run_id"], version=2, status="approved",
+            content={"dimensions": [{"name": "functional_requirements"}]},
+        ))
+        s.commit()
+
+    path = f"/api/runs/{fx['run_id']}/results"
+    body = client.get(path, params={"rubric_version": 2}).json()
+    cell = _sandbox_result(body, sid)["dimensions"]["code_quality"]
+    assert (cell["source"], cell["score"], cell["note"]) == ("human", 7, "Reviewed")
 
 
 def test_results_human_override_wins(

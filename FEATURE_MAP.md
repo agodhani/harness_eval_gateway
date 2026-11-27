@@ -334,7 +334,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   per-sandbox cred); writes score + rationale per rubric dimension
   (functional requirements, acceptance criteria, code quality, cyclomatic
   complexity); `scores.json` parsed into `Score` rows with salvage-mode
-  parsing (incl. flat `{dimension: score}` normalization); `EVAL_TRANSCRIPT.log`
+  parsing (incl. flat `{dimension: score}` normalization); both judge paths
+  drop dimension rows outside the frozen rubric. `EVAL_TRANSCRIPT.log` is
   written for evidence. Bounded retry: a judge run that produces zero Score
   rows is re-spawned up to `EVAL_SCORE_RETRIES` times (default 1) with a fresh
   cred, emitting an `eval_retry` checkpoint — covers small-model flake modes
@@ -929,7 +930,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
     lookups). `GET /api/runs/{id}/results?rubric_version=N` filters the
     matrix to one version's scores; the default view is per-sandbox
     newest-wins (asc created_at, seq, rubric_version, id → last row
-    wins). `GET
+    wins). The matrix folds historical aliases into the declared rubric
+    names and hides judge dimensions outside their source rubric
+    without discarding valid scores from earlier versions on partial
+    rescoring. Human overrides remain visible across versions. `GET
     /api/runs/{id}/rubrics`
     lists versions + score counts; `GET /api/rubrics/{id}` returns one
     version incl. content (prefills the editor).

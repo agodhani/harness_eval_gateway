@@ -180,6 +180,23 @@ def test_parse_genuine_overall_not_flagged() -> None:
     assert not any("computed from dimension scores" in w for w in parsed.warnings)
 
 
+def test_parse_overall_recomputed_when_off_rubric_scores_are_dropped() -> None:
+    payload = {
+        "scores": [
+            {"dimension": "field_fidelity", "score": 4},
+            {"dimension": "output_precision", "score": 3},
+            {"dimension": "exec", "score": 10},
+        ],
+        "overall": 9,
+    }
+    scales = {"field_fidelity": (0, 4, 3), "output_precision": (1, 5, 1)}
+    parsed = parse_scores_json(
+        json.dumps(payload), dimension_scales=scales, rubric_only=True,
+    )
+    assert parsed.overall == 8.8
+    assert any("overall discarded with off-rubric scores" in w for w in parsed.warnings)
+
+
 def test_parse_overall_synthesis_rounds_to_one_decimal() -> None:
     payload = {
         "scores": [
@@ -407,6 +424,16 @@ def test_parse_folds_judge_spelling_onto_declared_dimension() -> None:
     scales = {"accuracy": (0.0, 10.0, 1.0)}
     parsed = parse_scores_json(json.dumps(payload), dimension_scales=scales)
     assert [e.dimension for e in parsed.entries] == ["accuracy"]
+
+
+def test_parse_folds_full_label_before_limiting_its_length() -> None:
+    payload = {"scores": [{"dimension": "Field" + "-" * 128 + " Fidelity", "score": 8}]}
+    parsed = parse_scores_json(
+        json.dumps(payload),
+        dimension_scales={"field_fidelity": (0.0, 10.0, 1.0)},
+        rubric_only=True,
+    )
+    assert [e.dimension for e in parsed.entries] == ["field_fidelity"]
 
 
 def test_parse_folds_alias_spelling_onto_declared_dimension() -> None:
