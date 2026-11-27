@@ -65,8 +65,8 @@ What it does:
 Return / failure semantics (plan §6): returns the ``Score`` rows it
 managed to persist. A missing/invalid ``scores.json`` yields an ``error``
 event + ``[]`` — the orchestrator decides run-level failure by counting
-rows. Infrastructure failures (bad params, missing workspace, spawn errors)
-raise. The eval sandbox is always removed; the staged dir is kept for
+rows. Infrastructure failures and empty submissions raise. The eval sandbox
+is always removed; the staged dir is kept for
 debugging.
 """
 
@@ -109,6 +109,7 @@ from evaluator.scores import (
     load_scores_file,
     rubric_dimension_scales,
 )
+from evaluator.submission import EVALUATOR_FILES, has_submission
 from evaluator.testgen import GENERATED_TESTS_DIRNAME, generate_tests_signal
 from sandbox.runtime import DEFAULT_IMAGE, SandboxRuntime
 from scoring import AnalysisReport, SignalReport, checkers, collect_signals
@@ -145,6 +146,9 @@ _ACTIVE_STATES = {"created", "running", "restarting", "paused"}
 #: — a call bounded AT the deadline could be cancelled while its scores
 #: were being persisted.
 _FALLBACK_EXIT_RESERVE_SECONDS = 5.0
+
+class EmptySubmissionError(FileNotFoundError):
+    """The snapshot contains no submission that can be judged."""
 
 
 # ---------------------------------------------------------------------------
@@ -388,14 +392,15 @@ def _stage_prompt_submission(
     ``<eval_root>/<run>/<sandbox>/prompt_submission/`` (daemon-visible like
     the eval workspace itself); collectors/staging/judging then run
     unchanged — analysis reports an empty code profile, and the judge
-    reads output.txt as the submission. A missing/unreadable output stages
-    an empty file (same judgment as an empty workspace).
+    reads output.txt as the submission.
     """
+    text = _read_text_capped(output_path, PROMPT_OUTPUT_MAX_CHARS)
+    if text is None:
+        raise EmptySubmissionError("prompt output is missing, unreadable, or blank")
     sub_dir = eval_root / str(run_uuid) / str(sandbox_uuid) / "prompt_submission"
     if sub_dir.exists():
         shutil.rmtree(sub_dir)
     sub_dir.mkdir(parents=True)
-    text = _read_text_capped(Path(output_path), PROMPT_OUTPUT_MAX_CHARS) or ""
     (sub_dir / "output.txt").write_text(text, encoding="utf-8")
     return sub_dir
 
@@ -451,15 +456,7 @@ def _stage_eval_workspace(
     # under those names could inject fake "measured" evidence into the brief.
     # generated_tests/ (PR8) is likewise evaluator-authored — a candidate dir
     # under that name could plant fake "LLM-generated" tests for the judge.
-    for reserved in (
-        SCORES_FILENAME,
-        "rubric.json",
-        "EVAL_PROMPT.md",
-        "EVAL_TRANSCRIPT.log",
-        ANALYSIS_MD_FILENAME,
-        ANALYSIS_JSON_FILENAME,
-        GENERATED_TESTS_DIRNAME,
-    ):
+    for reserved in EVALUATOR_FILES:
         p = eval_ws / reserved
         if p.is_dir() and not p.is_symlink():
             shutil.rmtree(p)
@@ -527,6 +524,8 @@ async def _wait_for_exit(
 async def _direct_judge_fallback(
     *,
     eval_ws: Path,
+    submission_workspace: Path,
+    seed_dir: Path | None,
     rubric: dict[str, Any],
     model: str,
     gateway_base_url: str,
@@ -561,6 +560,8 @@ async def _direct_judge_fallback(
         parsed = await asyncio.wait_for(
             judge_direct(
                 eval_workspace=eval_ws,
+                submission_workspace=submission_workspace if seed_dir is not None else None,
+                seed_dir=seed_dir,
                 rubric=rubric,
                 gateway_base_url=gateway_base_url,
                 cred=cred,
@@ -621,6 +622,7 @@ async def evaluate_sandbox(
     rubric: dict[str, Any] | None = None,
     artifact_dir: Path | str | None = None,
     workspace_dir: Path | str | None = None,
+    seed_dir: Path | None = None,
     prompt_output_path: Path | str | None = None,
     transcript_path: Path | str | None = None,
     terminal_reason: str | None = None,
@@ -648,8 +650,8 @@ async def evaluate_sandbox(
     (or the run's latest rubric when no id is passed).
 
     Returns the persisted ``Score`` ORM rows (detached). Raises ``ValueError``
-    on missing required inputs, ``FileNotFoundError`` when the artifact
-    workspace is absent, and propagates sandbox spawn/runtime errors.
+    on missing required inputs, ``EmptySubmissionError`` when no submission
+    is available to judge, and propagates sandbox spawn/runtime errors.
 
     ``judge_max_tokens`` overrides the judge's per-request output cap
     (miniloop ``MAX_TOKENS`` env); ``None`` keeps the 4096 agent default.
@@ -674,8 +676,7 @@ async def evaluate_sandbox(
     snapshot workspace. A bounded copy is staged into a synthesized
     submission dir and the usual pipeline (analysis, judge staging, direct
     fallback) treats it as the submission — ``workspace_dir`` is ignored
-    and never required. A missing/unreadable output evaluates as an empty
-    submission.
+    and never required. Missing, unreadable or blank output is not judged.
     """
     # ---- resolve + validate ------------------------------------------------
     attempt_started = time.monotonic()
@@ -714,10 +715,8 @@ async def evaluate_sandbox(
             )
         ws_path = Path(ws_dir)
         art_path = art_dir if art_dir is not None else ws_path.parent
-        if not ws_path.is_dir():
-            raise FileNotFoundError(
-                f"evaluate_sandbox: artifact workspace not found: {ws_path}"
-            )
+        if not await asyncio.to_thread(has_submission, ws_path, seed_dir):
+            raise EmptySubmissionError("workspace has no non-empty submission files added or changed")
     transcript = (
         Path(transcript_path)
         if transcript_path is not None
@@ -995,6 +994,8 @@ async def evaluate_sandbox(
         prior_parts = [p for p in (prior_error, f"{reason}: {exc}") if p]
         parsed, fallback_detail = await _direct_judge_fallback(
             eval_ws=eval_ws,
+            submission_workspace=ws_path,
+            seed_dir=seed_dir,
             rubric=rubric,
             model=model_name,
             gateway_base_url=gateway_base_url,

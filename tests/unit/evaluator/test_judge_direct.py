@@ -177,7 +177,9 @@ async def test_analysis_and_transcript_included(eval_ws: Path) -> None:
     assert "tail-line" in user
 
 
-async def test_binary_and_generated_tests_skipped(eval_ws: Path) -> None:
+async def test_binary_path_listed_without_contents_and_generated_tests_skipped(
+    eval_ws: Path,
+) -> None:
     (eval_ws / "blob.bin").write_bytes(b"\x00\x01\x02binary")
     gen = eval_ws / "generated_tests"
     gen.mkdir()
@@ -185,8 +187,23 @@ async def test_binary_and_generated_tests_skipped(eval_ws: Path) -> None:
     client = _FakeClient()
     await _judge(eval_ws, client=client)
     user = client.calls[0]["json"]["messages"][1]["content"]
-    assert "blob.bin" not in user
+    assert '- "blob.bin" (binary)' in user
+    assert "\x00\x01\x02binary" not in user
     assert "test_x.py" not in user
+
+
+async def test_fallback_includes_hidden_deliverables_but_not_harness_scaffolding(eval_ws):
+    (eval_ws / ".vscode").mkdir()
+    (eval_ws / ".vscode" / "settings.json").write_text('{"editor.tabSize": 2}')
+    (eval_ws / ".gitignore").write_text(".aider*\n")
+    (eval_ws / ".aider.chat.history.md").write_text("harness history")
+    client = _FakeClient()
+    await _judge(eval_ws, client=client)
+    user = client.calls[0]["json"]["messages"][1]["content"]
+    assert "### FILE: .vscode/settings.json" in user
+    assert '"editor.tabSize": 2' in user
+    assert ".gitignore" not in user
+    assert ".aider.chat.history.md" not in user
 
 
 async def test_gather_sources_skips_symlinks(eval_ws: Path, tmp_path: Path) -> None:
@@ -332,12 +349,64 @@ async def test_max_tokens_env_knob(eval_ws: Path, monkeypatch) -> None:
 
 async def test_source_budget_bounds_prompt(eval_ws: Path, monkeypatch) -> None:
     (eval_ws / "big.py").write_text("x = '" + "y" * 5000 + "'\n")
+    (eval_ws / "biggest.py").write_text("z" * 6000)
     client = _FakeClient()
-    await _judge(eval_ws, client=client, source_budget_bytes=100)
+    await _judge(eval_ws, client=client, source_budget_bytes=400)
     user = client.calls[0]["json"]["messages"][1]["content"]
     assert "[truncated" in user
     # every source still represented
     assert "main.py" in user and "big.py" in user
+    assert '- "biggest.py" (source budget)' in user
+    assert "z" * 100 not in user
+
+
+async def test_many_over_budget_paths_have_a_compact_bounded_listing(eval_ws):
+    for i in range(1001):
+        (eval_ws / f"candidate-{i:04}.txt").write_text("a" * 100)
+    client = _FakeClient()
+    await _judge(eval_ws, client=client, source_budget_bytes=24_000)
+    user = client.calls[0]["json"]["messages"][1]["content"]
+    section = user.split("# Submission files", 1)[1].split("# Candidate transcript", 1)[0]
+    contents, omitted = section.split("## Present files (contents omitted)")
+    assert len(("# Submission files" + section).encode()) <= 24_000
+    assert omitted.count("(source budget)") == 50
+    unlisted = 1001 - contents.count("### FILE: candidate-") - 50
+    assert f"and {unlisted} more files not listed" in omitted
+    assert "candidate-1000.txt" not in omitted
+
+
+async def test_dependencies_do_not_crowd_out_submission_sources(eval_ws: Path) -> None:
+    for directory in ("node_modules/package", "vendor/lib", ".venv/lib/site-packages"):
+        path = eval_ws / directory
+        path.mkdir(parents=True)
+        for index in range(30):
+            (path / f"{index}.py").write_text("x")
+    client = _FakeClient()
+    await _judge(eval_ws, client=client, source_budget_bytes=700)
+    user = client.calls[0]["json"]["messages"][1]["content"]
+    assert "### FILE: main.py" in user
+    assert user.index("### FILE: main.py") < user.index("### FILE: .venv/")
+    assert "(source budget)" in user
+
+
+async def test_primary_source_survives_400_small_node_modules_files(tmp_path: Path) -> None:
+    primary = "export const primaryDeliverable = true;\n" * 40
+    (tmp_path / "main.js").write_text(primary)
+    modules = tmp_path / "node_modules" / "package"
+    modules.mkdir(parents=True)
+    for index in range(400):
+        (modules / f"dep-{index:03}.js").write_text("// dependency\n" * 6)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        evidence = json.loads(request.content)["messages"][1]["content"]
+        assert f"### FILE: main.js\n```\n{primary.rstrip()}\n```" in evidence
+        assert evidence.index("### FILE: main.js") < evidence.index("### FILE: node_modules/")
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": json.dumps(SCORES_OBJ)}}]}
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert (await _judge(tmp_path, client=client)).overall == 7
 
 
 # ----------------------------------------------------------------------

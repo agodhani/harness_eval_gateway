@@ -539,21 +539,23 @@ async def _evaluate_all(
         )
         return
 
-    if evaluator_fn is None:
-        try:
+    try:
+        from evaluator.evaluate import EmptySubmissionError
+
+        if evaluator_fn is None:
             evaluator_fn = _import_evaluator()
-        except Exception as exc:  # noqa: BLE001 — evaluator module absent/broken
-            log.warning("evaluator unavailable: %s", exc)
-            _emit_run_event(
-                session_factory,
-                run.id,
-                event_type="error",
-                payload={
-                    "stage": "evaluation",
-                    "message": f"evaluator unavailable: {type(exc).__name__}: {exc}",
-                },
-            )
-            return
+    except Exception as exc:  # noqa: BLE001 — evaluator module absent/broken
+        log.warning("evaluator unavailable: %s", exc)
+        _emit_run_event(
+            session_factory,
+            run.id,
+            event_type="error",
+            payload={
+                "stage": "evaluation",
+                "message": f"evaluator unavailable: {type(exc).__name__}: {exc}",
+            },
+        )
+        return
 
     # PR29 — judge panel: an explicit ``model`` override (re-score)
     # re-judges with that ONE judge; otherwise the run's panel
@@ -579,6 +581,7 @@ async def _evaluate_all(
     check_entries, check_suite_dir = _suite_check_specs(run, settings)
     for sb in sandboxes:
         artifact_dir = Path(sb.artifact_path)  # type: ignore[arg-type]
+        is_prompt_cell = prompt_cell.is_prompt_config(sb.harness_config)
         if check_entries:
             # Post-artifact step — measured before the judge runs so the
             # objective verdict is persisted even if eval later fails.
@@ -603,7 +606,7 @@ async def _evaluate_all(
             # (ignored for container cells).
             "prompt_output_path": (
                 artifact_dir / prompt_cell.OUTPUT_FILENAME
-                if prompt_cell.is_prompt_config(sb.harness_config)
+                if is_prompt_cell
                 else None
             ),
             "transcript_path": artifact_dir / "transcript.log",
@@ -622,6 +625,8 @@ async def _evaluate_all(
             # reasoning before scores.json; the 4096 default truncates.
             "judge_max_tokens": int(settings.EVAL_JUDGE_MAX_TOKENS),
         }
+        if not is_prompt_cell and (sb.harness_config or {}).get("seed_sha"):
+            kwargs["seed_dir"] = Path(runtime.state_dir).parent / "seeds" / str(run.id) / "content"
         # One judge at a time (sequential — the eval sandbox id + staged
         # workspace are per-sandbox, not per-judge). Each judge gets its
         # own cred + retry budget; one judge's failure mustn't zero the
@@ -637,6 +642,7 @@ async def _evaluate_all(
             # delta, and unstamped/legacy rows still count as output.
             baseline = _sandbox_score_count(session_factory, sb.id)
             attempts = 0
+            empty_submission = False
             for attempt in range(1, retries + 2):
                 attempts = attempt
                 try:
@@ -668,6 +674,20 @@ async def _evaluate_all(
                         evaluator_fn(**kwargs),
                         timeout=timeout + _EVAL_TIMEOUT_MARGIN_SECONDS,
                     )
+                except EmptySubmissionError as exc:
+                    _emit_run_event(
+                        session_factory,
+                        run.id,
+                        sandbox_id=sb.id,
+                        event_type="error",
+                        payload={
+                            "stage": "evaluation",
+                            "reason": "empty_submission",
+                            "message": str(exc),
+                        },
+                    )
+                    empty_submission = True
+                    break
                 except Exception as exc:  # noqa: BLE001 — per-sandbox isolation
                     log.warning(
                         "evaluation failed for sandbox %s (judge %s): %s",
@@ -706,6 +726,8 @@ async def _evaluate_all(
                             "reason": "no scores produced",
                         },
                     )
+            if empty_submission:
+                break
             if _sandbox_score_count(session_factory, sb.id) == baseline:
                 # THIS judge produced nothing across its attempts — the
                 # per-judge eval-failure marker (PR29: judge A scoring

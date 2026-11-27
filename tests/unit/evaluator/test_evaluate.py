@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from db.models import Base, Event, Rubric, Run, Sandbox, Score
+from evaluator import evaluate as evaluate_mod
 from evaluator.evaluate import evaluate_sandbox
 from evaluator.sandbox_spec import eval_sandbox_id, sandbox_gateway_url
 from sandbox.runtime import SandboxRuntime, SpawnResult
@@ -739,6 +740,41 @@ async def test_direct_fallback_scores_when_agent_fails(
     assert "scores_missing" in user
 
 
+async def test_seeded_direct_fallback_prioritizes_patch_over_starter_files(
+    seeded, session_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = seeded["workspace"]
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    for path in workspace.iterdir():
+        (seed / path.name).write_bytes(path.read_bytes())
+    for directory in (seed, workspace):
+        dependencies = directory / "vendor" / "pkg"
+        dependencies.mkdir(parents=True)
+        (dependencies / "patched.js").write_text("return false;\n" * 12)
+        (dependencies / "untouched.js").write_text("x")
+        for index in range(40):
+            (directory / f"starter-{index:02}.txt").write_text("starter contents\n")
+    patch = "return  true;\n" * 12
+    (workspace / "vendor" / "pkg" / "patched.js").write_text(patch)
+    (workspace / ".github").mkdir()
+    (workspace / ".github" / "settings.yml").write_text("name: edited\n")
+    monkeypatch.setenv("EVAL_DIRECT_SOURCE_BUDGET_BYTES", "700")
+    client = _FakeClient()
+
+    rows = await _eval(
+        seeded, session_factory, FakeRuntime(scores_obj=None), direct_client=client, seed_dir=seed
+    )
+
+    assert len(rows) == 3
+    user = client.calls[0]["json"]["messages"][1]["content"]
+    first_party = user.index("### FILE: .github/settings.yml")
+    vendored_patch = user.index(f"### FILE: vendor/pkg/patched.js\n```\n{patch.rstrip()}\n```")
+    starter = user.index("### FILE: hello.txt")
+    assert first_party < vendored_patch < starter
+    assert "### FILE: vendor/pkg/untouched.js" not in user
+
+
 async def test_direct_fallback_failure_emits_fallback_detail(
     seeded, session_factory
 ) -> None:
@@ -976,33 +1012,106 @@ async def test_evaluate_prompt_output_submission(
     assert "prompt-only" in prompt or "prompt" in prompt.lower()
 
 
-async def test_evaluate_prompt_output_missing_stages_empty(
-    seeded_prompt, session_factory
+@pytest.mark.parametrize("content", [None, "", " \n\t"])
+async def test_evaluate_prompt_output_missing_or_blank_is_not_scored(
+    seeded_prompt, session_factory, content
 ) -> None:
-    """A missing output.txt stages an empty submission rather than
-    FileNotFoundError — same judgement posture as an empty workspace."""
     fake = FakeRuntime()
-    rows = await evaluate_sandbox(
-        run_id=seeded_prompt["run_id"],
-        sandbox_id=seeded_prompt["sandbox_id"],
-        rubric_id=seeded_prompt["rubric_id"],
-        rubric=RUBRIC,
-        artifact_dir=seeded_prompt["artifact_dir"],
-        prompt_output_path=seeded_prompt["artifact_dir"] / "output.txt.missing",
-        transcript_path=seeded_prompt["transcript"],
-        terminal_reason="error",
-        model="judge-model",
-        gateway_cred="heg.testcred",
-        session_factory=session_factory,
-        runtime=fake,
-        eval_root=seeded_prompt["eval_root"],
-        timeout_seconds=30,
-        poll_interval_seconds=0.01,
-        max_iters=5,
-    )
+    output = seeded_prompt["output"]
+    if content is None:
+        output.unlink()
+    else:
+        output.write_text(content)
+    with pytest.raises(FileNotFoundError, match="prompt output"):
+        await _eval(
+            {**seeded_prompt, "workspace": None},
+            session_factory,
+            fake,
+            prompt_output_path=output,
+        )
+    assert not fake.specs
+    assert not _scores_in_db(session_factory)
+
+
+async def test_evaluate_workspace_with_only_empty_files_and_scaffolding_is_not_scored(
+    seeded, session_factory
+) -> None:
+    workspace = seeded["workspace"]
+    (workspace / "main.py").unlink()
+    (workspace / "hello.txt").write_text("")
+    (workspace / ".git").mkdir()
+    (workspace / ".git" / "config").write_text("git metadata")
+    (workspace / ".gitignore").write_text(".aider*\n")
+    (workspace / ".aider.chat.history.md").write_text("Aider scaffolding")
+    (workspace / ".aider.tags.cache.v4").mkdir()
+    (workspace / ".aider.tags.cache.v4" / "cache.db").write_text("cache")
+    (workspace / "scores.json").write_text('{"overall": 10}')
+    (workspace / "nested").mkdir()
+    (workspace / "link.txt").symlink_to(seeded["transcript"])
+    fake = FakeRuntime()
+    with pytest.raises(FileNotFoundError, match="workspace has no non-empty submission"):
+        await _eval(seeded, session_factory, fake)
+    assert not fake.specs
+    assert not _scores_in_db(session_factory)
+
+
+@pytest.mark.parametrize("path", [".gitignore", ".github/workflows/ci.yml", ".vscode/settings.json"])
+async def test_evaluate_workspace_with_only_hidden_deliverable(
+    seeded, session_factory, path
+) -> None:
+    workspace = seeded["workspace"]
+    (workspace / "main.py").unlink()
+    (workspace / "hello.txt").unlink()
+    deliverable = workspace / path
+    deliverable.parent.mkdir(parents=True, exist_ok=True)
+    deliverable.write_text("submission\n")
+
+    fake = FakeRuntime()
+    rows = await _eval(seeded, session_factory, fake)
+
     assert len(rows) == 3
-    eval_ws = Path(fake.specs[0].workspace_host_path)
-    assert (eval_ws / "output.txt").read_text() == ""
+    assert (Path(fake.specs[0].workspace_host_path) / path).read_text() == "submission\n"
+
+
+@pytest.mark.parametrize("change", [None, "add", "modify", "mode", "aider", "aider-and-rule"])
+async def test_seed_only_workspace_never_reaches_judges_or_score_parser(
+    seeded, session_factory, tmp_path, monkeypatch, change
+) -> None:
+    workspace = seeded["workspace"]
+    (workspace / "main.py").unlink()
+    (workspace / "hello.txt").unlink()
+    starter = "Starter README\n"
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / "README.md").write_text(starter)
+    (workspace / "README.md").write_text(starter)
+    if change == "mode":
+        for directory in (seed, workspace):
+            (directory / "run.sh").write_text("#!/bin/sh\n")
+            (directory / "run.sh").chmod(0o644)
+        (workspace / "run.sh").chmod(0o755)
+    if change in ("aider", "aider-and-rule"):
+        (seed / ".gitignore").write_text("build/")
+        suffix = "\ndist/" if change == "aider-and-rule" else ""
+        (workspace / ".gitignore").write_text(f"build/\n\n.aider*{suffix}\n")
+    fake = FakeRuntime()
+
+    if change in (None, "aider"):
+        def unexpected(*args, **kwargs):
+            pytest.fail("empty submission reached judging or score parsing")
+
+        monkeypatch.setattr(evaluate_mod, "judge_direct", unexpected)
+        monkeypatch.setattr(evaluate_mod, "load_scores_file", unexpected)
+        with pytest.raises(FileNotFoundError, match="no non-empty submission files"):
+            await _eval(seeded, session_factory, fake, seed_dir=seed)
+        assert not fake.specs
+        assert not _scores_in_db(session_factory)
+        return
+    if change == "modify":
+        (workspace / "README.md").write_text(starter.replace("Starter", "Changed"))
+    elif change == "add":
+        (workspace / ".deliverable").write_text("new work")
+    assert len(await _eval(seeded, session_factory, fake, seed_dir=seed)) == 3
 
 
 async def test_evaluate_prompt_output_analysis_persists(
