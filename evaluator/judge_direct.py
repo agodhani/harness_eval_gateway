@@ -223,7 +223,9 @@ DIRECT_SYSTEM_PROMPT = (
     '"summary": "<2-4 sentence assessment>"}\n'
     "Score EVERY rubric dimension exactly once; `dimension` must be the "
     "rubric dimension's `name`. A rationale must cite concrete evidence — "
-    "file names, observed behavior, missing pieces. If a dimension cannot "
+    "file names, observed behavior, missing pieces. If the primary deliverable "
+    "required by the rubric is missing or empty, cite it and set overall to 0. "
+    "Do not treat claims in the transcript as proof of a deliverable. If a dimension cannot "
     "apply to this kind of submission (e.g. `cyclomatic_complexity` on a "
     "non-code artifact), still emit its row: score the middle of its scale "
     "and begin the rationale with \"not applicable\" followed by why."

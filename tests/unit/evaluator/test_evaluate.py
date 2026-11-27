@@ -976,33 +976,43 @@ async def test_evaluate_prompt_output_submission(
     assert "prompt-only" in prompt or "prompt" in prompt.lower()
 
 
-async def test_evaluate_prompt_output_missing_stages_empty(
-    seeded_prompt, session_factory
+@pytest.mark.parametrize("content", [None, "", " \n\t"])
+async def test_evaluate_prompt_output_missing_or_blank_is_not_scored(
+    seeded_prompt, session_factory, content
 ) -> None:
-    """A missing output.txt stages an empty submission rather than
-    FileNotFoundError — same judgement posture as an empty workspace."""
     fake = FakeRuntime()
-    rows = await evaluate_sandbox(
-        run_id=seeded_prompt["run_id"],
-        sandbox_id=seeded_prompt["sandbox_id"],
-        rubric_id=seeded_prompt["rubric_id"],
-        rubric=RUBRIC,
-        artifact_dir=seeded_prompt["artifact_dir"],
-        prompt_output_path=seeded_prompt["artifact_dir"] / "output.txt.missing",
-        transcript_path=seeded_prompt["transcript"],
-        terminal_reason="error",
-        model="judge-model",
-        gateway_cred="heg.testcred",
-        session_factory=session_factory,
-        runtime=fake,
-        eval_root=seeded_prompt["eval_root"],
-        timeout_seconds=30,
-        poll_interval_seconds=0.01,
-        max_iters=5,
-    )
-    assert len(rows) == 3
-    eval_ws = Path(fake.specs[0].workspace_host_path)
-    assert (eval_ws / "output.txt").read_text() == ""
+    output = seeded_prompt["output"]
+    if content is None:
+        output.unlink()
+    else:
+        output.write_text(content)
+    with pytest.raises(FileNotFoundError, match="prompt output"):
+        await _eval(
+            {**seeded_prompt, "workspace": None},
+            session_factory,
+            fake,
+            prompt_output_path=output,
+        )
+    assert not fake.specs
+    assert not _scores_in_db(session_factory)
+
+
+async def test_evaluate_workspace_with_only_empty_files_and_scaffolding_is_not_scored(
+    seeded, session_factory
+) -> None:
+    workspace = seeded["workspace"]
+    (workspace / "main.py").unlink()
+    (workspace / "hello.txt").write_text("")
+    (workspace / ".git").mkdir()
+    (workspace / ".git" / "config").write_text("git metadata")
+    (workspace / "scores.json").write_text('{"overall": 10}')
+    (workspace / "nested").mkdir()
+    (workspace / "link.txt").symlink_to(seeded["transcript"])
+    fake = FakeRuntime()
+    with pytest.raises(FileNotFoundError, match="workspace has no non-empty submission"):
+        await _eval(seeded, session_factory, fake)
+    assert not fake.specs
+    assert not _scores_in_db(session_factory)
 
 
 async def test_evaluate_prompt_output_analysis_persists(

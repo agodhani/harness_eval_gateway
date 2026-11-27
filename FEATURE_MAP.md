@@ -411,6 +411,9 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   zero-runnable-file output, and timeouts. A scores doc missing
   `overall` gets it synthesized from the dimension scores
   (scale-normalized to 0-10) + warning (`parse_scores_json`).
+  A workspace without non-empty submission files or a prompt cell without
+  a non-blank reply is not sent to either judge. Results report
+  `empty_submission` without creating score rows or retrying the panel.
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
   `prompts.py`, `judge_direct.py` — direct-completion fallback,
   `testgen.py` — PR8 suite generation + exec orchestration),
@@ -426,7 +429,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Verify:**
   - Unit: `tests/unit/evaluator/` (`test_evaluate.py`, `test_scores.py`,
     `test_prompts.py`) — mocked runtime; staging, timeout salvage, malformed
-    scores covered; `tests/unit/evaluator/test_judge_direct.py` — fake
+    scores and missing/empty submissions covered;
+    `tests/unit/evaluator/test_judge_direct.py` — fake
     gateway client: request contract, 4xx response_format retry, bounded
     prompt gather, error mapping; `tests/unit/evaluator/test_testgen.py` — fake gateway
     client + fake exec runner: skip/error semantics, deterministic

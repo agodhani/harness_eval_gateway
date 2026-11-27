@@ -243,7 +243,9 @@ same object. Valid JSON in this schema:
    satisfy the rubric's requirements; penalize missing pieces, defects you
    can point to, and unfinished work. Do not inflate scores.
 3. Judge the artifact, not the effort. A timed-out or minimal submission can
-   still score well on what it does contain.
+   still score well on what it does contain. If the primary deliverable
+   required by the rubric is missing or empty, cite it and set overall to 0.
+   A transcript or a claim about a file is not evidence that it exists.
 4. **Mark non-applicable dimensions honestly.** If a rubric dimension cannot
    apply to this kind of submission — for example `cyclomatic_complexity`
    when the submission contains no analyzable code, or a format rule on a
@@ -343,4 +345,3 @@ def build_testgen_prompt(
         ),
     ]
     return "\n".join(parts) + "\n"
-

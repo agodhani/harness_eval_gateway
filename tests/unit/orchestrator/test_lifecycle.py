@@ -927,6 +927,35 @@ async def test_lifecycle_prompt_only_run_skips_seed(
 # ---------------------------------------------------------------------------
 
 
+async def test_lifecycle_blank_prompt_skips_every_judge_without_retry(
+    session_factory, settings, artifact_root, monkeypatch
+) -> None:
+    requests = _patch_gateway(monkeypatch, lambda r: _chat_ok("  "))
+    cfg = run_config(harness_configs=[{"adapter": "prompt"}])
+    cfg["evaluator_models"] = ["judge-a", "judge-b"]
+    run = make_run(session_factory, status="provisioning", config=cfg)
+    _approved_rubric(session_factory, run.id)
+    fake = FakeRuntime(artifact_root=artifact_root)
+
+    await run_lifecycle(
+        run.id, session_factory=session_factory, runtime=fake, settings=settings
+    )
+
+    assert len(requests) == 1
+    assert not fake.spawned
+    with session_factory() as s:
+        assert not s.scalars(select(Score)).all()
+        events = s.scalars(select(Event).where(Event.run_id == run.id)).all()
+    assert [
+        event.payload["reason"]
+        for event in events
+        if event.sandbox_id is not None
+        and event.type == "error"
+        and event.payload.get("stage") == "evaluation"
+    ] == ["empty_submission"]
+    assert not any(event.payload.get("stage") == "eval_retry" for event in events)
+
+
 async def test_lifecycle_judge_panel_scores_every_artifact(
     session_factory, settings, artifact_root, monkeypatch
 ) -> None:
