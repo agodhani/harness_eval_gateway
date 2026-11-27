@@ -357,7 +357,7 @@ def main() -> int:
         return 1
     warnings: list[str] = []
     result: dict[str, Any] = {
-        "version": 1,
+        "version": 2,
         "language": "python",
         "phases": {},
         "warnings": warnings,
