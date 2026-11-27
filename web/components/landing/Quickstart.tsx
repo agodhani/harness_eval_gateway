@@ -4,7 +4,13 @@ import { ArrowUpRight, GithubMark } from "./icons";
 
 const CMDS: [string, string][] = [
   ["git clone https://github.com/agodhani/harness_eval_gateway && cd harness_eval_gateway", ""],
-  ["ollama pull qwen2.5-coder:3b", "# start Ollama first"],
+  [
+    "bridge_ip=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')",
+    "# native Linux only: run both bridge commands in the server and CLI terminals",
+  ],
+  ['export OLLAMA_HOST="${bridge_ip}:11434"', "# native Linux only: required before starting Ollama"],
+  ["ollama serve", "# leave running in a separate terminal"],
+  ["ollama pull qwen2.5-coder:3b", "# in the CLI terminal"],
   ["docker compose up -d --wait postgres", "# postgres :5433"],
   ["docker compose run --rm --build api alembic upgrade head", "# schema"],
   ["docker build -f sandbox/images/miniloop.Dockerfile -t heg-sandbox:latest .", ""],
@@ -67,6 +73,10 @@ export default function Quickstart() {
                 <span key={p}>{p}</span>
               ))}
             </div>
+            <p>
+              If Ollama is already managed as a service on native Linux, set the same
+              OLLAMA_HOST on the service and restart it before pulling the model.
+            </p>
             <a
               href="https://github.com/agodhani/harness_eval_gateway#quickstart"
               className="lp-repolink"

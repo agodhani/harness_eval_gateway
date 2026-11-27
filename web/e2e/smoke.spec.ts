@@ -21,6 +21,9 @@ test.describe("smoke", () => {
     await page.goto("/");
 
     const quickstart = page.locator("#start");
+    await expect(quickstart).toContainText(
+      /docker network inspect bridge.*export OLLAMA_HOST.*ollama serve.*ollama pull qwen2\.5-coder:3b/s,
+    );
     await expect(quickstart).toContainText("docker compose run --rm --build api alembic upgrade head");
     await expect(quickstart).toContainText("-t heg-sandbox:latest");
     await expect(quickstart).toContainText("-t heg-exec:latest");

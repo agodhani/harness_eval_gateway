@@ -68,7 +68,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   - Follow README Quickstart → `/health` + `/health/db` ok and `/api/models`
     lists the pulled Ollama model
   - `web/e2e/smoke.spec.ts` checks that the landing Quickstart uses the
-    Compose API, builds its sandbox images, and links to the Linux setup.
+    Compose API, builds its sandbox images, and puts the required Linux
+    bridge setup before pulling the model.
   - `uv run pytest` + `uv run ruff check .` green
   - `cd web && npm run lint && npm run build` green
   - `cd web && E2E_PORT=3100 npm run test:e2e` → smoke passes (3100 avoids
