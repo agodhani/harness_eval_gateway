@@ -53,6 +53,23 @@ test("mobile results keep trial analytics and pricing controls inside the card",
   expect(pickerBounds.x + pickerBounds.width).toBeLessThanOrEqual(bounds.x + bounds.width);
   await picker.selectOption(rate);
   await expect(picker).toHaveValue(rate);
+
+  const matrix = card.locator(".matrix-wrap");
+  const lastColumn = matrix.getByRole("columnheader").last();
+  await expect(lastColumn).toContainText("t2");
+  const { scrollWidth, clientWidth, overflowX } = await matrix.evaluate((el) => ({
+    scrollWidth: el.scrollWidth,
+    clientWidth: el.clientWidth,
+    overflowX: getComputedStyle(el).overflowX,
+  }));
+  expect(scrollWidth).toBeGreaterThan(clientWidth);
+  expect(overflowX).toMatch(/^(auto|scroll)$/);
+  await matrix.evaluate((el) => {
+    el.scrollIntoView({ block: "start", inline: "nearest" });
+    el.scrollLeft = el.scrollWidth;
+  });
+  await expect(lastColumn).toBeInViewport({ ratio: 0.99 });
+
   await card.getByRole("tab", { name: "by cell" }).click();
   await expect(card.getByText("8.0 ±0.0 (n=2)")).toBeVisible();
 });
