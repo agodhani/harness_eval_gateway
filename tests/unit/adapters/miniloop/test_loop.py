@@ -124,6 +124,220 @@ def test_done_terminates_agent_done(harness, tmp_path: Path) -> None:
     assert term["payload"]["terminal_state"] == "agent_done"
 
 
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        "{}",
+        "<tool_call>{}</tool_call>",
+        "```json\n{}\n```",
+        "```json \t\n{}\n```",
+        "```json\n{}\n  \t```  ",
+        "```json  \r\n{}\r\n  ```  ",
+    ],
+)
+def test_content_tool_call_dispatch_and_replay(harness, tmp_path: Path, wrapper: str) -> None:
+    make, out = harness
+    args = {"path": "hi.txt", "content": "hi"}
+    content = wrapper.format(json.dumps({"name": "write_file", "arguments": args}))
+    agent, client, _ = make(
+        [
+            _response(_assistant(content=content, tool_calls=[])),
+            _response(_assistant(tool_calls=[_tool_call("done", {"summary": "wrote file"})])),
+        ]
+    )
+
+    assert _run(agent).terminal_state == "agent_done"
+    assert (tmp_path / "hi.txt").read_text() == "hi"
+    assistant, tool = client.calls[1]["messages"][-2:]
+    assert assistant["content"] is None
+    (call,) = assistant["tool_calls"]
+    assert call["function"]["name"] == "write_file"
+    assert json.loads(call["function"]["arguments"]) == args
+    assert tool["role"] == "tool"
+    assert tool["tool_call_id"] == call["id"]
+    assert [e["payload"]["name"] for e in _events(out) if e["type"] == "tool_call"] == [
+        "write_file", "done",
+    ]
+
+
+def test_structured_tool_call_takes_precedence_over_content(harness, tmp_path: Path) -> None:
+    make, _ = harness
+    agent, _, _ = make(
+        [
+            _response(
+                _assistant(
+                    content='{"name":"write_file","arguments":{"path":"ignored.txt","content":"hi"}}',
+                    tool_calls=[_tool_call("done", {"summary": "finished"})],
+                )
+            ),
+        ]
+    )
+
+    assert _run(agent).terminal_state == "agent_done"
+    assert not (tmp_path / "ignored.txt").exists()
+
+
+def test_content_done_with_declared_status(harness) -> None:
+    make, _ = harness
+    content = '{"name":"done","arguments":{"summary":"awaiting input","status":"blocked"}}'
+    agent, _, _ = make([_response(_assistant(content=content))])
+
+    result = _run(agent)
+
+    assert result.terminal_state == "agent_done"
+    assert result.done_status == "blocked"
+
+
+def test_content_call_coerces_integral_float_arguments(harness, tmp_path: Path) -> None:
+    make, _ = harness
+    (tmp_path / "file.txt").write_text("one\ntwo\n")
+    content = json.dumps({
+        "name": "read_file",
+        "arguments": {"path": "file.txt", "offset": 2.0, "limit": 1.0},
+    })
+    agent, client, _ = make(
+        [
+            _response(_assistant(content=content)),
+            _response(_assistant(tool_calls=[_tool_call("done", {"summary": "read file"})])),
+        ]
+    )
+
+    assert _run(agent).terminal_state == "agent_done"
+    assistant, tool = client.calls[1]["messages"][-2:]
+    args = json.loads(assistant["tool_calls"][0]["function"]["arguments"])
+    assert type(args["offset"]) is int and args["offset"] == 2
+    assert type(args["limit"]) is int and args["limit"] == 1
+    assert json.loads(tool["content"])["content"] == "two"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "invalid_type"),
+    [
+        ({}, None),
+        ({"flag": 1}, "boolean"),
+        ({"items": {}}, "array"),
+        ({"metadata": []}, "object"),
+    ],
+)
+def test_content_call_with_optional_schema_properties(
+    harness, tmp_path: Path, monkeypatch, overrides: dict, invalid_type: str | None
+) -> None:
+    tools = copy.deepcopy(agent_mod.TOOLS)
+    schema = next(
+        tool["function"]["parameters"] for tool in tools
+        if tool["function"]["name"] == "write_file"
+    )
+    schema.pop("required")
+    schema["properties"].update(
+        optional={"type": "string"},
+        flag={"type": "boolean"},
+        items={"type": "array"},
+        metadata={"type": "object"},
+        unrecognized_type={"type": "custom"},
+        multitype={"type": ["string", "null"]},
+        unconstrained={},
+    )
+    monkeypatch.setattr(agent_mod, "TOOLS", tools)
+    args = {
+        "path": "hello.txt",
+        "content": "hello\n",
+        "flag": True,
+        "items": [],
+        "metadata": {},
+        "unrecognized_type": 42,
+        "multitype": None,
+        "unconstrained": True,
+        "unknown_key": {"path": "not-written.txt"},
+        **overrides,
+    }
+    make, out = harness
+    agent, client, _ = make([
+        _response(_assistant(content=json.dumps({"name": "write_file", "arguments": args}))),
+        _response(_assistant(tool_calls=[_tool_call("done", {"summary": "finished"})])),
+    ])
+
+    assert _run(agent).terminal_state == "agent_done"
+    if invalid_type is None:
+        assert (tmp_path / "hello.txt").read_bytes() == b"hello\n"
+        assert not (tmp_path / "not-written.txt").exists()
+        assert [
+            event["payload"]["name"] for event in _events(out) if event["type"] == "tool_call"
+        ] == ["write_file", "done"]
+    else:
+        assert not (tmp_path / "hello.txt").exists()
+        assert f"must have type {invalid_type}" in client.calls[1]["messages"][-1]["content"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'Example: <tool_call>{"name":"done","arguments":{}}</tool_call>',
+        'Example:\n```json\n{"name":"done","arguments":{"summary":"finished","status":"success"}}\n```',
+        '```json\n{"name":"done","arguments":{"summary":"finished","status":"success"}}\n```\nMore text',
+        '```json example\n{"name":"done","arguments":{"summary":"finished","status":"success"}}\n```',
+        '```json\n{"name":"done","arguments":{"summary":"finished","status":"success"}}\n  ``` example',
+        '```json\n{"name":"done","arguments":{"summary":"finished"}}\n```',
+        '{"name":"unknown","arguments":{}}',
+        '{"name":"done","arguments":"{}"}',
+        '<tool_call>{"name":"done","arguments":',
+        '{"name":"done","arguments":{},"example":true}',
+        '{"name":"done","arguments":{"summary":"finished"}}',
+        '{"name":"done","arguments":{"summary":"finished","status":"done"}}',
+        '{"name":"done","arguments":{"status":"success"}}',
+        '{"name":"done","arguments":{"summary":1,"status":"success"}}',
+        '{"name":"write_file","arguments":{"path":"file"}}',
+        r'{"name":"write_file","arguments":{"path":"file","content":"\ud800"}}',
+        '{"name":"read_file","arguments":{"path":"file","limit":true}}',
+        '{"name":"read_file","arguments":{"path":"file","offset":2.5}}',
+    ],
+)
+def test_invalid_content_tool_call_stays_text_only(harness, content: str) -> None:
+    make, out = harness
+    agent, _, _ = make([_response(_assistant(content=content))], max_iters=1)
+
+    assert _run(agent).terminal_state == "harness_complete"
+    assert not any(e["type"] == "tool_call" for e in _events(out))
+    assert not any(e["type"] == "done_signal" for e in _events(out))
+    assert any(e["payload"].get("stage") == "agent_nudge" for e in _events(out))
+
+
+@pytest.mark.parametrize(
+    ("args", "feedback"),
+    [
+        (
+            {"summary": "finished"},
+            "missing required argument 'status' (allowed values: success, blocked)",
+        ),
+        (
+            {"summary": "finished", "status": "done"},
+            "argument 'status' must be one of: success, blocked",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("nudge_retries", "num_rejections", "nudge"),
+    [(2, 1, AGENT_NUDGE), (0, 2, NUDGE_TEXT_STREAK_2)],
+)
+def test_rejected_content_call_nudge_names_invalid_argument(
+    harness, args: dict, feedback: str, nudge_retries: int, num_rejections: int, nudge: str
+) -> None:
+    make, out = harness
+    invalid = json.dumps({"name": "done", "arguments": args})
+    valid = json.dumps({"name": "done", "arguments": {"summary": "finished", "status": "success"}})
+    agent, client, _ = make(
+        [_response(_assistant(content=invalid))] * num_rejections
+        + [_response(_assistant(content=valid))],
+        nudge_retries=nudge_retries,
+    )
+
+    assert _run(agent).done_status == "success"
+    reply, user = client.calls[-1]["messages"][-2:]
+    assert reply["content"] == invalid
+    assert nudge in user["content"]
+    assert feedback in user["content"]
+    assert len([e for e in _events(out) if e["type"] == "done_signal"]) == 1
+
+
 def test_identical_tool_calls_three_times_stuck(harness) -> None:
     make, _ = harness
     same = _tool_call("shell", {"command": "ls"}, "c1")

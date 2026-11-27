@@ -266,10 +266,15 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   model `qwen3:8b` via Ollama; JSONL harness events on stdout + HTTP ingest;
   `MINILOOP_RESULT` terminator line; skill packs vendored under `skillpacks/`
   (51 SKILL.md: superpowers 14, mattpocock-skills 28, spec-kit 9 generated);
-  progressive-disclosure catalog in system prompt. Tool-less assistant
-  replies get `MINILOOP_NUDGE_RETRIES` corrective nudges (default 2,
+  progressive-disclosure catalog in system prompt. When there are no
+  structured calls, a standalone JSON call to a declared tool can be
+  dispatched as a structured reply. The fallback accepts bare JSON,
+  `<tool_call>` wrappers, or standalone Markdown JSON fences and checks
+  required arguments, supported property types, and enum values.
+  Other tool-less assistant replies get `MINILOOP_NUDGE_RETRIES` corrective nudges (default 2,
   `stage="agent_nudge"` checkpoints) before counting toward the text-only
-  `stuck_loop` streak. Per model-call timeout
+  `stuck_loop` streak; rejected content calls get targeted argument
+  feedback in these nudges. Per model-call timeout
   `MINILOOP_LLM_TIMEOUT_SECONDS` (default 960 — must exceed the gateway's
   worst-case call hold, (1 + `UPSTREAM_RETRY_ATTEMPTS`) ×
   `UPSTREAM_TIMEOUT_SECONDS` + retry backoff, so calls aren't abandoned
@@ -277,7 +282,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
 - **Where:** `adapters/miniloop/` (`agent.py`, `tools.py`, `events.py`,
   `skills.py`, `prompts.py`, `adapter.py`, `__main__.py`), `skillpacks/`
 - **Verify:**
-  - Unit: `tests/unit/adapters/miniloop/` (64 tests — loop, tools, events,
+  - Unit: `tests/unit/adapters/miniloop/` (loop, tools, events,
     skills, adapter)
   - Live: `python -m adapters.miniloop` vs host Ollama → agent_done ✓
   - M2 e2e proven: in-sandbox run, 51 skills discovered, done_signal emitted
