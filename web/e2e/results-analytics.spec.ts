@@ -51,8 +51,14 @@ test("mobile results keep trial analytics and pricing controls inside the card",
   const pickerBounds = (await picker.boundingBox())!;
   expect(pickerBounds.x).toBeGreaterThanOrEqual(bounds.x);
   expect(pickerBounds.x + pickerBounds.width).toBeLessThanOrEqual(bounds.x + bounds.width);
+  expect(pickerBounds.x + pickerBounds.width).toBeLessThanOrEqual(390);
+  const costs = card.getByRole("row").filter({ hasText: "estimated cost" }).getByRole("cell");
+  await expect(costs.nth(1)).toHaveText("unpriced");
+  await expect(costs.nth(2)).toHaveText("unpriced");
   await picker.selectOption(rate);
   await expect(picker).toHaveValue(rate);
+  await expect(costs.nth(1)).toHaveText("$0.0002");
+  await expect(costs.nth(2)).toHaveText("$0.0002");
 
   const matrix = card.locator(".matrix-wrap");
   const lastColumn = matrix.getByRole("columnheader").last();
