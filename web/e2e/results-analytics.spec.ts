@@ -8,7 +8,6 @@ test("mobile results keep trial analytics and pricing controls inside the card",
   const rate = "example-provider-long-model-name-with-a-long-price-option";
   const metrics = {
     model,
-    tokens: { input: 10, output: 5, total: 15, cache_read: 0 },
     latency_ms: { avg: null },
     tool_calls: { total: 0, by_tool: {} },
     skill_calls: { total: 0, by_skill: {} },
@@ -19,6 +18,10 @@ test("mobile results keep trial analytics and pricing controls inside the card",
     shell_commands: 0,
     test_executions: 0,
   };
+  const trialTokens = [
+    { input: 10, output: 5, total: 15, cache_read: 0 },
+    { input: 20, output: 10, total: 30, cache_read: 0 },
+  ];
   const results = [1, 2].map((trial_index) => ({
     sandbox_id: `sandbox-${trial_index}`,
     model,
@@ -36,8 +39,8 @@ test("mobile results keep trial analytics and pricing controls inside the card",
   }));
   await page.route(`**/api/runs/${runId}/analytics`, (route) => route.fulfill({
     json: {
-      sandboxes: results.map((sb) => ({ ...sb, ...metrics })),
-      cells: [{ ...metrics, cell: "miniloop", label: "miniloop", sandbox_count: 2, overall_mean: 8, overall_sd: 0, overall_n: 2 }],
+      sandboxes: results.map((sb, i) => ({ ...sb, ...metrics, tokens: trialTokens[i] })),
+      cells: [{ ...metrics, tokens: { input: 30, output: 15, total: 45, cache_read: 0 }, cell: "miniloop", label: "miniloop", sandbox_count: 2, overall_mean: 8, overall_sd: 0, overall_n: 2 }],
       price_table: { [rate]: { input_per_mtok_usd: 10, output_per_mtok_usd: 20 } },
     },
   }));
@@ -58,7 +61,7 @@ test("mobile results keep trial analytics and pricing controls inside the card",
   await picker.selectOption(rate);
   await expect(picker).toHaveValue(rate);
   await expect(costs.nth(1)).toHaveText("$0.0002");
-  await expect(costs.nth(2)).toHaveText("$0.0002");
+  await expect(costs.nth(2)).toHaveText("$0.0004");
 
   const matrix = card.locator(".matrix-wrap");
   const lastColumn = matrix.getByRole("columnheader").last();
