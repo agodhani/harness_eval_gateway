@@ -519,24 +519,30 @@ async def _request_rubric_content(
             return _message_content(response.json())
 
         parts: list[str] = []
-        async for line in response.aiter_lines():
-            if not line.startswith("data:"):
-                continue
-            data = line.removeprefix("data:").strip()
-            if data == "[DONE]":
-                break
-            frame = json.loads(data)
-            if not isinstance(frame, dict):
-                raise RubricParseError("invalid chat response frame")
-            if frame.get("error"):
-                raise httpx.RemoteProtocolError("upstream rubric stream returned an error")
-            for choice in frame.get("choices") or []:
-                if choice.get("index", 0) != 0:
+        done = False
+        try:
+            async for line in response.aiter_lines():
+                if done or not line.startswith("data:"):
                     continue
-                content = (choice.get("delta") or {}).get("content")
-                if isinstance(content, str):
-                    parts.append(content)
-        else:
+                data = line.removeprefix("data:").strip()
+                if data == "[DONE]":
+                    done = True
+                    continue
+                frame = json.loads(data)
+                if not isinstance(frame, dict):
+                    raise RubricParseError("invalid chat response frame")
+                if frame.get("error"):
+                    raise httpx.RemoteProtocolError("upstream rubric stream returned an error")
+                for choice in frame.get("choices") or []:
+                    if choice.get("index", 0) != 0:
+                        continue
+                    content = (choice.get("delta") or {}).get("content")
+                    if isinstance(content, str):
+                        parts.append(content)
+        except httpx.RequestError:
+            if not done:
+                raise
+        if not done:
             raise httpx.RemoteProtocolError("upstream rubric stream ended before [DONE]")
         content = "".join(parts)
         if not content.strip():

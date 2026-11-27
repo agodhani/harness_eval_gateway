@@ -355,21 +355,27 @@ async def test_ollama_rubric_retries_truncated_stream_and_joins_content(
         assert stored.content["summary"] == "Test rubric"
 
 
-async def test_ollama_rubric_stops_reading_after_done(session_factory) -> None:
+@pytest.mark.parametrize("read_error", [False, True])
+async def test_ollama_rubric_drains_after_done_without_retry(session_factory, read_error) -> None:
     run = make_run(session_factory, status="submitted", task_prompt="extract apples")
     attempts = 0
+    drained = False
     frame = {"choices": [{"delta": {"content": json.dumps(_valid_rubric_payload())}}]}
 
-    class LateReadError(httpx.AsyncByteStream):
+    class RubricStream(httpx.AsyncByteStream):
         async def __aiter__(self):
+            nonlocal drained
             yield f"data: {json.dumps(frame)}\n\ndata: [DONE]\n\n".encode()
-            raise httpx.ReadError("read attempted after DONE")
+            yield b"data: ignored after DONE\n\n"
+            drained = True
+            if read_error:
+                raise httpx.ReadError("connection lost after DONE")
 
     def handler(_request: httpx.Request) -> httpx.Response:
         nonlocal attempts
         attempts += 1
         return httpx.Response(
-            200, headers={"content-type": "text/event-stream"}, stream=LateReadError()
+            200, headers={"content-type": "text/event-stream"}, stream=RubricStream()
         )
 
     async with _mock_client(handler) as client:
@@ -378,6 +384,7 @@ async def test_ollama_rubric_stops_reading_after_done(session_factory) -> None:
         )
 
     assert attempts == 1
+    assert drained
     with session_factory() as s:
         assert s.get(Run, run.id).status == "rubric_review"
 
