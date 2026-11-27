@@ -22,11 +22,12 @@ test.describe("smoke", () => {
 
     const quickstart = page.locator("#start");
     await expect(quickstart).toContainText(
-      /docker network inspect bridge.*export OLLAMA_HOST.*ollama serve.*ollama pull qwen2\.5-coder:3b/s,
+      /docker network inspect bridge[\s\S]*export OLLAMA_HOST[\s\S]*ollama serve[\s\S]*ollama pull qwen2\.5-coder:3b/,
     );
     await expect(quickstart).toContainText("docker compose run --rm --build api alembic upgrade head");
     await expect(quickstart).toContainText("-t heg-sandbox:latest");
     await expect(quickstart).toContainText("-t heg-exec:latest");
+    await expect(quickstart.getByText("docker compose up -d --wait", { exact: true })).toBeVisible();
     await expect(quickstart).not.toContainText("uvicorn");
     await expect(quickstart.getByRole("link", { name: /native Linux Ollama/ })).toHaveAttribute(
       "href", "https://github.com/agodhani/harness_eval_gateway#quickstart",
