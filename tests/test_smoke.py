@@ -1,8 +1,11 @@
 """F0 smoke tests — the app boots and the health surface responds."""
 
 import json
+import shlex
 import shutil
 import subprocess
+import sys
+import textwrap
 from pathlib import Path
 from uuid import uuid4
 
@@ -31,6 +34,26 @@ def test_compose_api_waits_for_gateway_to_listen() -> None:
     assert gateway["depends_on"]["postgres"]["condition"] == "service_healthy"
     assert "api" not in gateway["depends_on"]
     assert not gateway["healthcheck"].get("disable", False)
+
+    mode, command = gateway["healthcheck"]["test"]
+    executable, flag, script = shlex.split(command)
+    assert (mode, executable, flag) == ("CMD-SHELL", "python", "-c")
+    stub = textwrap.dedent("""\
+        import urllib.request
+        from types import SimpleNamespace
+
+        def urlopen(url, **kwargs):
+            print(url)
+            return SimpleNamespace(status=200)
+
+        urllib.request.urlopen = urlopen
+        """)
+    probe = subprocess.run(
+        [sys.executable, "-c", stub + script],
+        capture_output=True, text=True, timeout=5, check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.splitlines() == ["http://localhost:8080/health"]
 
 
 @pytest.mark.docker
