@@ -439,7 +439,7 @@ class ExecRunner:
     ) -> ExecOutcome:
         """Run the exec container over ``workspace`` (never modifies it).
 
-        ``test_target`` (PR8) is a host directory holding an externally
+        ``test_target`` (PR8) is a directory holding an externally
         supplied pytest suite — mounted read-only at
         :data:`CONTAINER_TEST_TARGET` and run INSTEAD of the workspace's own
         detected tests. A non-directory target is a caller bug: fail fast on
@@ -478,6 +478,17 @@ class ExecRunner:
         )
         started = time.monotonic()
         spawned = False
+        if (
+            target_dir is not None
+            and self._rt.host_data_root is not None
+            and self._rt.to_host_path(target_dir) == target_dir
+        ):
+            try:
+                target_dir = shutil.copytree(target_dir, work_dir / "tests", symlinks=True)
+            except OSError as exc:
+                outcome.error = f"could not stage exec test target: {exc}"
+                shutil.rmtree(work_dir, ignore_errors=True)
+                return outcome
         try:
             spawned = self._spawn(name, ws, outcome, test_target=target_dir)
         except (OSError, subprocess.SubprocessError) as exc:

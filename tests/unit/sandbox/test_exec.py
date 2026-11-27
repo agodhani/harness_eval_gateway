@@ -273,6 +273,26 @@ def test_execute_with_test_target_passes_mount(tmp_path: Path) -> None:
     assert any(f"{target}" in a and ":ro" in a for a in run_args)
 
 
+def test_execute_stages_container_local_test_target_in_compose(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    host_root = tmp_path / "daemon-data"
+    rt = _FakeRuntime(
+        tmp_path,
+        artifact_root=data_root / "artifacts",
+        host_data_root=host_root,
+    )
+    runner = ExecRunner(runtime=rt)
+    target = tmp_path / "vendored-tests"
+    target.mkdir()
+    (target / "test_example.py").write_text("def test_example(): pass\n")
+
+    outcome = runner.execute(_ws(tmp_path), test_target=target)
+
+    run_args = next(c for c in rt.calls if c and c[0] == "run")
+    assert f"{host_root / 'exec' / outcome.container / 'tests'}:/srv/test_target:ro" in run_args
+    assert not (runner.work_root / outcome.container).exists()
+
+
 # ----------------------------------------------------------------------
 # result parsing — sentinel primary, file fallback, spoof ordering
 # ----------------------------------------------------------------------

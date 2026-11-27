@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 
 from sandbox.exec import EXEC_IMAGE, ExecRunner
+from sandbox.runtime import SandboxRuntime
+from scoring.checkers import run_checks
 from scoring.collectors import COLLECTORS, collect_signals
 from scoring.exec import ExecSandboxCollector
 from scoring.models import AnalysisReport
@@ -252,3 +254,25 @@ def test_exec_with_test_target_records_failures(
     assert tests.get("failed") == 1
     assert tests.get("ok") is False
     assert "test_gen_calc::test_mul_wrong" in (tests.get("failed_tests") or [])
+
+
+def test_vendored_pytest_checks_html_workspace(tmp_path: Path, exec_image: str) -> None:
+    data = tmp_path / "data"
+    artifact = data / "artifacts" / "wordle"
+    workspace = artifact / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "index.html").write_text("<!DOCTYPE html><html><script></script></html>")
+    host_data = tmp_path / "host-data"
+    host_data.symlink_to(data, target_is_directory=True)
+    runtime = SandboxRuntime(artifact_root=data / "artifacts", host_data_root=host_data)
+    suite = REPO_ROOT / "benchmark_suites" / "starter-regression"
+
+    (result,) = run_checks(
+        [{"check": "py_test", "path": "tests/wordle"}],
+        artifact_dir=artifact,
+        suite_dir=suite,
+        runner=ExecRunner(image=exec_image, runtime=runtime),
+    )
+
+    assert result.status == "pass", result.detail
+    assert result.detail == "3/3 tests passed"

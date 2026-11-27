@@ -266,6 +266,23 @@ def test_py_test_fail_on_red_suite(artifact: Path, suite_dir: Path) -> None:
     assert "test_bad" in out.detail
 
 
+@pytest.mark.parametrize("phases", [{}, {"tests": None}])
+def test_py_test_no_test_phase_is_measured_failure(
+    artifact: Path, suite_dir: Path, phases: dict
+) -> None:
+    outcome = _exec_outcome(tests=None)
+    outcome.result = {"phases": phases}
+    (out,) = checkers.run_checks(
+        [{"check": "py_test", "path": "tests"}],
+        artifact_dir=artifact,
+        suite_dir=suite_dir,
+        runner=FakeRunner(outcome),
+    )
+    assert out.status == "fail"
+    assert out.detail == "no tests collected from the suite dir"
+    assert out.test_summary and out.test_summary["collected"] == 0
+
+
 def test_py_test_unavailable_exec_is_skipped(artifact: Path, suite_dir: Path) -> None:
     """No docker / no heg-exec image → honest 'skipped', never fail/error."""
     runner = FakeRunner(

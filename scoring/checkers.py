@@ -619,7 +619,8 @@ def _check_py_test(
             "error",
             outcome.error or "exec produced no result payload",
         )
-    tests = (outcome.result or {}).get("phases", {}).get("tests")
+    phases = (outcome.result or {}).get("phases") or {}
+    tests = phases.get("tests") or {}
     summary = {
         "collected": int(tests.get("collected") or 0),
         "passed": int(tests.get("passed") or 0),
@@ -627,9 +628,9 @@ def _check_py_test(
         "errors": int(tests.get("errors") or 0),
         "skipped": int(tests.get("skipped") or 0),
         "duration_seconds": tests.get("duration_seconds"),
-        "ok": bool(tests.get("ok")) if tests else False,
+        "ok": bool(tests.get("ok")),
     }
-    if not tests or not tests.get("detected"):
+    if not tests.get("detected"):
         return _outcome(
             "py_test",
             spec,
