@@ -212,6 +212,13 @@ async def test_nonempty_workspace_not_flagged(
     assert not any(p.get("stage") == "empty_workspace" for p in payloads)
 
 
+def test_workflow_only_workspace_is_not_empty(tmp_path):
+    workflow = tmp_path / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("name: CI\n")
+    assert not monitor._workspace_is_empty(tmp_path)
+
+
 async def test_empty_workspace_error_reason_no_warning(
     session_factory, settings, fake_runtime
 ) -> None:

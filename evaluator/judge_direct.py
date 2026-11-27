@@ -49,20 +49,18 @@ import httpx
 
 from evaluator.prompts import _render_dimensions
 from evaluator.scores import (
-    SCORES_FILENAME,
     ParsedScores,
     ScoresFileError,
     parse_scores_json,
     rubric_dimension_scales,
 )
+from evaluator.submission import submission_files
 from evaluator.testgen import (
-    GENERATED_TESTS_DIRNAME,
     _env_float,
     _env_int,
 )
 from scoring.exec import _OFF_VALUES
-from scoring.render import ANALYSIS_JSON_FILENAME, ANALYSIS_MD_FILENAME
-from scoring.static import SKIP_DIRS
+from scoring.render import ANALYSIS_MD_FILENAME
 
 logger = logging.getLogger(__name__)
 
@@ -80,22 +78,6 @@ ANALYSIS_BUDGET_CHARS = 16_000
 TRANSCRIPT_TAIL_BYTES = 8_000
 #: Binary sniff — a NUL byte in the first block means not-source.
 _BINARY_SNIFF_BYTES = 8_192
-
-#: Evaluator-staged files the source gather must skip — they enter the
-#: prompt through their own sections (or are judge output, not candidate
-#: code). ``generated_tests/`` joins SKIP_DIRS entirely.
-_SOURCE_SKIP_DIRS = SKIP_DIRS | {GENERATED_TESTS_DIRNAME}
-_SOURCE_SKIP_FILES = frozenset(
-    {
-        "rubric.json",
-        SCORES_FILENAME,
-        "EVAL_PROMPT.md",
-        "EVAL_TRANSCRIPT.log",
-        ANALYSIS_MD_FILENAME,
-        ANALYSIS_JSON_FILENAME,
-    }
-)
-
 
 class DirectJudgeError(Exception):
     """Direct judge call failed or produced unusable scores content."""
@@ -127,22 +109,7 @@ def _gather_sources(
     without their contents. Reads are capped at the remaining budget — a
     100MB artifact never costs a 100MB read.
     """
-    candidates: list[tuple[int, Path]] = []
-    for dirpath, dirnames, filenames in os.walk(workspace):
-        dirnames[:] = [d for d in dirnames if d not in _SOURCE_SKIP_DIRS]
-        for name in sorted(filenames):
-            if name in _SOURCE_SKIP_FILES:
-                continue
-            path = Path(dirpath) / name
-            try:
-                if path.is_symlink() or not path.is_file():
-                    continue
-                size = path.stat().st_size
-            except OSError:
-                continue
-            if size:
-                candidates.append((size, path))
-    candidates.sort(key=lambda t: (t[0], str(t[1])))
+    candidates = sorted(submission_files(workspace))
 
     out: list[tuple[str, str]] = []
     remaining = budget_bytes

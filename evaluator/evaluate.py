@@ -109,6 +109,7 @@ from evaluator.scores import (
     load_scores_file,
     rubric_dimension_scales,
 )
+from evaluator.submission import EVALUATOR_FILES, has_submission
 from evaluator.testgen import GENERATED_TESTS_DIRNAME, generate_tests_signal
 from sandbox.runtime import DEFAULT_IMAGE, SandboxRuntime
 from scoring import AnalysisReport, SignalReport, checkers, collect_signals
@@ -145,17 +146,6 @@ _ACTIVE_STATES = {"created", "running", "restarting", "paused"}
 #: — a call bounded AT the deadline could be cancelled while its scores
 #: were being persisted.
 _FALLBACK_EXIT_RESERVE_SECONDS = 5.0
-
-_EVALUATOR_FILES = {
-    SCORES_FILENAME,
-    "rubric.json",
-    "EVAL_PROMPT.md",
-    "EVAL_TRANSCRIPT.log",
-    ANALYSIS_MD_FILENAME,
-    ANALYSIS_JSON_FILENAME,
-    GENERATED_TESTS_DIRNAME,
-}
-
 
 class EmptySubmissionError(FileNotFoundError):
     """The snapshot contains no submission that can be judged."""
@@ -389,23 +379,6 @@ def _staging_ignore(dirpath: str, names: list[str]) -> set[str]:
     return ignored
 
 
-def _workspace_has_submission(workspace: Path) -> bool:
-    for root, dirs, files in os.walk(workspace):
-        path = Path(root)
-        reserved = _EVALUATOR_FILES if path == workspace else ()
-        dirs[:] = [name for name in dirs if name != ".git" and name not in reserved]
-        for name in files:
-            if name == ".git" or name in reserved:
-                continue
-            try:
-                info = (path / name).lstat()
-            except OSError:
-                continue
-            if stat.S_ISREG(info.st_mode) and info.st_size:
-                return True
-    return False
-
-
 def _stage_prompt_submission(
     eval_root: Path,
     run_uuid: uuid.UUID,
@@ -483,7 +456,7 @@ def _stage_eval_workspace(
     # under those names could inject fake "measured" evidence into the brief.
     # generated_tests/ (PR8) is likewise evaluator-authored — a candidate dir
     # under that name could plant fake "LLM-generated" tests for the judge.
-    for reserved in _EVALUATOR_FILES:
+    for reserved in EVALUATOR_FILES:
         p = eval_ws / reserved
         if p.is_dir() and not p.is_symlink():
             shutil.rmtree(p)
@@ -737,7 +710,7 @@ async def evaluate_sandbox(
             )
         ws_path = Path(ws_dir)
         art_path = art_dir if art_dir is not None else ws_path.parent
-        if not await asyncio.to_thread(_workspace_has_submission, ws_path):
+        if not await asyncio.to_thread(has_submission, ws_path):
             raise EmptySubmissionError("workspace has no non-empty submission files")
     transcript = (
         Path(transcript_path)

@@ -192,6 +192,20 @@ async def test_binary_path_listed_without_contents_and_generated_tests_skipped(
     assert "test_x.py" not in user
 
 
+async def test_fallback_includes_hidden_deliverables_but_not_harness_scaffolding(eval_ws):
+    (eval_ws / ".vscode").mkdir()
+    (eval_ws / ".vscode" / "settings.json").write_text('{"editor.tabSize": 2}')
+    (eval_ws / ".gitignore").write_text(".aider*\n")
+    (eval_ws / ".aider.chat.history.md").write_text("harness history")
+    client = _FakeClient()
+    await _judge(eval_ws, client=client)
+    user = client.calls[0]["json"]["messages"][1]["content"]
+    assert "### FILE: .vscode/settings.json" in user
+    assert '"editor.tabSize": 2' in user
+    assert ".gitignore" not in user
+    assert ".aider.chat.history.md" not in user
+
+
 async def test_gather_sources_skips_symlinks(eval_ws: Path, tmp_path: Path) -> None:
     """Workspace symlinks survive staging — the host-side gather must not
     follow them or files outside the workspace land in the prompt."""

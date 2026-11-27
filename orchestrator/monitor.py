@@ -51,6 +51,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from api import pricing
 from db.models import Artifact, Event, Run, Sandbox
+from evaluator.submission import has_submission
 from gateway import metering
 from gateway.metering import (
     budget_state as metering_budget_state,
@@ -414,26 +415,7 @@ def _snapshot_sizes(snapshot: Any) -> dict[str, int]:
 
 
 def _workspace_is_empty(path: Path) -> bool:
-    """True when the snapshot workspace holds no real files.
-
-    "Empty" = no entries at all, or only dot-entries (``.git``,
-    ``.gitignore``, ``.env`` …) — harness/agent scaffolding doesn't count
-    as produced work. Dot-directories are pruned so ``.git`` internals
-    can't count either; a non-dot subdirectory is produced structure and
-    counts as non-empty. ``os.walk`` doesn't follow symlinked dirs, so a
-    candidate-planted symlink can't pull the scan outside the artifact
-    tree. Runs on a worker thread (same FS walk cost as sizing).
-    """
-    if not path.is_dir():
-        return True
-    for _root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
-        if dirs:
-            return False
-        for name in files:
-            if not name.startswith("."):
-                return False
-    return True
+    return not has_submission(path)
 
 
 def _finalize_db(

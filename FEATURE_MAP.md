@@ -412,9 +412,10 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   zero-runnable-file output, and timeouts. A scores doc missing
   `overall` gets it synthesized from the dimension scores
   (scale-normalized to 0-10) + warning (`parse_scores_json`).
-  Hidden deliverables count as submission files; VCS internals and
-  evaluator-reserved files do not. A workspace without non-empty submission files or a prompt cell without
-  a non-blank reply is not sent to either judge. Results report
+  The monitor and both judge paths share one submission file check. Hidden
+  deliverables count; VCS internals, known Aider scaffolding and
+  evaluator-reserved files do not. A workspace without non-empty submission
+  files or a prompt cell without a non-blank reply is not sent to either judge. Results report
   `empty_submission` without creating score rows or retrying the panel.
 - **Where:** `evaluator/` (`evaluate.py`, `sandbox_spec.py`, `scores.py`,
   `prompts.py`, `judge_direct.py` — direct-completion fallback,

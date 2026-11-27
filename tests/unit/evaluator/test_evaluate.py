@@ -1005,6 +1005,10 @@ async def test_evaluate_workspace_with_only_empty_files_and_scaffolding_is_not_s
     (workspace / "hello.txt").write_text("")
     (workspace / ".git").mkdir()
     (workspace / ".git" / "config").write_text("git metadata")
+    (workspace / ".gitignore").write_text(".aider*\n")
+    (workspace / ".aider.chat.history.md").write_text("Aider scaffolding")
+    (workspace / ".aider.tags.cache.v4").mkdir()
+    (workspace / ".aider.tags.cache.v4" / "cache.db").write_text("cache")
     (workspace / "scores.json").write_text('{"overall": 10}')
     (workspace / "nested").mkdir()
     (workspace / "link.txt").symlink_to(seeded["transcript"])
@@ -1015,7 +1019,7 @@ async def test_evaluate_workspace_with_only_empty_files_and_scaffolding_is_not_s
     assert not _scores_in_db(session_factory)
 
 
-@pytest.mark.parametrize("path", [".gitignore", ".github/workflows/ci.yml"])
+@pytest.mark.parametrize("path", [".gitignore", ".github/workflows/ci.yml", ".vscode/settings.json"])
 async def test_evaluate_workspace_with_only_hidden_deliverable(
     seeded, session_factory, path
 ) -> None:
