@@ -82,9 +82,9 @@ class ParsedScores:
 
     ``entries`` are the valid per-dimension scores (invalid entries are
     dropped and described in ``warnings``). ``overall``/``summary`` come from
-    the top-level fields when present and valid; when ``overall`` is missing
-    or unusable but entries exist, it is synthesized from the dimension
-    scores — the weighted mean of each score's normalized position on its
+    the top-level fields when present and valid. When ``overall`` is missing,
+    unusable, or discarded alongside off-rubric entries, it is synthesized
+    from the dimension scores: the weighted mean of each score's position on its
     declared scale (a plain mean when no scales are known), clamped to the
     0-10 headline and flagged in ``warnings`` — so the results surface never
     shows a silent null.
@@ -326,6 +326,7 @@ def parse_scores_json(
     gives each dimension's declared scale so the synthesized ``overall``
     stays a 0-10 score on custom-scale rubrics. With ``rubric_only``,
     drop entries not defined by the rubric when usable dimensions exist.
+    Recompute the overall score if any off-rubric entry was dropped.
     """
     obj = _loads_lenient(text)
     if obj is None:
@@ -346,6 +347,7 @@ def parse_scores_json(
         raise ScoresFileError("scores.json has no 'scores' list")
 
     parsed = ParsedScores()
+    dropped_off_rubric = False
     seen: set[str] = set()
     for i, item in enumerate(raw_scores):
         if not isinstance(item, dict):
@@ -365,6 +367,7 @@ def parse_scores_json(
             )
             continue
         if rubric_only and dimension_scales and folded not in dimension_scales:
+            dropped_off_rubric = True
             parsed.warnings.append(
                 f"scores[{i}] ({dim!r}) is not a rubric dimension — dropped"
             )
@@ -404,19 +407,18 @@ def parse_scores_json(
         raise ScoresFileError("scores.json contains no valid score entries")
 
     overall = _as_float(obj.get("overall"))
-    if overall is not None:
+    if overall is not None and not dropped_off_rubric:
         parsed.overall = overall
-    elif "overall" in obj:
+    elif overall is None and "overall" in obj:
         parsed.warnings.append("'overall' is not numeric — ignored")
     if parsed.overall is None:
-        # A judge that scored every dimension but omitted `overall` must not
-        # leave the field null — the results matrix reads it as the headline
-        # score. Synthesize it from the dimension scores and flag it as
-        # derived so the eval_scored event's warnings show where the number
-        # came from.
         parsed.overall = _synthesized_overall(parsed.entries, dimension_scales)
+        reason = (
+            "overall discarded with off-rubric scores"
+            if overall is not None else "overall missing"
+        )
         parsed.warnings.append(
-            "overall missing — computed from dimension scores "
+            f"{reason} — computed from dimension scores "
             "(scale-normalized to 0-10)"
         )
 
