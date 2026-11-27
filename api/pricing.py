@@ -51,7 +51,13 @@ PRICE_TABLE: dict[str, ModelPrice] = {
     "claude-opus-4.1": ModelPrice(input_per_mtok_usd=15.0, output_per_mtok_usd=75.0),
     "gpt-4o": ModelPrice(input_per_mtok_usd=2.5, output_per_mtok_usd=10.0),
     "gpt-4o-mini": ModelPrice(input_per_mtok_usd=0.15, output_per_mtok_usd=0.6),
+    "llama3.1:8b": ModelPrice(input_per_mtok_usd=0.0, output_per_mtok_usd=0.0, local=True),
+    "qwen2.5-coder:3b": ModelPrice(input_per_mtok_usd=0.0, output_per_mtok_usd=0.0, local=True),
+    "qwen2.5-coder:7b": ModelPrice(input_per_mtok_usd=0.0, output_per_mtok_usd=0.0, local=True),
+    "qwen2.5vl:3b": ModelPrice(input_per_mtok_usd=0.0, output_per_mtok_usd=0.0, local=True),
+    "qwen2.5vl:7b": ModelPrice(input_per_mtok_usd=0.0, output_per_mtok_usd=0.0, local=True),
     "qwen3:8b": ModelPrice(input_per_mtok_usd=0.0, output_per_mtok_usd=0.0, local=True),
+    "smollm2:135m": ModelPrice(input_per_mtok_usd=0.0, output_per_mtok_usd=0.0, local=True),
 }
 
 
