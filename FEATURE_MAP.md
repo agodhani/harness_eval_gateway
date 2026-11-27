@@ -249,11 +249,13 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `heg-sandbox` (`--internal`, egress locked — proven: external DNS fails);
   gateway attached with alias `gateway` → `http://gateway:8080` is the only
   egress; `./skillpacks` bind-mounted ro at `/opt/skillpacks`; `done` CLI on
-  PATH → `POST /internal/done`; workspace bind-mount; snapshot →
+  PATH → `POST /internal/done`; workspace bind-mount owned by the image user
+  when staged by the root Compose API; snapshot →
   `data/artifacts/<run>/<sandbox>/{workspace/,transcript.log,meta.json}`.
 - **Where:** `sandbox/` (`runtime.py`, `spec.py`, `images/miniloop.Dockerfile`,
   `images/done`, `images/testapp/`), `data/artifacts/`, `data/sandboxes/`
 - **Verify:**
+  - Workspace ownership from Compose: `tests/unit/sandbox/test_runtime.py`
   - Integration: `tests/integration/test_sandbox.py` (`@pytest.mark.docker`,
     6 pass 1 skip) — incl. egress-lockdown proof
   - M2 e2e proven: real miniloop sandbox completed task + artifact
