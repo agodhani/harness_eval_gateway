@@ -35,9 +35,11 @@ NETWORK_NAME = "heg-sandbox"
 GATEWAY_CONTAINER = "harness_eval_gateway-gateway-1"
 
 
-def _docker(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+def _docker(
+    *args: str, check: bool = False, input: str | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["docker", *args], capture_output=True, text=True, check=check
+        ["docker", *args], capture_output=True, text=True, check=check, input=input
     )
 
 
@@ -184,6 +186,68 @@ def test_spawn_exec_env_and_state_file(
         assert state["container"] == f"heg-{spec.sandbox_id}"
         assert state["env"]["TEST_VAR"] == "hi"
         assert state["env"]["GATEWAY_CRED"] == "***"
+
+
+def test_compose_workspace_allows_nonroot_agent_to_edit_seed(
+    testapp_image: str, tmp_path: Path
+) -> None:
+    suffix = uuid.uuid4().hex[:10]
+    sandbox_id = f"s{suffix}"
+    network = f"heg-test-{suffix}"
+    agent = _docker(
+        "build", "-q", "-",
+        input=f"FROM {testapp_image}\nUSER 42424:42424\n",
+    )
+    assert agent.returncode == 0, agent.stderr
+    api = _docker("build", "-q", str(REPO_ROOT))
+    assert api.returncode == 0, api.stderr
+    script = """
+import shutil
+import sys
+from pathlib import Path
+
+from sandbox.runtime import SandboxRuntime
+from sandbox.spec import SandboxSpec
+
+image, sandbox_id, network = sys.argv[1:]
+root = Path("/data")
+rt = SandboxRuntime(artifact_root=root / "artifacts", network=network,
+                    gateway_container=f"absent-{network}")
+workspace = root / "sandboxes" / sandbox_id
+seed = root / "seed"
+(seed / "nested").mkdir(parents=True)
+(seed / "nested" / "start.txt").write_text("original")
+try:
+    rt.spawn(SandboxSpec(sandbox_id=sandbox_id, run_id="seeded-run", image=image,
+                         workspace_host_path=workspace, seed_host_path=seed,
+                         cmd=["sleep", "60"]))
+    probe = rt.exec(sandbox_id, [
+        "sh", "-ec",
+        'test "$(id -u)" = 42424; test "$(cat nested/start.txt)" = original; '
+        'echo edited > nested/start.txt; echo new > created.txt',
+    ])
+    assert probe.returncode == 0, probe.stderr
+    assert (workspace / "nested" / "start.txt").read_text() == "edited\\n"
+    assert (workspace / "created.txt").read_text() == "new\\n"
+    assert (seed / "nested" / "start.txt").read_text() == "original"
+finally:
+    shutil.rmtree(workspace, ignore_errors=True)
+    shutil.rmtree(seed, ignore_errors=True)
+    shutil.rmtree(rt.state_dir, ignore_errors=True)
+"""
+    try:
+        proc = _docker(
+            "run", "--rm", "--network", "none",
+            "-v", "/var/run/docker.sock:/var/run/docker.sock",
+            "-v", f"{tmp_path}:/data",
+            "-e", f"HOST_DATA_ROOT={tmp_path}",
+            api.stdout.strip(), "python", "-c", script,
+            agent.stdout.strip(), sandbox_id, network,
+        )
+        assert proc.returncode == 0, proc.stderr
+    finally:
+        _docker("rm", "-f", f"heg-{sandbox_id}")
+        _docker("network", "rm", network)
 
 
 # ----------------------------------------------------------------------

@@ -54,6 +54,7 @@ DEFAULT_GATEWAY_CONTAINER = "harness_eval_gateway-gateway-1"
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DOCKER_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+_IMAGE_USER_RE = re.compile(r"^uid=(\d+).*?\bgid=(\d+)")
 _SENSITIVE_ENV_RE = re.compile(r"cred|key|token|secret|pass", re.IGNORECASE)
 
 # Vendored skill packs are bind-mounted read-only into every sandbox at
@@ -360,6 +361,33 @@ class SandboxRuntime:
     # lifecycle
     # ------------------------------------------------------------------
 
+    def _set_workspace_owner(self, workspace: Path, image: str) -> None:
+        """Give the image user ownership of a workspace staged by the Compose API."""
+        if self.host_data_root is None or os.geteuid() != 0:
+            return
+        local = self._docker(["image", "inspect", image], check=False, timeout=30)
+        if local.returncode != 0:
+            self._docker(["pull", image], timeout=180)
+        proc = self._docker(
+            [
+                "run", "--rm", "--pull", "never", "--network", "none",
+                "--entrypoint", "id", image,
+            ],
+            check=False,
+            timeout=30,
+        )
+        identity = _IMAGE_USER_RE.match(proc.stdout) if proc.returncode == 0 else None
+        if identity is None:
+            logger.warning("no workspace ownership change: could not identify user for %r", image)
+            return
+        uid, gid = map(int, identity.groups())
+        if (uid, gid) == (0, 0):
+            return
+        os.chown(workspace, uid, gid, follow_symlinks=False)
+        for directory, dirs, files in os.walk(workspace, followlinks=False):
+            for name in (*dirs, *files):
+                os.chown(Path(directory) / name, uid, gid, follow_symlinks=False)
+
     def spawn(self, spec: SandboxSpec) -> SpawnResult:
         """``docker run -d`` one sandbox container on the internal network.
 
@@ -391,6 +419,8 @@ class SandboxRuntime:
             from sandbox.seeds import copy_seed
 
             seed_sha = copy_seed(Path(spec.seed_host_path), ws)
+
+        self._set_workspace_owner(ws, spec.image)
 
         env = {**_DEFAULT_ENV, **spec.env}
         args = [
