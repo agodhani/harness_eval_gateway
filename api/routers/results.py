@@ -110,6 +110,7 @@ from orchestrator import prompt_cell, runner, state_machine
 from orchestrator.matrix import (
     judge_models,
     run_models,
+    same_model_eval,
     sandbox_model,
     trial_index,
 )
@@ -1214,7 +1215,7 @@ def get_run_results(
         models=run_models(cfg, run.model_name),
         evaluator_model=cfg.get("evaluator_model"),
         evaluator_models=panel,
-        same_model_eval=cfg.get("same_model_eval"),
+        same_model_eval=same_model_eval(cfg, run.model_name),
         task_inputs=cfg.get("task_inputs") or None,
         selected_rubric_version=rubric_version,
         rubric_versions=[
@@ -2174,7 +2175,7 @@ def _run_spec_out(run: Run) -> RunSpecOut:
         model_name=run.model_name,
         models=run_models(cfg, run.model_name),
         evaluator_model=cfg.get("evaluator_model"),
-        same_model_eval=cfg.get("same_model_eval"),
+        same_model_eval=same_model_eval(cfg, run.model_name),
         trials=getattr(run, "trials", None) or cfg.get("trials") or 1,
         config=cfg,
         preset_ref=run.preset_ref,

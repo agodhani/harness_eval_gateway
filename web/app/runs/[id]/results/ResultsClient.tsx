@@ -1156,9 +1156,8 @@ export default function ResultsClient({ runId }: { runId: string }) {
       <div className="stack">
         {sameModel === true ? (
           <WarnNote>
-            <strong>Same-model evaluation:</strong> the evaluator model equals a
-            participant model (<code>{evaluatorModel ?? modelName}</code>). Scores
-            are produced by the same weights being judged — treat rankings as
+            <strong>Same-model evaluation:</strong> at least one configured judge
+            also runs as a participant. Treat scores from those matchups as
             indicative, not independent.
           </WarnNote>
         ) : evaluatorModel ? (

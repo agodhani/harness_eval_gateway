@@ -31,6 +31,14 @@ export function participantModels(rows: readonly ModelRowInput[]): string[] {
   return out;
 }
 
+export function matrixParticipantModels(
+  models: readonly string[],
+  configs: readonly { model?: string | null }[],
+): string[] {
+  const pins = configs.map((config) => config.model?.trim() || null);
+  return [...new Set(pins.flatMap((pin) => (pin ? [pin] : models)))];
+}
+
 /** Rows → `RunCreate` fields: `model_name` = row 1 verbatim (blank → "",
  * required-validation's job to catch); `models` = the deduped remainder —
  * EXCLUDING the primary, matching the server's "additional models" contract

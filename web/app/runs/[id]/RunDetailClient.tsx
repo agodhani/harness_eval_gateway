@@ -619,7 +619,7 @@ export default function RunDetailClient({ runId }: { runId: string }) {
                 : run.status}
             </Badge>
             {run.same_model_eval ? (
-              <Badge tone="amber" title="evaluator model == a participant model">
+              <Badge tone="amber" title="A configured judge also runs as a participant">
                 same-model eval
               </Badge>
             ) : null}

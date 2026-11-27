@@ -58,8 +58,8 @@ def run_models(config: Mapping[str, Any] | None, model_name: str) -> list[str]:
 
     The run's model list (``config.models``) plus any per-config ``model``
     pins in ``config.harness_configs`` — a pin overrides the run list for
-    its config but still counts as a participant (same-model-eval flag,
-    run/results ``models`` fields, analytics rollups).
+    its config but still appears in run/results ``models`` fields and
+    analytics rollups.
     """
     cfg = config or {}
     pinned = [
@@ -152,6 +152,19 @@ def judge_models(config: Mapping[str, Any] | None, model_name: str) -> list[str]
             return out
     single = _clean(cfg.get("evaluator_model")) or _clean(model_name)
     return [single] if single else []
+
+
+def same_model_eval(config: Mapping[str, Any] | None, model_name: str) -> bool:
+    """Whether any configured judge also runs in a participant cell."""
+    cfg = config or {}
+    configs = [
+        hc
+        for hc in cfg.get("harness_configs") or []
+        if isinstance(hc, Mapping)
+    ]
+    cells = expanded_configs(configs or [{}], cfg.get("models"), model_name)
+    actual_participants = {sandbox_model(cell, model_name) for cell in cells}
+    return bool(actual_participants.intersection(judge_models(cfg, model_name)))
 
 
 def sandbox_model(harness_config: Mapping[str, Any] | None, default_model: str) -> str:

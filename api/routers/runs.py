@@ -51,7 +51,7 @@ from gateway import metering
 from orchestrator import adapters as orch_adapters
 from orchestrator import events as orch_events
 from orchestrator import pacing, provision, runner, state_machine
-from orchestrator.matrix import judge_models, participant_models, run_models
+from orchestrator.matrix import participant_models, run_models, same_model_eval
 from orchestrator.rubric import RubricContent
 from sandbox import seeds
 from skillpack_import.store import imported_root
@@ -93,15 +93,6 @@ def _run_sandboxes(session: Session, run_id: uuid.UUID) -> list[Sandbox]:
         .scalars()
         .all()
     )
-
-
-def _same_model_eval(run: Run) -> bool:
-    """True when ANY judge model equals a participant model — non-independent
-    judging for that cell (PR29: the flag aggregates across the judge
-    panel; PR14: participants are a set, not just model_name — per-config
-    ``model`` pins count too — ``run_models``)."""
-    participants = set(run_models(run.config, run.model_name))
-    return bool(set(judge_models(run.config, run.model_name)) & participants)
 
 
 def _queue_positions(session: Session) -> dict[uuid.UUID, int]:
@@ -186,7 +177,7 @@ def _run_out(
         model_name=run.model_name,
         trials=run.trials or 1,
         config=run.config or {},
-        same_model_eval=_same_model_eval(run),
+        same_model_eval=same_model_eval(run.config, run.model_name),
         created_at=run.created_at,
         updated_at=run.updated_at,
         started_at=run.started_at,
@@ -355,13 +346,7 @@ def _persist_run(session: Session, body: RunCreate, warnings: list[str]) -> Run:
         # read it without parsing config; the matrix expansion reads config.
         "trials": body.trials,
     }
-    # Judge == any participant model flags non-independent scoring; pins
-    # count as participants even when outside the run's model list.
-    # PR29: ANY panel member counts — a 3-judge panel where one judge is
-    # a participant is still non-independent.
-    config["same_model_eval"] = bool(
-        set(evaluator_models) & set(run_models(config, body.model_name))
-    )
+    config["same_model_eval"] = same_model_eval(config, body.model_name)
 
     # PR22 preset resolution — a preset_ref asserts the task came from the
     # preset: the preset's body REPLACES the submitted task_prompt (stored

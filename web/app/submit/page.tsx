@@ -46,7 +46,11 @@ import {
   type UploadOut,
 } from "@/lib/api";
 import { truncate } from "@/lib/format";
-import { modelsPayload, participantModels } from "@/lib/modelRows";
+import {
+  matrixParticipantModels,
+  modelsPayload,
+  participantModels,
+} from "@/lib/modelRows";
 import {
   consumeResubmit,
   stageRunWarnings,
@@ -672,7 +676,8 @@ export default function SubmitPage() {
   );
   // PR14 + PR29: flagged when ANY judge on the panel equals a participant
   // model — non-independent judging for that matrix cell.
-  const judgeOverlap = participants.filter((m) => judgePanel.includes(m));
+  const judgeOverlap = matrixParticipantModels(participants, configs)
+    .filter((m) => judgePanel.includes(m));
   const sameModelEval = judgeOverlap.length > 0;
 
   const canAddConfig = configs.length < MAX_CONFIGS;
