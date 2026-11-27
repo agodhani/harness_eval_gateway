@@ -55,7 +55,7 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   Alembic base schema (`runs`, `sandboxes`, `events`, `rubrics`, `scores`,
   `artifacts`), pytest + ruff scaffold, Next.js 16 app, GitHub Actions CI
   (backend lint+pytest w/ Postgres service, web lint+build, Playwright e2e).
-- **Where:** `docker-compose.yml`, `Dockerfile`, `db/migrations/`,
+- **Where:** [README Quickstart](README.md#quickstart), `docker-compose.yml`, `Dockerfile`, `db/migrations/`,
   `pyproject.toml`, `.github/workflows/ci.yml`, `web/playwright.config.ts`,
   `web/e2e/smoke.spec.ts`, `tests/`
 - **Theme:** `web/app/globals.css` — dark "instrument panel" tokens
@@ -65,8 +65,8 @@ Status legend: 🔲 planned · 🚧 in progress · ✅ working
   `web/app/landing.css` + `web/components/landing/*` (scripted run-console
   replay in `web/lib/sim.ts`), plain CSS, no framework.
 - **Verify:**
-  - `docker compose up -d` → `curl localhost:8001/health` + `/health/db` ok
-  - `DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5433/harness_eval alembic upgrade head` → all tables present
+  - Follow README Quickstart → `/health` + `/health/db` ok and `/api/models`
+    lists the pulled Ollama model
   - `uv run pytest` + `uv run ruff check .` green
   - `cd web && npm run lint && npm run build` green
   - `cd web && E2E_PORT=3100 npm run test:e2e` → smoke passes (3100 avoids
