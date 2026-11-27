@@ -623,12 +623,15 @@ def _check_py_test(
     phases = result.get("phases") or {}
     tests = phases.get("tests") or {}
     version = result.get("version")
-    if not tests and (not isinstance(version, int) or version < 2):
+    if not tests:
+        detail = "exec image did not report a pytest phase for the supplied test target"
+        if not isinstance(version, int) or version < 3:
+            detail = f"exec image {outcome.image!r} did not report a pytest phase; rebuild the exec image"
         return _outcome(
             "py_test",
             spec,
             "error",
-            f"exec image {outcome.image!r} did not report a pytest phase; rebuild the exec image",
+            detail,
         )
     summary = {
         "collected": int(tests.get("collected") or 0),

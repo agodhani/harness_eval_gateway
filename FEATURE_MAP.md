@@ -1784,7 +1784,9 @@ rigged before it starts.
   `heg-exec` container (`ExecRunner` — never on the host), including
   HTML-only workspaces. Container-local suite files stage under the
   shared data root for the read-only Docker mount. An older exec image
-  that reports no pytest phase is an unmeasured error with a rebuild hint. Statuses:
+  that reports no pytest phase is an unmeasured error with a rebuild hint.
+  A test mount that cannot be staged is also unmeasured; an empty, readable
+  test target is a measured failure. Statuses:
   `pass`/`fail` are measured outcomes; `skipped` = infrastructure
   absent (no Docker/image); `error` = checker misconfig/crash.
 - **Lifecycle** (`orchestrator/lifecycle.py`): post-artifact, pre-judge

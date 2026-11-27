@@ -357,7 +357,7 @@ def main() -> int:
         return 1
     warnings: list[str] = []
     result: dict[str, Any] = {
-        "version": 2,
+        "version": 3,
         "language": "python",
         "phases": {},
         "warnings": warnings,
@@ -387,6 +387,10 @@ def main() -> int:
     if TEST_TARGET_SRC is not None:
         result["test_target"] = str(TEST_TARGET_SRC)
         tests_root = _stage_test_target(TEST_TARGET_SRC, warnings)
+        if tests_root is None:
+            result["error"] = warnings[-1]
+            _emit(result)
+            return 1
 
     if not py_files and TEST_TARGET_SRC is None:
         warnings.append("no python sources found after copy — nothing to run")
@@ -412,7 +416,7 @@ def main() -> int:
     if not test_files:
         if TEST_TARGET_SRC is not None:
             warnings.append("EXEC_TEST_TARGET produced no test_*.py files")
-        phases["tests"] = None
+        phases["tests"] = {"detected": False} if TEST_TARGET_SRC is not None else None
     else:
         pytest_target = str(tests_root) if tests_root is not None else "."
         pytest_prefix = [sys.executable]

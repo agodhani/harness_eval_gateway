@@ -276,3 +276,33 @@ def test_vendored_pytest_checks_html_workspace(tmp_path: Path, exec_image: str) 
 
     assert result.status == "pass", result.detail
     assert result.detail == "3/3 tests passed"
+
+
+@pytest.mark.parametrize("broken_target", [False, True])
+def test_vendored_pytest_distinguishes_empty_and_unreadable_targets(
+    tmp_path: Path, exec_image: str, broken_target: bool
+) -> None:
+    artifact = tmp_path / "artifact"
+    (artifact / "workspace").mkdir(parents=True)
+    suite = tmp_path / "suite"
+    target = suite / "tests"
+    target.mkdir(parents=True)
+    if broken_target:
+        (target / "test_example.py").write_text("def test_example(): pass\n")
+        (target / "fixture.json").symlink_to("missing-fixture.json")
+
+    (result,) = run_checks(
+        [{"check": "py_test", "path": "tests"}],
+        artifact_dir=artifact,
+        suite_dir=suite,
+        runner=ExecRunner(image=exec_image, runtime=SandboxRuntime(artifact_root=artifact)),
+    )
+
+    if broken_target:
+        assert result.status == "error", result.detail
+        assert "test target copy failed" in result.detail
+        assert result.test_summary is None
+    else:
+        assert result.status == "fail", result.detail
+        assert result.detail == "no tests collected from the suite dir"
+        assert result.test_summary and result.test_summary["collected"] == 0

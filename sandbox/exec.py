@@ -634,9 +634,11 @@ class ExecRunner:
             # collectable before a confirmed exit is pre-completion data.
             return
         self._cp_result(name, out_dir, outcome)
-        outcome.result = self._parse_result(
-            out_dir, stdout_tail, outcome.warnings
-        )
+        result = self._parse_result(out_dir, stdout_tail, outcome.warnings)
+        if result and isinstance(result.get("error"), str):
+            outcome.error = result["error"]
+            return
+        outcome.result = result
         if outcome.result is None and outcome.error is None:
             outcome.error = (
                 "exec container produced no result payload "

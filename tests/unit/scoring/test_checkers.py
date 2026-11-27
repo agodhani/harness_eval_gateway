@@ -266,12 +266,8 @@ def test_py_test_fail_on_red_suite(artifact: Path, suite_dir: Path) -> None:
     assert "test_bad" in out.detail
 
 
-@pytest.mark.parametrize("phases", [{}, {"tests": None}])
-def test_py_test_no_test_phase_is_measured_failure(
-    artifact: Path, suite_dir: Path, phases: dict
-) -> None:
-    outcome = _exec_outcome(tests=None)
-    outcome.result = {"version": 2, "phases": phases}
+def test_py_test_empty_suite_is_measured_failure(artifact: Path, suite_dir: Path) -> None:
+    outcome = _exec_outcome(tests={"detected": False})
     (out,) = checkers.run_checks(
         [{"check": "py_test", "path": "tests"}],
         artifact_dir=artifact,
@@ -285,6 +281,7 @@ def test_py_test_no_test_phase_is_measured_failure(
 
 @pytest.mark.parametrize("result", [
     {"version": 1, "phases": {"scan": {"python_files": 0}}},
+    {"version": 2, "phases": {"tests": None}},
     {"phases": {"tests": None}},
 ])
 def test_py_test_stale_runner_without_test_phase_is_unmeasured(
