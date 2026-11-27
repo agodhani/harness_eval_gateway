@@ -96,6 +96,11 @@ def test_parse_no_json_raises() -> None:
         parse_rubric_json("sorry, I cannot help with that")
 
 
+def test_parse_malformed_json_raises_rubric_parse_error() -> None:
+    with pytest.raises(RubricParseError, match="invalid rubric JSON: Expecting property name"):
+        parse_rubric_json("draft: {malformed}")
+
+
 def test_parse_invalid_schema_raises_validation_error() -> None:
     payload = _valid_rubric_payload()
     payload["dimensions"] = []  # below the 1-dimension minimum (PR23)
@@ -521,16 +526,59 @@ async def test_draft_rubric_failure_saves_capped_gateway_body(
         assert len(message) < 600
 
 
-async def test_draft_rubric_double_failure_marks_failed(session_factory) -> None:
+@pytest.mark.parametrize(
+    ("output", "decoder_detail"),
+    [
+        ("still not json", None),
+        (
+            "draft: {malformed}",
+            "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)",
+        ),
+        ('{"summary":', "Expecting value: line 1 column 12 (char 11)"),
+    ],
+)
+async def test_draft_rubric_double_failure_marks_failed(
+    session_factory, output: str, decoder_detail: str | None
+) -> None:
     run = make_run(session_factory, status="submitted")
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return _chat_response("still not json")
+        return _chat_response(output)
 
     client = _mock_client(handler)
     await rubric_mod.draft_rubric(run.id, session_factory=session_factory, settings=SETTINGS, client=client)
     with session_factory() as s:
         assert s.get(Run, run.id).status == "failed"
+        error = s.execute(
+            select(Event).where(Event.run_id == run.id, Event.type == "error")
+        ).scalar_one()
+        assert error.payload["stage"] == "rubric_generation"
+        assert "Rubric draft was invalid" in error.payload["message"]
+        assert "pin the participant model" in error.payload["message"]
+        if decoder_detail is not None:
+            assert decoder_detail in error.payload["message"]
+
+
+async def test_invalid_draft_recommends_changing_configured_rubric_model(session_factory) -> None:
+    run = make_run(session_factory, status="submitted")
+    settings = SimpleNamespace(**{**vars(SETTINGS), "RUBRIC_MODEL": "cheap-model"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["model"] == settings.RUBRIC_MODEL
+        return _chat_response("still not json")
+
+    async with _mock_client(handler) as client:
+        await rubric_mod.draft_rubric(
+            run.id, session_factory=session_factory, settings=settings, client=client
+        )
+    with session_factory() as s:
+        assert s.get(Run, run.id).status == "failed"
+        error = s.execute(
+            select(Event).where(Event.run_id == run.id, Event.type == "error")
+        ).scalar_one()
+        assert error.payload["message"] == (
+            "Rubric draft was invalid. Set RUBRIC_MODEL to a stronger model."
+        )
 
 
 async def test_draft_rubric_missing_run_is_noop(session_factory) -> None:

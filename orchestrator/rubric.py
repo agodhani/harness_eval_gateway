@@ -457,9 +457,9 @@ def _extract_json(text: str) -> str:
         stripped = "\n".join(lines).strip()
     start = stripped.find("{")
     end = stripped.rfind("}")
-    if start == -1 or end == -1 or end <= start:
+    if start == -1:
         raise RubricParseError("no JSON object found in model output")
-    return stripped[start : end + 1]
+    return stripped[start : end + 1] if end > start else stripped[start:]
 
 
 def parse_rubric_json(text: str) -> RubricContent:
@@ -467,12 +467,15 @@ def parse_rubric_json(text: str) -> RubricContent:
 
     Tolerates ``` fences and leading/trailing prose, plus the small
     coercions in :func:`_normalize_rubric_dict`. Raises
-    :class:`RubricParseError` (no JSON) or pydantic ``ValidationError``
+    :class:`RubricParseError` (missing or malformed JSON) or pydantic ``ValidationError``
     (schema violations — incl. the 1–12 dimension bounds and
     duplicate-after-normalization) — the caller retries on either with the
     failure fed back into the prompt.
     """
-    data = json.loads(_extract_json(text))
+    try:
+        data = json.loads(_extract_json(text))
+    except json.JSONDecodeError as exc:
+        raise RubricParseError(f"invalid rubric JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise RubricParseError("rubric JSON is not an object")
     return RubricContent.model_validate(_normalize_rubric_dict(data))
@@ -732,8 +735,19 @@ def _persist_draft(
         session.commit()
 
 
-def _failure_message(exc: Exception) -> str:
+def _failure_message(exc: Exception, *, rubric_model: str = "") -> str:
     """Human-readable failure reason; surfaces the gateway's error body."""
+    if isinstance(exc, RubricParseError):
+        if rubric_model:
+            message = "Rubric draft was invalid. Set RUBRIC_MODEL to a stronger model."
+        else:
+            message = (
+                "Rubric draft was invalid. Use a stronger run model to draft it "
+                "and pin the participant model separately in the API."
+            )
+        if isinstance(exc.__cause__, json.JSONDecodeError):
+            message += f" JSON error: {exc.__cause__}"
+        return message
     if isinstance(exc, httpx.HTTPStatusError):
         body = exc.response.text.strip()
         if body:
@@ -908,7 +922,7 @@ async def draft_rubric(
         log.info("draft_rubric: run %s -> rubric_review", run_id)
     except Exception as exc:
         log.exception("draft_rubric: run %s failed", run_id)
-        message = _failure_message(exc)
+        message = _failure_message(exc, rubric_model=settings.RUBRIC_MODEL)
         try:
             _mark_failed(session_factory, run_id, message)
         except Exception:
