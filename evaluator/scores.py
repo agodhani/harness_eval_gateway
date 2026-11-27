@@ -217,7 +217,7 @@ def _clean_dimension(value: Any) -> str | None:
     dim = value.strip()
     if not dim:
         return None
-    return dim[:MAX_DIMENSION_LEN]
+    return dim
 
 
 def rubric_dimension_scales(
@@ -358,6 +358,7 @@ def parse_scores_json(
             )
             continue
         folded = fold_dimension_name(dim)
+        dim = dim[:MAX_DIMENSION_LEN]
         if folded in RESERVED_DIMENSION_NAMES:
             parsed.warnings.append(
                 f"scores[{i}] ({dim!r}) names a reserved score field — dropped"

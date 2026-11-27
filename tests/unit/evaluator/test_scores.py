@@ -409,6 +409,16 @@ def test_parse_folds_judge_spelling_onto_declared_dimension() -> None:
     assert [e.dimension for e in parsed.entries] == ["accuracy"]
 
 
+def test_parse_folds_full_label_before_limiting_its_length() -> None:
+    payload = {"scores": [{"dimension": "Field" + "-" * 128 + " Fidelity", "score": 8}]}
+    parsed = parse_scores_json(
+        json.dumps(payload),
+        dimension_scales={"field_fidelity": (0.0, 10.0, 1.0)},
+        rubric_only=True,
+    )
+    assert [e.dimension for e in parsed.entries] == ["field_fidelity"]
+
+
 def test_parse_folds_alias_spelling_onto_declared_dimension() -> None:
     """A judge's alias spelling (``functional``, ``complexity``) for a
     rubric declaring the canonical name persists under the declared name —
