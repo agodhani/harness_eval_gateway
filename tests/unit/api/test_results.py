@@ -2075,6 +2075,29 @@ def test_results_checker_source_and_eval_error(
     assert "judge-a" in sb_b["eval_error"]
 
 
+def test_results_keep_human_override_outside_selected_rubric(
+    client: TestClient, session_factory, artifact_root
+) -> None:
+    fx = _panel_run(session_factory, artifact_root)
+    sid = fx["sb_a"]
+    override = client.post(
+        f"/api/sandboxes/{sid}/scores",
+        json={"dimension": "code_quality", "score": 7, "note": "Reviewed"},
+    )
+    assert override.status_code == 201
+    with session_factory() as s:
+        s.add(Rubric(
+            run_id=fx["run_id"], version=2, status="approved",
+            content={"dimensions": [{"name": "functional_requirements"}]},
+        ))
+        s.commit()
+
+    path = f"/api/runs/{fx['run_id']}/results"
+    body = client.get(path, params={"rubric_version": 2}).json()
+    cell = _sandbox_result(body, sid)["dimensions"]["code_quality"]
+    assert (cell["source"], cell["score"], cell["note"]) == ("human", 7, "Reviewed")
+
+
 def test_results_human_override_wins(
     client: TestClient, session_factory, artifact_root
 ) -> None:

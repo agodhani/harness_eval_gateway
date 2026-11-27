@@ -1150,7 +1150,9 @@ def get_run_results(
         active_dimensions = rubric_dimensions.get(active_version or 0)
         visible_scores: list[Score] = []
         for sc in sb_scores:
-            if sc.dimension not in {OVERALL_DIMENSION, SUITE_PASS_DIMENSION}:
+            if sc.source != "human" and sc.dimension not in {
+                OVERALL_DIMENSION, SUITE_PASS_DIMENSION,
+            }:
                 if active_dimensions and sc.dimension not in active_dimensions:
                     continue
                 original_dimensions = rubric_dimensions.get(score_version(sc) or 0)
