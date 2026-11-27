@@ -110,6 +110,7 @@ from orchestrator import prompt_cell, runner, state_machine
 from orchestrator.matrix import (
     judge_models,
     run_models,
+    same_model_eval,
     sandbox_model,
     trial_index,
 )
@@ -1214,7 +1215,7 @@ def get_run_results(
         models=run_models(cfg, run.model_name),
         evaluator_model=cfg.get("evaluator_model"),
         evaluator_models=panel,
-        same_model_eval=cfg.get("same_model_eval"),
+        same_model_eval=same_model_eval(cfg, run.model_name),
         task_inputs=cfg.get("task_inputs") or None,
         selected_rubric_version=rubric_version,
         rubric_versions=[
@@ -2016,8 +2017,8 @@ class EventLiteOut(BaseModel):
 class RunSpecOut(BaseModel):
     """The run's submitted spec + lifecycle stamps — the spec block shared
     by the JSON export (``RunExport.spec``) and the share view
-    (``ShareOut.run``). ``config`` is the verbatim submitted config
-    (harness_configs, models, budgets, task_inputs, ...)."""
+    (``ShareOut.run``). ``config`` includes the submitted settings and
+    the derived same-model flag."""
 
     id: UUID
     status: str
@@ -2167,6 +2168,7 @@ def _event_lite_rows(
 
 def _run_spec_out(run: Run) -> RunSpecOut:
     cfg = run.config or {}
+    overlap = same_model_eval(cfg, run.model_name)
     return RunSpecOut(
         id=run.id,
         status=run.status,
@@ -2174,9 +2176,9 @@ def _run_spec_out(run: Run) -> RunSpecOut:
         model_name=run.model_name,
         models=run_models(cfg, run.model_name),
         evaluator_model=cfg.get("evaluator_model"),
-        same_model_eval=cfg.get("same_model_eval"),
+        same_model_eval=overlap,
         trials=getattr(run, "trials", None) or cfg.get("trials") or 1,
-        config=cfg,
+        config={**cfg, "same_model_eval": overlap},
         preset_ref=run.preset_ref,
         preset_revision=run.preset_revision,
         suite_ref=run.suite_ref,

@@ -15,6 +15,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  matrixParticipantModels,
   modelsPayload,
   participantModels,
   type ModelRowInput,
@@ -47,6 +48,22 @@ describe("participantModels", () => {
 
   test("blank primary does not suppress a later model", () => {
     assert.deepEqual(participantModels(rows("", "b")), ["b"]);
+  });
+});
+
+describe("matrixParticipantModels", () => {
+  test("fully pinned configs exclude unused run models", () => {
+    assert.deepEqual(
+      matrixParticipantModels(["a", "b"], [{ model: "c" }, { model: "c" }]),
+      ["c"],
+    );
+  });
+
+  test("an unpinned config includes the run models alongside pins", () => {
+    assert.deepEqual(
+      matrixParticipantModels(["a", "b"], [{}, { model: "c" }, { model: "b" }]),
+      ["a", "b", "c"],
+    );
   });
 });
 

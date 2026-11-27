@@ -361,6 +361,23 @@ def test_create_run_same_model_eval_against_any_participant(api) -> None:
     assert data["same_model_eval"] is False
 
 
+@pytest.mark.parametrize("judge,expected", [("qwen3:8b", False), ("gpt-4o", True)])
+def test_same_model_eval_uses_actual_pinned_cells(api, judge, expected) -> None:
+    data = _post_run(
+        api.client,
+        _valid_body(
+            harness_configs=[{"adapter": "miniloop", "model": "gpt-4o"}],
+            evaluator_model="independent-judge",
+            evaluator_models=[judge],
+        ),
+    )
+    assert data["config"]["same_model_eval"] is expected
+    assert data["same_model_eval"] is expected
+    results = api.client.get(f"/api/runs/{data['id']}/results")
+    assert results.status_code == 200
+    assert results.json()["same_model_eval"] is expected
+
+
 def test_create_run_matrix_size_cap(api) -> None:
     """PR14: configs × models is capped — each cell is a real sandbox."""
     # 8 configs × (1 + 4 models) = 40 cells > MAX_MATRIX_CELLS (32)
